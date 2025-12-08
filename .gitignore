@@ -1,0 +1,36 @@
+# ───────── ENTORNO PYTHON / VENV ─────────
+venv/
+.venv/
+env/
+ENV/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+*.pdb
+
+# ───────── EDITORES ─────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ───────── SISTEMA / OS ─────────
+.DS_Store
+Thumbs.db
+
+# ───────── ARCHIVOS SENSIBLES ─────────
+.env
+*.env
+.env.*
+.env.local
+
+# ───────── LOGS ─────────
+*.log
+logs/
+*.sqlite3
+
+# ───────── BUILD / DIST ─────────
+dist/
+build/
+*.egg-info/

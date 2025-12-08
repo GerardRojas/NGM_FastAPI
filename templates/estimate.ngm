@@ -1,0 +1,994 @@
+{
+  "project_name": "1928 Test St",
+  "date": "2025-11-24",
+  "categories": [
+    {
+      "id": "001",
+      "name": "Plans & Permits",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "001.01",
+          "name": "Schematic Plans",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "001.02",
+          "name": "Engineering",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "001.03",
+          "name": "Permit Issuance",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "001.04",
+          "name": "ROW Work",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "002",
+      "name": "Preparation",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "002.01",
+          "name": "Services",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "002.02",
+          "name": "Clearing",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "002.03",
+          "name": "Rough Grading",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "003",
+      "name": "Underground",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "003.01",
+          "name": "Trenching",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.02",
+          "name": "Electrical",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.03",
+          "name": "Well",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.04",
+          "name": "Water",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.05",
+          "name": "Septic System",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.06",
+          "name": "Sewer",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.07",
+          "name": "Gas",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.08",
+          "name": "Data",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "003.09",
+          "name": "Other Utiliry Connections",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "004",
+      "name": "Trash",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "004.01",
+          "name": "Hauling & dump",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "004.02",
+          "name": "Toxic materials removal",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "005",
+      "name": "Rough Structure",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "005.01",
+          "name": "Concrete Formwork",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "005.02",
+          "name": "Footings",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "005.03",
+          "name": "Structural Slabs",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "005.04",
+          "name": "Concrete Stairs",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "005.05",
+          "name": "Precast Decks and Walls",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "005.06",
+          "name": "Retaining Wall",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "006",
+      "name": "Waterproofing",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "006.01",
+          "name": "Footings Waterproofing",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "006.02",
+          "name": "Bathroom Waterproofing",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "007",
+      "name": "Rough Framing",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "007.01",
+          "name": "Sub-Joist",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "007.02",
+          "name": "Walls",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "007.03",
+          "name": "Floor Joist ",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "007.04",
+          "name": "Roof Rafters",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "007.05",
+          "name": "Ceiling Joist",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "007.06",
+          "name": "Scaffolding",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "007.07",
+          "name": "Trusses",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "007.08",
+          "name": "Framing - Sheathing",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "008",
+      "name": "Insulation",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "008.01",
+          "name": "Foundation and Basement Insulation",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "008.02",
+          "name": "Roof and Ceiling Insulation",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "008.03",
+          "name": "Wall Insulation",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "008.04",
+          "name": "Floor Insulation",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "009",
+      "name": "Drywall",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "009.01",
+          "name": "Drywall",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "010",
+      "name": "Drywall Texture",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "010.01",
+          "name": "Drywall Level 3 Texture",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "011",
+      "name": "Interior Trim",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "011.01",
+          "name": "Casing",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "011.02",
+          "name": "Base Board",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "011.03",
+          "name": "Interior Moulding",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "011.04",
+          "name": "Faux Beams",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "012",
+      "name": "Exterior Finishes",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "012.01",
+          "name": "Posts and Columns",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "012.02",
+          "name": "Exterior Stone Finish",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "012.03",
+          "name": "Stucco",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "012.04",
+          "name": "Gutters",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "012.05",
+          "name": "Siding",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "012.06",
+          "name": "Exterior Trim Hardware",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "013",
+      "name": "Exterior Structures",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "013.01",
+          "name": "Deck water proof & Texture",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "013.02",
+          "name": "Pergola",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "013.03",
+          "name": "Fences",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "014",
+      "name": "HVAC",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "014.01",
+          "name": "Furnace",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "014.02",
+          "name": "Ducting",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "014.03",
+          "name": "AC Condenser",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "014.04",
+          "name": "Thermostat",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "014.05",
+          "name": "Mini-Split",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "015",
+      "name": "Roof",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "015.01",
+          "name": "Roof - Shingles",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "015.02",
+          "name": "Roof - Torch down",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "015.03",
+          "name": "Roof - Tile",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "015.04",
+          "name": "Roof - Sheathing",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "016",
+      "name": "Solar Panels",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "016.01",
+          "name": "Solar Panels Instalation",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "017",
+      "name": "Rough Plumbing",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "017.01",
+          "name": "Rough Plumbing per Exits",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "018",
+      "name": "Rough Electrical",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "018.01",
+          "name": "Electrical Exits",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "018.02",
+          "name": "Electrical Panel",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "018.03",
+          "name": "Subpanel",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "018.04",
+          "name": "Temporary Electric",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "019",
+      "name": "Windows",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "019.01",
+          "name": "Custom Windows",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "020",
+      "name": "Doors",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "020.01",
+          "name": "Front Door / Front Door Hardware",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "020.02",
+          "name": "Exterior Doors",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "020.03",
+          "name": "Garage Doors",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "020.04",
+          "name": "French Doors",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "020.05",
+          "name": "Interior Doors / Interior Door Hardware",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "020.06",
+          "name": "Closet Doors",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "020.07",
+          "name": "Sliding Glass Doors",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "020.08",
+          "name": "Custom Shower Glass Door",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "021",
+      "name": "Flooring",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "021.01",
+          "name": "Laminate",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "021.02",
+          "name": "Vinyl Floor",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "021.03",
+          "name": "Tile",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "022",
+      "name": "Stair Case",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "022.01",
+          "name": "Interior Staircase",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "022.02",
+          "name": "Exterior Stair Case",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "022.03",
+          "name": "Handrail",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "023",
+      "name": "Ceramic Tile",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "023.01",
+          "name": "Interior Tile",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "024",
+      "name": "Cabinets",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "024.01",
+          "name": "Kitchen Cabinets",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "024.02",
+          "name": "Handles",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "025",
+      "name": "Countertops",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "025.01",
+          "name": "Kitchen Countertops",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "026",
+      "name": "Paint",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "026.01",
+          "name": "Three Tones Interior Paint",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "026.02",
+          "name": "Two Tones Exterior Paint",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "027",
+      "name": "Appliances",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "027.01",
+          "name": "Home Appliances",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "028",
+      "name": "Finish Plumbing",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "028.01",
+          "name": "Plumbing Fixtures",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "028.02",
+          "name": "Bathroom Accesories",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "028.03",
+          "name": "Water Heaters",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "029",
+      "name": "Finish Electrical",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "029.01",
+          "name": "Electrical Fixtures",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "029.02",
+          "name": "Lighting",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "029.03",
+          "name": "Ceiling Fans",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "029.04",
+          "name": "Electrical Complements",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "030",
+      "name": "Landscaping",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "030.01",
+          "name": "Landscape",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "031",
+      "name": "Clean-up",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "031.01",
+          "name": "Hardscape By Design",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        },
+        {
+          "id": "031.02",
+          "name": "Cleaning Building Service",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "032",
+      "name": "Manufactured Units Assembler",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "032.01",
+          "name": "MFG Units Site Work",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "033",
+      "name": "Profit & Overhead",
+      "base_cost": 0,
+      "total_cost": 0,
+      "subcategories": [
+        {
+          "id": "033.01",
+          "name": "Profit & Overhead",
+          "base_cost": 0,
+          "total_cost": 0,
+          "items": []
+        }
+      ]
+    }
+  ],
+  "project": {
+    "Project Name": "1928 Test St",
+    "Address": "",
+    "Project Type": "ADU Dettached",
+    "Number of Rooms": "",
+    "Number of Bathrooms": "",
+    "Number of Units": "",
+    "Foundation Type": "Slab",
+    "Date": "2025-11-24"
+  }
+}
