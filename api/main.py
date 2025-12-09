@@ -12,13 +12,14 @@ load_dotenv(env_path)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Routers existentes
+# ========= ROUTERS EXISTENTES =========
 from api.schema import router as schema_router
 from api.routers.projects import router as projects_router
 from api.routers.pipeline import router as pipeline_router
-
-# Nuevo router del cotizador / estructura base
 from api.routers.estimator import router as estimator_router
+
+# ========= NUEVO: AUTH LOGIN ==========
+from api.auth import router as auth_router
 
 
 # ========================================
@@ -32,7 +33,7 @@ app = FastAPI(title="NGM HUB API")
 # ========================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Ajustar a producción después
+    allow_origins=["*"],   # Ajustar a dominios específicos en producción
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,13 +47,16 @@ app.add_middleware(
 # Inspector de base de datos
 app.include_router(schema_router)
 
+# Módulo de autenticación (LOGIN)
+app.include_router(auth_router)
+
 # Módulo de proyectos
 app.include_router(projects_router)
 
 # Pipeline Manager (tasks, grouped, etc.)
 app.include_router(pipeline_router)
 
-# ⚡ NUEVO: Cotizador – Base Structure (.ngm generator)
+# Cotizador – Base Structure (.ngm generator)
 app.include_router(estimator_router)
 
 
