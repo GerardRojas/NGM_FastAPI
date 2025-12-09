@@ -61,8 +61,13 @@ app.include_router(estimator_router)
 
 
 # ========================================
-# Root
+# Root & Healthcheck
 # ========================================
-@app.get("/")
-def root():
+
+@app.get("/", include_in_schema=False)
+async def root():
     return {"message": "NGM HUB API running"}
+
+@app.get("/health", include_in_schema=False)
+async def health():
+    return {"status": "ok"}
