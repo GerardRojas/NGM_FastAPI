@@ -1,8 +1,23 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from api.supabase_client import supabase
+import uuid
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
+
+# ====== MODELOS ======
+
+class ProjectCreate(BaseModel):
+    project_name: str
+    source_company: str
+    client: str | None = None
+    address: str | None = None
+    city: str | None = None
+    status: str | None = None
+
+
+# ====== HELPERS ======
 
 def extract_rel_value(row: dict, rel_name: str, field: str):
     """
@@ -22,6 +37,48 @@ def extract_rel_value(row: dict, rel_name: str, field: str):
         return rel.get(field)
 
     return None
+
+
+# ====== ENDPOINTS ======
+
+@router.post("/", status_code=201)
+def create_project(payload: ProjectCreate):
+    try:
+        data = payload.dict()
+
+        # ===== VALIDACIÓN DE FOREIGN KEYS =====
+        # Validar source_company
+        comp = supabase.table("companies").select("id").eq("id", data["source_company"]).single().execute()
+        if not comp.data:
+            raise HTTPException(status_code=400, detail="Invalid source_company")
+
+        # Validar status
+        if data["status"] is not None:
+            status = supabase.table("project_status").select("status_id").eq("status_id", data["status"]).single().execute()
+            if not status.data:
+                raise HTTPException(status_code=400, detail="Invalid status")
+
+        # Validar client
+        if data["client"] is not None:
+            client = supabase.table("clients").select("client_id").eq("client_id", data["client"]).single().execute()
+            if not client.data:
+                raise HTTPException(status_code=400, detail="Invalid client")
+
+        # Generar un UUID para project_id
+        data["project_id"] = str(uuid.uuid4())
+
+        # ===== INSERCIÓN =====
+        res = supabase.table("projects").insert(data).execute()
+
+        return {
+            "message": "Project created",
+            "project": res.data[0],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/")
@@ -81,9 +138,10 @@ def get_projects_meta():
     Devuelve catálogos básicos para la UI de Projects:
       - companies: company_id + name  (mapeado desde companies.id)
       - statuses: status_id + status
+      - clients: client_id + client_name
     """
     try:
-        # En la tabla companies la PK se llama 'id', no 'company_id'
+        # Companies (PK se llama 'id')
         companies_resp = (
             supabase
             .table("companies")
@@ -92,6 +150,7 @@ def get_projects_meta():
             .execute()
         )
 
+        # Statuses
         status_resp = (
             supabase
             .table("project_status")
@@ -100,10 +159,19 @@ def get_projects_meta():
             .execute()
         )
 
+        # Clients
+        clients_resp = (
+            supabase
+            .table("clients")
+            .select("client_id, client_name")
+            .order("client_name")
+            .execute()
+        )
+
         raw_companies = companies_resp.data or []
         raw_statuses = status_resp.data or []
+        raw_clients = clients_resp.data or []
 
-        # Normalizamos para que el front siempre vea company_id + name
         companies = [
             {
                 "company_id": c.get("id"),
@@ -113,10 +181,12 @@ def get_projects_meta():
         ]
 
         statuses = raw_statuses  # ya vienen como status_id + status
+        clients = raw_clients    # ya vienen como client_id + client_name
 
         return {
             "companies": companies,
             "statuses": statuses,
+            "clients": clients,
         }
 
     except Exception as e:
