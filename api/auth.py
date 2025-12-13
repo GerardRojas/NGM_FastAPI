@@ -81,7 +81,7 @@ def create_user(payload: CreateUserRequest):
 
 @router.post("/login")
 def login(payload: LoginRequest):
-    # 1. Buscar usuario por user_name
+    # 1) Buscar usuario por user_name
     try:
         result = (
             supabase.table("users")
@@ -92,7 +92,6 @@ def login(payload: LoginRequest):
         )
     except APIError as e:
         print("APIError en /auth/login:", repr(e))
-        # Respuesta genérica por seguridad
         raise HTTPException(status_code=401, detail="Invalid username or password")
     except Exception as e:
         print("Error inesperado en /auth/login:", repr(e))
@@ -109,22 +108,44 @@ def login(payload: LoginRequest):
             detail="User has no password configured (missing password_hash)",
         )
 
-    # 2. Verificar password
-    if not verify_password(payload.password, hashed):
+    # DEBUG seguro (sin revelar password)
+    pw = payload.password or ""
+    try:
+        print("[LOGIN] username:", payload.username)
+        print("[LOGIN] password chars:", len(pw))
+        print("[LOGIN] password bytes:", len(pw.encode("utf-8")))
+        print("[LOGIN] hash prefix:", str(hashed)[:4])
+        print("[LOGIN] hash length:", len(str(hashed)))
+    except Exception:
+        # no queremos que logs rompan login
+        pass
+
+    # 2) Verificar password (nunca 500 por bcrypt)
+    try:
+        ok = verify_password(pw, hashed)
+    except ValueError as e:
+        # bcrypt lanza ValueError si "secret" >72 bytes, hash inválido, etc.
+        print("bcrypt ValueError during login:", repr(e))
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    except Exception as e:
+        # Cualquier otra excepción inesperada
+        print("Unexpected error during password verify:", repr(e))
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    # 3. Resolver FK de rol a nombre legible
-    role_id = user.get("user_rol")
-    seniority_id = user.get("user_seniority")  # la dejamos como ID crudo por ahora
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    # 3) Resolver FK de rol a nombre legible
+    role_id = user.get("user_rol")              # UUID (FK)
+    seniority_id = user.get("user_seniority")  # crudo por ahora
 
     role_name = None
-    # ---- ROL (tabla rols, columna rol_name) ----
     if role_id:
         try:
             role_res = (
                 supabase.table("rols")
                 .select("rol_name")
-                .eq("rol_id", role_id)  # si tu PK es 'id', cambia a .eq("id", role_id)
+                .eq("rol_id", role_id)
                 .single()
                 .execute()
             )
@@ -132,24 +153,24 @@ def login(payload: LoginRequest):
                 role_name = role_res.data.get("rol_name")
         except Exception as e:
             print("Error obteniendo rol en /auth/login:", repr(e))
-            # Dejamos role_name en None y seguimos
+            role_name = None
 
-    # 4. Seniority: por ahora sin tabla → lo forzamos a null en el campo legible
-    seniority_name = None  # siempre null de momento
+    # 4) Seniority legible (placeholder)
+    seniority_name = None
 
-    # 5. Respuesta OK con IDs + etiquetas legibles
+    # 5) Respuesta OK (sin mezclar UUID con label)
     return {
         "message": "Login ok",
         "user": {
             "id": user.get("user_id"),
             "username": user.get("user_name"),
 
-            # IDs crudos (UUIDs, FKs)
+            # IDs crudos (Fks)
             "role_id": role_id,
             "seniority_id": seniority_id,
 
-            # Valores legibles (para dashboard)
-            "role": role_name or role_id,   # idealmente rol_name = COO / CEO / etc.
-            "seniority": seniority_name,    # null por ahora
+            # Labels legibles
+            "role": role_name,           # <-- solo string o None
+            "seniority": seniority_name, # <-- por ahora None
         },
     }
