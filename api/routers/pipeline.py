@@ -22,10 +22,17 @@ _pool: Optional[asyncpg.Pool] = None
 async def get_pool() -> asyncpg.Pool:
     """Crea (lazy) y devuelve el pool de conexiones a Supabase."""
     global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(SUPABASE_DB_URL)
-    return _pool
 
+    if _pool is None:
+        dsn = SUPABASE_DB_URL.replace("postgres://", "postgresql://", 1)
+
+        _pool = await asyncpg.create_pool(
+            dsn,
+            ssl="require",
+            timeout=10,
+        )
+
+    return _pool
 
 def _to_jsonable(value: Any) -> Any:
     """Convierte tipos comunes de Postgres a tipos JSON-friendly."""
@@ -139,9 +146,6 @@ async def get_pipeline_grouped() -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
-    # Para evitar colisiones o meter basura: sólo incluimos columnas reales de tasks
-    tasks_cols_set: Set[str] = set(tasks_columns)
-
     # Agrupar por status_id
     groups_map: Dict[str, Dict[str, Any]] = {}
 
@@ -230,7 +234,7 @@ async def get_pipeline_grouped() -> Dict[str, Any]:
             # nested para front
             "owner": owner_obj,
             "collaborators": collaborators_list,
-            "manager_obj": manager_obj,
+            "manager": manager_obj,
             "priority": priority_obj,
             "finished_status": finished_obj,
         }
