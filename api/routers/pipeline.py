@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Set
 import os
 import datetime as dt
 import uuid
+import traceback
 
 import asyncpg
 from fastapi import APIRouter, HTTPException
@@ -143,7 +144,10 @@ async def get_pipeline_grouped() -> Dict[str, Any]:
 
             rows = await conn.fetch(sql)
             status_rows = await conn.fetch(sql_statuses)
+
     except Exception as e:
+        print("ERROR in GET /pipeline/grouped:", repr(e))
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
     # Agrupar por status_id
