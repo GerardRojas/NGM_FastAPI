@@ -1,12 +1,18 @@
 # api/auth.py
 
 import os
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
+from datetime import datetime, timedelta, timezone
+import jwt
 
 from utils.auth import hash_password, verify_password
+
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME")
+JWT_ALG = "HS256"
+JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "43200"))  # 30 días
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -155,22 +161,70 @@ def login(payload: LoginRequest):
             print("Error obteniendo rol en /auth/login:", repr(e))
             role_name = None
 
-    # 4) Seniority legible (placeholder)
-    seniority_name = None
+        # 4) Seniority legible (placeholder)
+        seniority_name = None
 
-    # 5) Respuesta OK (sin mezclar UUID con label)
+        # ====== ACCESS TOKEN (JWT) ======
+        from datetime import datetime, timedelta, timezone
+        import jwt
+
+        now = datetime.now(timezone.utc)
+
+        access_token = jwt.encode(
+            {
+                "sub": str(user.get("user_id")),
+                "username": user.get("user_name"),
+                "role": role_name,
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp()),
+            },
+            JWT_SECRET,
+            algorithm=JWT_ALG,
+        )
+
+        # 5) Respuesta OK (sin mezclar UUID con label)
+        return {
+            "message": "Login ok",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.get("user_id"),
+                "username": user.get("user_name"),
+
+                # IDs crudos (Fks)
+                "role_id": role_id,
+                "seniority_id": seniority_id,
+
+                # Labels legibles
+                "role": role_name,           # <-- solo string o None
+                "seniority": seniority_name, # <-- por ahora None
+            },
+        }
+        
+def make_access_token(user_id: str, username: str, role: str | None):
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "username": username,
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+@router.get("/me")
+def me(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     return {
-        "message": "Login ok",
-        "user": {
-            "id": user.get("user_id"),
-            "username": user.get("user_name"),
-
-            # IDs crudos (Fks)
-            "role_id": role_id,
-            "seniority_id": seniority_id,
-
-            # Labels legibles
-            "role": role_name,           # <-- solo string o None
-            "seniority": seniority_name, # <-- por ahora None
-        },
+        "user_name": payload.get("username"),
+        "user_role": payload.get("role"),
+        "user_id": payload.get("sub"),
     }
