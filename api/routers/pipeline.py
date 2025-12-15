@@ -31,7 +31,11 @@ async def get_pool() -> asyncpg.Pool:
             dsn,
             ssl="require",
             timeout=10,
+            statement_cache_size=0,
+            min_size=1,
+            max_size=5,
         )
+
 
     return _pool
 
