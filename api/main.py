@@ -18,6 +18,7 @@ from api.routers.projects import router as projects_router
 from api.routers.pipeline import router as pipeline_router
 from api.routers.estimator import router as estimator_router
 from api.routers.debug_supabase import router as debug_supabase_router
+from api.routers.team import router as team_router
 
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
@@ -66,6 +67,8 @@ app.include_router(pipeline_router)
 app.include_router(estimator_router)
 
 app.include_router(debug_supabase_router)
+
+app.include_router(team_router)
 
 # ========================================
 # Root & Healthcheck
