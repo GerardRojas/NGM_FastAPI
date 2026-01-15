@@ -17,6 +17,13 @@ class ProjectCreate(BaseModel):
     status: str | None = None
 
 
+class ProjectUpdate(BaseModel):
+    project_name: str | None = None
+    source_company: str | None = None
+    city: str | None = None
+    status: str | None = None
+
+
 # ====== HELPERS ======
 
 def extract_rel_value(row: dict, rel_name: str, field: str):
@@ -244,3 +251,90 @@ def get_project(project_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error leyendo project: {e}")
+
+
+@router.delete("/{project_id}", status_code=200)
+def delete_project(project_id: str):
+    """
+    Elimina un proyecto por su UUID.
+    """
+    try:
+        # Verificar que el proyecto existe
+        existing = (
+            supabase
+            .table("projects")
+            .select("project_id")
+            .eq("project_id", project_id)
+            .single()
+            .execute()
+        )
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        # Eliminar el proyecto
+        supabase.table("projects").delete().eq("project_id", project_id).execute()
+
+        return {"message": "Project deleted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/{project_id}", status_code=200)
+def update_project(project_id: str, payload: ProjectUpdate):
+    """
+    Actualiza un proyecto existente.
+    Campos actualizables: project_name, source_company, city, status
+    """
+    try:
+        # Verificar que el proyecto existe
+        existing = (
+            supabase
+            .table("projects")
+            .select("project_id")
+            .eq("project_id", project_id)
+            .single()
+            .execute()
+        )
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        # Filtrar solo los campos que no son None
+        update_data = {k: v for k, v in payload.dict().items() if v is not None}
+
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        # Validar foreign keys si se proporcionan
+        if "source_company" in update_data:
+            comp = supabase.table("companies").select("id").eq("id", update_data["source_company"]).single().execute()
+            if not comp.data:
+                raise HTTPException(status_code=400, detail="Invalid source_company")
+
+        if "status" in update_data:
+            status = supabase.table("project_status").select("status_id").eq("status_id", update_data["status"]).single().execute()
+            if not status.data:
+                raise HTTPException(status_code=400, detail="Invalid status")
+
+        # Actualizar el proyecto
+        res = (
+            supabase
+            .table("projects")
+            .update(update_data)
+            .eq("project_id", project_id)
+            .execute()
+        )
+
+        return {
+            "message": "Project updated",
+            "project": res.data[0],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
