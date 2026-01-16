@@ -272,6 +272,64 @@ def update_expense(expense_id: str, payload: ExpenseUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.patch("/{expense_id}")
+def patch_expense(expense_id: str, payload: ExpenseUpdate):
+    """
+    Actualiza parcialmente un gasto existente.
+    Solo se actualizan los campos proporcionados en el body.
+
+    Campos actualizables:
+    - TxnDate: fecha de la transacción (formato ISO)
+    - txn_type: UUID del tipo de transacción
+    - vendor_id: UUID del vendor
+    - payment_type: UUID del método de pago
+    - Amount: monto del gasto
+    - LineDescription: descripción del gasto
+    """
+    try:
+        # Verificar que el gasto existe
+        existing = supabase.table("expenses_manual_COGS").select("expense_id").eq("expense_id", expense_id).single().execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Expense not found")
+
+        # Preparar datos para actualizar (solo campos proporcionados)
+        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+
+        if not data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        # Validar txn_type si se está actualizando
+        if "txn_type" in data:
+            txn = supabase.table("txn_types").select("TnxType_id").eq("TnxType_id", data["txn_type"]).single().execute()
+            if not txn.data:
+                raise HTTPException(status_code=400, detail="Invalid txn_type")
+
+        # Validar vendor_id si se está actualizando
+        if "vendor_id" in data:
+            vendor = supabase.table("Vendors").select("id").eq("id", data["vendor_id"]).single().execute()
+            if not vendor.data:
+                raise HTTPException(status_code=400, detail="Invalid vendor_id")
+
+        # Validar payment_type si se está actualizando
+        if "payment_type" in data:
+            payment = supabase.table("paymet_methods").select("id").eq("id", data["payment_type"]).single().execute()
+            if not payment.data:
+                raise HTTPException(status_code=400, detail="Invalid payment_type")
+
+        # Actualizar
+        res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
+
+        return {
+            "message": "Expense updated successfully",
+            "expense": res.data[0] if res.data else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/{expense_id}")
 def delete_expense(expense_id: str):
     """
