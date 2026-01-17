@@ -109,6 +109,166 @@ async def _get_tasks_columns(conn: asyncpg.Connection) -> List[str]:
     return [r["column_name"] for r in rows]
 
 
+@router.get("/projects")
+async def get_pipeline_projects() -> Dict[str, Any]:
+    """
+    Devuelve lista de proyectos para dropdowns en Pipeline UI.
+    """
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT project_id, project_name
+                FROM projects
+                ORDER BY project_name;
+                """
+            )
+
+            projects = [
+                {
+                    "project_id": _to_jsonable(r["project_id"]),
+                    "project_name": r["project_name"],
+                }
+                for r in rows
+            ]
+
+            return {"data": projects}
+
+    except Exception as e:
+        print("ERROR in GET /pipeline/projects:", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.get("/companies")
+async def get_pipeline_companies() -> Dict[str, Any]:
+    """
+    Devuelve lista de empresas para dropdowns en Pipeline UI.
+    """
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, name
+                FROM companies
+                ORDER BY name;
+                """
+            )
+
+            companies = [
+                {
+                    "id": _to_jsonable(r["id"]),
+                    "name": r["name"],
+                }
+                for r in rows
+            ]
+
+            return {"data": companies}
+
+    except Exception as e:
+        print("ERROR in GET /pipeline/companies:", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.get("/task-departments")
+async def get_pipeline_task_departments() -> Dict[str, Any]:
+    """
+    Devuelve lista de departamentos para dropdowns en Pipeline UI.
+    """
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT department_id, department_name
+                FROM task_departments
+                ORDER BY department_name;
+                """
+            )
+
+            departments = [
+                {
+                    "department_id": _to_jsonable(r["department_id"]),
+                    "department_name": r["department_name"],
+                }
+                for r in rows
+            ]
+
+            return {"data": departments}
+
+    except Exception as e:
+        print("ERROR in GET /pipeline/task-departments:", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.get("/task-types")
+async def get_pipeline_task_types() -> Dict[str, Any]:
+    """
+    Devuelve lista de tipos de tarea para dropdowns en Pipeline UI.
+    """
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT type_id, type_name
+                FROM task_types
+                ORDER BY type_name;
+                """
+            )
+
+            types = [
+                {
+                    "type_id": _to_jsonable(r["type_id"]),
+                    "type_name": r["type_name"],
+                }
+                for r in rows
+            ]
+
+            return {"data": types}
+
+    except Exception as e:
+        print("ERROR in GET /pipeline/task-types:", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.get("/task-priorities")
+async def get_pipeline_task_priorities() -> Dict[str, Any]:
+    """
+    Devuelve lista de prioridades para dropdowns en Pipeline UI.
+    """
+    pool = await get_pool()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT priority_id, priority
+                FROM tasks_priority
+                ORDER BY priority;
+                """
+            )
+
+            priorities = [
+                {
+                    "priority_id": _to_jsonable(r["priority_id"]),
+                    "priority": r["priority"],
+                }
+                for r in rows
+            ]
+
+            return {"data": priorities}
+
+    except Exception as e:
+        print("ERROR in GET /pipeline/task-priorities:", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
 @router.get("/grouped")
 async def get_pipeline_grouped() -> Dict[str, Any]:
     """
