@@ -10,8 +10,50 @@ import traceback
 
 import asyncpg
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, field_validator
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
+
+
+# ====== MODELOS ======
+
+class TaskCreate(BaseModel):
+    task_description: str
+    company: str  # UUID de la empresa
+    project: Optional[str] = None  # UUID del proyecto
+    owner: str  # UUID del owner
+    collaborator: Optional[str] = None  # UUID del colaborador
+    type: str  # UUID del tipo de tarea
+    department: str  # UUID del departamento
+    due_date: Optional[str] = None  # Fecha YYYY-MM-DD
+    deadline: Optional[str] = None  # Fecha YYYY-MM-DD
+    status: str = "not started"  # Nombre del status
+
+    @field_validator("task_description", "company", "owner", "type", "department")
+    @classmethod
+    def not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Field cannot be empty")
+        return v.strip()
+
+
+class TaskUpdate(BaseModel):
+    """Modelo para actualización parcial de tareas."""
+    task_description: Optional[str] = None
+    project: Optional[str] = None  # UUID del proyecto (puede ser null para limpiar)
+    company: Optional[str] = None  # UUID de la empresa
+    department: Optional[str] = None  # UUID del departamento
+    type: Optional[str] = None  # UUID del tipo de tarea
+    owner: Optional[str] = None  # UUID del owner
+    collaborator: Optional[str] = None  # UUID del colaborador (puede ser null)
+    manager: Optional[str] = None  # UUID del manager (puede ser null)
+    due_date: Optional[str] = None  # Fecha YYYY-MM-DD (puede ser null)
+    start_date: Optional[str] = None  # Fecha YYYY-MM-DD (puede ser null)
+    deadline: Optional[str] = None  # Fecha YYYY-MM-DD (puede ser null)
+    time_start: Optional[str] = None  # Hora HH:MM (puede ser null)
+    time_finish: Optional[str] = None  # Hora HH:MM (puede ser null)
+    status: Optional[str] = None  # Nombre del status o UUID
+    priority: Optional[str] = None  # UUID de prioridad
 
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 if not SUPABASE_DB_URL:
@@ -273,3 +315,334 @@ async def get_pipeline_grouped() -> Dict[str, Any]:
         groups.append(remaining_group)
 
     return {"groups": groups}
+
+
+@router.post("/tasks", status_code=201)
+async def create_task(payload: TaskCreate) -> Dict[str, Any]:
+    """
+    Crea una nueva tarea en el pipeline.
+
+    Campos requeridos:
+    - task_description: descripción de la tarea
+    - company: UUID de la empresa
+    - owner: UUID del owner
+    - type: UUID del tipo de tarea
+    - department: UUID del departamento
+
+    Campos opcionales:
+    - project: UUID del proyecto
+    - collaborator: UUID del colaborador
+    - due_date: fecha de vencimiento (YYYY-MM-DD)
+    - deadline: fecha límite (YYYY-MM-DD)
+    - status: estado inicial (default: "not started")
+    """
+    pool = await get_pool()
+
+    try:
+        async with pool.acquire() as conn:
+            # Buscar el status_id basado en el nombre del status
+            status_row = await conn.fetchrow(
+                "SELECT task_status_id FROM tasks_status WHERE LOWER(task_status) = LOWER($1)",
+                payload.status
+            )
+
+            if not status_row:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid status: '{payload.status}'. Status not found in tasks_status table."
+                )
+
+            status_id = status_row["task_status_id"]
+
+            # Validar que la empresa existe
+            company_row = await conn.fetchrow(
+                "SELECT id FROM companies WHERE id = $1",
+                uuid.UUID(payload.company)
+            )
+            if not company_row:
+                raise HTTPException(status_code=400, detail="Invalid company ID")
+
+            # Validar que el owner existe
+            owner_row = await conn.fetchrow(
+                "SELECT user_id FROM users WHERE user_id = $1",
+                uuid.UUID(payload.owner)
+            )
+            if not owner_row:
+                raise HTTPException(status_code=400, detail="Invalid owner ID")
+
+            # Validar project si se proporciona
+            if payload.project:
+                project_row = await conn.fetchrow(
+                    "SELECT project_id FROM projects WHERE project_id = $1",
+                    uuid.UUID(payload.project)
+                )
+                if not project_row:
+                    raise HTTPException(status_code=400, detail="Invalid project ID")
+
+            # Validar collaborator si se proporciona
+            if payload.collaborator:
+                collab_row = await conn.fetchrow(
+                    "SELECT user_id FROM users WHERE user_id = $1",
+                    uuid.UUID(payload.collaborator)
+                )
+                if not collab_row:
+                    raise HTTPException(status_code=400, detail="Invalid collaborator ID")
+
+            # Preparar fechas
+            due_date = None
+            if payload.due_date:
+                try:
+                    due_date = dt.datetime.strptime(payload.due_date, "%Y-%m-%d").date()
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid due_date format. Use YYYY-MM-DD")
+
+            deadline = None
+            if payload.deadline:
+                try:
+                    deadline = dt.datetime.strptime(payload.deadline, "%Y-%m-%d").date()
+                except ValueError:
+                    raise HTTPException(status_code=400, detail="Invalid deadline format. Use YYYY-MM-DD")
+
+            # Insertar la tarea
+            insert_sql = """
+                INSERT INTO tasks (
+                    task_description,
+                    company_management,
+                    project_id,
+                    "Owner_id",
+                    "Colaborators_id",
+                    task_type,
+                    task_department,
+                    due_date,
+                    deadline,
+                    task_status,
+                    created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                RETURNING *;
+            """
+
+            row = await conn.fetchrow(
+                insert_sql,
+                payload.task_description,
+                uuid.UUID(payload.company),
+                uuid.UUID(payload.project) if payload.project else None,
+                uuid.UUID(payload.owner),
+                uuid.UUID(payload.collaborator) if payload.collaborator else None,
+                uuid.UUID(payload.type),
+                uuid.UUID(payload.department),
+                due_date,
+                deadline,
+                status_id,
+            )
+
+            # Convertir el resultado a diccionario JSON-friendly
+            task_data = {key: _to_jsonable(value) for key, value in dict(row).items()}
+
+            return {
+                "message": "Task created successfully",
+                "task": task_data,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("ERROR in POST /pipeline/tasks:", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+# Mapeo de campos UI → columnas de la tabla tasks
+FIELD_TO_COLUMN = {
+    "task_description": "task_description",
+    "project": "project_id",
+    "company": "company_management",
+    "department": "task_department",
+    "type": "task_type",
+    "owner": "Owner_id",
+    "collaborator": "Colaborators_id",
+    "manager": "manager",
+    "due_date": "due_date",
+    "start_date": "start_date",
+    "deadline": "deadline",
+    "time_start": "time_start",
+    "time_finish": "time_finish",
+    "status": "task_status",
+    "priority": "task_priority",
+}
+
+# Campos que son UUIDs (foreign keys)
+UUID_FIELDS = {
+    "project", "company", "department", "type", "owner",
+    "collaborator", "manager", "status", "priority"
+}
+
+# Campos de fecha
+DATE_FIELDS = {"due_date", "start_date", "deadline"}
+
+# Campos de hora
+TIME_FIELDS = {"time_start", "time_finish"}
+
+
+@router.patch("/tasks/{task_id}")
+async def patch_task(task_id: str, payload: TaskUpdate) -> Dict[str, Any]:
+    """
+    Actualiza campos individuales de una tarea.
+
+    Campos permitidos:
+    - task_description: descripción de la tarea
+    - project: UUID del proyecto (null para limpiar)
+    - company: UUID de la empresa
+    - department: UUID del departamento
+    - type: UUID del tipo de tarea
+    - owner: UUID del owner
+    - collaborator: UUID del colaborador (null para limpiar)
+    - manager: UUID del manager (null para limpiar)
+    - due_date: fecha de vencimiento YYYY-MM-DD (null para limpiar)
+    - start_date: fecha de inicio YYYY-MM-DD (null para limpiar)
+    - deadline: fecha límite YYYY-MM-DD (null para limpiar)
+    - time_start: hora de inicio HH:MM (null para limpiar)
+    - time_finish: hora de fin HH:MM (null para limpiar)
+    - status: nombre del status o UUID
+    - priority: UUID de prioridad
+    """
+    pool = await get_pool()
+
+    try:
+        # Validar task_id como UUID
+        try:
+            task_uuid = uuid.UUID(task_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid task_id format")
+
+        # Obtener solo los campos que fueron enviados (no None en el payload original)
+        # Usamos model_dump con exclude_unset para obtener solo los campos enviados
+        updates_raw = payload.model_dump(exclude_unset=True)
+
+        if not updates_raw:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        async with pool.acquire() as conn:
+            # Verificar que la tarea existe
+            existing = await conn.fetchrow(
+                'SELECT task_id FROM tasks WHERE task_id = $1',
+                task_uuid
+            )
+            if not existing:
+                raise HTTPException(status_code=404, detail="Task not found")
+
+            # Construir los valores a actualizar
+            update_values: Dict[str, Any] = {}
+
+            for field, value in updates_raw.items():
+                column = FIELD_TO_COLUMN.get(field)
+                if not column:
+                    continue  # Campo no permitido, ignorar
+
+                # Manejar status especial (puede ser nombre o UUID)
+                if field == "status":
+                    if value is None:
+                        update_values[column] = None
+                    else:
+                        # Intentar primero como UUID
+                        try:
+                            update_values[column] = uuid.UUID(value)
+                        except ValueError:
+                            # Buscar por nombre
+                            status_row = await conn.fetchrow(
+                                "SELECT task_status_id FROM tasks_status WHERE LOWER(task_status) = LOWER($1)",
+                                value
+                            )
+                            if not status_row:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Invalid status: '{value}'"
+                                )
+                            update_values[column] = status_row["task_status_id"]
+
+                # Manejar campos UUID
+                elif field in UUID_FIELDS:
+                    if value is None:
+                        update_values[column] = None
+                    else:
+                        try:
+                            update_values[column] = uuid.UUID(value)
+                        except ValueError:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Invalid UUID format for {field}"
+                            )
+
+                # Manejar campos de fecha
+                elif field in DATE_FIELDS:
+                    if value is None:
+                        update_values[column] = None
+                    else:
+                        try:
+                            update_values[column] = dt.datetime.strptime(value, "%Y-%m-%d").date()
+                        except ValueError:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Invalid date format for {field}. Use YYYY-MM-DD"
+                            )
+
+                # Manejar campos de hora
+                elif field in TIME_FIELDS:
+                    if value is None:
+                        update_values[column] = None
+                    else:
+                        try:
+                            update_values[column] = dt.datetime.strptime(value, "%H:%M").time()
+                        except ValueError:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Invalid time format for {field}. Use HH:MM"
+                            )
+
+                # Campos de texto
+                else:
+                    update_values[column] = value
+
+            if not update_values:
+                raise HTTPException(status_code=400, detail="No valid fields to update")
+
+            # Construir la query de UPDATE dinámicamente
+            set_clauses = []
+            params = [task_uuid]  # $1 es task_id
+            param_idx = 2
+
+            for column, value in update_values.items():
+                # Escapar columnas con mayúsculas
+                if column in ("Owner_id", "Colaborators_id"):
+                    set_clauses.append(f'"{column}" = ${param_idx}')
+                else:
+                    set_clauses.append(f"{column} = ${param_idx}")
+                params.append(value)
+                param_idx += 1
+
+            update_sql = f"""
+                UPDATE tasks
+                SET {", ".join(set_clauses)}
+                WHERE task_id = $1
+                RETURNING *;
+            """
+
+            row = await conn.fetchrow(update_sql, *params)
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Task not found after update")
+
+            # Convertir el resultado a diccionario JSON-friendly
+            task_data = {key: _to_jsonable(value) for key, value in dict(row).items()}
+
+            return {
+                "message": "Task updated successfully",
+                "task": task_data,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("ERROR in PATCH /pipeline/tasks/:id:", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
