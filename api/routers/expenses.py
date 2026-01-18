@@ -529,6 +529,14 @@ INSTRUCTIONS:
 4. ONLY use account_id values from the provided accounts list - do NOT invent accounts
 5. If no good match exists, use the most general/appropriate account with confidence <60
 
+SPECIAL RULES - VERY IMPORTANT:
+⚠️ POWER TOOLS (drills, saws, grinders, nail guns, etc.) are CAPITAL ASSETS and should NOT be categorized in COGS accounts.
+   - If you detect a power tool (the tool itself, not consumables), set confidence to 0 and add "WARNING: Power tool - not a COGS expense" in reasoning
+   - Consumables FOR power tools (drill bits, saw blades, nails, etc.) ARE valid COGS and should be categorized normally
+
+✓ BEVERAGES & REFRESHMENTS (water bottles, energy drinks, coffee, sports drinks, etc.) should be categorized under "Base Materials" account
+   - These are considered crew provisions and ARE valid construction expenses
+
 Return ONLY valid JSON in this format:
 {{
   "categorizations": [
@@ -537,7 +545,8 @@ Return ONLY valid JSON in this format:
       "account_id": "exact-account-id-from-list",
       "account_name": "exact-account-name-from-list",
       "confidence": 85,
-      "reasoning": "Brief explanation of why this account was chosen"
+      "reasoning": "Brief explanation of why this account was chosen",
+      "warning": "Optional warning message for special cases like power tools"
     }}
   ]
 }}
@@ -680,6 +689,22 @@ async def parse_receipt(file: UploadFile = File(...)):
         if "Unknown" not in vendors_list:
             vendors_list.append("Unknown")
 
+        # Obtener lista de transaction types de la base de datos
+        transaction_types_resp = supabase.table("transaction_types").select("id, type_name").execute()
+        transaction_types_list = [
+            {"id": t.get("id"), "name": t.get("type_name")}
+            for t in (transaction_types_resp.data or [])
+            if t.get("type_name")
+        ]
+
+        # Obtener lista de payment methods de la base de datos
+        payment_methods_resp = supabase.table("payment_methods").select("id, payment_method_name").execute()
+        payment_methods_list = [
+            {"id": p.get("id"), "name": p.get("payment_method_name")}
+            for p in (payment_methods_resp.data or [])
+            if p.get("payment_method_name")
+        ]
+
         # Procesar PDF o imagen
         base64_image = None
         media_type = file.content_type
@@ -730,6 +755,12 @@ Analyze this receipt/invoice and extract ALL expense items in JSON format.
 AVAILABLE VENDORS (you MUST match to one of these, or use "Unknown"):
 {json.dumps(vendors_list, indent=2)}
 
+AVAILABLE TRANSACTION TYPES (you MUST match to one of these by name, or use "Unknown"):
+{json.dumps(transaction_types_list, indent=2)}
+
+AVAILABLE PAYMENT METHODS (you MUST match to one of these by name, or use "Unknown"):
+{json.dumps(payment_methods_list, indent=2)}
+
 IMPORTANT RULES:
 1. Extract EVERY line item as a separate expense (don't combine items)
 2. For each item, extract:
@@ -738,11 +769,13 @@ IMPORTANT RULES:
    - vendor: Match the merchant name to one from the AVAILABLE VENDORS list. Use case-insensitive matching and look for partial matches (e.g., "Home Depot #1234" matches "Home Depot"). If no match found, use "Unknown"
    - amount: Item amount as a number (without currency symbols)
    - category: Expense category (e.g., "Office Supplies", "Food & Beverage", "Transportation", "Utilities", etc.)
+   - transaction_type: Match to one from AVAILABLE TRANSACTION TYPES list by analyzing the receipt type (invoice, purchase order, credit card statement, etc.). Use the EXACT "name" field. If uncertain, use "Unknown"
+   - payment_method: Match to one from AVAILABLE PAYMENT METHODS list by looking for payment indicators on receipt (Cash, Credit Card, Check, etc.). Use the EXACT "name" field. If uncertain, use "Unknown"
 
 3. If there are subtotals, taxes, or fees, include them as separate items with clear descriptions
 4. If the receipt shows only ONE total (no itemization), create ONE expense with that total
 5. Use the currency shown on the receipt (or USD if not specified)
-6. CRITICAL: The vendor field MUST be EXACTLY one of the names from the AVAILABLE VENDORS list above, or "Unknown"
+6. CRITICAL: The vendor, transaction_type, and payment_method fields MUST be EXACTLY one of the names from their respective lists above, or "Unknown"
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -750,9 +783,11 @@ Return ONLY valid JSON in this exact format:
     {{
       "date": "2025-01-17",
       "description": "Item name or description",
-      "vendor": "Exact vendor name from list or Unknown",
+      "vendor": "Exact vendor name from VENDORS list or Unknown",
       "amount": 45.99,
-      "category": "Category name"
+      "category": "Category name",
+      "transaction_type": "Exact name from TRANSACTION TYPES list or Unknown",
+      "payment_method": "Exact name from PAYMENT METHODS list or Unknown"
     }}
   ]
 }}
