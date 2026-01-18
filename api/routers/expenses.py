@@ -1,7 +1,14 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, File, UploadFile
 from pydantic import BaseModel
 from api.supabase_client import supabase
-from typing import Optional
+from typing import Optional, List
+import base64
+import os
+from openai import OpenAI
+import json
+import io
+from pdf2image import convert_from_bytes
+from PIL import Image
 
 router = APIRouter(prefix="/expenses", tags=["Expenses"])
 
@@ -434,3 +441,204 @@ def get_expenses_summary_by_project():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculando resumen: {e}")
+
+
+
+@router.post("/parse-receipt")
+async def parse_receipt(file: UploadFile = File(...)):
+    """
+    Parsea un recibo/factura usando OpenAI Vision API.
+
+    Acepta: imágenes (JPG, PNG, WebP, GIF) y PDFs
+
+    Para PDFs, se convierte la primera página a imagen antes de procesarla.
+
+    Retorna: JSON estructurado con los gastos detectados
+
+    Formato de respuesta:
+    {
+        "success": true,
+        "data": {
+            "expenses": [
+                {
+                    "date": "2025-01-17",
+                    "description": "Office supplies",
+                    "vendor": "Staples",
+                    "amount": 45.99,
+                    "category": "Office Expenses"
+                }
+            ]
+        },
+        "count": 1
+    }
+    """
+    try:
+        # Validar tipo de archivo
+        allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "application/pdf"]
+        if file.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Allowed: JPG, PNG, WebP, GIF, PDF. Got: {file.content_type}"
+            )
+
+        # Leer archivo
+        file_content = await file.read()
+
+        # Validar tamaño (máx 20MB para OpenAI)
+        if len(file_content) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large. Maximum size is 20MB.")
+
+        # Obtener API key de OpenAI
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key or openai_api_key == "your-openai-api-key-here":
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+        # Inicializar cliente de OpenAI
+        client = OpenAI(api_key=openai_api_key)
+
+        # Procesar PDF o imagen
+        base64_image = None
+        media_type = file.content_type
+
+        if file.content_type == "application/pdf":
+            # Convertir PDF a imagen (primera página)
+            try:
+                # Detectar sistema operativo para path de Poppler
+                import platform
+                poppler_path = None
+                if platform.system() == "Windows":
+                    # Windows: usar instalación local
+                    poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin'
+                # En Linux (Render), poppler-utils está en PATH por defecto
+
+                images = convert_from_bytes(
+                    file_content,
+                    first_page=1,
+                    last_page=1,
+                    dpi=200,
+                    poppler_path=poppler_path
+                )
+                if not images:
+                    raise HTTPException(status_code=400, detail="Could not convert PDF to image")
+
+                # Convertir la primera página a base64
+                img = images[0]
+                buffer = io.BytesIO()
+                img.save(buffer, format='PNG')
+                buffer.seek(0)
+                base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                media_type = "image/png"
+
+            except Exception as pdf_error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Error processing PDF: {str(pdf_error)}"
+                )
+        else:
+            # Imagen directa
+            base64_image = base64.b64encode(file_content).decode('utf-8')
+
+        # Prompt para OpenAI - Instrucciones muy específicas
+        prompt = """You are an expert at extracting expense data from receipts, invoices, and bills.
+
+Analyze this receipt/invoice and extract ALL expense items in JSON format.
+
+IMPORTANT RULES:
+1. Extract EVERY line item as a separate expense (don't combine items)
+2. For each item, extract:
+   - date: Transaction date in YYYY-MM-DD format (if not on item, use receipt date)
+   - description: Item description (be specific, include item name/details)
+   - vendor: Vendor/merchant name
+   - amount: Item amount as a number (without currency symbols)
+   - category: Expense category (e.g., "Office Supplies", "Food & Beverage", "Transportation", "Utilities", etc.)
+
+3. If there are subtotals, taxes, or fees, include them as separate items with clear descriptions
+4. If the receipt shows only ONE total (no itemization), create ONE expense with that total
+5. Use the currency shown on the receipt (or USD if not specified)
+
+Return ONLY valid JSON in this exact format:
+{
+  "expenses": [
+    {
+      "date": "2025-01-17",
+      "description": "Item name or description",
+      "vendor": "Vendor name",
+      "amount": 45.99,
+      "category": "Category name"
+    }
+  ]
+}
+
+DO NOT include any text before or after the JSON. ONLY return the JSON object."""
+
+        # Llamar a OpenAI Vision API
+        response = client.chat.completions.create(
+            model="gpt-4o",  # GPT-4 Vision model
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{base64_image}",
+                                "detail": "high"  # Alta calidad para mejor OCR
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=2000,
+            temperature=0.1  # Baja temperatura para respuestas más deterministas
+        )
+
+        # Extraer respuesta
+        result_text = response.choices[0].message.content.strip()
+
+        # Parsear JSON
+        try:
+            # Intentar parsear directamente
+            parsed_data = json.loads(result_text)
+        except json.JSONDecodeError:
+            # Si falla, intentar extraer JSON de texto con markdown
+            import re
+            json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
+            if json_match:
+                parsed_data = json.loads(json_match.group(1))
+            else:
+                # Intentar encontrar cualquier JSON en el texto
+                json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+                if json_match:
+                    parsed_data = json.loads(json_match.group(0))
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"OpenAI returned invalid JSON: {result_text[:200]}"
+                    )
+
+        # Validar estructura
+        if "expenses" not in parsed_data or not isinstance(parsed_data["expenses"], list):
+            raise HTTPException(
+                status_code=500,
+                detail="OpenAI response missing 'expenses' array"
+            )
+
+        # Validar cada expense
+        for expense in parsed_data["expenses"]:
+            if not all(key in expense for key in ["date", "description", "amount"]):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Some expenses are missing required fields (date, description, amount)"
+                )
+
+        return {
+            "success": True,
+            "data": parsed_data,
+            "count": len(parsed_data["expenses"])
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error parsing receipt: {str(e)}")
