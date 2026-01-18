@@ -25,11 +25,15 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 class AccountCreate(BaseModel):
     Name: str
+    AcctNum: Optional[int] = None
+    AccountCategory: Optional[str] = None
     account_id: Optional[str] = None  # Si es auto-generado por Supabase, hacerlo opcional
 
 
 class AccountUpdate(BaseModel):
     Name: Optional[str] = None
+    AcctNum: Optional[int] = None
+    AccountCategory: Optional[str] = None
 
 
 # ========================================
@@ -79,6 +83,10 @@ async def create_account(account: AccountCreate):
             raise HTTPException(status_code=400, detail="Account with this name already exists")
 
         insert_data = {"Name": account.Name}
+        if account.AcctNum is not None:
+            insert_data["AcctNum"] = account.AcctNum
+        if account.AccountCategory is not None:
+            insert_data["AccountCategory"] = account.AccountCategory
         if account.account_id:
             insert_data["account_id"] = account.account_id
 
@@ -111,6 +119,12 @@ async def update_account(account_id: str, account: AccountUpdate):
             if name_check.data and len(name_check.data) > 0:
                 raise HTTPException(status_code=400, detail="Account name already in use")
             update_data["Name"] = account.Name
+
+        if account.AcctNum is not None:
+            update_data["AcctNum"] = account.AcctNum
+
+        if account.AccountCategory is not None:
+            update_data["AccountCategory"] = account.AccountCategory
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
