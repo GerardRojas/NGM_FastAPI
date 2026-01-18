@@ -16,11 +16,32 @@ OPENAI_API_KEY=<TU-OPENAI-API-KEY-AQUI>
 
 ## Configuración de Build
 
-### Opción 1: Usar el script de build (Recomendado)
+### Opción 1: Usar Dockerfile (Recomendado para Poppler)
+
+Render detectará automáticamente el `Dockerfile` en la raíz del proyecto.
+
+**En Render Dashboard:**
+1. Ve a Settings
+2. En "Build & Deploy", Render debería detectar automáticamente que usas Docker
+3. Si no, selecciona "Docker" como Runtime
+4. No necesitas configurar Build Command ni Start Command (están en el Dockerfile)
+5. Solo asegúrate de que el puerto sea **10000**
+
+### Opción 2: Usar render.yaml (Alternativa)
+
+Si prefieres usar el archivo `render.yaml`:
+
+1. Commitea el archivo `render.yaml` al repo
+2. En Render, crea un nuevo servicio desde el dashboard
+3. Render detectará automáticamente la configuración
+
+### Opción 3: Python nativo (sin poppler, solo imágenes)
+
+Si no necesitas soporte para PDFs, puedes usar Python nativo:
 
 **Build Command:**
 ```bash
-bash render-build.sh
+pip install --upgrade pip && pip install -r requirements.txt
 ```
 
 **Start Command:**
@@ -28,19 +49,7 @@ bash render-build.sh
 uvicorn main:app --host 0.0.0.0 --port 10000
 ```
 
-### Opción 2: Build command manual
-
-Si el script no funciona, usa este comando directo:
-
-**Build Command:**
-```bash
-apt-get update && apt-get install -y poppler-utils && pip install --upgrade pip && pip install -r requirements.txt
-```
-
-**Start Command:**
-```bash
-uvicorn main:app --host 0.0.0.0 --port 10000
-```
+**NOTA:** Esta opción NO instalará poppler, por lo que el escaneo de PDFs fallará.
 
 ## Verificación Post-Deploy
 
