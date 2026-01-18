@@ -481,7 +481,7 @@ async def auto_categorize_expenses(payload: dict):
             raise HTTPException(status_code=400, detail="Missing stage or expenses")
 
         # Get all accounts from database
-        accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum, Subaccount").execute()
+        accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum").execute()
         accounts = accounts_resp.data or []
 
         if not accounts:
@@ -501,8 +501,7 @@ async def auto_categorize_expenses(payload: dict):
             acc_info = {
                 "account_id": acc.get("account_id"),
                 "name": acc.get("Name"),
-                "number": acc.get("AcctNum"),
-                "subaccount": acc.get("Subaccount", False)
+                "number": acc.get("AcctNum")
             }
             accounts_list.append(acc_info)
 
@@ -674,7 +673,7 @@ async def parse_receipt(file: UploadFile = File(...)):
         client = OpenAI(api_key=openai_api_key)
 
         # Obtener lista de vendors de la base de datos
-        vendors_resp = supabase.table("vendors").select("vendor_name").execute()
+        vendors_resp = supabase.table("Vendors").select("vendor_name").execute()
         vendors_list = [v.get("vendor_name") for v in (vendors_resp.data or []) if v.get("vendor_name")]
 
         # Agregar "Unknown" a la lista si no está
