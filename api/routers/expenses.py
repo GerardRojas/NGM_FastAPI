@@ -180,7 +180,7 @@ def get_expenses_meta():
         vendors_resp = supabase.table("Vendors").select("*").order("vendor_name").execute()
 
         # Métodos de pago
-        payment_methods_resp = supabase.table("paymet_methods").select("*").execute()
+        payment_methods_resp = supabase.table("payment_methods").select("*").execute()
 
         # Cuentas
         accounts_resp = supabase.table("accounts").select("*").execute()
@@ -690,11 +690,11 @@ async def parse_receipt(file: UploadFile = File(...)):
             vendors_list.append("Unknown")
 
         # Obtener lista de transaction types de la base de datos
-        transaction_types_resp = supabase.table("txn_types").select("id, type_name").execute()
+        transaction_types_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
         transaction_types_list = [
-            {"id": t.get("id"), "name": t.get("type_name")}
+            {"id": t.get("TnxType_id"), "name": t.get("TnxType_name")}
             for t in (transaction_types_resp.data or [])
-            if t.get("type_name")
+            if t.get("TnxType_name")
         ]
 
         # Obtener lista de payment methods de la base de datos
