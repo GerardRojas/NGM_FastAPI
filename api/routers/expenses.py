@@ -444,6 +444,184 @@ def get_expenses_summary_by_project():
 
 
 
+@router.post("/auto-categorize")
+async def auto_categorize_expenses(payload: dict):
+    """
+    Auto-categorizes expenses using GPT-4 based on construction stage and description.
+
+    Request body:
+    {
+        "stage": "Framing",  // Construction stage
+        "expenses": [
+            {
+                "rowIndex": 0,
+                "description": "Wood stud 2x4"
+            }
+        ]
+    }
+
+    Response:
+    {
+        "success": true,
+        "categorizations": [
+            {
+                "rowIndex": 0,
+                "account_id": "account-uuid",
+                "account_name": "Lumber & Materials",
+                "confidence": 95
+            }
+        ]
+    }
+    """
+    try:
+        stage = payload.get("stage")
+        expenses = payload.get("expenses", [])
+
+        if not stage or not expenses:
+            raise HTTPException(status_code=400, detail="Missing stage or expenses")
+
+        # Get all accounts from database
+        accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum, Classification, Subaccount").execute()
+        accounts = accounts_resp.data or []
+
+        if not accounts:
+            raise HTTPException(status_code=500, detail="No accounts found in database")
+
+        # Get OpenAI API key
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key or openai_api_key == "your-openai-api-key-here":
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+        # Initialize OpenAI client
+        client = OpenAI(api_key=openai_api_key)
+
+        # Build accounts list for GPT prompt
+        accounts_list = []
+        for acc in accounts:
+            acc_info = {
+                "account_id": acc.get("account_id"),
+                "name": acc.get("Name"),
+                "number": acc.get("AcctNum"),
+                "classification": acc.get("Classification"),
+                "subaccount": acc.get("Subaccount", False)
+            }
+            accounts_list.append(acc_info)
+
+        # Build GPT prompt
+        prompt = f"""You are an expert construction accountant specializing in categorizing expenses.
+
+CONSTRUCTION STAGE: {stage}
+
+AVAILABLE ACCOUNTS:
+{json.dumps(accounts_list, indent=2)}
+
+EXPENSE DESCRIPTIONS TO CATEGORIZE:
+{json.dumps([{"rowIndex": e["rowIndex"], "description": e["description"]} for e in expenses], indent=2)}
+
+INSTRUCTIONS:
+1. For each expense description, determine the MOST APPROPRIATE account from the available accounts list.
+2. Consider the construction stage when categorizing. For example:
+   - "Wood stud" in "Framing" stage → likely "Lumber & Materials" or similar
+   - "Wood stud" in "Roof" stage → likely "Roofing Materials" or similar
+   - Same material can have different categorizations based on stage
+3. Calculate a confidence score (0-100) based on:
+   - How well the description matches the account (50% weight)
+   - How appropriate the stage is for this account (30% weight)
+   - How specific/detailed the description is (20% weight)
+4. ONLY use account_id values from the provided accounts list - do NOT invent accounts
+5. If no good match exists, use the most general/appropriate account with confidence <60
+
+Return ONLY valid JSON in this format:
+{{
+  "categorizations": [
+    {{
+      "rowIndex": 0,
+      "account_id": "exact-account-id-from-list",
+      "account_name": "exact-account-name-from-list",
+      "confidence": 85,
+      "reasoning": "Brief explanation of why this account was chosen"
+    }}
+  ]
+}}
+
+IMPORTANT:
+- Match rowIndex from input to output
+- Use EXACT account_id and Name from the accounts list
+- Confidence must be 0-100
+- Be conservative with confidence scores - better to under-estimate than over-estimate
+- DO NOT include any text before or after the JSON"""
+
+        # Call OpenAI
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a construction accounting expert. You always return valid JSON with accurate account categorizations."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.3,  # Low temperature for more consistent results
+            max_tokens=2000
+        )
+
+        # Parse response
+        result_text = response.choices[0].message.content.strip()
+
+        try:
+            # Try direct JSON parse
+            parsed_data = json.loads(result_text)
+        except json.JSONDecodeError:
+            # Try to extract JSON from markdown code blocks
+            import re
+            json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
+            if json_match:
+                parsed_data = json.loads(json_match.group(1))
+            else:
+                # Try to find any JSON in the text
+                json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+                if json_match:
+                    parsed_data = json.loads(json_match.group(0))
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"OpenAI returned invalid JSON: {result_text[:500]}"
+                    )
+
+        # Validate response structure
+        if "categorizations" not in parsed_data or not isinstance(parsed_data["categorizations"], list):
+            raise HTTPException(
+                status_code=500,
+                detail="OpenAI response missing 'categorizations' array"
+            )
+
+        # Validate each categorization
+        for cat in parsed_data["categorizations"]:
+            required_fields = ["rowIndex", "account_id", "account_name", "confidence"]
+            if not all(field in cat for field in required_fields):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Categorization missing required fields: {cat}"
+                )
+
+            # Validate confidence is 0-100
+            if not (0 <= cat["confidence"] <= 100):
+                cat["confidence"] = max(0, min(100, cat["confidence"]))
+
+        return {
+            "success": True,
+            "categorizations": parsed_data["categorizations"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error auto-categorizing expenses: {str(e)}")
+
+
 @router.post("/parse-receipt")
 async def parse_receipt(file: UploadFile = File(...)):
     """
