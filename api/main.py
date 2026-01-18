@@ -20,6 +20,8 @@ from api.routers.estimator import router as estimator_router
 from api.routers.debug_supabase import router as debug_supabase_router
 from api.routers.team import router as team_router
 from api.routers.expenses import router as expenses_router
+from api.routers.vendors import router as vendors_router
+from api.routers.accounts import router as accounts_router
 
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
@@ -74,6 +76,10 @@ app.include_router(debug_supabase_router)
 app.include_router(team_router)
 
 app.include_router(expenses_router)
+
+# Vendors & Accounts (catálogos de expenses)
+app.include_router(vendors_router)
+app.include_router(accounts_router)
 
 # ========================================
 # Root & Healthcheck
