@@ -36,7 +36,7 @@ async def list_all_roles():
 
 
 @router.get("/role/{rol_id}")
-async def get_permissions_by_role(rol_id: int):
+async def get_permissions_by_role(rol_id: str):
     """
     Obtiene todos los permisos para un rol específico
     """
@@ -174,7 +174,7 @@ async def check_permission(user_id: str, module_key: str, action: str = "view"):
 # ========================================
 
 class PermissionUpdate(BaseModel):
-    rol_id: int
+    rol_id: str
     module_key: str
     can_view: bool
     can_edit: bool

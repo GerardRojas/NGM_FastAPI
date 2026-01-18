@@ -481,7 +481,7 @@ async def auto_categorize_expenses(payload: dict):
             raise HTTPException(status_code=400, detail="Missing stage or expenses")
 
         # Get all accounts from database
-        accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum, Classification, Subaccount").execute()
+        accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum, Subaccount").execute()
         accounts = accounts_resp.data or []
 
         if not accounts:
@@ -502,7 +502,6 @@ async def auto_categorize_expenses(payload: dict):
                 "account_id": acc.get("account_id"),
                 "name": acc.get("Name"),
                 "number": acc.get("AcctNum"),
-                "classification": acc.get("Classification"),
                 "subaccount": acc.get("Subaccount", False)
             }
             accounts_list.append(acc_info)
@@ -674,6 +673,14 @@ async def parse_receipt(file: UploadFile = File(...)):
         # Inicializar cliente de OpenAI
         client = OpenAI(api_key=openai_api_key)
 
+        # Obtener lista de vendors de la base de datos
+        vendors_resp = supabase.table("vendors").select("vendor_name").execute()
+        vendors_list = [v.get("vendor_name") for v in (vendors_resp.data or []) if v.get("vendor_name")]
+
+        # Agregar "Unknown" a la lista si no está
+        if "Unknown" not in vendors_list:
+            vendors_list.append("Unknown")
+
         # Procesar PDF o imagen
         base64_image = None
         media_type = file.content_type
@@ -717,35 +724,39 @@ async def parse_receipt(file: UploadFile = File(...)):
             base64_image = base64.b64encode(file_content).decode('utf-8')
 
         # Prompt para OpenAI - Instrucciones muy específicas
-        prompt = """You are an expert at extracting expense data from receipts, invoices, and bills.
+        prompt = f"""You are an expert at extracting expense data from receipts, invoices, and bills.
 
 Analyze this receipt/invoice and extract ALL expense items in JSON format.
+
+AVAILABLE VENDORS (you MUST match to one of these, or use "Unknown"):
+{json.dumps(vendors_list, indent=2)}
 
 IMPORTANT RULES:
 1. Extract EVERY line item as a separate expense (don't combine items)
 2. For each item, extract:
    - date: Transaction date in YYYY-MM-DD format (if not on item, use receipt date)
    - description: Item description (be specific, include item name/details)
-   - vendor: Vendor/merchant name
+   - vendor: Match the merchant name to one from the AVAILABLE VENDORS list. Use case-insensitive matching and look for partial matches (e.g., "Home Depot #1234" matches "Home Depot"). If no match found, use "Unknown"
    - amount: Item amount as a number (without currency symbols)
    - category: Expense category (e.g., "Office Supplies", "Food & Beverage", "Transportation", "Utilities", etc.)
 
 3. If there are subtotals, taxes, or fees, include them as separate items with clear descriptions
 4. If the receipt shows only ONE total (no itemization), create ONE expense with that total
 5. Use the currency shown on the receipt (or USD if not specified)
+6. CRITICAL: The vendor field MUST be EXACTLY one of the names from the AVAILABLE VENDORS list above, or "Unknown"
 
 Return ONLY valid JSON in this exact format:
-{
+{{
   "expenses": [
-    {
+    {{
       "date": "2025-01-17",
       "description": "Item name or description",
-      "vendor": "Vendor name",
+      "vendor": "Exact vendor name from list or Unknown",
       "amount": 45.99,
       "category": "Category name"
-    }
+    }}
   ]
-}
+}}
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object."""
 
