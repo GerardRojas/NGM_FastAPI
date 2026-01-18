@@ -36,6 +36,8 @@ class ExpenseUpdate(BaseModel):
     show_on_reports: Optional[bool] = None
     coinciliation_status: Optional[bool] = None
     account_id: Optional[str] = None
+    auth_status: Optional[bool] = None
+    auth_by: Optional[str] = None
 
 
 # ====== HELPERS ======
@@ -285,6 +287,8 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate):
     - payment_type: UUID del método de pago
     - Amount: monto del gasto
     - LineDescription: descripción del gasto
+    - auth_status: estado de autorización (boolean)
+    - auth_by: UUID del usuario que autorizó
     """
     try:
         # Verificar que el gasto existe
