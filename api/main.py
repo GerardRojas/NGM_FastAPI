@@ -23,6 +23,7 @@ from api.routers.expenses import router as expenses_router
 from api.routers.vendors import router as vendors_router
 from api.routers.accounts import router as accounts_router
 from api.routers.permissions import router as permissions_router
+from api.routers.budgets import router as budgets_router
 
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
@@ -77,6 +78,9 @@ app.include_router(debug_supabase_router)
 app.include_router(team_router)
 
 app.include_router(expenses_router)
+
+# Budgets (presupuestos de QuickBooks)
+app.include_router(budgets_router)
 
 # Vendors & Accounts (catálogos de expenses)
 app.include_router(vendors_router)
