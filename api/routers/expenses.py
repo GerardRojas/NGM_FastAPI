@@ -690,7 +690,7 @@ async def parse_receipt(file: UploadFile = File(...)):
             vendors_list.append("Unknown")
 
         # Obtener lista de transaction types de la base de datos
-        transaction_types_resp = supabase.table("transaction_types").select("id, type_name").execute()
+        transaction_types_resp = supabase.table("txn_types").select("id, type_name").execute()
         transaction_types_list = [
             {"id": t.get("id"), "name": t.get("type_name")}
             for t in (transaction_types_resp.data or [])
