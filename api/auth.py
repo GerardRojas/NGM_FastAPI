@@ -1,7 +1,8 @@
 # api/auth.py
 
 import os
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
@@ -227,4 +228,44 @@ def me(authorization: str | None = Header(default=None)):
         "user_name": payload.get("username"),
         "user_role": payload.get("role"),
         "user_id": payload.get("sub"),
+    }
+
+# ====== DEPENDENCY: Get current user from JWT ======
+
+security = HTTPBearer()
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Dependency to extract and verify JWT token from Authorization header.
+    Returns user info from token payload.
+
+    Usage:
+        @router.get("/protected")
+        def protected_route(current_user: dict = Depends(get_current_user)):
+            return {"user_id": current_user["user_id"]}
+    """
+    token = credentials.credentials
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception as e:
+        print(f"[AUTH] Error decoding token: {repr(e)}")
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+    # Extract user info from payload
+    user_id = payload.get("sub")
+    username = payload.get("username")
+    role = payload.get("role")
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    return {
+        "user_id": user_id,
+        "username": username,
+        "role": role,
     }
