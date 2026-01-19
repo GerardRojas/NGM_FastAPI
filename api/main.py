@@ -24,6 +24,7 @@ from api.routers.vendors import router as vendors_router
 from api.routers.accounts import router as accounts_router
 from api.routers.permissions import router as permissions_router
 from api.routers.budgets import router as budgets_router
+from api.routers.payment_methods import router as payment_methods_router
 
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
@@ -82,9 +83,10 @@ app.include_router(expenses_router)
 # Budgets (presupuestos de QuickBooks)
 app.include_router(budgets_router)
 
-# Vendors & Accounts (catálogos de expenses)
+# Vendors, Accounts & Payment Methods (catálogos de expenses)
 app.include_router(vendors_router)
 app.include_router(accounts_router)
+app.include_router(payment_methods_router)
 
 # Permissions (control de acceso basado en roles)
 app.include_router(permissions_router)
