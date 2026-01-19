@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, date
 
 from api.auth import get_current_user
-from api.db import get_supabase
+from api.supabase_client import supabase
 
 router = APIRouter(prefix="/budgets", tags=["budgets"])
 
@@ -110,8 +110,6 @@ async def get_budgets(
     - year: Filter by budget year
     - active_only: Only return active budgets (default: true)
     """
-    supabase = get_supabase()
-
     try:
         # Build query
         query = supabase.table("budgets_qbo").select("*")
@@ -150,8 +148,6 @@ async def import_budgets(
     Each row represents one budget account line item.
     All rows are linked to the specified NGM project.
     """
-    supabase = get_supabase()
-
     try:
         # Validate headers
         expected_headers = [
@@ -263,8 +259,6 @@ async def delete_batch(
     current_user: dict = Depends(get_current_user)
 ):
     """Delete all budgets from a specific import batch"""
-    supabase = get_supabase()
-
     try:
         result = supabase.table("budgets_qbo").delete().eq("import_batch_id", batch_id).execute()
 
