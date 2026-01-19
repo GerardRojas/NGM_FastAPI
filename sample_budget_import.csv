@@ -1,0 +1,7 @@
+BudgetName	BudgetId	Year	StartDate	EndDate	Active	AccountId	AccountName	Amount_SUM
+FY2024 Operations	BDG-001	2024	01/01/2024	12/31/2024	true	ACC-100	Job Materials	50000.00
+FY2024 Operations	BDG-001	2024	01/01/2024	12/31/2024	true	ACC-200	Labor	100000.00
+FY2024 Operations	BDG-001	2024	01/01/2024	12/31/2024	true	ACC-300	Equipment	25000.00
+FY2024 Operations	BDG-001	2024	01/01/2024	12/31/2024	true	ACC-400	Subcontractors	75000.00
+FY2025 Expansion	BDG-002	2025	01/01/2025	12/31/2025	true	ACC-100	Job Materials	60000.00
+FY2025 Expansion	BDG-002	2025	01/01/2025	12/31/2025	true	ACC-200	Labor	120000.00
