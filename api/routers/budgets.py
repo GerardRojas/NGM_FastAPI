@@ -9,8 +9,8 @@ from typing import List, Optional
 import uuid
 from datetime import datetime, date
 
-from ..auth import get_current_user
-from ..db import get_supabase
+from api.auth import get_current_user
+from api.db import get_supabase
 
 router = APIRouter(prefix="/budgets", tags=["budgets"])
 
