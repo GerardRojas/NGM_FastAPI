@@ -125,7 +125,7 @@ async def update_vendor(vendor_id: str, vendor: VendorUpdate):
 async def delete_vendor(vendor_id: str):
     """
     Elimina un vendor
-    NOTA: Esto fallará si hay gastos (expenses) asociados a este vendor debido a foreign key constraint
+    Devuelve una advertencia si hay gastos (expenses) asociados que necesitarán especificar un nuevo vendor
     """
     try:
         # Verificar que el vendor exista
@@ -134,18 +134,32 @@ async def delete_vendor(vendor_id: str):
         if not existing.data:
             raise HTTPException(status_code=404, detail="Vendor not found")
 
-        # Verificar si hay expenses asociados
-        expenses_check = supabase.table("expenses").select("expense_id").eq("vendor_id", vendor_id).limit(1).execute()
+        # Verificar si hay expenses asociados en la tabla expenses_manual_COGS
+        expenses_check = supabase.table("expenses_manual_COGS").select("expense_id, LineDescription, Amount").eq("vendor_id", vendor_id).execute()
 
+        affected_expenses = []
         if expenses_check.data and len(expenses_check.data) > 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot delete vendor: there are expenses associated with this vendor"
-            )
+            affected_expenses = [
+                {
+                    "expense_id": exp.get("expense_id"),
+                    "description": exp.get("LineDescription", ""),
+                    "amount": exp.get("Amount", 0)
+                }
+                for exp in expenses_check.data
+            ]
 
+        # Eliminar el vendor (esto hará que los expenses tengan vendor_id NULL)
         response = supabase.table("Vendors").delete().eq("id", vendor_id).execute()
 
-        return {"message": "Vendor deleted successfully"}
+        # Devolver mensaje con advertencia si hay expenses afectados
+        if affected_expenses:
+            return {
+                "message": "Vendor deleted successfully",
+                "warning": f"{len(affected_expenses)} expense(s) now have no vendor assigned",
+                "affected_expenses": affected_expenses
+            }
+        else:
+            return {"message": "Vendor deleted successfully"}
     except HTTPException:
         raise
     except Exception as e:
