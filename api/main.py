@@ -33,7 +33,8 @@ from api.auth import router as auth_router
 # ========================================
 # Inicializar FastAPI
 # ========================================
-app = FastAPI(title="NGM HUB API")
+# redirect_slashes=False evita redirects HTTP que causan Mixed Content errors
+app = FastAPI(title="NGM HUB API", redirect_slashes=False)
 
 
 # ========================================
