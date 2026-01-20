@@ -106,10 +106,11 @@ def create_expense(payload: ExpenseCreate):
 
 
 @router.get("/")
-def list_expenses(project: Optional[str] = None, limit: int = 100):
+def list_expenses(project: Optional[str] = None, limit: Optional[int] = None):
     """
     Lista todos los gastos, opcionalmente filtrados por project.
     Incluye información de tipo de transacción, proyecto, vendor, etc.
+    Si no se especifica limit, devuelve todos los gastos.
     """
     try:
         # Obtener los gastos
@@ -118,7 +119,13 @@ def list_expenses(project: Optional[str] = None, limit: int = 100):
         if project:
             query = query.eq("project", project)
 
-        resp = query.order("TxnDate", desc=True).limit(limit).execute()
+        query = query.order("TxnDate", desc=True)
+
+        # Solo aplicar límite si se especifica
+        if limit is not None:
+            query = query.limit(limit)
+
+        resp = query.execute()
         raw_expenses = resp.data or []
 
         # Obtener tipos de transacción
