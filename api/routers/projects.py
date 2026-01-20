@@ -88,7 +88,7 @@ def create_project(payload: ProjectCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/")
+@router.get("")
 def list_projects(limit: int = 100):
     """
     Devuelve lista de proyectos desde 'projects',

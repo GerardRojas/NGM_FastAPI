@@ -40,7 +40,7 @@ class AccountUpdate(BaseModel):
 # Endpoints
 # ========================================
 
-@router.get("/")
+@router.get("")
 async def list_accounts():
     """
     Lista todas las cuentas ordenadas por nombre
@@ -70,7 +70,7 @@ async def get_account(account_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching account: {str(e)}")
 
 
-@router.post("/")
+@router.post("")
 async def create_account(account: AccountCreate):
     """
     Crea una nueva cuenta

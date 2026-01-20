@@ -36,7 +36,7 @@ class PaymentMethodUpdate(BaseModel):
 # Endpoints
 # ========================================
 
-@router.get("/")
+@router.get("")
 async def list_payment_methods():
     """
     Lista todos los payment methods ordenados por nombre
@@ -66,7 +66,7 @@ async def get_payment_method(payment_method_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching payment method: {str(e)}")
 
 
-@router.post("/")
+@router.post("")
 async def create_payment_method(payment_method: PaymentMethodCreate):
     """
     Crea un nuevo payment method

@@ -71,7 +71,7 @@ def extract_rel_value(row: dict, rel_name: str, field: str):
 
 # ====== ENDPOINTS ======
 
-@router.post("/", status_code=201)
+@router.post("", status_code=201)
 def create_expense(payload: ExpenseCreate):
     """
     Crea un nuevo gasto
@@ -105,7 +105,7 @@ def create_expense(payload: ExpenseCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/")
+@router.get("")
 def list_expenses(project: Optional[str] = None, limit: Optional[int] = None):
     """
     Lista todos los gastos, opcionalmente filtrados por project.

@@ -35,7 +35,7 @@ class VendorUpdate(BaseModel):
 # Endpoints
 # ========================================
 
-@router.get("/")
+@router.get("")
 async def list_vendors():
     """
     Lista todos los vendors ordenados por nombre
@@ -65,7 +65,7 @@ async def get_vendor(vendor_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching vendor: {str(e)}")
 
 
-@router.post("/")
+@router.post("")
 async def create_vendor(vendor: VendorCreate):
     """
     Crea un nuevo vendor
