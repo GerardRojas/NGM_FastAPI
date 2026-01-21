@@ -1,0 +1,344 @@
+/**
+ * IMPORT ALL EXPENSE LINES (Master + Project sheets + Unassigned)
+ *
+ * Outputs:
+ *  - QBO_LEDGER_ALL (master truth, deduped by GlobalLineUID)
+ *  - PRJ - <ProjectName> (one sheet per project/job)
+ *  - QBO_UNASSIGNED (UNASSIGNED + NOT_A_PROJECT)
+ *
+ * Notes:
+ *  - Projects/Jobs = Customer WHERE Job=true AND Active=true
+ *  - Effective customer id per line = line.CustomerRef OR header.CustomerRef
+ *  - GlobalLineUID = TxnType:TxnId:LineId  (does NOT include ProjectId → avoids duplication when reassigned)
+ *  - Sign handling:
+ *      JournalEntry uses PostingType
+ *      VendorCredit default negative
+ *      Bill/Purchase default positive
+ */
+function qboImportAllExpensesSplitByProject() {
+  // Optional: limit volume (recommended). Leave empty to fetch all time.
+  const DATE_FROM = ""; // "2025-01-01"
+  const DATE_TO   = ""; // "2026-01-14"
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1) Project catalog (Jobs/Subcustomers)
+  const projectCatalog = qboGetProjectCatalog_(); // { set, map }
+  const projectIdSet = projectCatalog.set;
+  const projectMap = projectCatalog.map;
+
+  // 2) Account metadata map (cached)
+  const acctMap = qboGetAccountMetaMapCached_();
+
+  // 3) Fetch all spend entities once, extract all lines
+  const txTypes = ["Bill", "Purchase", "VendorCredit", "JournalEntry"];
+
+  const allLines = [];
+  txTypes.forEach(txnType => {
+    let txns = [];
+    try {
+      txns = qboFetchAllTxns_(txnType, DATE_FROM, DATE_TO);
+    } catch (e) {
+      Logger.log("⚠️ Skipping entity=%s due to error: %s", txnType, e);
+      return;
+    }
+    allLines.push(...qboExtractAllLinesWithBuckets_(txns, txnType, projectIdSet, projectMap));
+  });
+
+  // 4) Deduplicate by GlobalLineUID (TxnType:TxnId:LineId)
+  const dedupMap = {};
+  const dedup = [];
+  for (let i = 0; i < allLines.length; i++) {
+    const r = allLines[i];
+    const k = r.GlobalLineUID;
+    if (!k) continue;
+    if (dedupMap[k]) continue;
+    dedupMap[k] = true;
+    dedup.push(r);
+  }
+
+  // 5) Enrich with account meta + IsCOGS
+  const enriched = dedup.map(r => {
+    const meta = r.AccountId ? (acctMap[String(r.AccountId)] || {}) : {};
+    const accountName = r.AccountName || meta.Name || "";
+    const accountType = meta.AccountType || "";
+    const accountSub  = meta.AccountSubType || "";
+    const isCogs = (accountType === "Cost of Goods Sold") ? "YES" : "NO";
+
+    return Object.assign({}, r, {
+      AccountName: accountName,
+      AccountType: accountType,
+      AccountSubType: accountSub,
+      IsCOGS: isCogs
+    });
+  });
+
+  // 6) Prepare headers (same for master + project + unassigned)
+  const headers = [
+    "Bucket",          // PROJECT | UNASSIGNED | NOT_A_PROJECT
+    "ProjectId",       // only if Bucket=PROJECT (Job=true)
+    "ProjectName",     // resolved from catalog
+    "CustomerId",      // effective cust id (may be non-project customer)
+    "CustomerName",    // effective cust name (best-effort)
+
+    "TxnType",
+    "TxnId",
+    "LineId",
+    "TxnDate",
+    "VendorName",
+    "PaymentType",
+
+    "AccountId",
+    "AccountName",
+    "AccountType",
+    "AccountSubType",
+    "IsCOGS",
+
+    "Amount",          // absolute
+    "Sign",            // +1/-1
+    "SignedAmount",    // Amount*Sign
+    "SignSource",      // PostingType | EntityDefault | Heuristic
+    "PostingType",     // Debit|Credit (JE)
+
+    "LineDescription",
+
+    "GlobalLineUID"    // TxnType:TxnId:LineId
+  ];
+
+  // 7) Write MASTER sheet
+  const shMaster = ensureSheet_(ss, "QBO_LEDGER_ALL");
+  writeExpensesSheetOverwrite_(shMaster, headers, enriched);
+
+  // 8) Split to project sheets + unassigned
+  const byProject = {}; // projectId -> rows
+  const unassigned = [];
+
+  enriched.forEach(r => {
+    if (r.Bucket === "PROJECT" && r.ProjectId) {
+      if (!byProject[r.ProjectId]) byProject[r.ProjectId] = [];
+      byProject[r.ProjectId].push(r);
+    } else {
+      // UNASSIGNED + NOT_A_PROJECT go together
+      unassigned.push(r);
+    }
+  });
+
+  // 9) Write UNASSIGNED sheet (combined)
+  const shUn = ensureSheet_(ss, "QBO_UNASSIGNED");
+  writeExpensesSheetOverwrite_(shUn, headers, unassigned);
+
+  // 10) Write / overwrite each project sheet
+  const projectIds = Object.keys(byProject).sort((a, b) => Number(a) - Number(b));
+  projectIds.forEach(pid => {
+    const pname = projectMap[String(pid)] || ("Project_" + pid);
+    const sheetName = sanitizeSheetName_("PRJ - " + pname);
+    const sh = ensureSheet_(ss, sheetName);
+    writeExpensesSheetOverwrite_(sh, headers, byProject[pid]);
+  });
+
+  Logger.log(
+    "✅ Import ALL complete | TotalLinesRaw=%s | Deduped=%s | Projects=%s | Unassigned=%s | Master=%s",
+    allLines.length,
+    enriched.length,
+    projectIds.length,
+    unassigned.length,
+    shMaster.getName()
+  );
+
+  return {
+    raw: allLines.length,
+    deduped: enriched.length,
+    projectSheets: projectIds.length,
+    unassignedRows: unassigned.length,
+    masterSheet: shMaster.getName()
+  };
+}
+
+/**
+ * Build project catalog:
+ *  - set: Set(ProjectId)
+ *  - map: { ProjectId -> FullyQualifiedName/DisplayName }
+ */
+function qboGetProjectCatalog_() {
+  const set = new Set();
+  const map = {};
+  const pageSize = 1000;
+  let start = 1;
+
+  while (true) {
+    const sql =
+      "SELECT Id, DisplayName, FullyQualifiedName " +
+      "FROM Customer " +
+      "WHERE Job = true AND Active = true " +
+      "STARTPOSITION " + start + " MAXRESULTS " + pageSize;
+
+    const data = qboQuery_(sql);
+    const rows = (data.QueryResponse && data.QueryResponse.Customer) || [];
+    if (!rows.length) break;
+
+    rows.forEach(c => {
+      const id = String(c.Id || "");
+      if (!id) return;
+      set.add(id);
+      const name = String(c.FullyQualifiedName || c.DisplayName || "").trim();
+      map[id] = name || ("Project_" + id);
+    });
+
+    if (rows.length < pageSize) break;
+    start += pageSize;
+  }
+
+  return { set, map };
+}
+
+/**
+ * Extract all lines from txns and assign Bucket/ProjectId.
+ * Buckets:
+ *  - PROJECT: effectiveCustId exists and is in projectIdSet
+ *  - UNASSIGNED: no effectiveCustId
+ *  - NOT_A_PROJECT: effectiveCustId exists but not in projectIdSet
+ */
+function qboExtractAllLinesWithBuckets_(txns, txnType, projectIdSet, projectMap) {
+  const out = [];
+  if (!Array.isArray(txns)) return out;
+
+  txns.forEach(txn => {
+    const txnId = String(txn.Id || "");
+    if (!txnId) return;
+
+    const txnDate = String(txn.TxnDate || (txn.MetaData && txn.MetaData.CreateTime) || "");
+    const vendorName =
+      (txn.EntityRef && txn.EntityRef.name) ? String(txn.EntityRef.name) :
+      (txn.VendorRef && txn.VendorRef.name) ? String(txn.VendorRef.name) : "";
+
+    const paymentType = String(txn.PaymentType || "");
+
+    const headerCustomerId =
+      (txn.CustomerRef && txn.CustomerRef.value) ? String(txn.CustomerRef.value) : "";
+    const headerCustomerName =
+      (txn.CustomerRef && txn.CustomerRef.name) ? String(txn.CustomerRef.name) : "";
+
+    const lines = Array.isArray(txn.Line) ? txn.Line : [];
+    lines.forEach((line, idx) => {
+      const amount = Number(line.Amount || 0);
+      const desc = String(line.Description || "");
+
+      const dt = String(line.DetailType || "");
+      const d =
+        (dt === "AccountBasedExpenseLineDetail") ? (line.AccountBasedExpenseLineDetail || {}) :
+        (dt === "ItemBasedExpenseLineDetail")    ? (line.ItemBasedExpenseLineDetail || {}) :
+        (dt === "JournalEntryLineDetail")        ? (line.JournalEntryLineDetail || {}) :
+        null;
+
+      if (!d) return;
+
+      // Effective customer (project anchor)
+      const lineCustVal = d.CustomerRef && (d.CustomerRef.value || d.CustomerRef);
+      const lineCustName = (d.CustomerRef && d.CustomerRef.name) ? String(d.CustomerRef.name) : "";
+
+      const effectiveCustId = String(lineCustVal || headerCustomerId || "");
+      const effectiveCustName = String(lineCustName || headerCustomerName || "");
+
+      let bucket = "";
+      let projectId = "";
+      let projectName = "";
+
+      if (!effectiveCustId) {
+        bucket = "UNASSIGNED";
+      } else if (projectIdSet.has(effectiveCustId)) {
+        bucket = "PROJECT";
+        projectId = effectiveCustId;
+        projectName = projectMap[String(projectId)] || ("Project_" + projectId);
+      } else {
+        bucket = "NOT_A_PROJECT";
+      }
+
+      // Account resolution
+      let accountId = (d.AccountRef && d.AccountRef.value) ? String(d.AccountRef.value) : "";
+      let accountName = (d.AccountRef && d.AccountRef.name) ? String(d.AccountRef.name) : "";
+
+      // Item-based fallback -> Item expense / COGS account
+      if (!accountId && d.ItemRef && d.ItemRef.value) {
+        const acct = qboGetItemExpenseAccountFast_(String(d.ItemRef.value));
+        if (acct) accountId = String(acct);
+      }
+
+      const lineId = String(line.Id || (idx + 1));
+
+      // Sign handling (reuse your existing helper)
+      const signPack = qboGetLineSign_(txnType, dt, d, amount);
+      const sign = Number(signPack.sign || 1);
+      const signedAmount = amount * sign;
+
+      const globalLineUID = String(txnType) + ":" + String(txnId) + ":" + String(lineId);
+
+      out.push({
+        Bucket: bucket,
+        ProjectId: projectId,
+        ProjectName: projectName,
+        CustomerId: effectiveCustId,
+        CustomerName: effectiveCustName,
+
+        TxnType: txnType,
+        TxnId: txnId,
+        LineId: lineId,
+        TxnDate: txnDate,
+        VendorName: vendorName,
+        PaymentType: paymentType,
+
+        AccountId: accountId,
+        AccountName: accountName,
+
+        Amount: amount,
+        Sign: sign,
+        SignedAmount: signedAmount,
+        SignSource: signPack.source || "",
+        PostingType: signPack.postingType || "",
+
+        LineDescription: (desc || dt),
+
+        GlobalLineUID: globalLineUID
+      });
+    });
+  });
+
+  return out;
+}
+
+/**
+ * Overwrite sheet with headers + rows, apply basic formats + filter.
+ * Expects rows as array of objects matching headers.
+ */
+function writeExpensesSheetOverwrite_(sh, headers, objRows) {
+  sh.clearContents();
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  if (!objRows || !objRows.length) {
+    sh.setFrozenRows(1);
+    return;
+  }
+
+  const rows = objRows.map(r => headers.map(h => r[h] !== undefined ? r[h] : ""));
+
+  sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  sh.setFrozenRows(1);
+
+  // Number formats for Amount / SignedAmount (columns depend on header order)
+  const colAmount = headers.indexOf("Amount") + 1;
+  const colSign = headers.indexOf("Sign") + 1;
+  const colSigned = headers.indexOf("SignedAmount") + 1;
+
+  if (colAmount > 0) sh.getRange(2, colAmount, rows.length, 1).setNumberFormat("#,##0.00");
+  if (colSign > 0) sh.getRange(2, colSign, rows.length, 1).setNumberFormat("0");
+  if (colSigned > 0) sh.getRange(2, colSigned, rows.length, 1).setNumberFormat("#,##0.00");
+
+  // Filter
+  try {
+    sh.getRange(1, 1, sh.getLastRow(), headers.length).createFilter();
+  } catch (e) {
+    // ignore if filter already exists in some weird state
+  }
+
+  // Optional: resize for readability (can be slow on huge sheets; comment out if needed)
+  // sh.autoResizeColumns(1, headers.length);
+}

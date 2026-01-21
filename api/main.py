@@ -25,6 +25,8 @@ from api.routers.accounts import router as accounts_router
 from api.routers.permissions import router as permissions_router
 from api.routers.budgets import router as budgets_router
 from api.routers.payment_methods import router as payment_methods_router
+from api.routers.reconciliations import router as reconciliations_router
+from api.routers.qbo import router as qbo_router
 
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
@@ -83,6 +85,12 @@ app.include_router(debug_supabase_router)
 app.include_router(team_router)
 
 app.include_router(expenses_router)
+
+# Reconciliations (vincular gastos manuales con facturas QBO)
+app.include_router(reconciliations_router)
+
+# QBO Integration (OAuth, sync de gastos, mapeo de proyectos)
+app.include_router(qbo_router)
 
 # Budgets (presupuestos de QuickBooks)
 app.include_router(budgets_router)
