@@ -120,7 +120,7 @@ def get_pipeline_task_priorities() -> Dict[str, Any]:
 def get_pipeline_users() -> Dict[str, Any]:
     """Devuelve lista de usuarios para dropdowns en Pipeline UI."""
     try:
-        response = supabase.table("users").select("user_id, user_name, email").order("user_name").execute()
+        response = supabase.table("users").select("user_id, user_name").order("user_name").execute()
         return {"data": response.data or []}
     except Exception as e:
         print(f"[PIPELINE] ERROR in GET /pipeline/users: {repr(e)}")
@@ -155,7 +155,7 @@ def get_pipeline_grouped() -> Dict[str, Any]:
         print("[PIPELINE] Fetching related data...")
 
         # Users (para owner, collaborator, manager)
-        users_response = supabase.table("users").select("user_id, user_name, email").execute()
+        users_response = supabase.table("users").select("user_id, user_name").execute()
         users_map = {u["user_id"]: u for u in (users_response.data or [])}
 
         # Projects
