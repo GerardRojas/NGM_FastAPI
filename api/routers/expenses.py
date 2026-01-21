@@ -769,38 +769,86 @@ AVAILABLE PAYMENT METHODS (you MUST match to one of these by name, or use "Unkno
 {json.dumps(payment_methods_list, indent=2)}
 
 IMPORTANT RULES:
-1. Extract EVERY line item as a separate expense (don't combine items)
-2. For each item, extract:
-   - date: Transaction date in YYYY-MM-DD format (if not on item, use receipt date)
-   - description: Item description (be specific, include item name/details)
-   - vendor: Match the merchant name to one from the AVAILABLE VENDORS list. Use case-insensitive matching and look for partial matches (e.g., "Home Depot #1234" matches "Home Depot"). If no match found, use "Unknown"
-   - amount: Item amount as a number (without currency symbols)
-   - category: Expense category (e.g., "Office Supplies", "Food & Beverage", "Transportation", "Utilities", etc.)
-   - transaction_type: Match to one from AVAILABLE TRANSACTION TYPES list by analyzing the receipt type (invoice, purchase order, credit card statement, etc.). Use the EXACT "name" field. If uncertain, use "Unknown"
-   - payment_method: Match to one from AVAILABLE PAYMENT METHODS list by looking for payment indicators on receipt (Cash, Credit Card, Check, etc.). Use the EXACT "name" field. If uncertain, use "Unknown"
 
-3. TAX DISTRIBUTION - CRITICAL:
-   - If the receipt shows Sales Tax, Tax, HST, GST, VAT, or any similar tax amount, DO NOT create a separate tax line item
+1. ALWAYS USE LINE TOTALS - CRITICAL:
+   - For each line item, ALWAYS use the LINE TOTAL (extended/calculated amount), NOT the unit price
+   - Common column names for line totals: EXTENSION, EXT, AMOUNT, LINE TOTAL, TOTAL, SUBTOTAL (per line)
+   - The line total is typically the RIGHTMOST dollar amount on each line
+   - Examples:
+     * "QTY: 80, PRICE EACH: $1.84, EXTENSION: $147.20" → amount is $147.20
+     * "2 x $5.00 = $10.00" → amount is $10.00
+     * "Widget (3 @ $25.00) ... $75.00" → amount is $75.00
+     * "Service charge ..... $150.00" → amount is $150.00
+   - NEVER use unit prices like "PRICE EACH", "UNIT PRICE", "per each", "@ $X.XX each"
+
+2. DOCUMENT STRUCTURE - Adapt to ANY format:
+
+   A) SIMPLE RECEIPTS (grocery stores, restaurants, retail):
+      - Usually single page with items listed vertically
+      - Look for: item name followed by price on the same line
+      - Total at the bottom
+
+   B) ITEMIZED INVOICES (contractors, services):
+      - May have: Description, Quantity, Rate, Amount columns
+      - Use the AMOUNT column (rightmost), not Rate
+
+   C) COMPLEX MULTI-SECTION INVOICES (Home Depot, Lowe's, supply stores):
+      - May have multiple sections: "CARRY OUT", "DELIVERY #1", "DELIVERY #2", etc.
+      - May span multiple pages: "Page 1 of 2", "Continued on next page"
+      - Extract items from ALL sections and ALL pages
+      - Don't stop at section subtotals (MERCHANDISE TOTAL) - continue to find all items
+      - The GRAND TOTAL at the end covers everything
+
+   D) STATEMENTS/SUMMARIES:
+      - May show only totals per category
+      - Extract each category as a line item if no detail available
+
+3. Extract EVERY line item as a separate expense (don't combine items)
+
+4. For each item, extract:
+   - date: Transaction date in YYYY-MM-DD format (look for: Date, Invoice Date, Transaction Date, or use document date)
+   - description: Item description (include quantity if shown, e.g., "3x Lumber 2x4", "Labor - 4 hours")
+   - vendor: Match to AVAILABLE VENDORS list using partial/fuzzy matching. If not found, use "Unknown"
+   - amount: The LINE TOTAL as a number (no currency symbols) - NOT the unit price!
+   - category: Expense category (e.g., "Materials", "Labor", "Office Supplies", "Food & Beverage", "Transportation", "Utilities", "Equipment Rental", etc.)
+   - transaction_type: Match to AVAILABLE TRANSACTION TYPES by document type. If uncertain, use "Unknown"
+   - payment_method: Match to AVAILABLE PAYMENT METHODS by payment indicators on receipt. If uncertain, use "Unknown"
+
+5. TAX DISTRIBUTION - CRITICAL:
+   - If the receipt shows Sales Tax, Tax, HST, GST, VAT, IVA, or similar tax amounts, DO NOT create a separate tax line item
    - Instead, DISTRIBUTE the tax proportionally across all product/service line items based on each item's percentage of the subtotal
-   - Example: If subtotal is $100, Item A is $60 (60%), Item B is $40 (40%), and tax is $8, then:
-     - Item A final amount = $60 + ($8 × 0.60) = $64.80
-     - Item B final amount = $40 + ($8 × 0.40) = $43.20
+   - Example: Subtotal $100, Item A $60 (60%), Item B $40 (40%), Tax $8:
+     * Item A final = $60 + ($8 × 0.60) = $64.80
+     * Item B final = $40 + ($8 × 0.40) = $43.20
    - The sum of all final amounts MUST equal the receipt's TOTAL (including tax)
-   - VERIFY: Add up all your expense amounts - they must match the receipt total exactly
-   - For each expense item that received tax distribution, add a field "tax_included" with the tax amount added to that item
+   - Add "tax_included" field to each item showing the tax amount added to it
+   - NOTE: Even if tax rate shows 0%, check for actual tax line amounts
 
-4. FEES ARE LINE ITEMS (not distributed):
-   - Delivery Fee, Service Fee, Convenience Fee, Processing Fee, Handling Fee, Tip, Gratuity, etc. - these are NOT taxes
-   - These fees MUST be included as separate line items with their own amount
-   - Only actual TAX amounts get distributed
+6. FEES ARE LINE ITEMS (not distributed):
+   - These are NOT taxes and should be separate line items:
+     * Delivery Fee, Shipping, Freight
+     * Service Fee, Convenience Fee, Processing Fee
+     * Handling Fee, Restocking Fee
+     * Tip, Gratuity
+     * Environmental fees (CA LUMBER FEE, recycling fee, etc.)
+     * Fuel surcharge
+   - Only actual TAX amounts (Sales Tax, VAT, GST, HST) get distributed
 
-5. If the receipt shows only ONE total (no itemization), create ONE expense with that total
-6. Use the currency shown on the receipt (or USD if not specified)
-7. CRITICAL: The vendor, transaction_type, and payment_method fields MUST be EXACTLY one of the names from their respective lists above, or "Unknown"
+7. SINGLE TOTAL FALLBACK:
+   - If the receipt shows only ONE total with no itemization, create ONE expense with that total amount
+   - Use the vendor name or document title as the description
 
-VALIDATION:
-- Before returning, verify that the SUM of all expense amounts equals the receipt's GRAND TOTAL
-- If there's a discrepancy, adjust the amounts to match the total
+8. Use the currency shown on the receipt (default to USD if not specified)
+
+9. CRITICAL: vendor, transaction_type, and payment_method MUST exactly match one from their respective lists, or use "Unknown"
+
+VALIDATION - MANDATORY:
+1. Find the GRAND TOTAL / TOTAL DUE / AMOUNT DUE shown on the receipt - this is "invoice_total"
+2. Calculate the arithmetic sum of all your expense amounts - this is "calculated_sum"
+3. Compare them:
+   - If they match (within $0.02 tolerance), set "validation_passed" to true
+   - If they DON'T match, set "validation_passed" to false and include a "validation_warning" message
+4. The "invoice_total" must be the EXACT value printed on the receipt, not your calculation
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -825,12 +873,20 @@ Return ONLY valid JSON in this exact format:
       {{"description": "Item A", "original_amount": 60.00, "tax_added": 4.80, "final_amount": 64.80}},
       {{"description": "Item B", "original_amount": 40.00, "tax_added": 3.20, "final_amount": 43.20}}
     ]
+  }},
+  "validation": {{
+    "invoice_total": 108.00,
+    "calculated_sum": 108.00,
+    "validation_passed": true,
+    "validation_warning": null
   }}
 }}
 
 IMPORTANT:
 - If NO tax was detected on the receipt, set "tax_summary" to null
 - The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
+- The "invoice_total" MUST be the exact total shown on the receipt/invoice document
+- If validation fails, explain in "validation_warning" why the numbers don't match (e.g., "Calculated sum $105.00 does not match invoice total $108.00 - possible missing item or rounding issue")
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object."""
 
