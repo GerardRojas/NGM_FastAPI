@@ -713,11 +713,12 @@ async def parse_receipt(file: UploadFile = File(...)):
         ]
 
         # Procesar PDF o imagen
-        base64_image = None
+        # base64_images es una lista para soportar PDFs multi-página
+        base64_images = []
         media_type = file.content_type
 
         if file.content_type == "application/pdf":
-            # Convertir PDF a imagen (primera página)
+            # Convertir PDF a imágenes (TODAS las páginas)
             try:
                 # Detectar sistema operativo para path de Poppler
                 import platform
@@ -727,23 +728,24 @@ async def parse_receipt(file: UploadFile = File(...)):
                     poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin'
                 # En Linux (Render), poppler-utils está en PATH por defecto
 
+                # Convertir TODAS las páginas del PDF (sin límite de first_page/last_page)
                 images = convert_from_bytes(
                     file_content,
-                    first_page=1,
-                    last_page=1,
                     dpi=200,
                     poppler_path=poppler_path
                 )
                 if not images:
                     raise HTTPException(status_code=400, detail="Could not convert PDF to image")
 
-                # Convertir la primera página a base64
-                img = images[0]
-                buffer = io.BytesIO()
-                img.save(buffer, format='PNG')
-                buffer.seek(0)
-                base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                # Convertir CADA página a base64
+                for img in images:
+                    buffer = io.BytesIO()
+                    img.save(buffer, format='PNG')
+                    buffer.seek(0)
+                    base64_images.append(base64.b64encode(buffer.getvalue()).decode('utf-8'))
+
                 media_type = "image/png"
+                print(f"PDF processed: {len(base64_images)} page(s) converted to images")
 
             except Exception as pdf_error:
                 raise HTTPException(
@@ -751,12 +753,17 @@ async def parse_receipt(file: UploadFile = File(...)):
                     detail=f"Error processing PDF: {str(pdf_error)}"
                 )
         else:
-            # Imagen directa
-            base64_image = base64.b64encode(file_content).decode('utf-8')
+            # Imagen directa (solo 1 imagen)
+            base64_images = [base64.b64encode(file_content).decode('utf-8')]
 
         # Prompt para OpenAI - Instrucciones muy específicas
-        prompt = f"""You are an expert at extracting expense data from receipts, invoices, and bills.
+        # Indicar si es un documento multi-página
+        page_count_hint = ""
+        if len(base64_images) > 1:
+            page_count_hint = f"\n\nIMPORTANT: This document has {len(base64_images)} pages. Analyze ALL pages and combine the data from all of them into a single response. The images are provided in page order (Page 1, Page 2, etc.).\n"
 
+        prompt = f"""You are an expert at extracting expense data from receipts, invoices, and bills.
+{page_count_hint}
 Analyze this receipt/invoice and extract ALL expense items in JSON format.
 
 AVAILABLE VENDORS (you MUST match to one of these, or use "Unknown"):
@@ -890,25 +897,31 @@ IMPORTANT:
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object."""
 
+        # Construir contenido del mensaje con TODAS las imágenes (para PDFs multi-página)
+        message_content = [{"type": "text", "text": prompt}]
+
+        # Agregar cada imagen/página al contenido
+        for i, base64_img in enumerate(base64_images):
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{media_type};base64,{base64_img}",
+                    "detail": "high"  # Alta calidad para mejor OCR
+                }
+            })
+
+        print(f"Sending {len(base64_images)} image(s) to OpenAI Vision API")
+
         # Llamar a OpenAI Vision API
         response = client.chat.completions.create(
             model="gpt-4o",  # GPT-4 Vision model
             messages=[
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{base64_image}",
-                                "detail": "high"  # Alta calidad para mejor OCR
-                            }
-                        }
-                    ]
+                    "content": message_content
                 }
             ],
-            max_tokens=2000,
+            max_tokens=4000,  # Aumentado para documentos multi-página
             temperature=0.1  # Baja temperatura para respuestas más deterministas
         )
 
