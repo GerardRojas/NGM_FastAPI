@@ -68,16 +68,23 @@ async def get_pool() -> asyncpg.Pool:
 
     if _pool is None:
         dsn = SUPABASE_DB_URL.replace("postgres://", "postgresql://", 1)
+        print(f"[PIPELINE] Creating connection pool...")
+        print(f"[PIPELINE] DSN starts with: {dsn[:30]}...")
 
-        _pool = await asyncpg.create_pool(
-            dsn,
-            ssl="require",
-            timeout=10,
-            statement_cache_size=0,
-            min_size=1,
-            max_size=5,
-        )
-
+        try:
+            _pool = await asyncpg.create_pool(
+                dsn,
+                ssl="require",
+                timeout=30,  # Increased timeout for cold starts
+                statement_cache_size=0,
+                min_size=1,
+                max_size=5,
+            )
+            print("[PIPELINE] Connection pool created successfully")
+        except Exception as e:
+            print(f"[PIPELINE] ERROR creating pool: {repr(e)}")
+            print(f"[PIPELINE] Pool creation traceback: {traceback.format_exc()}")
+            raise
 
     return _pool
 
@@ -292,6 +299,7 @@ async def get_pipeline_grouped() -> Dict[str, Any]:
       ]
     }
     """
+    print("[PIPELINE] GET /pipeline/grouped called")
 
     # Traemos todas las columnas de tasks (t.*) + alias útiles de joins
     sql = """
@@ -342,18 +350,24 @@ async def get_pipeline_grouped() -> Dict[str, Any]:
     ORDER BY task_status;
     """
 
+    print("[PIPELINE] Getting database pool...")
     pool = await get_pool()
+    print("[PIPELINE] Pool acquired, fetching data...")
     try:
         async with pool.acquire() as conn:
+            print("[PIPELINE] Connection acquired")
             # 👇 clave: saber exactamente qué columnas existen HOY en public.tasks
             tasks_columns: List[str] = await _get_tasks_columns(conn)
+            print(f"[PIPELINE] Tasks columns: {len(tasks_columns)} columns found")
 
             rows = await conn.fetch(sql)
+            print(f"[PIPELINE] Fetched {len(rows)} tasks from database")
             status_rows = await conn.fetch(sql_statuses)
+            print(f"[PIPELINE] Fetched {len(status_rows)} statuses")
 
     except Exception as e:
-        print("ERROR in GET /pipeline/grouped:", repr(e))
-        print(traceback.format_exc())
+        print("[PIPELINE] ERROR in GET /pipeline/grouped:", repr(e))
+        print("[PIPELINE] Traceback:", traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
     # Agrupar por status_id
@@ -474,6 +488,8 @@ async def get_pipeline_grouped() -> Dict[str, Any]:
     for remaining_group in groups_map.values():
         groups.append(remaining_group)
 
+    total_tasks = sum(len(g.get("tasks", [])) for g in groups)
+    print(f"[PIPELINE] Returning {len(groups)} groups with {total_tasks} total tasks")
     return {"groups": groups}
 
 
