@@ -779,10 +779,28 @@ IMPORTANT RULES:
    - transaction_type: Match to one from AVAILABLE TRANSACTION TYPES list by analyzing the receipt type (invoice, purchase order, credit card statement, etc.). Use the EXACT "name" field. If uncertain, use "Unknown"
    - payment_method: Match to one from AVAILABLE PAYMENT METHODS list by looking for payment indicators on receipt (Cash, Credit Card, Check, etc.). Use the EXACT "name" field. If uncertain, use "Unknown"
 
-3. If there are subtotals, taxes, or fees, include them as separate items with clear descriptions
-4. If the receipt shows only ONE total (no itemization), create ONE expense with that total
-5. Use the currency shown on the receipt (or USD if not specified)
-6. CRITICAL: The vendor, transaction_type, and payment_method fields MUST be EXACTLY one of the names from their respective lists above, or "Unknown"
+3. TAX DISTRIBUTION - CRITICAL:
+   - If the receipt shows Sales Tax, Tax, HST, GST, VAT, or any similar tax amount, DO NOT create a separate tax line item
+   - Instead, DISTRIBUTE the tax proportionally across all product/service line items based on each item's percentage of the subtotal
+   - Example: If subtotal is $100, Item A is $60 (60%), Item B is $40 (40%), and tax is $8, then:
+     - Item A final amount = $60 + ($8 × 0.60) = $64.80
+     - Item B final amount = $40 + ($8 × 0.40) = $43.20
+   - The sum of all final amounts MUST equal the receipt's TOTAL (including tax)
+   - VERIFY: Add up all your expense amounts - they must match the receipt total exactly
+   - For each expense item that received tax distribution, add a field "tax_included" with the tax amount added to that item
+
+4. FEES ARE LINE ITEMS (not distributed):
+   - Delivery Fee, Service Fee, Convenience Fee, Processing Fee, Handling Fee, Tip, Gratuity, etc. - these are NOT taxes
+   - These fees MUST be included as separate line items with their own amount
+   - Only actual TAX amounts get distributed
+
+5. If the receipt shows only ONE total (no itemization), create ONE expense with that total
+6. Use the currency shown on the receipt (or USD if not specified)
+7. CRITICAL: The vendor, transaction_type, and payment_method fields MUST be EXACTLY one of the names from their respective lists above, or "Unknown"
+
+VALIDATION:
+- Before returning, verify that the SUM of all expense amounts equals the receipt's GRAND TOTAL
+- If there's a discrepancy, adjust the amounts to match the total
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -794,10 +812,25 @@ Return ONLY valid JSON in this exact format:
       "amount": 45.99,
       "category": "Category name",
       "transaction_type": "Exact name from TRANSACTION TYPES list or Unknown",
-      "payment_method": "Exact name from PAYMENT METHODS list or Unknown"
+      "payment_method": "Exact name from PAYMENT METHODS list or Unknown",
+      "tax_included": 3.45
     }}
-  ]
+  ],
+  "tax_summary": {{
+    "total_tax_detected": 8.00,
+    "tax_label": "Sales Tax",
+    "subtotal": 100.00,
+    "grand_total": 108.00,
+    "distribution": [
+      {{"description": "Item A", "original_amount": 60.00, "tax_added": 4.80, "final_amount": 64.80}},
+      {{"description": "Item B", "original_amount": 40.00, "tax_added": 3.20, "final_amount": 43.20}}
+    ]
+  }}
 }}
+
+IMPORTANT:
+- If NO tax was detected on the receipt, set "tax_summary" to null
+- The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object."""
 
