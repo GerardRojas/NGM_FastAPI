@@ -29,6 +29,9 @@ from api.routers.payment_methods import router as payment_methods_router
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
 
+# ========= ARTURITO: Chat Bot ==========
+from api.routers.arturito import router as arturito_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -91,6 +94,9 @@ app.include_router(payment_methods_router)
 
 # Permissions (control de acceso basado en roles)
 app.include_router(permissions_router)
+
+# Arturito Chat Bot (Google Chat integration)
+app.include_router(arturito_router)
 
 # ========================================
 # Root & Healthcheck
