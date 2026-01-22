@@ -19,6 +19,7 @@ class ExpenseCreate(BaseModel):
     project: str  # UUID del proyecto
     txn_type: Optional[str] = None  # UUID del tipo de transacción
     TxnDate: Optional[str] = None  # Fecha en formato ISO
+    bill_id: Optional[str] = None  # Invoice/Bill number
     vendor_id: Optional[str] = None  # UUID del vendor
     payment_type: Optional[str] = None  # UUID del método de pago
     Amount: Optional[float] = None
@@ -34,6 +35,7 @@ class ExpenseCreate(BaseModel):
 class ExpenseUpdate(BaseModel):
     txn_type: Optional[str] = None
     TxnDate: Optional[str] = None
+    bill_id: Optional[str] = None  # Invoice/Bill number
     vendor_id: Optional[str] = None
     payment_type: Optional[str] = None
     Amount: Optional[float] = None
