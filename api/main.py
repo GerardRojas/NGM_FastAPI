@@ -27,6 +27,7 @@ from api.routers.budgets import router as budgets_router
 from api.routers.payment_methods import router as payment_methods_router
 from api.routers.reconciliations import router as reconciliations_router
 from api.routers.qbo import router as qbo_router
+from api.routers.bills import router as bills_router
 
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
@@ -99,6 +100,9 @@ app.include_router(budgets_router)
 app.include_router(vendors_router)
 app.include_router(accounts_router)
 app.include_router(payment_methods_router)
+
+# Bills (metadata de facturas/recibos)
+app.include_router(bills_router)
 
 # Permissions (control de acceso basado en roles)
 app.include_router(permissions_router)
