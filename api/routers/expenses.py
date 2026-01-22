@@ -814,6 +814,7 @@ IMPORTANT RULES:
 
 4. For each item, extract:
    - date: Transaction date in YYYY-MM-DD format (look for: Date, Invoice Date, Transaction Date, or use document date)
+   - bill_id: Invoice/Bill/Receipt number - extract from: "Invoice #", "Invoice No.", "Bill #", "Receipt #", "Ref #", "PO #", "Order #", "Transaction ID", "Document #", "Confirmation #", or any similar reference number at the top of the document. This is typically the same for all items in one receipt/invoice.
    - description: Item description (include quantity if shown, e.g., "3x Lumber 2x4", "Labor - 4 hours")
    - vendor: Match to AVAILABLE VENDORS list using partial/fuzzy matching. If not found, use "Unknown"
    - amount: The LINE TOTAL as a number (no currency symbols) - NOT the unit price!
@@ -862,6 +863,7 @@ Return ONLY valid JSON in this exact format:
   "expenses": [
     {{
       "date": "2025-01-17",
+      "bill_id": "INV-12345",
       "description": "Item name or description",
       "vendor": "Exact vendor name from VENDORS list or Unknown",
       "amount": 45.99,
