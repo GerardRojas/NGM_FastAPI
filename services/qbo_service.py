@@ -434,29 +434,68 @@ def get_connection_status() -> Dict[str, Any]:
     """
     Get the current QBO connection status.
     """
-    result = supabase.table("qbo_tokens").select("*").execute()
+    try:
+        result = supabase.table("qbo_tokens").select("*").execute()
 
-    connections = []
-    for token in (result.data or []):
-        access_expires = datetime.fromisoformat(token["access_token_expires_at"].replace("Z", ""))
-        refresh_expires = datetime.fromisoformat(token["refresh_token_expires_at"].replace("Z", ""))
-        now = datetime.utcnow()
+        # Debug: log what we got
+        print(f"[QBO] get_connection_status - result.data: {result.data}")
 
-        connections.append({
-            "realm_id": token["realm_id"],
-            "company_name": token.get("company_name", "Unknown"),
-            "access_token_valid": now < access_expires,
-            "access_token_expires_at": token["access_token_expires_at"],
-            "refresh_token_valid": now < refresh_expires,
-            "refresh_token_expires_at": token["refresh_token_expires_at"],
-            "last_updated": token.get("updated_at")
-        })
+        connections = []
+        for token in (result.data or []):
+            try:
+                # Safe parsing of timestamps
+                access_expires_str = token.get("access_token_expires_at")
+                refresh_expires_str = token.get("refresh_token_expires_at")
 
-    return {
-        "connected": len(connections) > 0,
-        "connections": connections,
-        "environment": QBO_ENVIRONMENT
-    }
+                now = datetime.utcnow()
+                access_valid = False
+                refresh_valid = False
+
+                if access_expires_str:
+                    access_expires = datetime.fromisoformat(access_expires_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    access_valid = now < access_expires
+
+                if refresh_expires_str:
+                    refresh_expires = datetime.fromisoformat(refresh_expires_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    refresh_valid = now < refresh_expires
+
+                connections.append({
+                    "realm_id": token.get("realm_id"),
+                    "company_name": token.get("company_name", "Unknown"),
+                    "access_token_valid": access_valid,
+                    "access_token_expires_at": access_expires_str,
+                    "refresh_token_valid": refresh_valid,
+                    "refresh_token_expires_at": refresh_expires_str,
+                    "last_updated": token.get("updated_at")
+                })
+            except Exception as token_error:
+                print(f"[QBO] Error processing token: {token_error}")
+                # Include the token with error info
+                connections.append({
+                    "realm_id": token.get("realm_id"),
+                    "company_name": token.get("company_name", "Unknown"),
+                    "access_token_valid": False,
+                    "access_token_expires_at": None,
+                    "refresh_token_valid": False,
+                    "refresh_token_expires_at": None,
+                    "last_updated": token.get("updated_at"),
+                    "error": str(token_error)
+                })
+
+        return {
+            "connected": len(connections) > 0,
+            "connections": connections,
+            "environment": QBO_ENVIRONMENT
+        }
+    except Exception as e:
+        print(f"[QBO] Error in get_connection_status: {e}")
+        # Return empty status instead of crashing
+        return {
+            "connected": False,
+            "connections": [],
+            "environment": QBO_ENVIRONMENT,
+            "error": str(e)
+        }
 
 
 def disconnect(realm_id: str) -> bool:
