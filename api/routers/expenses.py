@@ -32,6 +32,11 @@ class ExpenseCreate(BaseModel):
     created_by: Optional[str] = None
 
 
+class ExpenseBatchCreate(BaseModel):
+    """Modelo para crear múltiples gastos en una sola llamada"""
+    expenses: List[ExpenseCreate]
+
+
 class ExpenseUpdate(BaseModel):
     txn_type: Optional[str] = None
     TxnDate: Optional[str] = None
@@ -47,6 +52,17 @@ class ExpenseUpdate(BaseModel):
     account_id: Optional[str] = None
     auth_status: Optional[bool] = None
     auth_by: Optional[str] = None
+
+
+class ExpenseUpdateItem(BaseModel):
+    """Un item para actualización batch - incluye el ID"""
+    expense_id: str
+    data: ExpenseUpdate
+
+
+class ExpenseBatchUpdate(BaseModel):
+    """Modelo para actualizar múltiples gastos en una sola llamada"""
+    updates: List[ExpenseUpdateItem]
 
 
 # ====== HELPERS ======
@@ -103,6 +119,131 @@ def create_expense(payload: ExpenseCreate):
 
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/batch", status_code=201)
+def create_expenses_batch(payload: ExpenseBatchCreate):
+    """
+    Crea múltiples gastos en una sola operación (bulk insert).
+    Mucho más eficiente que crear uno por uno.
+
+    Returns:
+        - created: lista de gastos creados exitosamente
+        - failed: lista de errores (si los hay)
+        - summary: resumen de la operación
+    """
+    try:
+        expenses_data = []
+        failed = []
+
+        # Validar project una sola vez (asumimos mismo proyecto para todos)
+        project_ids = set()
+        for exp in payload.expenses:
+            if exp.project:
+                project_ids.add(exp.project)
+
+        # Validar que todos los proyectos existan
+        for project_id in project_ids:
+            project = supabase.table("projects").select("project_id").eq("project_id", project_id).single().execute()
+            if not project.data:
+                raise HTTPException(status_code=400, detail=f"Invalid project: {project_id}")
+
+        # Preparar datos para inserción bulk
+        for idx, exp in enumerate(payload.expenses):
+            try:
+                data = exp.model_dump(exclude_none=True)
+                expenses_data.append(data)
+            except Exception as e:
+                failed.append({
+                    "index": idx,
+                    "error": str(e),
+                    "data": exp.model_dump() if exp else None
+                })
+
+        if not expenses_data:
+            raise HTTPException(status_code=400, detail="No valid expenses to create")
+
+        # Inserción bulk - una sola operación a la base de datos
+        res = supabase.table("expenses_manual_COGS").insert(expenses_data).execute()
+
+        created_expenses = res.data or []
+
+        return {
+            "message": f"Batch insert completed: {len(created_expenses)} created",
+            "created": created_expenses,
+            "failed": failed,
+            "summary": {
+                "total_requested": len(payload.expenses),
+                "total_created": len(created_expenses),
+                "total_failed": len(failed)
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/batch")
+def update_expenses_batch(payload: ExpenseBatchUpdate):
+    """
+    Actualiza múltiples gastos en una sola operación.
+    Cada update se procesa individualmente pero en una sola llamada HTTP.
+
+    Returns:
+        - updated: lista de gastos actualizados exitosamente
+        - failed: lista de errores (si los hay)
+        - summary: resumen de la operación
+    """
+    try:
+        updated = []
+        failed = []
+
+        for item in payload.updates:
+            try:
+                # Preparar datos para actualización (excluir None)
+                update_data = item.data.model_dump(exclude_none=True)
+
+                if not update_data:
+                    failed.append({
+                        "expense_id": item.expense_id,
+                        "error": "No fields to update"
+                    })
+                    continue
+
+                # Actualizar el gasto
+                res = supabase.table("expenses_manual_COGS").update(update_data).eq(
+                    "expense_id", item.expense_id
+                ).execute()
+
+                if res.data:
+                    updated.append(res.data[0])
+                else:
+                    failed.append({
+                        "expense_id": item.expense_id,
+                        "error": "Expense not found or no changes made"
+                    })
+
+            except Exception as e:
+                failed.append({
+                    "expense_id": item.expense_id,
+                    "error": str(e)
+                })
+
+        return {
+            "message": f"Batch update completed: {len(updated)} updated, {len(failed)} failed",
+            "updated": updated,
+            "failed": failed,
+            "summary": {
+                "total_requested": len(payload.updates),
+                "total_updated": len(updated),
+                "total_failed": len(failed)
+            }
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
