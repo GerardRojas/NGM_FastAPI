@@ -115,6 +115,7 @@ def list_projects(limit: int = 100):
                 clients(client_name)
                 """
             )
+            .order("project_name")
             .limit(limit)
             .execute()
         )
