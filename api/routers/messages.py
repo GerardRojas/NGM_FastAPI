@@ -1,0 +1,597 @@
+"""
+═══════════════════════════════════════════════════════════════════════════════
+ NGM HUB — Messages Router
+═══════════════════════════════════════════════════════════════════════════════
+ Endpoints for chat/messaging system:
+ - Project channels (General, Accounting, Receipts)
+ - Custom channels
+ - Direct messages
+ - Threads, reactions, mentions, attachments
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
+from fastapi import APIRouter, HTTPException, Depends, Query
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from uuid import UUID
+from api.supabase_client import supabase
+from api.auth import get_current_user
+
+router = APIRouter(prefix="/messages", tags=["messages"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MessageCreate(BaseModel):
+    content: str = Field(..., min_length=1)
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct)$")
+    channel_id: Optional[str] = None  # For custom/direct channels
+    project_id: Optional[str] = None  # For project channels
+    reply_to_id: Optional[str] = None
+
+
+class MessageResponse(BaseModel):
+    id: str
+    content: str
+    channel_type: str
+    channel_id: Optional[str]
+    project_id: Optional[str]
+    user_id: str
+    user_name: Optional[str]
+    avatar_color: Optional[str]
+    reply_to_id: Optional[str]
+    thread_count: int
+    is_edited: bool
+    created_at: str
+    reactions: Optional[Dict[str, List[str]]]
+    attachments: Optional[List[Dict[str, Any]]]
+
+
+class ChannelCreate(BaseModel):
+    type: str = Field(..., pattern="^(custom|direct)$")
+    name: Optional[str] = None
+    description: Optional[str] = None
+    member_ids: List[str] = []
+
+
+class ReactionToggle(BaseModel):
+    emoji: str = Field(..., min_length=1, max_length=10)
+    action: str = Field(..., pattern="^(add|remove)$")
+
+
+class ThreadReplyCreate(BaseModel):
+    content: str = Field(..., min_length=1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def normalize_message(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert raw Supabase row to standardized message format"""
+    # Handle joined user data
+    user_data = row.get("users") or {}
+    if isinstance(user_data, list) and user_data:
+        user_data = user_data[0]
+
+    return {
+        "id": str(row.get("id", "")),
+        "content": row.get("content", ""),
+        "channel_type": row.get("channel_type", ""),
+        "channel_id": str(row["channel_id"]) if row.get("channel_id") else None,
+        "project_id": str(row["project_id"]) if row.get("project_id") else None,
+        "user_id": str(row.get("user_id", "")),
+        "user_name": user_data.get("user_name") if isinstance(user_data, dict) else None,
+        "avatar_color": user_data.get("avatar_color") if isinstance(user_data, dict) else None,
+        "reply_to_id": str(row["reply_to_id"]) if row.get("reply_to_id") else None,
+        "thread_count": row.get("thread_count", 0),
+        "is_edited": row.get("is_edited", False),
+        "created_at": row.get("created_at", ""),
+        "reactions": row.get("reactions"),
+        "attachments": row.get("attachments"),
+    }
+
+
+def normalize_channel(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert raw Supabase row to standardized channel format"""
+    return {
+        "id": str(row.get("id", "")),
+        "name": row.get("name"),
+        "description": row.get("description"),
+        "type": row.get("type", ""),
+        "created_by": str(row["created_by"]) if row.get("created_by") else None,
+        "created_at": row.get("created_at", ""),
+        "unread_count": row.get("unread_count", 0),
+        "members": row.get("members", []),
+    }
+
+
+def get_reactions_for_message(message_id: str) -> Dict[str, List[str]]:
+    """Get reactions grouped by emoji for a message"""
+    try:
+        result = supabase.table("message_reactions") \
+            .select("emoji, user_id") \
+            .eq("message_id", message_id) \
+            .execute()
+
+        reactions: Dict[str, List[str]] = {}
+        for row in (result.data or []):
+            emoji = row.get("emoji")
+            user_id = str(row.get("user_id"))
+            if emoji not in reactions:
+                reactions[emoji] = []
+            reactions[emoji].append(user_id)
+
+        return reactions
+    except Exception:
+        return {}
+
+
+def get_attachments_for_message(message_id: str) -> List[Dict[str, Any]]:
+    """Get attachments for a message"""
+    try:
+        result = supabase.table("message_attachments") \
+            .select("id, name, type, size, url, thumbnail_url") \
+            .eq("message_id", message_id) \
+            .execute()
+
+        return result.data or []
+    except Exception:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MESSAGES ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("")
+def get_messages(
+    channel_type: str = Query(...),
+    channel_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get messages for a channel.
+    For project channels, use channel_type + project_id.
+    For custom/direct channels, use channel_type + channel_id.
+    """
+    try:
+        query = supabase.table("messages") \
+            .select("*, users!user_id(user_name, avatar_color)") \
+            .eq("channel_type", channel_type)
+
+        # Filter by channel
+        if channel_type in ["custom", "direct"]:
+            if not channel_id:
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct channels")
+            query = query.eq("channel_id", channel_id)
+        else:
+            # Project channels
+            if not project_id:
+                raise HTTPException(status_code=400, detail="project_id required for project channels")
+            query = query.eq("project_id", project_id)
+
+        # Only get top-level messages (not thread replies)
+        query = query.is_("reply_to_id", "null")
+
+        # Order and paginate
+        result = query.order("created_at", desc=False) \
+            .range(offset, offset + limit - 1) \
+            .execute()
+
+        messages = []
+        for row in (result.data or []):
+            msg = normalize_message(row)
+            # Fetch reactions and attachments
+            msg["reactions"] = get_reactions_for_message(row["id"])
+            msg["attachments"] = get_attachments_for_message(row["id"])
+            messages.append(msg)
+
+        return {"messages": messages}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.post("", status_code=201)
+def create_message(
+    payload: MessageCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new message"""
+    try:
+        user_id = current_user["user_id"]
+
+        data = {
+            "content": payload.content,
+            "channel_type": payload.channel_type,
+            "user_id": user_id,
+            "reply_to_id": payload.reply_to_id,
+        }
+
+        # Set channel reference
+        if payload.channel_type in ["custom", "direct"]:
+            if not payload.channel_id:
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct channels")
+            data["channel_id"] = payload.channel_id
+        else:
+            if not payload.project_id:
+                raise HTTPException(status_code=400, detail="project_id required for project channels")
+            data["project_id"] = payload.project_id
+
+        result = supabase.table("messages").insert(data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create message")
+
+        # Get user info for response
+        msg = result.data[0]
+        user_result = supabase.table("users") \
+            .select("user_name, avatar_color") \
+            .eq("user_id", user_id) \
+            .single() \
+            .execute()
+
+        response = normalize_message(msg)
+        if user_result.data:
+            response["user_name"] = user_result.data.get("user_name")
+            response["avatar_color"] = user_result.data.get("avatar_color")
+
+        return {"message": response}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THREADS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/{message_id}/thread")
+def get_thread_replies(
+    message_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all replies to a message (thread)"""
+    try:
+        result = supabase.table("messages") \
+            .select("*, users!user_id(user_name, avatar_color)") \
+            .eq("reply_to_id", message_id) \
+            .order("created_at", desc=False) \
+            .execute()
+
+        replies = []
+        for row in (result.data or []):
+            msg = normalize_message(row)
+            msg["reactions"] = get_reactions_for_message(row["id"])
+            replies.append(msg)
+
+        return {"replies": replies}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.post("/{message_id}/thread", status_code=201)
+def create_thread_reply(
+    message_id: str,
+    payload: ThreadReplyCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Reply to a message in a thread"""
+    try:
+        user_id = current_user["user_id"]
+
+        # Get parent message to copy channel info
+        parent = supabase.table("messages") \
+            .select("channel_type, channel_id, project_id") \
+            .eq("id", message_id) \
+            .single() \
+            .execute()
+
+        if not parent.data:
+            raise HTTPException(status_code=404, detail="Parent message not found")
+
+        parent_data = parent.data
+
+        data = {
+            "content": payload.content,
+            "channel_type": parent_data["channel_type"],
+            "channel_id": parent_data.get("channel_id"),
+            "project_id": parent_data.get("project_id"),
+            "user_id": user_id,
+            "reply_to_id": message_id,
+        }
+
+        result = supabase.table("messages").insert(data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create reply")
+
+        msg = normalize_message(result.data[0])
+
+        # Get user info
+        user_result = supabase.table("users") \
+            .select("user_name, avatar_color") \
+            .eq("user_id", user_id) \
+            .single() \
+            .execute()
+
+        if user_result.data:
+            msg["user_name"] = user_result.data.get("user_name")
+            msg["avatar_color"] = user_result.data.get("avatar_color")
+
+        return {"reply": msg}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REACTIONS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/{message_id}/reactions")
+def toggle_reaction(
+    message_id: str,
+    payload: ReactionToggle,
+    current_user: dict = Depends(get_current_user)
+):
+    """Add or remove a reaction to a message"""
+    try:
+        user_id = current_user["user_id"]
+
+        if payload.action == "add":
+            # Try to insert (will fail if already exists due to unique constraint)
+            try:
+                supabase.table("message_reactions").insert({
+                    "message_id": message_id,
+                    "user_id": user_id,
+                    "emoji": payload.emoji,
+                }).execute()
+            except Exception:
+                # Already exists, ignore
+                pass
+        else:
+            # Remove reaction
+            supabase.table("message_reactions") \
+                .delete() \
+                .eq("message_id", message_id) \
+                .eq("user_id", user_id) \
+                .eq("emoji", payload.emoji) \
+                .execute()
+
+        # Return updated reactions
+        reactions = get_reactions_for_message(message_id)
+
+        return {"reactions": reactions}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANNELS ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/channels")
+def get_channels(
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all custom and direct message channels for current user"""
+    try:
+        user_id = current_user["user_id"]
+
+        # Get channels where user is a member
+        result = supabase.table("channel_members") \
+            .select("channel_id, channels(*)") \
+            .eq("user_id", user_id) \
+            .execute()
+
+        channels = []
+        for row in (result.data or []):
+            channel_data = row.get("channels")
+            if channel_data:
+                channel = normalize_channel(channel_data)
+
+                # Get members for this channel
+                members_result = supabase.table("channel_members") \
+                    .select("user_id, users(user_id, user_name, avatar_color)") \
+                    .eq("channel_id", channel["id"]) \
+                    .execute()
+
+                members = []
+                for m in (members_result.data or []):
+                    user_data = m.get("users")
+                    if user_data:
+                        members.append({
+                            "user_id": str(user_data.get("user_id", "")),
+                            "user_name": user_data.get("user_name"),
+                            "avatar_color": user_data.get("avatar_color"),
+                        })
+
+                channel["members"] = members
+                channels.append(channel)
+
+        return {"channels": channels}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.post("/channels", status_code=201)
+def create_channel(
+    payload: ChannelCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new custom or direct message channel"""
+    try:
+        user_id = current_user["user_id"]
+
+        # Validate
+        if payload.type == "custom" and not payload.name:
+            raise HTTPException(status_code=400, detail="Name required for custom channels")
+
+        if payload.type == "direct" and len(payload.member_ids) == 0:
+            raise HTTPException(status_code=400, detail="At least one member required for direct messages")
+
+        # Create channel
+        channel_data = {
+            "type": payload.type,
+            "name": payload.name,
+            "description": payload.description,
+            "created_by": user_id,
+        }
+
+        result = supabase.table("channels").insert(channel_data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create channel")
+
+        channel_id = result.data[0]["id"]
+
+        # Add creator as admin member
+        supabase.table("channel_members").insert({
+            "channel_id": channel_id,
+            "user_id": user_id,
+            "role": "admin",
+        }).execute()
+
+        # Add other members
+        for member_id in payload.member_ids:
+            if member_id != user_id:  # Don't add creator twice
+                try:
+                    supabase.table("channel_members").insert({
+                        "channel_id": channel_id,
+                        "user_id": member_id,
+                        "role": "member",
+                    }).execute()
+                except Exception:
+                    # Ignore if user doesn't exist
+                    pass
+
+        channel = normalize_channel(result.data[0])
+
+        return {"channel": channel}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SEARCH ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/search")
+def search_messages(
+    q: str = Query(..., min_length=2),
+    channel_type: Optional[str] = Query(None),
+    channel_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: dict = Depends(get_current_user)
+):
+    """Search messages by content"""
+    try:
+        query = supabase.table("messages") \
+            .select("*, users!user_id(user_name, avatar_color)") \
+            .ilike("content", f"%{q}%")
+
+        # Apply channel filters if provided
+        if channel_type:
+            query = query.eq("channel_type", channel_type)
+
+            if channel_type in ["custom", "direct"] and channel_id:
+                query = query.eq("channel_id", channel_id)
+            elif project_id:
+                query = query.eq("project_id", project_id)
+
+        result = query.order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        messages = [normalize_message(row) for row in (result.data or [])]
+
+        return {"messages": messages}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MENTIONS ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/mentions")
+def get_my_mentions(
+    unread_only: bool = Query(False),
+    current_user: dict = Depends(get_current_user)
+):
+    """Get messages where current user was mentioned"""
+    try:
+        user_id = current_user["user_id"]
+
+        query = supabase.table("message_mentions") \
+            .select("*, messages(*, users!user_id(user_name, avatar_color))") \
+            .eq("user_id", user_id)
+
+        if unread_only:
+            query = query.is_("read_at", "null")
+
+        result = query.order("created_at", desc=True).limit(50).execute()
+
+        mentions = []
+        for row in (result.data or []):
+            msg_data = row.get("messages")
+            if msg_data:
+                mention = {
+                    "id": str(row.get("id", "")),
+                    "read_at": row.get("read_at"),
+                    "created_at": row.get("created_at"),
+                    "message": normalize_message(msg_data),
+                }
+                mentions.append(mention)
+
+        return {"mentions": mentions}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.patch("/mentions/{mention_id}/read")
+def mark_mention_read(
+    mention_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Mark a mention as read"""
+    try:
+        user_id = current_user["user_id"]
+
+        result = supabase.table("message_mentions") \
+            .update({"read_at": "now()"}) \
+            .eq("id", mention_id) \
+            .eq("user_id", user_id) \
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Mention not found")
+
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")

@@ -35,6 +35,9 @@ from api.auth import router as auth_router
 # ========= ARTURITO: Chat Bot ==========
 from api.routers.arturito import router as arturito_router
 
+# ========= MESSAGES: Chat Module ==========
+from api.routers.messages import router as messages_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -109,6 +112,9 @@ app.include_router(permissions_router)
 
 # Arturito Chat Bot (Google Chat integration)
 app.include_router(arturito_router)
+
+# Messages (Chat module - channels, threads, reactions)
+app.include_router(messages_router)
 
 # ========================================
 # Root & Healthcheck
