@@ -309,6 +309,67 @@ def list_expenses(project: Optional[str] = None, limit: Optional[int] = None):
         raise HTTPException(status_code=500, detail=f"Error leyendo expenses: {e}")
 
 
+@router.get("/all")
+def list_all_expenses(limit: Optional[int] = 1000):
+    """
+    Lista todos los gastos de todos los proyectos.
+    Incluye información del proyecto en cada gasto.
+    Por defecto limita a 1000 gastos para evitar problemas de rendimiento.
+    """
+    try:
+        # Obtener los gastos
+        query = supabase.table("expenses_manual_COGS").select("*")
+        query = query.order("TxnDate", desc=True)
+
+        if limit is not None:
+            query = query.limit(limit)
+
+        resp = query.execute()
+        raw_expenses = resp.data or []
+
+        # Obtener tipos de transacción
+        txn_types_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
+        txn_types_map = {t["TnxType_id"]: t for t in (txn_types_resp.data or [])}
+
+        # Obtener proyectos
+        projects_resp = supabase.table("projects").select("project_id, project_name").execute()
+        projects_map = {p["project_id"]: p for p in (projects_resp.data or [])}
+
+        # Obtener vendors
+        vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
+        vendors_map = {v["id"]: v for v in (vendors_resp.data or [])}
+
+        # Obtener métodos de pago
+        payment_resp = supabase.table("paymet_methods").select("id, payment_method_name").execute()
+        payment_map = {p["id"]: p for p in (payment_resp.data or [])}
+
+        # Obtener cuentas
+        accounts_resp = supabase.table("accounts").select("account_id, Name").execute()
+        accounts_map = {a["account_id"]: a for a in (accounts_resp.data or [])}
+
+        # Enriquecer cada gasto con nombres
+        expenses = []
+        for row in raw_expenses:
+            txn = txn_types_map.get(row.get("txn_type"))
+            proj = projects_map.get(row.get("project"))
+            vendor = vendors_map.get(row.get("vendor_id"))
+            payment = payment_map.get(row.get("payment_type"))
+            account = accounts_map.get(row.get("account_id"))
+
+            row["txn_type_name"] = txn.get("TnxType_name") if txn else None
+            row["project_name"] = proj.get("project_name") if proj else None
+            row["vendor_name"] = vendor.get("vendor_name") if vendor else None
+            row["payment_method_name"] = payment.get("payment_method_name") if payment else None
+            row["account_name"] = account.get("Name") if account else None
+
+            expenses.append(row)
+
+        return {"data": expenses}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error leyendo all expenses: {e}")
+
+
 @router.get("/meta")
 def get_expenses_meta():
     """
