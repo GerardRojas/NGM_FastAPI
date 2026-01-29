@@ -193,13 +193,11 @@ def route(
             "data": {"level": level}
         }
 
-    # GREETING
+    # GREETING - Use personality-based responses
     if intent == "GREETING":
-        user_name = ctx.get("user_name", "")
-        greeting = f"¡Hola{', ' + user_name if user_name else ''}! "
-        greeting += "Soy Arturito. ¿En qué puedo ayudarte?"
+        response = generate_small_talk_response(raw_text, space_id)
         return {
-            "text": greeting,
+            "text": response,
             "action": "greeting"
         }
 
