@@ -538,6 +538,519 @@ async def create_bug_task(
 
 
 # -----------------------------------------------------------------------------
+# LIST PROJECTS HANDLER
+# -----------------------------------------------------------------------------
+
+def handle_list_projects(
+    request: dict,
+    context: dict = None
+) -> dict:
+    """
+    Handle requests to list all projects.
+
+    Returns a formatted list of projects with their status.
+    """
+    from api.supabase_client import supabase
+
+    try:
+        # Query projects with related data (same as projects router)
+        resp = (
+            supabase
+            .table("projects")
+            .select(
+                """
+                project_id,
+                project_name,
+                status,
+                city,
+                project_status(status),
+                companies(name)
+                """
+            )
+            .order("project_name")
+            .limit(50)
+            .execute()
+        )
+
+        raw_projects = resp.data or []
+
+        if not raw_projects:
+            return {
+                "text": "No encontré proyectos registrados en el sistema.",
+                "action": "list_projects",
+                "data": {"projects": [], "count": 0},
+            }
+
+        # Process projects
+        projects = []
+        for row in raw_projects:
+            # Extract status name from relation
+            status_rel = row.get("project_status")
+            status_name = None
+            if isinstance(status_rel, dict):
+                status_name = status_rel.get("status")
+            elif isinstance(status_rel, list) and status_rel:
+                status_name = status_rel[0].get("status")
+
+            # Extract company name from relation
+            company_rel = row.get("companies")
+            company_name = None
+            if isinstance(company_rel, dict):
+                company_name = company_rel.get("name")
+            elif isinstance(company_rel, list) and company_rel:
+                company_name = company_rel[0].get("name")
+
+            projects.append({
+                "project_id": row.get("project_id"),
+                "name": row.get("project_name"),
+                "status": status_name or "Sin estado",
+                "city": row.get("city") or "",
+                "company": company_name or "",
+            })
+
+        # Build response text
+        response = f"**Proyectos ({len(projects)})**\n\n"
+
+        for p in projects:
+            status_emoji = "🟢" if p["status"] and "active" in p["status"].lower() else "⚪"
+            city_text = f" - {p['city']}" if p["city"] else ""
+            response += f"{status_emoji} **{p['name']}**{city_text}\n"
+            if p["status"]:
+                response += f"   Status: {p['status']}\n"
+
+        response += f"\n*Total: {len(projects)} proyectos*"
+
+        return {
+            "text": response,
+            "action": "list_projects",
+            "data": {
+                "projects": projects,
+                "count": len(projects),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing projects: {e}")
+        return {
+            "text": f"Hubo un error al obtener los proyectos: {str(e)}",
+            "action": "error",
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# LIST VENDORS HANDLER
+# -----------------------------------------------------------------------------
+
+def handle_list_vendors(
+    request: dict,
+    context: dict = None
+) -> dict:
+    """
+    Handle requests to list all vendors.
+
+    Returns a formatted list of vendors.
+    """
+    from api.supabase_client import supabase
+
+    try:
+        # Query vendors ordered by name
+        resp = (
+            supabase
+            .table("Vendors")
+            .select("id, vendor_name")
+            .order("vendor_name")
+            .limit(100)
+            .execute()
+        )
+
+        vendors = resp.data or []
+
+        if not vendors:
+            return {
+                "text": "No hay vendors registrados en el sistema.",
+                "action": "list_vendors",
+                "data": {"vendors": [], "count": 0},
+            }
+
+        # Build response text
+        response = f"**Vendors ({len(vendors)})**\n\n"
+
+        for v in vendors:
+            response += f"• {v['vendor_name']}\n"
+
+        response += f"\n*Total: {len(vendors)} vendors*"
+
+        return {
+            "text": response,
+            "action": "list_vendors",
+            "data": {
+                "vendors": vendors,
+                "count": len(vendors),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing vendors: {e}")
+        return {
+            "text": f"Hubo un error al obtener los vendors: {str(e)}",
+            "action": "error",
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# CREATE VENDOR HANDLER
+# -----------------------------------------------------------------------------
+
+def handle_create_vendor(
+    request: dict,
+    context: dict = None
+) -> dict:
+    """
+    Handle requests to create a new vendor.
+
+    Expects 'vendor_name' in entities.
+    """
+    from api.supabase_client import supabase
+
+    entities = request.get("entities", {})
+    vendor_name = entities.get("vendor_name", "").strip()
+
+    if not vendor_name:
+        return {
+            "text": "Necesito el nombre del vendor. Ejemplo: *agregar vendor Home Depot*",
+            "action": "missing_vendor_name",
+        }
+
+    try:
+        # Check if vendor already exists
+        existing = (
+            supabase
+            .table("Vendors")
+            .select("id, vendor_name")
+            .ilike("vendor_name", vendor_name)
+            .execute()
+        )
+
+        if existing.data:
+            return {
+                "text": f"Ya existe un vendor con el nombre **{existing.data[0]['vendor_name']}**.",
+                "action": "vendor_exists",
+                "data": {"existing_vendor": existing.data[0]},
+            }
+
+        # Create the vendor
+        result = (
+            supabase
+            .table("Vendors")
+            .insert({"vendor_name": vendor_name})
+            .execute()
+        )
+
+        if result.data:
+            new_vendor = result.data[0]
+            return {
+                "text": f"✅ Vendor **{vendor_name}** creado exitosamente.",
+                "action": "vendor_created",
+                "data": {"vendor": new_vendor},
+            }
+        else:
+            return {
+                "text": "No se pudo crear el vendor. Intenta de nuevo.",
+                "action": "error",
+            }
+
+    except Exception as e:
+        logger.error(f"Error creating vendor: {e}")
+        return {
+            "text": f"Hubo un error al crear el vendor: {str(e)}",
+            "action": "error",
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# CREATE PROJECT HANDLER
+# -----------------------------------------------------------------------------
+
+def handle_create_project(
+    request: dict,
+    context: dict = None
+) -> dict:
+    """
+    Handle requests to create a new project.
+
+    Expects 'project_name' in entities.
+    Since source_company is required, we'll use a default or ask user.
+    """
+    from api.supabase_client import supabase
+    import uuid
+
+    entities = request.get("entities", {})
+    project_name = entities.get("project_name", "").strip()
+
+    if not project_name:
+        return {
+            "text": "Necesito el nombre del proyecto. Ejemplo: *crear proyecto Del Rio*",
+            "action": "missing_project_name",
+        }
+
+    try:
+        # Check if project already exists
+        existing = (
+            supabase
+            .table("projects")
+            .select("project_id, project_name")
+            .ilike("project_name", project_name)
+            .execute()
+        )
+
+        if existing.data:
+            return {
+                "text": f"Ya existe un proyecto con el nombre **{existing.data[0]['project_name']}**.",
+                "action": "project_exists",
+                "data": {"existing_project": existing.data[0]},
+            }
+
+        # Get default company (first one, or NGM)
+        companies = (
+            supabase
+            .table("companies")
+            .select("id, name")
+            .limit(1)
+            .execute()
+        )
+
+        if not companies.data:
+            return {
+                "text": "No hay compañías registradas en el sistema. Necesitas crear una compañía primero.",
+                "action": "no_companies",
+            }
+
+        default_company = companies.data[0]
+
+        # Get default status (first active status)
+        statuses = (
+            supabase
+            .table("project_status")
+            .select("status_id, status")
+            .limit(1)
+            .execute()
+        )
+
+        default_status = statuses.data[0]["status_id"] if statuses.data else None
+
+        # Create the project
+        project_data = {
+            "project_id": str(uuid.uuid4()),
+            "project_name": project_name,
+            "source_company": default_company["id"],
+            "status": default_status,
+        }
+
+        result = (
+            supabase
+            .table("projects")
+            .insert(project_data)
+            .execute()
+        )
+
+        if result.data:
+            new_project = result.data[0]
+            return {
+                "text": f"✅ Proyecto **{project_name}** creado exitosamente.\n\nCompañía: {default_company['name']}\n\nPuedes editar los detalles del proyecto en la sección de Projects.",
+                "action": "project_created",
+                "data": {"project": new_project},
+            }
+        else:
+            return {
+                "text": "No se pudo crear el proyecto. Intenta de nuevo.",
+                "action": "error",
+            }
+
+    except Exception as e:
+        logger.error(f"Error creating project: {e}")
+        return {
+            "text": f"Hubo un error al crear el proyecto: {str(e)}",
+            "action": "error",
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# SEARCH EXPENSES HANDLER
+# -----------------------------------------------------------------------------
+
+def handle_search_expenses(
+    request: dict,
+    context: dict = None
+) -> dict:
+    """
+    Handle requests to search for expenses.
+
+    Supports searching by:
+    - amount: Approximate amount (will search +/- 10%)
+    - vendor: Vendor name (partial match)
+    - category: Account/category name (partial match)
+    - project: Project name (partial match)
+
+    Example queries:
+    - "busca un expense de 1000 dlls que se le pagó a Home Depot para rough framing"
+    - "encuentra el gasto de $500 a Lowes"
+    - "gastos de electrical en Del Rio"
+    """
+    from api.supabase_client import supabase
+
+    entities = request.get("entities", {})
+    amount = entities.get("amount")
+    vendor_name = entities.get("vendor")
+    category = entities.get("category")
+    project_name = entities.get("project")
+
+    # Need at least one search criteria
+    if not any([amount, vendor_name, category, project_name]):
+        return {
+            "text": "Necesito al menos un criterio de búsqueda. Puedes buscar por:\n"
+                    "• **Monto**: _busca gasto de $1000_\n"
+                    "• **Vendor**: _gasto pagado a Home Depot_\n"
+                    "• **Categoría**: _gastos de electrical_\n"
+                    "• **Proyecto**: _gastos en Del Rio_",
+            "action": "missing_search_criteria",
+        }
+
+    try:
+        # Build search criteria description
+        criteria_parts = []
+        if amount:
+            criteria_parts.append(f"monto ~${amount:,.2f}")
+        if vendor_name:
+            criteria_parts.append(f"vendor '{vendor_name}'")
+        if category:
+            criteria_parts.append(f"categoría '{category}'")
+        if project_name:
+            criteria_parts.append(f"proyecto '{project_name}'")
+
+        criteria_desc = ", ".join(criteria_parts)
+
+        # Get vendors map for name matching
+        vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
+        vendors_map = {v["id"]: v["vendor_name"] for v in (vendors_resp.data or [])}
+        vendors_by_name = {v["vendor_name"].lower(): v["id"] for v in (vendors_resp.data or [])}
+
+        # Get projects map for name matching
+        projects_resp = supabase.table("projects").select("project_id, project_name").execute()
+        projects_map = {p["project_id"]: p["project_name"] for p in (projects_resp.data or [])}
+        projects_by_name = {p["project_name"].lower(): p["project_id"] for p in (projects_resp.data or [])}
+
+        # Get accounts map for category matching
+        accounts_resp = supabase.table("accounts").select("account_id, Name").execute()
+        accounts_map = {a["account_id"]: a["Name"] for a in (accounts_resp.data or [])}
+
+        # Start building query
+        query = supabase.table("expenses_manual_COGS").select("*")
+
+        # Filter by vendor if specified
+        matched_vendor_id = None
+        if vendor_name:
+            vendor_lower = vendor_name.lower()
+            # Find vendor ID by partial name match
+            for vname, vid in vendors_by_name.items():
+                if vendor_lower in vname or vname in vendor_lower:
+                    matched_vendor_id = vid
+                    break
+            if matched_vendor_id:
+                query = query.eq("vendor_id", matched_vendor_id)
+
+        # Filter by project if specified
+        matched_project_id = None
+        if project_name:
+            project_lower = project_name.lower()
+            # Find project ID by partial name match
+            for pname, pid in projects_by_name.items():
+                if project_lower in pname or pname in project_lower:
+                    matched_project_id = pid
+                    break
+            if matched_project_id:
+                query = query.eq("project", matched_project_id)
+
+        # Filter by amount range if specified (+/- 15%)
+        if amount:
+            min_amount = amount * 0.85
+            max_amount = amount * 1.15
+            query = query.gte("Amount", min_amount).lte("Amount", max_amount)
+
+        # Execute query
+        query = query.order("TxnDate", desc=True).limit(20)
+        resp = query.execute()
+        expenses = resp.data or []
+
+        # Post-filter by category/account name if specified
+        if category and expenses:
+            category_lower = category.lower()
+            filtered = []
+            for exp in expenses:
+                account_id = exp.get("account_id")
+                if account_id:
+                    account_name = accounts_map.get(account_id, "")
+                    if category_lower in account_name.lower():
+                        filtered.append(exp)
+                # Also check LineDescription
+                desc = exp.get("LineDescription", "") or ""
+                if category_lower in desc.lower():
+                    if exp not in filtered:
+                        filtered.append(exp)
+            expenses = filtered
+
+        if not expenses:
+            return {
+                "text": f"No encontré gastos con los criterios: {criteria_desc}",
+                "action": "no_results",
+                "data": {"criteria": entities},
+            }
+
+        # Format results
+        response = f"**Encontré {len(expenses)} gasto(s)** ({criteria_desc})\n\n"
+
+        for i, exp in enumerate(expenses[:10], 1):  # Limit to 10 results
+            amount_val = exp.get("Amount", 0)
+            date = exp.get("TxnDate", "")[:10] if exp.get("TxnDate") else "Sin fecha"
+            vendor = vendors_map.get(exp.get("vendor_id"), "Sin vendor")
+            project = projects_map.get(exp.get("project"), "Sin proyecto")
+            account = accounts_map.get(exp.get("account_id"), "")
+            desc = exp.get("LineDescription", "") or ""
+
+            response += f"**{i}.** ${amount_val:,.2f} - {vendor}\n"
+            response += f"   📅 {date} | 📁 {project}\n"
+            if account:
+                response += f"   📂 {account}\n"
+            if desc:
+                response += f"   📝 {desc[:50]}{'...' if len(desc) > 50 else ''}\n"
+            response += "\n"
+
+        if len(expenses) > 10:
+            response += f"_...y {len(expenses) - 10} más_"
+
+        return {
+            "text": response,
+            "action": "search_expenses_results",
+            "data": {
+                "criteria": entities,
+                "count": len(expenses),
+                "expenses": expenses[:10],  # Return first 10
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error searching expenses: {e}")
+        return {
+            "text": f"Hubo un error al buscar gastos: {str(e)}",
+            "action": "error",
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
 # EXPENSE AUTHORIZATION REMINDER
 # -----------------------------------------------------------------------------
 

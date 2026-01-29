@@ -68,6 +68,7 @@ class WebChatMessage(BaseModel):
     text: str
     user_name: Optional[str] = None
     user_email: Optional[str] = None
+    user_role: Optional[str] = None  # Rol del usuario para control de permisos
     session_id: Optional[str] = None
     personality_level: Optional[int] = 3
     thread_id: Optional[str] = None  # Optional: client can provide existing thread
@@ -217,6 +218,7 @@ async def web_chat(message: WebChatMessage):
         context = {
             "user_name": message.user_name,
             "user_email": message.user_email,
+            "user_role": message.user_role,  # Rol para control de permisos
             "space_name": "NGM HUB Web",
             "space_id": session_id,
             "is_mention": True,
@@ -379,3 +381,149 @@ async def google_chat_webhook(payload: Dict[str, Any]):
 
     except Exception as e:
         return {"text": f"⚠️ Error: {str(e)}"}
+
+
+# ================================
+# PERMISSIONS CONTROL PANEL
+# ================================
+
+@router.get("/permissions")
+async def get_permissions():
+    """
+    Obtiene la configuración actual de permisos de Arturito.
+    Útil para mostrar en un panel de control.
+    """
+    from services.arturito.permissions import get_all_permissions, get_permissions_by_category
+
+    return {
+        "permissions": get_all_permissions(),
+        "by_category": get_permissions_by_category(),
+    }
+
+
+class PermissionUpdate(BaseModel):
+    """Modelo para actualizar un permiso"""
+    intent: str
+    enabled: bool
+
+
+@router.patch("/permissions")
+async def update_permission(update: PermissionUpdate):
+    """
+    Actualiza un permiso específico de Arturito.
+
+    Body:
+    {
+        "intent": "CREATE_VENDOR",
+        "enabled": true
+    }
+    """
+    from services.arturito.permissions import ARTURITO_PERMISSIONS
+
+    intent = update.intent.upper()
+
+    if intent not in ARTURITO_PERMISSIONS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Permission '{intent}' not found"
+        )
+
+    # Actualizar el permiso en memoria
+    ARTURITO_PERMISSIONS[intent]["enabled"] = update.enabled
+
+    return {
+        "success": True,
+        "message": f"Permission '{intent}' updated",
+        "intent": intent,
+        "enabled": update.enabled,
+    }
+
+
+@router.post("/permissions/reset")
+async def reset_permissions():
+    """
+    Resetea todos los permisos a sus valores por defecto.
+    """
+    from services.arturito.permissions import ARTURITO_PERMISSIONS
+
+    # Valores por defecto
+    defaults = {
+        "LIST_PROJECTS": True,
+        "LIST_VENDORS": True,
+        "BUDGET_VS_ACTUALS": True,
+        "CONSULTA_ESPECIFICA": True,
+        "SCOPE_OF_WORK": True,
+        "SEARCH_EXPENSES": True,
+        "CREATE_VENDOR": True,
+        "CREATE_PROJECT": True,
+        "DELETE_VENDOR": False,
+        "DELETE_PROJECT": False,
+        "UPDATE_VENDOR": False,
+        "UPDATE_PROJECT": False,
+        "EXPENSE_REMINDER": True,
+        "REPORT_BUG": True,
+        "NGM_ACTION": True,
+        "COPILOT": True,
+    }
+
+    for intent, enabled in defaults.items():
+        if intent in ARTURITO_PERMISSIONS:
+            ARTURITO_PERMISSIONS[intent]["enabled"] = enabled
+
+    return {
+        "success": True,
+        "message": "Permissions reset to defaults",
+    }
+
+
+# ================================
+# TASK DELEGATION
+# ================================
+
+class DelegationRequest(BaseModel):
+    """Modelo para solicitar delegación de tarea a otro equipo"""
+    team_key: str
+    action_description: str
+    original_request: Optional[str] = None
+    user_name: Optional[str] = None
+    user_email: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@router.post("/delegate-task")
+async def delegate_task(request: DelegationRequest):
+    """
+    Envía una solicitud de tarea a otro equipo.
+    Por ahora, simula el envío (en producción se integraría con
+    sistema de mensajes, Pipeline, o notificaciones).
+    """
+    from services.arturito.permissions import TEAMS
+
+    team = TEAMS.get(request.team_key)
+    if not team:
+        raise HTTPException(status_code=404, detail=f"Team '{request.team_key}' not found")
+
+    team_name = team["name"]
+    team_roles = team["roles"]
+
+    # TODO: En producción, aquí se enviaría:
+    # 1. Notificación push a usuarios con esos roles
+    # 2. Crear tarea en Pipeline
+    # 3. Enviar email al equipo
+    # 4. Crear mensaje interno
+
+    # Por ahora, retornamos un mensaje de confirmación
+    return {
+        "success": True,
+        "text": f"He enviado tu solicitud al **{team_name}**.\n\nLes notifiqué que necesitas ayuda para: _{request.action_description}_\n\nTe avisarán cuando esté lista.",
+        "team": {
+            "key": request.team_key,
+            "name": team_name,
+            "roles": team_roles,
+        },
+        "request": {
+            "action": request.action_description,
+            "original_text": request.original_request,
+            "requested_by": request.user_name,
+        }
+    }

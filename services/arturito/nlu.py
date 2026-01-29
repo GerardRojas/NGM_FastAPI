@@ -28,6 +28,11 @@ VALID_INTENTS = [
     "COPILOT",              # Comandos copilot para controlar la pagina actual
     "REPORT_BUG",           # Reportar un bug o problema
     "EXPENSE_REMINDER",     # Recordatorio de gastos pendientes a autorizadores
+    "LIST_PROJECTS",        # Listar proyectos activos
+    "LIST_VENDORS",         # Listar vendors/proveedores
+    "CREATE_VENDOR",        # Crear nuevo vendor/proveedor
+    "CREATE_PROJECT",       # Crear nuevo proyecto
+    "SEARCH_EXPENSES",      # Buscar gastos por criterios
     "UNKNOWN",              # No clasificado
 ]
 
@@ -188,6 +193,178 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             "confidence": 0.95,
             "source": "local"
         }
+
+    # ================================
+    # List Projects
+    # ================================
+
+    list_projects_patterns = [
+        r'^(lista|listar?|mostrar?|muestra|ver|dame|cuales son)\s+(los\s+)?(proyectos|projects)',
+        r'^(proyectos|projects)(\s+activos|\s+disponibles|\s+que\s+tenemos)?$',
+        r'(qué|que|cuáles|cuales)\s+(proyectos|projects)\s+(tenemos|hay|existen|estan)',
+        r'(dime|dame)\s+(los\s+)?(proyectos|projects)',
+        r'(en\s+qué|en\s+que|cuáles|cuales)\s+(proyectos?)\s+(estamos|trabajamos|tenemos)',
+    ]
+
+    for pattern in list_projects_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "LIST_PROJECTS",
+                "entities": {},
+                "confidence": 0.95,
+                "source": "local"
+            }
+
+    # ================================
+    # List Vendors
+    # ================================
+
+    list_vendors_patterns = [
+        r'^(lista|listar?|mostrar?|muestra|ver|dame|cuales son)\s+(los\s+)?(vendors?|proveedores?)',
+        r'^(vendors?|proveedores?)(\s+activos|\s+disponibles|\s+que\s+tenemos)?$',
+        r'(qué|que|cuáles|cuales)\s+(vendors?|proveedores?)\s+(tenemos|hay|existen|estan)',
+        r'(dime|dame)\s+(los\s+)?(vendors?|proveedores?)',
+        r'(con\s+qué|con\s+que|cuáles|cuales)\s+(vendors?|proveedores?)\s+(trabajamos|tenemos)',
+    ]
+
+    for pattern in list_vendors_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "LIST_VENDORS",
+                "entities": {},
+                "confidence": 0.95,
+                "source": "local"
+            }
+
+    # ================================
+    # Create Vendor
+    # ================================
+
+    # Pattern: "agregar vendor X", "crear vendor X", "nuevo vendor X", "añadir proveedor X"
+    create_vendor_patterns = [
+        r'(agregar?|añadir?|crear?|nuevo?)\s+(un\s+)?(vendor|proveedor)\s+(.+)',
+        r'(registrar?|dar\s+de\s+alta)\s+(un\s+)?(vendor|proveedor)\s+(.+)',
+    ]
+
+    for pattern in create_vendor_patterns:
+        match = re.search(pattern, t)
+        if match:
+            vendor_name = match.group(4).strip()
+            # Clean up common trailing words
+            vendor_name = re.sub(r'\s+(por\s+favor|please|pls)$', '', vendor_name, flags=re.IGNORECASE)
+            if vendor_name:
+                return {
+                    "intent": "CREATE_VENDOR",
+                    "entities": {"vendor_name": vendor_name},
+                    "confidence": 0.95,
+                    "source": "local"
+                }
+
+    # ================================
+    # Create Project
+    # ================================
+
+    # Pattern: "agregar proyecto X", "crear proyecto X", "nuevo proyecto X"
+    create_project_patterns = [
+        r'(agregar?|añadir?|crear?|nuevo?)\s+(un\s+)?(proyecto|project)\s+(.+)',
+        r'(registrar?|dar\s+de\s+alta)\s+(un\s+)?(proyecto|project)\s+(.+)',
+    ]
+
+    for pattern in create_project_patterns:
+        match = re.search(pattern, t)
+        if match:
+            project_name = match.group(4).strip()
+            # Clean up common trailing words
+            project_name = re.sub(r'\s+(por\s+favor|please|pls)$', '', project_name, flags=re.IGNORECASE)
+            if project_name:
+                return {
+                    "intent": "CREATE_PROJECT",
+                    "entities": {"project_name": project_name},
+                    "confidence": 0.95,
+                    "source": "local"
+                }
+
+    # ================================
+    # Search Expenses
+    # ================================
+
+    # Detectar si es una búsqueda de gastos
+    search_expense_triggers = [
+        r'(busca|buscar|encuentra|encontrar|dame|muestra|mostrar)\s+.*(gasto|expense|pago|payment)',
+        r'(gasto|expense|pago|payment)\s+.*(de|por|para|a)\s+\$?\d+',
+        r'(cuanto|cuánto)\s+(pagamos|gastamos|se\s+pagó|se\s+gasto)\s+',
+        r'(hay\s+)?(algún|algun|un)\s+(gasto|expense|pago)',
+        r'(gastos?|expenses?|pagos?)\s+(de|a|para|por)\s+',
+    ]
+
+    is_expense_search = any(re.search(p, t) for p in search_expense_triggers)
+
+    if is_expense_search:
+        entities = {}
+
+        # Extraer monto: $1000, 1000 dlls, 1,000 dollars, etc.
+        amount_patterns = [
+            r'\$\s*([\d,]+(?:\.\d{2})?)',  # $1000 or $1,000.00
+            r'([\d,]+(?:\.\d{2})?)\s*(?:dlls?|dollars?|usd|pesos?)',  # 1000 dlls
+            r'(?:de|por)\s*([\d,]+(?:\.\d{2})?)\s*(?:dlls?|dollars?|usd)?',  # de 1000
+        ]
+        for pattern in amount_patterns:
+            match = re.search(pattern, t, re.IGNORECASE)
+            if match:
+                amount_str = match.group(1).replace(',', '')
+                try:
+                    entities["amount"] = float(amount_str)
+                except ValueError:
+                    pass
+                break
+
+        # Extraer vendor: "a Xvendor", "de Xvendor", "pagado a Xvendor"
+        vendor_patterns = [
+            r'(?:a|de|para|pagado\s+a|se\s+le\s+pagó\s+a)\s+([A-Z][A-Za-z0-9\s&\'-]+?)(?:\s+(?:para|por|de|en|\$|$))',
+            r'(?:vendor|proveedor)\s+([A-Z][A-Za-z0-9\s&\'-]+?)(?:\s+(?:para|por|de|en|\$|$))',
+        ]
+        for pattern in vendor_patterns:
+            match = re.search(pattern, text.strip())  # Use original case
+            if match:
+                vendor_name = match.group(1).strip()
+                # Clean trailing words
+                vendor_name = re.sub(r'\s+(para|por|de|en)$', '', vendor_name, flags=re.IGNORECASE)
+                if vendor_name and len(vendor_name) > 1:
+                    entities["vendor"] = vendor_name
+                break
+
+        # Extraer categoría/cuenta: "para rough framing", "de hvac", "en electrical"
+        category_patterns = [
+            r'(?:para|de|en|por)\s+(rough\s+framing|framing|hvac|plumbing|electrical|drywall|paint|flooring|roofing|concrete|landscaping|appliances|insulation|cabinets|windows|doors|kitchen|bathroom)',
+            r'(?:categoria|category|cuenta|account)\s+([A-Za-z\s]+?)(?:\s+(?:de|en|para|\$|$))',
+        ]
+        for pattern in category_patterns:
+            match = re.search(pattern, t, re.IGNORECASE)
+            if match:
+                entities["category"] = match.group(1).strip()
+                break
+
+        # Extraer proyecto si se menciona
+        project_patterns = [
+            r'(?:en|del?|para|proyecto)\s+([A-Z][A-Za-z\s]+?)(?:\s+(?:de|para|por|\$|$))',
+        ]
+        for pattern in project_patterns:
+            match = re.search(pattern, text.strip())  # Use original case
+            if match:
+                proj = match.group(1).strip()
+                # Avoid matching common words
+                if proj.lower() not in ['rough', 'framing', 'hvac', 'electrical', 'el', 'la', 'los', 'las']:
+                    entities["project"] = proj
+                break
+
+        if entities:  # Only return if we extracted something useful
+            return {
+                "intent": "SEARCH_EXPENSES",
+                "entities": entities,
+                "confidence": 0.9,
+                "source": "local",
+                "raw_text": text,
+            }
 
     # ================================
     # NGM Hub Help Questions

@@ -168,18 +168,75 @@ def handle_budget_vs_actuals(
 
 
 def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
-    """Busca el proyecto por nombre o ID con búsqueda fuzzy."""
+    """
+    Busca el proyecto por nombre o ID con búsqueda fuzzy mejorada.
+
+    Algoritmo de búsqueda:
+    1. Búsqueda exacta por ID
+    2. Búsqueda directa por nombre (ilike)
+    3. Búsqueda por todas las palabras (cada palabra debe estar presente)
+    4. Búsqueda por scoring (la mayoría de palabras coinciden)
+
+    Ejemplos:
+    - "arthur neal court" -> "1519 Arthur Neal Court" ✓
+    - "del rio" -> "Del Rio Residence" ✓
+    - "1519" -> "1519 Arthur Neal Court" ✓
+    """
     try:
-        # Intentar búsqueda exacta por ID
+        # 1. Intentar búsqueda exacta por ID
         result = supabase.table("projects").select("*").eq("project_id", project_input).execute()
         if result.data:
             return result.data[0]
 
-        # Buscar por nombre (case-insensitive, parcial)
+        # 2. Buscar por nombre directo (case-insensitive, parcial)
         result = supabase.table("projects").select("*").ilike("project_name", f"%{project_input}%").execute()
         if result.data:
+            # Ordenar por longitud (preferir nombres más cortos/exactos)
             matches = sorted(result.data, key=lambda x: len(x.get("project_name", "")))
             return matches[0]
+
+        # 3. Si no encontró, intentar búsqueda por palabras individuales
+        # Esto permite que "arthur neal court" encuentre "1519 Arthur Neal Court"
+        search_words = [w.strip().lower() for w in project_input.split() if w.strip()]
+
+        if not search_words:
+            return None
+
+        # Obtener todos los proyectos para búsqueda fuzzy
+        all_projects = supabase.table("projects").select("*").execute()
+        if not all_projects.data:
+            return None
+
+        # Buscar proyectos donde TODAS las palabras de búsqueda estén presentes
+        best_match = None
+        best_score = 0
+
+        for project in all_projects.data:
+            project_name = project.get("project_name", "").lower()
+
+            # Contar cuántas palabras de búsqueda están en el nombre del proyecto
+            matches = sum(1 for word in search_words if word in project_name)
+
+            if matches == 0:
+                continue
+
+            # Calcular score: palabras encontradas / palabras buscadas
+            score = matches / len(search_words)
+
+            # Bonus si TODAS las palabras coinciden
+            if matches == len(search_words):
+                score += 0.5
+
+            # Bonus si el nombre es más corto (más específico)
+            score += 0.1 / (len(project_name) + 1)
+
+            if score > best_score:
+                best_score = score
+                best_match = project
+
+        # Solo retornar si al menos 50% de las palabras coinciden
+        if best_match and best_score >= 0.5:
+            return best_match
 
         return None
     except Exception as e:

@@ -15,7 +15,13 @@ from .handlers import (
     handle_bug_report,
     handle_copilot,
     handle_expense_reminder,
+    handle_list_projects,
+    handle_list_vendors,
+    handle_create_vendor,
+    handle_create_project,
+    handle_search_expenses,
 )
+from .permissions import is_action_permitted, get_permission_denial_message, check_role_permission
 from .persona import set_personality_level, get_identity_response
 from .responder import generate_small_talk_response
 
@@ -107,6 +113,41 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "optional_entities": ["message"],
         "description": "Enviar recordatorio de gastos pendientes a autorizadores",
     },
+
+    "LIST_PROJECTS": {
+        "handler": handle_list_projects,
+        "required_entities": [],
+        "optional_entities": [],
+        "description": "Lista todos los proyectos del sistema",
+    },
+
+    "LIST_VENDORS": {
+        "handler": handle_list_vendors,
+        "required_entities": [],
+        "optional_entities": [],
+        "description": "Lista todos los vendors/proveedores del sistema",
+    },
+
+    "CREATE_VENDOR": {
+        "handler": handle_create_vendor,
+        "required_entities": ["vendor_name"],
+        "optional_entities": [],
+        "description": "Crea un nuevo vendor/proveedor",
+    },
+
+    "CREATE_PROJECT": {
+        "handler": handle_create_project,
+        "required_entities": ["project_name"],
+        "optional_entities": [],
+        "description": "Crea un nuevo proyecto",
+    },
+
+    "SEARCH_EXPENSES": {
+        "handler": handle_search_expenses,
+        "required_entities": [],  # At least one of: amount, vendor, category, project
+        "optional_entities": ["amount", "vendor", "category", "project"],
+        "description": "Busca gastos por monto, vendor, categoría o proyecto",
+    },
 }
 
 # Aliases de intents (mapeo de nombres alternativos)
@@ -177,6 +218,31 @@ def route(
         return {
             "text": "🤔 No estoy seguro de entender. ¿Podrías ser más específico?",
             "action": "low_confidence"
+        }
+
+    # ================================
+    # Verificar permisos globales
+    # ================================
+    if not is_action_permitted(intent):
+        return {
+            "text": get_permission_denial_message(intent),
+            "action": "permission_denied",
+            "data": {"intent": intent}
+        }
+
+    # ================================
+    # Verificar permisos basados en rol
+    # ================================
+    role_allowed, delegation_info = check_role_permission(intent, ctx)
+    if not role_allowed and delegation_info:
+        return {
+            "text": delegation_info["message"],
+            "action": "suggest_delegation",
+            "data": {
+                "intent": intent,
+                "delegation": delegation_info,
+                "raw_text": raw_text,
+            }
         }
 
     # ================================
@@ -397,9 +463,31 @@ async def route_async(
     Returns:
         Dict con la respuesta formateada
     """
+    ctx = context or {}
     intent = intent_obj.get("intent", "UNKNOWN").upper()
     entities = intent_obj.get("entities", {})
     raw_text = intent_obj.get("raw_text", "")
+
+    # Verificar permisos globales
+    if not is_action_permitted(intent):
+        return {
+            "text": get_permission_denial_message(intent),
+            "action": "permission_denied",
+            "data": {"intent": intent}
+        }
+
+    # Verificar permisos basados en rol
+    role_allowed, delegation_info = check_role_permission(intent, ctx)
+    if not role_allowed and delegation_info:
+        return {
+            "text": delegation_info["message"],
+            "action": "suggest_delegation",
+            "data": {
+                "intent": intent,
+                "delegation": delegation_info,
+                "raw_text": raw_text,
+            }
+        }
 
     # Handle NGM_ACTION
     if intent == "NGM_ACTION":
