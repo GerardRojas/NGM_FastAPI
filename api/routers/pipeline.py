@@ -154,8 +154,8 @@ def get_pipeline_grouped() -> Dict[str, Any]:
         # 3. Obtener datos relacionados para enriquecer las tareas
         print("[PIPELINE] Fetching related data...")
 
-        # Users (para owner, collaborator, manager)
-        users_response = supabase.table("users").select("user_id, user_name").execute()
+        # Users (para owner, collaborator, manager) - incluye avatar_color y user_photo para avatares
+        users_response = supabase.table("users").select("user_id, user_name, avatar_color, user_photo").execute()
         users_map = {u["user_id"]: u for u in (users_response.data or [])}
 
         # Projects
@@ -226,18 +226,24 @@ def get_pipeline_grouped() -> Dict[str, Any]:
                 "status_name": status_name,
                 "priority_name": priority_data["priority"] if priority_data else None,
                 "finished_status_name": finished_data["completed_status"] if finished_data else None,
-                # Objetos anidados para el frontend
+                # Objetos anidados para el frontend (incluyen avatar_color y photo para avatares)
                 "owner": {
                     "id": owner_id,
                     "name": owner_data["user_name"] if owner_data else None,
+                    "avatar_color": owner_data.get("avatar_color") if owner_data else None,
+                    "photo": owner_data.get("user_photo") if owner_data else None,
                 } if owner_id else None,
                 "collaborators": [{
                     "id": collab_id,
                     "name": collab_data["user_name"] if collab_data else None,
+                    "avatar_color": collab_data.get("avatar_color") if collab_data else None,
+                    "photo": collab_data.get("user_photo") if collab_data else None,
                 }] if collab_id else [],
                 "manager": {
                     "id": manager_id,
                     "name": manager_data["user_name"] if manager_data else None,
+                    "avatar_color": manager_data.get("avatar_color") if manager_data else None,
+                    "photo": manager_data.get("user_photo") if manager_data else None,
                 } if manager_id else None,
                 "priority": {
                     "priority_id": priority_id,
@@ -437,3 +443,595 @@ def delete_task(task_id: str) -> Dict[str, Any]:
         print(f"[PIPELINE] ERROR in DELETE /pipeline/tasks/{task_id}: {repr(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+# ====== MY TASKS ENDPOINT (for Dashboard) ======
+
+@router.get("/tasks/my-tasks/{user_id}")
+def get_my_tasks(user_id: str) -> Dict[str, Any]:
+    """
+    Devuelve las tareas asignadas a un usuario para mostrar en su Dashboard.
+
+    Solo devuelve tareas que NO están en status "Done".
+    Incluye información del proyecto y prioridad.
+    """
+    print(f"[PIPELINE] GET /pipeline/tasks/my-tasks/{user_id}")
+
+    try:
+        # 1. Obtener el status_id de "Done" para excluirlo
+        done_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "done").execute()
+
+        done_status_id = None
+        if done_status_response.data:
+            done_status_id = done_status_response.data[0]["task_status_id"]
+
+        # 2. Obtener tareas del usuario (como owner)
+        query = supabase.table("tasks").select("*").eq("Owner_id", user_id)
+
+        # Excluir tareas completadas si encontramos el status
+        if done_status_id:
+            query = query.neq("task_status", done_status_id)
+
+        # Ordenar por fecha de creación (más recientes primero)
+        tasks_response = query.order("created_at", desc=True).execute()
+        tasks = tasks_response.data or []
+
+        print(f"[PIPELINE] Found {len(tasks)} tasks for user {user_id}")
+
+        if not tasks:
+            return {"tasks": []}
+
+        # 3. Obtener datos relacionados para enriquecer las tareas
+        # Projects
+        project_ids = list(set(t.get("project_id") for t in tasks if t.get("project_id")))
+        projects_map = {}
+        if project_ids:
+            projects_response = supabase.table("projects").select(
+                "project_id, project_name"
+            ).in_("project_id", project_ids).execute()
+            projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
+
+        # Priorities
+        priority_ids = list(set(t.get("task_priority") for t in tasks if t.get("task_priority")))
+        priorities_map = {}
+        if priority_ids:
+            priorities_response = supabase.table("tasks_priority").select(
+                "priority_id, priority"
+            ).in_("priority_id", priority_ids).execute()
+            priorities_map = {p["priority_id"]: p for p in (priorities_response.data or [])}
+
+        # Statuses
+        status_ids = list(set(t.get("task_status") for t in tasks if t.get("task_status")))
+        statuses_map = {}
+        if status_ids:
+            statuses_response = supabase.table("tasks_status").select(
+                "task_status_id, task_status"
+            ).in_("task_status_id", status_ids).execute()
+            statuses_map = {s["task_status_id"]: s for s in (statuses_response.data or [])}
+
+        # 4. Enriquecer las tareas
+        enriched_tasks = []
+        for task in tasks:
+            project_id = task.get("project_id")
+            priority_id = task.get("task_priority")
+            status_id = task.get("task_status")
+
+            project_info = projects_map.get(project_id, {})
+            priority_info = priorities_map.get(priority_id, {})
+            status_info = statuses_map.get(status_id, {})
+
+            enriched_tasks.append({
+                "task_id": task.get("task_id"),
+                "task_description": task.get("task_description"),
+                "project_id": project_id,
+                "project_name": project_info.get("project_name"),
+                "priority_id": priority_id,
+                "priority_name": priority_info.get("priority"),
+                "status_id": status_id,
+                "status_name": status_info.get("task_status"),
+                "due_date": task.get("due_date"),
+                "deadline": task.get("deadline"),
+                "time_start": task.get("time_start"),
+                "time_finish": task.get("time_finish"),
+                "task_notes": task.get("task_notes"),
+                "created_at": task.get("created_at"),
+            })
+
+        return {"tasks": enriched_tasks}
+
+    except Exception as e:
+        print(f"[PIPELINE] ERROR in GET /pipeline/tasks/my-tasks/{user_id}: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.post("/tasks/{task_id}/start")
+def start_task(task_id: str) -> Dict[str, Any]:
+    """
+    Inicia una tarea: cambia el status a "Working on It" y registra time_start.
+
+    Returns:
+        - task: La tarea actualizada
+        - status_changed: True si el status cambió
+    """
+    print(f"[PIPELINE] POST /pipeline/tasks/{task_id}/start")
+
+    try:
+        # 1. Verificar que la tarea existe
+        existing = supabase.table("tasks").select("task_id, task_status, time_start").eq(
+            "task_id", task_id
+        ).execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = existing.data[0]
+
+        # 2. Obtener el status_id de "Working on It"
+        working_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "working on it").execute()
+
+        if not working_status_response.data:
+            raise HTTPException(status_code=500, detail="Status 'Working on It' not found")
+
+        working_status_id = working_status_response.data[0]["task_status_id"]
+
+        # 3. Actualizar la tarea
+        from datetime import datetime
+        now = datetime.utcnow().isoformat()
+
+        update_data = {
+            "task_status": working_status_id,
+            "time_start": now,
+        }
+
+        # Solo actualizar start_date si no tiene uno
+        if not task.get("start_date"):
+            update_data["start_date"] = datetime.utcnow().date().isoformat()
+
+        response = supabase.table("tasks").update(update_data).eq(
+            "task_id", task_id
+        ).execute()
+
+        if not response.data:
+            raise HTTPException(status_code=500, detail="Failed to update task")
+
+        updated_task = response.data[0]
+
+        return {
+            "success": True,
+            "task": updated_task,
+            "status_changed": task.get("task_status") != working_status_id,
+            "new_status": "Working on It"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[PIPELINE] ERROR in POST /pipeline/tasks/{task_id}/start: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+class SendToReviewRequest(BaseModel):
+    notes: Optional[str] = None  # Optional notes from the user
+
+
+@router.post("/tasks/{task_id}/send-to-review")
+def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str, Any]:
+    """
+    Envía una tarea a revisión:
+    - Cambia el status a "Awaiting Approval"
+    - Registra time_finish
+    - Actualiza las notas si se proporcionan
+    - Crea una tarea automática para los autorizadores
+
+    Returns:
+        - task: La tarea actualizada
+        - reviewer_task_created: True si se creó tarea para el autorizador
+    """
+    print(f"[PIPELINE] POST /pipeline/tasks/{task_id}/send-to-review")
+
+    try:
+        from datetime import datetime
+
+        # 1. Obtener la tarea actual con todos sus datos
+        existing = supabase.table("tasks").select("*").eq(
+            "task_id", task_id
+        ).execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = existing.data[0]
+
+        # 2. Obtener el status_id de "Awaiting Approval"
+        approval_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "awaiting approval").execute()
+
+        if not approval_status_response.data:
+            raise HTTPException(status_code=500, detail="Status 'Awaiting Approval' not found")
+
+        approval_status_id = approval_status_response.data[0]["task_status_id"]
+
+        # 3. Actualizar la tarea original
+        now = datetime.utcnow().isoformat()
+
+        update_data = {
+            "task_status": approval_status_id,
+            "time_finish": now,
+        }
+
+        # Agregar notas si se proporcionaron
+        if payload.notes:
+            existing_notes = task.get("task_notes") or ""
+            if existing_notes:
+                update_data["task_notes"] = f"{existing_notes}\n\n[Submission Notes] {payload.notes}"
+            else:
+                update_data["task_notes"] = f"[Submission Notes] {payload.notes}"
+
+        response = supabase.table("tasks").update(update_data).eq(
+            "task_id", task_id
+        ).execute()
+
+        if not response.data:
+            raise HTTPException(status_code=500, detail="Failed to update task")
+
+        updated_task = response.data[0]
+
+        # 4. Crear tarea para el autorizador
+        reviewer_task_created = False
+        reviewer_task_id = None
+
+        try:
+            reviewer_task_id = _create_reviewer_task(task, payload.notes)
+            if reviewer_task_id:
+                reviewer_task_created = True
+        except Exception as e:
+            print(f"[PIPELINE] Warning: Could not create reviewer task: {e}")
+
+        # 5. Calcular tiempo trabajado
+        time_start = task.get("time_start")
+        elapsed_time = None
+        if time_start:
+            try:
+                start_dt = datetime.fromisoformat(time_start.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+                diff = end_dt - start_dt
+                hours = diff.total_seconds() / 3600
+                elapsed_time = f"{hours:.2f} hours"
+            except:
+                pass
+
+        return {
+            "success": True,
+            "task": updated_task,
+            "new_status": "Awaiting Approval",
+            "reviewer_task_created": reviewer_task_created,
+            "reviewer_task_id": reviewer_task_id,
+            "elapsed_time": elapsed_time
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[PIPELINE] ERROR in POST /pipeline/tasks/{task_id}/send-to-review: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+def _create_reviewer_task(original_task: dict, submission_notes: str) -> Optional[str]:
+    """
+    Crea una tarea para el autorizador basado en el proyecto de la tarea original.
+
+    El autorizador se determina por:
+    1. El manager del proyecto
+    2. Si no hay manager, busca usuarios con rol CEO/COO
+
+    Returns:
+        task_id del task creado, o None si no se pudo crear
+    """
+    project_id = original_task.get("project_id")
+    task_description = original_task.get("task_description", "Task")
+    owner_id = original_task.get("Owner_id")
+
+    # Obtener información del owner
+    owner_name = "Unknown"
+    if owner_id:
+        owner_response = supabase.table("users").select("user_name").eq(
+            "user_id", owner_id
+        ).execute()
+        if owner_response.data:
+            owner_name = owner_response.data[0].get("user_name", "Unknown")
+
+    # Determinar el reviewer (autorizador)
+    reviewer_id = None
+
+    # Opción 1: Manager del proyecto
+    if project_id:
+        project_response = supabase.table("projects").select(
+            "project_name, project_manager"
+        ).eq("project_id", project_id).execute()
+
+        if project_response.data:
+            project_data = project_response.data[0]
+            reviewer_id = project_data.get("project_manager")
+
+    # Opción 2: Si no hay manager, buscar CEO/COO
+    if not reviewer_id:
+        # Buscar roles de CEO/COO
+        roles_response = supabase.table("roles").select("role_id").or_(
+            "role_name.ilike.%CEO%,role_name.ilike.%COO%"
+        ).execute()
+
+        if roles_response.data:
+            role_ids = [r["role_id"] for r in roles_response.data]
+            # Buscar un usuario con ese rol
+            users_response = supabase.table("users").select("user_id").in_(
+                "role_id", role_ids
+            ).limit(1).execute()
+
+            if users_response.data:
+                reviewer_id = users_response.data[0]["user_id"]
+
+    if not reviewer_id:
+        print("[PIPELINE] No reviewer found for task")
+        return None
+
+    # Obtener el status "Not Started"
+    status_response = supabase.table("tasks_status").select(
+        "task_status_id"
+    ).ilike("task_status", "not started").execute()
+
+    not_started_id = None
+    if status_response.data:
+        not_started_id = status_response.data[0]["task_status_id"]
+
+    # Crear la tarea de revisión
+    review_task_data = {
+        "task_description": f"Review: {task_description} (submitted by {owner_name})",
+        "project_id": project_id,
+        "Owner_id": reviewer_id,
+        "task_status": not_started_id,
+        "task_notes": f"[AUTO-REVIEW] Task pending approval.\n\nOriginal task: {task_description}\nSubmitted by: {owner_name}\n\n{f'Notes: {submission_notes}' if submission_notes else ''}",
+    }
+
+    response = supabase.table("tasks").insert(review_task_data).execute()
+
+    if response.data:
+        new_task_id = response.data[0].get("task_id")
+        print(f"[PIPELINE] Created reviewer task: {new_task_id}")
+        return new_task_id
+
+    return None
+
+
+# ====== AUTOMATIONS ENDPOINTS ======
+
+class AutomationsRunRequest(BaseModel):
+    automations: List[str]  # List of automation IDs to run
+
+
+# Automation marker prefix - tasks created by automations will have this in task_notes
+AUTOMATION_MARKER = "[AUTOMATED]"
+
+
+@router.post("/automations/run")
+def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
+    """
+    Ejecuta las automatizaciones seleccionadas y crea/actualiza tareas.
+
+    Automatizaciones disponibles:
+    - pending_expenses_auth: Crea tareas para proyectos con gastos pendientes de autorización
+    - pending_invoices: Crea tareas para facturas pendientes por enviar
+    - overdue_tasks: Crea alertas para tareas vencidas
+    """
+    print(f"[AUTOMATIONS] Running automations: {payload.automations}")
+
+    tasks_created = 0
+    tasks_updated = 0
+    errors = []
+
+    try:
+        for automation_id in payload.automations:
+            if automation_id == "pending_expenses_auth":
+                created, updated = _run_pending_expenses_automation()
+                tasks_created += created
+                tasks_updated += updated
+            elif automation_id == "pending_invoices":
+                # TODO: Implementar lógica para facturas pendientes
+                print(f"[AUTOMATIONS] pending_invoices: Not implemented yet")
+            elif automation_id == "overdue_tasks":
+                # TODO: Implementar lógica para tareas vencidas
+                print(f"[AUTOMATIONS] overdue_tasks: Not implemented yet")
+            else:
+                errors.append(f"Unknown automation: {automation_id}")
+
+        return {
+            "success": True,
+            "tasks_created": tasks_created,
+            "tasks_updated": tasks_updated,
+            "errors": errors if errors else None
+        }
+
+    except Exception as e:
+        print(f"[AUTOMATIONS] ERROR: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Automation error: {e}") from e
+
+
+def _run_pending_expenses_automation() -> tuple:
+    """
+    Automation: Pending Expenses Authorization
+
+    Crea una tarea por cada proyecto que tenga gastos pendientes de autorización.
+    Si ya existe una tarea automatizada para ese proyecto, la actualiza.
+
+    Returns:
+        tuple: (tasks_created, tasks_updated)
+    """
+    print("[AUTOMATIONS] Running pending_expenses_auth...")
+
+    tasks_created = 0
+    tasks_updated = 0
+
+    try:
+        # 1. Obtener gastos pendientes de autorización agrupados por proyecto
+        expenses_response = supabase.table("expenses_manual_COGS").select(
+            "expense_id, project, Amount"
+        ).or_("auth_status.is.null,auth_status.eq.false").execute()
+
+        expenses = expenses_response.data or []
+        print(f"[AUTOMATIONS] Found {len(expenses)} pending expenses")
+
+        if not expenses:
+            return (0, 0)
+
+        # Agrupar por proyecto
+        by_project: Dict[str, Dict] = {}
+        for exp in expenses:
+            project_id = exp.get("project")
+            if not project_id:
+                continue
+
+            if project_id not in by_project:
+                by_project[project_id] = {"count": 0, "total": 0}
+
+            by_project[project_id]["count"] += 1
+            by_project[project_id]["total"] += float(exp.get("Amount") or 0)
+
+        print(f"[AUTOMATIONS] Projects with pending expenses: {len(by_project)}")
+
+        if not by_project:
+            return (0, 0)
+
+        # 2. Obtener nombres de proyectos
+        project_ids = list(by_project.keys())
+        projects_response = supabase.table("projects").select(
+            "project_id, project_name, project_manager"
+        ).in_("project_id", project_ids).execute()
+
+        projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
+
+        # 3. Obtener el status_id de "not started"
+        status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "not started").execute()
+
+        not_started_status_id = None
+        if status_response.data:
+            not_started_status_id = status_response.data[0]["task_status_id"]
+
+        # 4. Buscar tareas automatizadas existentes para estos proyectos
+        existing_tasks_response = supabase.table("tasks").select(
+            "task_id, project_id, task_notes"
+        ).in_("project_id", project_ids).like(
+            "task_notes", f"{AUTOMATION_MARKER}:pending_expenses_auth%"
+        ).execute()
+
+        existing_tasks_map = {
+            t["project_id"]: t for t in (existing_tasks_response.data or [])
+        }
+
+        # 5. Crear o actualizar tareas
+        for project_id, data in by_project.items():
+            project_info = projects_map.get(project_id, {})
+            project_name = project_info.get("project_name", "Unknown Project")
+            project_manager = project_info.get("project_manager")
+
+            count = data["count"]
+            total = data["total"]
+
+            task_description = f"Gastos pendientes por autorizar en {project_name}"
+            task_notes = f"{AUTOMATION_MARKER}:pending_expenses_auth | {count} gastos | ${total:,.2f} total"
+
+            if project_id in existing_tasks_map:
+                # Actualizar tarea existente
+                existing_task = existing_tasks_map[project_id]
+                supabase.table("tasks").update({
+                    "task_description": task_description,
+                    "task_notes": task_notes,
+                }).eq("task_id", existing_task["task_id"]).execute()
+
+                tasks_updated += 1
+                print(f"[AUTOMATIONS] Updated task for project: {project_name}")
+            else:
+                # Crear nueva tarea
+                new_task_data = {
+                    "task_description": task_description,
+                    "task_notes": task_notes,
+                    "project_id": project_id,
+                    "Owner_id": project_manager,  # Asignar al project manager
+                    "task_status": not_started_status_id,
+                }
+
+                supabase.table("tasks").insert(new_task_data).execute()
+                tasks_created += 1
+                print(f"[AUTOMATIONS] Created task for project: {project_name}")
+
+        # 6. Opcional: Limpiar tareas automatizadas de proyectos que ya no tienen gastos pendientes
+        # (esto evita que queden tareas obsoletas)
+        for existing_project_id, existing_task in existing_tasks_map.items():
+            if existing_project_id not in by_project:
+                # El proyecto ya no tiene gastos pendientes, eliminar la tarea
+                supabase.table("tasks").delete().eq(
+                    "task_id", existing_task["task_id"]
+                ).execute()
+                print(f"[AUTOMATIONS] Removed obsolete task for project: {existing_project_id}")
+
+        return (tasks_created, tasks_updated)
+
+    except Exception as e:
+        print(f"[AUTOMATIONS] ERROR in pending_expenses_auth: {repr(e)}")
+        print(traceback.format_exc())
+        raise
+
+
+@router.get("/automations/status")
+def get_automations_status() -> Dict[str, Any]:
+    """
+    Devuelve el estado actual de las automatizaciones.
+
+    Returns:
+        - pending_expenses_auth: Conteo de proyectos con gastos pendientes
+        - pending_invoices: Conteo de facturas pendientes
+        - overdue_tasks: Conteo de tareas vencidas
+    """
+    try:
+        # Pending expenses count
+        expenses_response = supabase.table("expenses_manual_COGS").select(
+            "project", count="exact"
+        ).or_("auth_status.is.null,auth_status.eq.false").execute()
+
+        pending_expenses_count = expenses_response.count if expenses_response.count else 0
+
+        # Get unique projects with pending expenses
+        expenses_data = supabase.table("expenses_manual_COGS").select(
+            "project"
+        ).or_("auth_status.is.null,auth_status.eq.false").execute()
+
+        unique_projects = set(
+            e.get("project") for e in (expenses_data.data or []) if e.get("project")
+        )
+
+        return {
+            "pending_expenses_auth": {
+                "expenses_count": pending_expenses_count,
+                "projects_count": len(unique_projects),
+            },
+            "pending_invoices": {
+                "count": 0,  # TODO: Implementar
+            },
+            "overdue_tasks": {
+                "count": 0,  # TODO: Implementar
+            }
+        }
+
+    except Exception as e:
+        print(f"[AUTOMATIONS] ERROR in GET /automations/status: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error: {e}") from e
