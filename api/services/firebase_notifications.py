@@ -250,3 +250,124 @@ async def notify_mentioned_users(
 
     logger.info(f"[Firebase] Notified {notified_count}/{len(mentioned_user_ids)} mentioned users")
     return notified_count
+
+
+# ============================================================================
+# Notify Expense Authorizers
+# ============================================================================
+
+async def get_expense_authorizers() -> List[dict]:
+    """
+    Get all users who can authorize expenses.
+    These are users with roles: CEO, COO, CFO, Admin
+    or users with can_edit permission on expenses module.
+    """
+    try:
+        supabase = get_supabase()
+
+        # Get users with authorizing roles
+        authorizing_roles = ['CEO', 'COO', 'CFO', 'Admin', 'Accounting Manager']
+
+        # First get the role IDs for these roles
+        roles_result = supabase.table("rols") \
+            .select("rol_id, rol_name") \
+            .in_("rol_name", authorizing_roles) \
+            .execute()
+
+        role_ids = [r["rol_id"] for r in (roles_result.data or [])]
+
+        if not role_ids:
+            logger.warning("[Firebase] No authorizing roles found")
+            return []
+
+        # Get users with these roles
+        users_result = supabase.table("users") \
+            .select("user_id, user_name, user_email") \
+            .in_("user_rol", role_ids) \
+            .execute()
+
+        authorizers = users_result.data or []
+        logger.info(f"[Firebase] Found {len(authorizers)} expense authorizers")
+
+        return authorizers
+
+    except Exception as e:
+        logger.error(f"[Firebase] Error getting expense authorizers: {e}")
+        return []
+
+
+async def notify_expense_authorizers(
+    sender_name: str,
+    pending_count: int,
+    message: str,
+    project_name: Optional[str] = None
+) -> dict:
+    """
+    Send push notifications to all expense authorizers.
+
+    Args:
+        sender_name: Name of the person requesting the reminder
+        pending_count: Number of pending expenses (0 if unknown)
+        message: Custom message from the user
+        project_name: Optional project name to scope the reminder
+
+    Returns:
+        Dict with success status and count of notified users
+    """
+    authorizers = await get_expense_authorizers()
+
+    if not authorizers:
+        return {
+            "success": False,
+            "notified_count": 0,
+            "error": "No expense authorizers found"
+        }
+
+    # Build notification
+    title = "⚠️ Recordatorio de Gastos Pendientes"
+
+    if pending_count > 0:
+        body = f"{sender_name} reporta: {pending_count} gastos esperando autorización"
+    else:
+        body = f"{sender_name}: {message[:100]}"
+
+    if project_name:
+        body += f" (Proyecto: {project_name})"
+
+    data = {
+        "type": "expense_reminder",
+        "url": "/expenses.html",
+        "sender": sender_name,
+    }
+
+    if pending_count > 0:
+        data["pending_count"] = str(pending_count)
+
+    notified_count = 0
+    notified_users = []
+
+    for user in authorizers:
+        user_id = user.get("user_id")
+        if not user_id:
+            continue
+
+        success = await send_push_notification(
+            user_id=user_id,
+            title=title,
+            body=body,
+            data=data,
+            sender_name=sender_name
+        )
+
+        if success:
+            notified_count += 1
+            notified_users.append(user.get("user_name", "Unknown"))
+
+    logger.info(f"[Firebase] Expense reminder sent to {notified_count}/{len(authorizers)} authorizers")
+
+    return {
+        "success": notified_count > 0,
+        "notified_count": notified_count,
+        "total_authorizers": len(authorizers),
+        "notified_users": notified_users
+    }

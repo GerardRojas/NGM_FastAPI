@@ -1,18 +1,20 @@
 # services/arturito/handlers/__init__.py
 # Individual command handlers for Arturito
 
-from .bva_handler import handle_budget_vs_actuals
+from .bva_handler import handle_budget_vs_actuals, handle_consulta_especifica
 from .info_handler import handle_info
 from .sow_handler import handle_scope_of_work
-from .ngm_hub_handler import handle_ngm_help, handle_ngm_action, handle_bug_report
+from .ngm_hub_handler import handle_ngm_help, handle_ngm_action, handle_bug_report, handle_expense_reminder
 from .copilot_handler import handle_copilot
 
 __all__ = [
     "handle_budget_vs_actuals",
+    "handle_consulta_especifica",
     "handle_info",
     "handle_scope_of_work",
     "handle_ngm_help",
     "handle_ngm_action",
     "handle_bug_report",
     "handle_copilot",
+    "handle_expense_reminder",
 ]

@@ -7,12 +7,14 @@
 from typing import Dict, Any, Callable, Optional, List
 from .handlers import (
     handle_budget_vs_actuals,
+    handle_consulta_especifica,
     handle_info,
     handle_scope_of_work,
     handle_ngm_help,
     handle_ngm_action,
     handle_bug_report,
     handle_copilot,
+    handle_expense_reminder,
 )
 from .persona import set_personality_level, get_identity_response
 from .responder import generate_small_talk_response
@@ -30,9 +32,9 @@ ROUTES: Dict[str, Dict[str, Any]] = {
     },
 
     "CONSULTA_ESPECIFICA": {
-        "handler": None,  # TODO: Implementar handler específico
-        "required_entities": ["project"],
-        "optional_entities": ["topic", "category", "question"],
+        "handler": handle_consulta_especifica,
+        "required_entities": [],  # Handler maneja casos sin proyecto/categoría
+        "optional_entities": ["project", "topic", "category", "trade", "question"],
         "description": "Responde consultas sobre categorías específicas del BVA",
     },
 
@@ -97,6 +99,13 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "required_entities": [],
         "optional_entities": ["command_type", "raw_command"],
         "description": "Comandos copilot para controlar la pagina actual",
+    },
+
+    "EXPENSE_REMINDER": {
+        "handler": None,  # Manejado en route_async
+        "required_entities": [],
+        "optional_entities": ["message"],
+        "description": "Enviar recordatorio de gastos pendientes a autorizadores",
     },
 }
 
@@ -222,6 +231,20 @@ def route(
         return {
             "text": None,
             "action": "report_bug_pending",
+            "data": {
+                "intent": intent,
+                "entities": entities,
+                "raw_text": raw_text,
+            },
+            "requires_async": True
+        }
+
+    # EXPENSE_REMINDER - Needs async handling (delegated to async_route)
+    if intent == "EXPENSE_REMINDER":
+        # Return marker for async processing
+        return {
+            "text": None,
+            "action": "expense_reminder_pending",
             "data": {
                 "intent": intent,
                 "entities": entities,
@@ -398,6 +421,16 @@ async def route_async(
             "raw_text": raw_text,
         }
         result = await handle_bug_report(request, context, db_client)
+        return result
+
+    # Handle EXPENSE_REMINDER
+    if intent == "EXPENSE_REMINDER":
+        request = {
+            "intent": intent,
+            "entities": entities,
+            "raw_text": raw_text,
+        }
+        result = await handle_expense_reminder(request, context, db_client)
         return result
 
     # Fall back to sync route for all other intents

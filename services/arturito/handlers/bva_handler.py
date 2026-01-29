@@ -55,19 +55,35 @@ def handle_budget_vs_actuals(
     ctx = context or {}
 
     # Extraer proyecto
-    project_input = entities.get("project", "").strip()
+    project_input = entities.get("project")
+    if project_input:
+        project_input = str(project_input).strip()
 
     # Fallback: usar nombre del espacio si no hay proyecto
     if not project_input:
         project_input = ctx.get("space_name", "")
 
     # Validar que tenemos proyecto
-    if not project_input or project_input.lower() in ["default", "general", "random"]:
-        return {
-            "ok": False,
-            "text": "⚠️ No pude identificar el proyecto. Por favor especifica el nombre.",
-            "action": "missing_project"
-        }
+    if not project_input or project_input.lower() in ["default", "general", "random", "none"]:
+        # Obtener lista de proyectos recientes para sugerir
+        recent_projects = fetch_recent_projects(limit=8)
+
+        if recent_projects:
+            project_list = "\n".join([f"• {p.get('project_name', 'Sin nombre')}" for p in recent_projects])
+            return {
+                "ok": False,
+                "text": f"📊 ¿De qué proyecto necesitas el reporte BVA?\n\nProyectos disponibles:\n{project_list}\n\n💡 Ejemplo: *bva Del Rio*",
+                "action": "ask_project",
+                "data": {
+                    "projects": [{"id": p.get("project_id"), "name": p.get("project_name")} for p in recent_projects]
+                }
+            }
+        else:
+            return {
+                "ok": False,
+                "text": "📊 ¿De qué proyecto necesitas el reporte BVA?\n\n💡 Ejemplo: *bva Del Rio*",
+                "action": "ask_project"
+            }
 
     try:
         # 1. Resolver proyecto (buscar por nombre o ID)
@@ -169,6 +185,21 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         print(f"[BVA] Error resolving project: {e}")
         return None
+
+
+def fetch_recent_projects(limit: int = 8) -> List[Dict[str, Any]]:
+    """Obtiene lista de proyectos recientes/activos para sugerir."""
+    try:
+        # Obtener proyectos ordenados por fecha de creación (más recientes primero)
+        result = supabase.table("projects") \
+            .select("project_id, project_name") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+        return result.data or []
+    except Exception as e:
+        print(f"[BVA] Error fetching recent projects: {e}")
+        return []
 
 
 def fetch_budgets(project_id: str) -> List[Dict[str, Any]]:
@@ -539,3 +570,460 @@ def format_bva_response(project_name: str, report_data: Dict[str, Any]) -> str:
         lines.append(f"⚠️ *{len(over_budget)} cuenta(s) sobre presupuesto*")
 
     return "\n".join(lines)
+
+
+# ================================
+# CONSULTA ESPECÍFICA Handler
+# ================================
+
+def handle_consulta_especifica(
+    request: Dict[str, Any],
+    context: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    Responde consultas específicas sobre una categoría/cuenta del BVA.
+
+    Ejemplos:
+    - "¿Cuánto tengo disponible para ventanas en Del Rio?"
+    - "¿Cuánto hemos gastado en HVAC en Thrasher Way?"
+    - "¿Cuál es el presupuesto de plomería en Arthur Neal?"
+
+    Args:
+        request: {intent, entities: {project, topic/category}, raw_text}
+        context: {user, space_id, space_name}
+
+    Returns:
+        Dict con respuesta sobre la categoría específica
+    """
+    entities = request.get("entities", {})
+    ctx = context or {}
+
+    # Extraer proyecto
+    project_input = entities.get("project")
+    if project_input:
+        project_input = str(project_input).strip()
+
+    # Extraer categoría/topic
+    category_input = entities.get("topic") or entities.get("category") or entities.get("trade")
+    if category_input:
+        category_input = str(category_input).strip()
+
+    # Fallback: usar nombre del espacio si no hay proyecto
+    if not project_input:
+        project_input = ctx.get("space_name", "")
+
+    # Validar proyecto
+    if not project_input or project_input.lower() in ["default", "general", "random", "none"]:
+        recent_projects = fetch_recent_projects(limit=6)
+        if recent_projects:
+            project_list = ", ".join([p.get("project_name", "") for p in recent_projects[:4]])
+            return {
+                "ok": False,
+                "text": f"¿De qué proyecto? Por ejemplo: {project_list}",
+                "action": "ask_project"
+            }
+        return {
+            "ok": False,
+            "text": "¿De qué proyecto necesitas la información?",
+            "action": "ask_project"
+        }
+
+    # Validar categoría
+    if not category_input:
+        return {
+            "ok": False,
+            "text": f"¿Qué categoría te interesa del proyecto? Por ejemplo: ventanas, HVAC, plomería, framing, etc.",
+            "action": "ask_category"
+        }
+
+    try:
+        # Resolver proyecto
+        project = resolve_project(project_input)
+        if not project:
+            return {
+                "ok": False,
+                "text": f"⚠️ No encontré el proyecto '{project_input}'. Verifica el nombre.",
+                "action": "project_not_found"
+            }
+
+        project_id = project.get("project_id") or project.get("id")
+        project_name = project.get("project_name") or project.get("name") or project_input
+
+        # Obtener datos
+        budgets = fetch_budgets(project_id)
+        expenses = fetch_expenses(project_id)
+        accounts = fetch_accounts()
+
+        # Buscar la categoría en los datos
+        category_data = find_category_data(category_input, budgets, expenses, accounts)
+
+        if not category_data:
+            # Sugerir categorías similares usando TODAS las cuentas de la tabla accounts
+            available_categories = get_available_categories(budgets, expenses, accounts, only_with_data=False)
+            suggestions = find_similar_categories(category_input, available_categories)
+
+            if suggestions:
+                suggestion_text = ", ".join(suggestions[:5])
+                return {
+                    "ok": False,
+                    "text": f"No encontré '{category_input}' en {project_name}.\n\n¿Quisiste decir: {suggestion_text}?",
+                    "action": "category_not_found",
+                    "data": {"suggestions": suggestions}
+                }
+            else:
+                return {
+                    "ok": False,
+                    "text": f"No encontré la categoría '{category_input}' en {project_name}.",
+                    "action": "category_not_found"
+                }
+
+        # Formatear respuesta
+        response = format_category_response(project_name, category_input, category_data)
+
+        return {
+            "ok": True,
+            "text": response,
+            "action": "category_query_response",
+            "data": {
+                "project_id": project_id,
+                "project_name": project_name,
+                "category": category_data["matched_name"],
+                "budget": category_data["budget"],
+                "actual": category_data["actual"],
+                "balance": category_data["balance"],
+                "percent_used": category_data["percent_of_budget"]
+            }
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "text": f"⚠️ Error consultando los datos: {str(e)}",
+            "action": "query_error",
+            "error": str(e)
+        }
+
+
+def find_category_data(
+    category_input: str,
+    budgets: List[Dict[str, Any]],
+    expenses: List[Dict[str, Any]],
+    accounts: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """
+    Busca una categoría en los datos del BVA y retorna sus métricas.
+    Usa la tabla accounts como fuente de verdad para nombres de categorías.
+    Hace búsqueda fuzzy para encontrar coincidencias parciales.
+    """
+    category_lower = category_input.lower()
+
+    # Mapeo de términos comunes español-inglés
+    CATEGORY_ALIASES = {
+        "ventanas": ["window", "windows", "ventana"],
+        "hvac": ["hvac", "heating", "cooling", "aire acondicionado", "calefaccion"],
+        "plomeria": ["plumbing", "plomeria", "plumber"],
+        "electricidad": ["electrical", "electric", "electricidad", "electrico"],
+        "framing": ["framing", "frame", "estructura"],
+        "drywall": ["drywall", "sheetrock"],
+        "pintura": ["paint", "painting", "pintura"],
+        "piso": ["flooring", "floor", "piso", "pisos"],
+        "techo": ["roof", "roofing", "techo"],
+        "cocina": ["kitchen", "cocina", "cabinets", "gabinetes"],
+        "baño": ["bathroom", "bath", "baño", "bano"],
+        "puertas": ["door", "doors", "puerta", "puertas"],
+        "concreto": ["concrete", "concreto", "foundation", "cimentacion"],
+        "landscaping": ["landscaping", "landscape", "jardineria", "jardin"],
+        "appliances": ["appliances", "appliance", "electrodomesticos"],
+        "insulation": ["insulation", "aislamiento"],
+    }
+
+    # Expandir términos de búsqueda
+    search_terms = [category_lower]
+    used_alias = False
+    for alias_key, alias_values in CATEGORY_ALIASES.items():
+        if category_lower in alias_values or category_lower == alias_key:
+            search_terms.extend(alias_values)
+            search_terms.append(alias_key)
+            used_alias = True
+
+    search_terms = list(set(search_terms))
+
+    # Helper para obtener nombre de cuenta
+    def get_account_name(account_id: str, account_name: str = None) -> str:
+        if account_name:
+            return account_name
+        if account_id:
+            for acc in accounts:
+                if (acc.get("account_id") or acc.get("id")) == account_id:
+                    return acc.get("Name") or acc.get("account_name") or "Unknown"
+        return "Unknown Account"
+
+    # Función para verificar si es coincidencia exacta
+    def is_exact_match(name: str, query: str) -> bool:
+        return name.lower() == query.lower()
+
+    # PASO 1: Buscar coincidencia EXACTA primero (en accounts y data)
+    exact_match = None
+    for acc in accounts:
+        acc_name = acc.get("Name") or acc.get("account_name")
+        if acc_name and is_exact_match(acc_name, category_input):
+            exact_match = acc_name
+            break
+
+    # PASO 2: Buscar coincidencia en la tabla accounts (fuente de verdad)
+    matched_account_from_table = None
+    match_type = "exact"  # Tipo de coincidencia encontrada
+
+    if exact_match:
+        matched_account_from_table = exact_match
+    else:
+        for acc in accounts:
+            acc_name = acc.get("Name") or acc.get("account_name")
+            if not acc_name:
+                continue
+            acc_lower = acc_name.lower()
+            for term in search_terms:
+                if term in acc_lower or acc_lower in term:
+                    matched_account_from_table = acc_name
+                    match_type = "fuzzy"  # No fue exacta
+                    break
+            if matched_account_from_table:
+                break
+
+    # Agrupar budgets por cuenta
+    budgets_by_account = {}
+    for budget in budgets:
+        account_name = get_account_name(budget.get("account_id"), budget.get("account_name"))
+        budgets_by_account[account_name] = budgets_by_account.get(account_name, 0) + float(budget.get("amount_sum") or 0)
+
+    # Agrupar expenses por cuenta
+    expenses_by_account = {}
+    for expense in expenses:
+        account_name = get_account_name(expense.get("account_id"), expense.get("account_name"))
+        amount = float(expense.get("Amount") or expense.get("amount") or 0)
+        expenses_by_account[account_name] = expenses_by_account.get(account_name, 0) + amount
+
+    # PASO 3: Buscar coincidencia en datos existentes (budgets + expenses)
+    all_data_accounts = set(list(budgets_by_account.keys()) + list(expenses_by_account.keys()))
+    matched_account_from_data = None
+
+    # Primero buscar exacta en datos
+    for account_name in all_data_accounts:
+        if is_exact_match(account_name, category_input):
+            matched_account_from_data = account_name
+            match_type = "exact"
+            break
+
+    # Si no hay exacta, buscar fuzzy en datos
+    if not matched_account_from_data:
+        for account_name in all_data_accounts:
+            account_lower = account_name.lower()
+            for term in search_terms:
+                if term in account_lower or account_lower in term:
+                    matched_account_from_data = account_name
+                    if match_type != "exact":
+                        match_type = "fuzzy"
+                    break
+            if matched_account_from_data:
+                break
+
+    # Usar coincidencia de datos si existe, sino de tabla accounts
+    matched_account = matched_account_from_data or matched_account_from_table
+
+    if not matched_account:
+        return None
+
+    # Determinar si hay que comunicar que fue búsqueda aproximada
+    # Solo si el nombre encontrado es diferente al buscado
+    is_approximate = (
+        match_type == "fuzzy" and
+        matched_account.lower() != category_input.lower()
+    )
+
+    # Calcular métricas
+    budget_amount = budgets_by_account.get(matched_account, 0)
+    actual_amount = expenses_by_account.get(matched_account, 0)
+    balance = budget_amount - actual_amount
+    percent = (actual_amount / budget_amount * 100) if budget_amount > 0 else 0
+
+    return {
+        "matched_name": matched_account,
+        "searched_term": category_input,  # Lo que el usuario buscó
+        "is_approximate": is_approximate,  # Si fue coincidencia aproximada
+        "budget": round(budget_amount, 2),
+        "actual": round(actual_amount, 2),
+        "balance": round(balance, 2),
+        "percent_of_budget": round(percent, 2),
+        "has_data": budget_amount > 0 or actual_amount > 0  # Indica si tiene datos
+    }
+
+
+def get_available_categories(
+    budgets: List[Dict[str, Any]],
+    expenses: List[Dict[str, Any]],
+    accounts: List[Dict[str, Any]],
+    only_with_data: bool = False
+) -> List[str]:
+    """
+    Retorna lista de categorías disponibles.
+
+    Args:
+        accounts: Lista de todas las cuentas de la tabla accounts
+        budgets: Budgets del proyecto (para filtrar si only_with_data=True)
+        expenses: Expenses del proyecto (para filtrar si only_with_data=True)
+        only_with_data: Si True, solo retorna categorías con budgets o expenses
+
+    Returns:
+        Lista de nombres de categorías ordenadas
+    """
+    # Usar accounts como fuente principal de categorías
+    all_account_names = []
+    for acc in accounts:
+        name = acc.get("Name") or acc.get("account_name")
+        if name:
+            all_account_names.append(name)
+
+    if not only_with_data:
+        # Retornar TODAS las categorías de la tabla accounts
+        return sorted(list(set(all_account_names)))
+
+    # Si only_with_data, filtrar solo las que tienen budgets o expenses
+    def get_account_name(account_id: str, account_name: str = None) -> str:
+        if account_name:
+            return account_name
+        if account_id:
+            for acc in accounts:
+                if (acc.get("account_id") or acc.get("id")) == account_id:
+                    return acc.get("Name") or acc.get("account_name") or "Unknown"
+        return "Unknown Account"
+
+    categories_with_data = set()
+    for budget in budgets:
+        categories_with_data.add(get_account_name(budget.get("account_id"), budget.get("account_name")))
+    for expense in expenses:
+        categories_with_data.add(get_account_name(expense.get("account_id"), expense.get("account_name")))
+
+    return sorted([c for c in categories_with_data if c != "Unknown Account"])
+
+
+def find_similar_categories(query: str, categories: List[str]) -> List[str]:
+    """
+    Encuentra categorías similares a la consulta usando fuzzy matching.
+    Ordena por relevancia (coincidencias más cercanas primero).
+    """
+    query_lower = query.lower()
+    query_words = query_lower.split()
+
+    # Categorías con puntuación de relevancia
+    scored_matches = []
+
+    # Mapeo de términos comunes español-inglés para mejorar búsqueda
+    TERM_TRANSLATIONS = {
+        "ventanas": "window", "ventana": "window",
+        "plomeria": "plumbing", "plomería": "plumbing",
+        "electricidad": "electrical", "electrico": "electrical", "eléctrico": "electrical",
+        "pintura": "paint",
+        "piso": "floor", "pisos": "floor",
+        "techo": "roof",
+        "cocina": "kitchen",
+        "baño": "bathroom", "bano": "bathroom",
+        "puertas": "door", "puerta": "door",
+        "concreto": "concrete",
+        "jardin": "landscape", "jardín": "landscape",
+        "aislamiento": "insulation",
+    }
+
+    # Expandir query con traducciones
+    expanded_query = [query_lower] + query_words
+    for word in query_words:
+        if word in TERM_TRANSLATIONS:
+            expanded_query.append(TERM_TRANSLATIONS[word])
+
+    for cat in categories:
+        cat_lower = cat.lower()
+        score = 0
+
+        # Coincidencia exacta (mayor puntuación)
+        if query_lower == cat_lower:
+            score = 100
+        # Query está contenido en categoría
+        elif query_lower in cat_lower:
+            score = 80
+        # Categoría está contenida en query
+        elif cat_lower in query_lower:
+            score = 70
+        else:
+            # Coincidencia de palabras individuales
+            for term in expanded_query:
+                if term in cat_lower:
+                    score = max(score, 50)
+                # Coincidencia parcial de palabra
+                elif any(term in word or word in term for word in cat_lower.split()):
+                    score = max(score, 30)
+
+        if score > 0:
+            scored_matches.append((cat, score))
+
+    # Ordenar por puntuación y retornar top 5
+    scored_matches.sort(key=lambda x: x[1], reverse=True)
+    return [cat for cat, score in scored_matches[:5]]
+
+
+def format_category_response(project_name: str, category_query: str, data: Dict[str, Any]) -> str:
+    """Formatea la respuesta de consulta específica."""
+    def fmt(amount: float) -> str:
+        if amount < 0:
+            return f"-${abs(amount):,.2f}"
+        return f"${amount:,.2f}"
+
+    matched_name = data["matched_name"]
+    searched_term = data.get("searched_term", category_query)
+    is_approximate = data.get("is_approximate", False)
+    budget = data["budget"]
+    actual = data["actual"]
+    balance = data["balance"]
+    percent = data["percent_of_budget"]
+    has_data = data.get("has_data", True)
+
+    # Construir header con mensaje de coincidencia aproximada si aplica
+    if is_approximate:
+        header = f"🔍 No encontré exactamente *{searched_term}*, pero encontré *{matched_name}*:\n\n"
+    else:
+        header = ""
+
+    # Caso especial: categoría existe pero no tiene datos
+    if not has_data:
+        no_data_msg = f"""📊 *{matched_name}* en *{project_name}*
+
+ℹ️ Esta categoría existe pero aún no tiene presupuesto ni gastos registrados.
+
+💡 Puedes agregar un budget desde la página de Reporting."""
+        return header + no_data_msg if header else no_data_msg
+
+    # Determinar estado
+    if balance > 0:
+        status_emoji = "✅"
+        status_text = "disponible"
+    elif balance == 0:
+        status_emoji = "⚠️"
+        status_text = "agotado"
+    else:
+        status_emoji = "🔴"
+        status_text = "sobre presupuesto"
+
+    response = f"""📊 *{matched_name}* en *{project_name}*
+
+💰 Presupuesto: {fmt(budget)}
+💸 Gastado: {fmt(actual)}
+{status_emoji} Disponible: {fmt(balance)} ({status_text})
+📈 Usado: {percent:.1f}%"""
+
+    # Agregar contexto según el estado
+    if balance < 0:
+        response += f"\n\n⚠️ Esta categoría está *{fmt(abs(balance))}* sobre presupuesto."
+    elif percent >= 90:
+        response += f"\n\n💡 Casi agotado - solo queda {100-percent:.1f}% del presupuesto."
+    elif percent <= 10 and budget > 0:
+        response += f"\n\n💡 Apenas se ha utilizado esta categoría."
+
+    return header + response if header else response

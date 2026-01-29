@@ -27,6 +27,7 @@ VALID_INTENTS = [
     "NGM_ACTION",           # Ejecutar acciones en NGM Hub (navegar, abrir modal)
     "COPILOT",              # Comandos copilot para controlar la pagina actual
     "REPORT_BUG",           # Reportar un bug o problema
+    "EXPENSE_REMINDER",     # Recordatorio de gastos pendientes a autorizadores
     "UNKNOWN",              # No clasificado
 ]
 
@@ -53,7 +54,7 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             "source": "local"
         }
 
-    # BVA directo: "bva del rio", "budgetvsactuals arthur neal"
+    # BVA con proyecto: "bva del rio", "budgetvsactuals arthur neal"
     match_bva = re.match(r'^(bva|budgetvsactuals)\s+(.+)$', t)
     if match_bva:
         return {
@@ -62,6 +63,104 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             "confidence": 1.0,
             "source": "local"
         }
+
+    # BVA sin proyecto: "bva", "reporte bva", "generar bva", "dame el bva", etc.
+    bva_no_project_patterns = [
+        r'^(bva|budgetvsactuals)$',  # Solo "bva"
+        r'^(reporte|report|genera|generar|dame|muéstrame|muestrame|quiero)\s+(el\s+)?(bva|budget\s*vs\s*actuals)',
+        r'^(bva|budget\s*vs\s*actuals)\s+(report|reporte)?$',
+        r'(necesito|quiero|dame)\s+(un\s+)?(reporte\s+)?(bva|budget\s*vs\s*actuals)',
+    ]
+    for pattern in bva_no_project_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "BUDGET_VS_ACTUALS",
+                "entities": {"project": None},  # No project specified
+                "confidence": 1.0,
+                "source": "local"
+            }
+
+    # ================================
+    # Consulta específica de categoría del BVA
+    # ================================
+    # Patrones: "cuanto tengo para ventanas en del rio", "cuanto hemos gastado en hvac en thrasher"
+
+    # Patrón 1: "cuanto [tengo/hay/queda] [disponible/de presupuesto] para/de [categoria] en [proyecto]"
+    consulta_pattern1 = re.search(
+        r'(?:cuánto|cuanto|cuál|cual|qué|que)\s+(?:tengo|hay|queda|tenemos|tienen)?\s*'
+        r'(?:disponible|de\s+presupuesto|de\s+budget|gastado|usado)?\s*'
+        r'(?:para|de|en)\s+(\w+(?:\s+\w+)?)\s+'
+        r'(?:en|del?|para)\s+(.+?)(?:\?|$)',
+        t
+    )
+    if consulta_pattern1:
+        category = consulta_pattern1.group(1).strip()
+        project = consulta_pattern1.group(2).strip()
+        return {
+            "intent": "CONSULTA_ESPECIFICA",
+            "entities": {"topic": category, "project": project},
+            "confidence": 0.95,
+            "source": "local"
+        }
+
+    # Patrón 2: "[categoria] en [proyecto]" al final de pregunta
+    consulta_pattern2 = re.search(
+        r'(?:presupuesto|budget|gastado|disponible|balance)\s+'
+        r'(?:de|para|en)\s+(\w+(?:\s+\w+)?)\s+'
+        r'(?:en|del?|para)\s+(.+?)(?:\?|$)',
+        t
+    )
+    if consulta_pattern2:
+        category = consulta_pattern2.group(1).strip()
+        project = consulta_pattern2.group(2).strip()
+        return {
+            "intent": "CONSULTA_ESPECIFICA",
+            "entities": {"topic": category, "project": project},
+            "confidence": 0.9,
+            "source": "local"
+        }
+
+    # Patrón 3: "cuanto hemos gastado en [categoria] en [proyecto]"
+    consulta_pattern3 = re.search(
+        r'(?:cuánto|cuanto)\s+(?:hemos|han|he)\s+(?:gastado|usado|invertido)\s+'
+        r'(?:en|para|de)\s+(\w+(?:\s+\w+)?)\s+'
+        r'(?:en|del?|para)\s+(.+?)(?:\?|$)',
+        t
+    )
+    if consulta_pattern3:
+        category = consulta_pattern3.group(1).strip()
+        project = consulta_pattern3.group(2).strip()
+        return {
+            "intent": "CONSULTA_ESPECIFICA",
+            "entities": {"topic": category, "project": project},
+            "confidence": 0.95,
+            "source": "local"
+        }
+
+    # Patrón 4: Consulta de categoría sin proyecto (preguntar después)
+    consulta_sin_proyecto = re.search(
+        r'(?:cuánto|cuanto|cuál|cual)\s+(?:tengo|hay|queda|tenemos)?\s*'
+        r'(?:disponible|de\s+presupuesto|gastado)?\s*'
+        r'(?:para|de|en)\s+(\w+(?:\s+\w+)?)(?:\?|$)',
+        t
+    )
+    # Solo si parece una consulta de presupuesto específica (no general)
+    if consulta_sin_proyecto:
+        category = consulta_sin_proyecto.group(1).strip().lower()
+        # Verificar que sea una categoría de construcción, no una pregunta general
+        construction_terms = [
+            "ventanas", "windows", "hvac", "plomeria", "plumbing", "electricidad",
+            "electrical", "framing", "drywall", "pintura", "paint", "piso", "flooring",
+            "techo", "roof", "cocina", "kitchen", "baño", "bathroom", "puertas", "doors",
+            "concreto", "concrete", "landscaping", "appliances", "insulation", "cabinets"
+        ]
+        if any(term in category for term in construction_terms):
+            return {
+                "intent": "CONSULTA_ESPECIFICA",
+                "entities": {"topic": consulta_sin_proyecto.group(1).strip(), "project": None},
+                "confidence": 0.85,
+                "source": "local"
+            }
 
     # Ayuda / Help
     if re.search(r'\b(ayuda|help|qué puedes hacer|what can you do)\b', t):
@@ -223,6 +322,30 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
                 "source": "local"
             }
 
+    # ================================
+    # Expense Authorization Reminders
+    # ================================
+
+    expense_reminder_patterns = [
+        r'(gastos?|expenses?)\s+(sin\s+)?(autorizar|autorización|autorizacion|pendientes?)',
+        r'(muchos?|demasiados?)\s+(gastos?|expenses?)\s+(sin\s+)?(autorizar|pendientes?)',
+        r'(recordar?|recordatorio|reminder)\s+(de\s+)?(gastos?|expenses?)',
+        r'(enviar?|mandar?)\s+(recordatorio|reminder)\s+(de\s+)?(gastos?|autorizacion)',
+        r'(avisar?|notificar?)\s+(a\s+)?(los?\s+)?(autorizadores?|aprobadores?)',
+        r'(pendientes?\s+de\s+)(autorizacion|autorización|aprobar)',
+        r'(nadie\s+autoriza|sin\s+aprobar)\s+(los?\s+)?(gastos?)?',
+        r'(hay\s+)(muchos?\s+)?(gastos?\s+)(esperando|pendientes?|sin\s+autorizar)',
+    ]
+
+    for pattern in expense_reminder_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "EXPENSE_REMINDER",
+                "entities": {"message": t},
+                "confidence": 0.95,
+                "source": "local"
+            }
+
     return None
 
 
@@ -275,7 +398,13 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
    - Señales: "reportar bug", "encontré un error", "algo no funciona", "hay un problema".
    - Extrae: 'description' (descripción del problema).
 
-9) SMALL_TALK
+9) EXPENSE_REMINDER
+   - Usuario quiere enviar recordatorio a los autorizadores de gastos.
+   - Señales: "gastos sin autorizar", "muchos gastos pendientes", "recordatorio de gastos", "avisar a los autorizadores".
+   - Activar cuando el usuario se queja de gastos sin autorizar o pide enviar notificación/recordatorio.
+   - Extrae: 'message' (mensaje original del usuario).
+
+10) SMALL_TALK
    - Conversación general o dudas técnicas simples.
    - Saludos, chistes, preguntas no relacionadas con proyectos ni NGM Hub.
 
@@ -284,6 +413,7 @@ PRIORIDAD DE CLASIFICACIÓN:
 - Si el usuario pregunta sobre FUNCIONES del sistema NGM Hub → NGM_HELP
 - Si el usuario quiere NAVEGAR o ABRIR modales → NGM_ACTION
 - Si el usuario reporta un PROBLEMA → REPORT_BUG
+- Si el usuario quiere ENVIAR RECORDATORIO de GASTOS pendientes → EXPENSE_REMINDER
 - Si pregunta sobre datos de un PROYECTO (budget, actuals) → BUDGET_VS_ACTUALS o CONSULTA_ESPECIFICA
 - Si pregunta sobre Arturito (el bot) → INFO
 

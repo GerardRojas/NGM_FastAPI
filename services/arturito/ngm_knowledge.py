@@ -650,6 +650,27 @@ COPILOT_ACTIONS = {
                     "encontrar gastos con 'plumbing'",
                 ],
             },
+            # Health Checks
+            "health_check_duplicate_bills": {
+                "description": "Verificar bills duplicados con diferentes vendors",
+                "command": "healthCheckDuplicateBills",
+                "params": [],
+                "keywords": [
+                    "health check", "verificar", "check", "revisar",
+                    "bills duplicados", "duplicate bills", "duplicados",
+                    "conflictos", "conflicts", "problemas", "issues",
+                    "mismo numero", "same number", "diferentes vendors",
+                    "different vendors", "integridad", "integrity",
+                ],
+                "examples": [
+                    "revisa si hay bills duplicados",
+                    "health check de expenses",
+                    "verificar conflictos de bills",
+                    "hay bills con el mismo numero pero diferente vendor?",
+                    "revisar integridad de bills",
+                    "check for duplicate bills",
+                ],
+            },
         },
     },
 

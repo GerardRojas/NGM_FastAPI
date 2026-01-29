@@ -10,6 +10,7 @@ from typing import Optional
 from supabase import create_client, Client
 
 from api.auth import get_current_user
+from api.services.firebase_notifications import send_push_notification
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -154,3 +155,75 @@ def get_notification_status(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"[Notifications] Error getting status: {repr(e)}")
         raise HTTPException(status_code=500, detail="Failed to get notification status")
+
+
+# ============================================================================
+# Test Endpoint
+# ============================================================================
+
+class TestNotificationRequest(BaseModel):
+    title: Optional[str] = "🔔 Test Notification"
+    body: Optional[str] = "This is a test push notification from NGM Hub!"
+
+
+@router.post("/test")
+async def send_test_notification(
+    payload: TestNotificationRequest = TestNotificationRequest(),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Send a test push notification to the current user.
+    Useful for verifying that push notifications are working.
+    """
+    user_id = current_user["user_id"]
+    user_name = current_user.get("user_name", "User")
+
+    # Check if user has any tokens
+    try:
+        tokens_result = supabase.table("push_tokens") \
+            .select("id") \
+            .eq("user_id", user_id) \
+            .eq("is_active", True) \
+            .execute()
+
+        if not tokens_result.data:
+            raise HTTPException(
+                status_code=400,
+                detail="No push tokens registered. Please allow notifications in your browser first."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Notifications] Error checking tokens: {repr(e)}")
+        raise HTTPException(status_code=500, detail="Failed to check tokens")
+
+    # Send test notification
+    try:
+        success = await send_push_notification(
+            user_id=user_id,
+            title=payload.title,
+            body=payload.body,
+            data={
+                "type": "test",
+                "url": "/dashboard.html"
+            },
+            sender_name="NGM Hub"
+        )
+
+        if success:
+            return {
+                "success": True,
+                "message": f"Test notification sent to {user_name}",
+                "tokens_count": len(tokens_result.data)
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send notification. Check Firebase configuration."
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Notifications] Error sending test: {repr(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")

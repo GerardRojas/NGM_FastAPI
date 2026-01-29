@@ -535,3 +535,100 @@ async def create_bug_task(
         "text": "Hubo un error inesperado. Por favor, crea el ticket manualmente en Pipeline.",
         "action": "error",
     }
+
+
+# -----------------------------------------------------------------------------
+# EXPENSE AUTHORIZATION REMINDER
+# -----------------------------------------------------------------------------
+
+async def handle_expense_reminder(
+    request: dict,
+    context: dict = None,
+    db_client=None
+) -> dict:
+    """
+    Handle requests to send reminders about pending expenses to authorizers.
+
+    Triggered by messages like:
+    - "Tenemos muchos gastos sin autorizar"
+    - "Recuerdale a los autorizadores que hay gastos pendientes"
+    - "Enviar recordatorio de gastos"
+
+    Returns:
+        Dict with response text and notification results
+    """
+    from api.services.firebase_notifications import notify_expense_authorizers, get_supabase
+
+    message = request.get("raw_text", "")
+    user_name = "Alguien"
+    pending_count = 0
+    project_name = None
+
+    # Get user name from context
+    if context:
+        user_name = context.get("user_name", "Alguien")
+
+    # Try to get pending expense count from database
+    try:
+        if db_client:
+            supabase = db_client
+        else:
+            supabase = get_supabase()
+
+        # Count pending expenses (those with auth_status = 'Pending' or similar)
+        result = supabase.table("expenses") \
+            .select("expense_id", count="exact") \
+            .eq("auth_status", "Pending") \
+            .execute()
+
+        pending_count = result.count if hasattr(result, 'count') else len(result.data or [])
+
+    except Exception as e:
+        logger.warning(f"Could not get pending expense count: {e}")
+        pending_count = 0
+
+    # Send notifications
+    try:
+        result = await notify_expense_authorizers(
+            sender_name=user_name,
+            pending_count=pending_count,
+            message=message,
+            project_name=project_name
+        )
+
+        if result["success"]:
+            notified_users = result.get("notified_users", [])
+            user_list = ", ".join(notified_users[:5])
+            if len(notified_users) > 5:
+                user_list += f" y {len(notified_users) - 5} más"
+
+            count_text = f"Hay **{pending_count} gastos** pendientes de autorización. " if pending_count > 0 else ""
+
+            response = f"📬 ¡Recordatorio enviado!\n\n"
+            response += count_text
+            response += f"Notifiqué a **{result['notified_count']}** autorizador(es): {user_list}.\n\n"
+            response += "Recibirán una notificación push en sus dispositivos."
+
+            return {
+                "text": response,
+                "action": "expense_reminder_sent",
+                "data": {
+                    "notified_count": result["notified_count"],
+                    "pending_expenses": pending_count,
+                    "notified_users": notified_users,
+                },
+            }
+        else:
+            return {
+                "text": "No pude enviar el recordatorio. No encontré autorizadores con notificaciones activas.",
+                "action": "expense_reminder_failed",
+                "data": result,
+            }
+
+    except Exception as e:
+        logger.error(f"Error sending expense reminder: {e}")
+        return {
+            "text": f"Hubo un error al enviar el recordatorio: {str(e)}",
+            "action": "error",
+            "error": str(e),
+        }

@@ -41,6 +41,12 @@ from api.routers.messages import router as messages_router
 # ========= NOTIFICATIONS: Push Notifications ==========
 from api.routers.notifications import router as notifications_router
 
+# ========= BUDGET ALERTS: Budget Monitoring ==========
+from api.routers.budget_alerts import router as budget_alerts_router
+
+# ========= PENDING RECEIPTS: Receipt Management ==========
+from api.routers.pending_receipts import router as pending_receipts_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -121,6 +127,12 @@ app.include_router(messages_router)
 
 # Notifications (Push notification token management)
 app.include_router(notifications_router)
+
+# Budget Alerts (automated budget monitoring)
+app.include_router(budget_alerts_router)
+
+# Pending Receipts (receipt management for expenses)
+app.include_router(pending_receipts_router)
 
 # ========================================
 # Root & Healthcheck

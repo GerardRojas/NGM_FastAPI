@@ -86,10 +86,22 @@ def handle_copilot(
     command = action_match["command"]
     description = action_match["description"]
 
-    response_text = f"Ejecutando: {description}"
-    if params:
-        param_str = ", ".join(f"{k}={v}" for k, v in params.items())
-        response_text += f" ({param_str})"
+    # Custom messages for special commands
+    custom_messages = {
+        "healthCheckDuplicateBills": (
+            "Revisando integridad de bills... Voy a verificar si hay facturas con el "
+            "mismo número pero asignadas a diferentes vendors. Si encuentro conflictos, "
+            "los resaltaré en naranja en la tabla."
+        ),
+    }
+
+    if command in custom_messages:
+        response_text = custom_messages[command]
+    else:
+        response_text = f"Ejecutando: {description}"
+        if params:
+            param_str = ", ".join(f"{k}={v}" for k, v in params.items())
+            response_text += f" ({param_str})"
 
     return {
         "text": response_text,
@@ -100,6 +112,7 @@ def handle_copilot(
             "page": current_page,
             "page_name": page_name,
             "action_id": action_match["action_id"],
+            "expects_result": command in custom_messages,  # Flag for frontend
         },
     }
 
