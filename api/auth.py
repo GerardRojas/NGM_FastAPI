@@ -13,7 +13,7 @@ from utils.auth import hash_password, verify_password
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME")
 JWT_ALG = "HS256"
-JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "43200"))  # 30 días
+JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "2880"))  # 2 días
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 

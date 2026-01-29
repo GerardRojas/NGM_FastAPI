@@ -1180,3 +1180,164 @@ DO NOT include any text before or after the JSON. ONLY return the JSON object.""
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error parsing receipt: {str(e)}")
+
+
+@router.get("/pending-authorization/count")
+def get_pending_authorization_count(user_id: str):
+    """
+    Get count of expenses pending authorization for a user.
+
+    Returns count based on user's role permissions:
+    - CEO/COO: Can authorize all expenses
+    - Project Manager: Can authorize expenses for their assigned projects
+    - Other roles: Based on expense authorization permissions
+
+    Args:
+        user_id: UUID of the user requesting the count
+
+    Returns:
+        - count: Number of expenses pending authorization
+        - can_authorize: Whether this user can authorize expenses
+        - role: User's role name
+    """
+    try:
+        # Get user info including role
+        user_resp = supabase.table("users").select(
+            "user_id, user_name, user_rol, rols!users_user_rol_fkey(rol_id, rol_name)"
+        ).eq("user_id", user_id).single().execute()
+
+        if not user_resp.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_data = user_resp.data
+        role_info = user_data.get("rols") or {}
+        role_name = role_info.get("rol_name", "")
+
+        # Define roles that can authorize expenses
+        AUTHORIZER_ROLES = ["CEO", "COO", "Accounting Manager", "Project Manager"]
+
+        can_authorize = role_name in AUTHORIZER_ROLES
+
+        if not can_authorize:
+            return {
+                "count": 0,
+                "can_authorize": False,
+                "role": role_name,
+                "message": "User role does not have authorization permissions"
+            }
+
+        # Get pending expenses (auth_status is false or null)
+        # For CEO/COO: All pending expenses
+        # For Project Manager: Only their assigned projects (future enhancement)
+
+        query = supabase.table("expenses_manual_COGS").select(
+            "expense_id", count="exact"
+        ).or_("auth_status.is.null,auth_status.eq.false")
+
+        # Execute query
+        result = query.execute()
+
+        pending_count = result.count if result.count else 0
+
+        return {
+            "count": pending_count,
+            "can_authorize": True,
+            "role": role_name
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting pending authorization count: {str(e)}")
+
+
+@router.get("/pending-authorization/summary")
+def get_pending_authorization_summary(user_id: str):
+    """
+    Get summary of expenses pending authorization for dashboard display.
+
+    Returns grouped data by project with counts and totals.
+
+    Args:
+        user_id: UUID of the user requesting the summary
+
+    Returns:
+        - total_count: Total number of pending expenses
+        - total_amount: Sum of all pending expense amounts
+        - by_project: Breakdown by project
+        - can_authorize: Whether this user can authorize expenses
+    """
+    try:
+        # Get user info including role
+        user_resp = supabase.table("users").select(
+            "user_id, user_name, user_rol, rols!users_user_rol_fkey(rol_id, rol_name)"
+        ).eq("user_id", user_id).single().execute()
+
+        if not user_resp.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_data = user_resp.data
+        role_info = user_data.get("rols") or {}
+        role_name = role_info.get("rol_name", "")
+
+        # Define roles that can authorize expenses
+        AUTHORIZER_ROLES = ["CEO", "COO", "Accounting Manager", "Project Manager"]
+
+        can_authorize = role_name in AUTHORIZER_ROLES
+
+        if not can_authorize:
+            return {
+                "total_count": 0,
+                "total_amount": 0,
+                "by_project": [],
+                "can_authorize": False,
+                "role": role_name
+            }
+
+        # Get pending expenses with project info
+        query = supabase.table("expenses_manual_COGS").select(
+            "expense_id, project, Amount"
+        ).or_("auth_status.is.null,auth_status.eq.false")
+
+        result = query.execute()
+        expenses = result.data or []
+
+        # Get project names
+        projects_resp = supabase.table("projects").select("project_id, project_name").execute()
+        projects_map = {p["project_id"]: p["project_name"] for p in (projects_resp.data or [])}
+
+        # Group by project
+        by_project = {}
+        total_amount = 0
+
+        for exp in expenses:
+            proj_id = exp.get("project")
+            amount = exp.get("Amount") or 0
+            total_amount += amount
+
+            if proj_id not in by_project:
+                by_project[proj_id] = {
+                    "project_id": proj_id,
+                    "project_name": projects_map.get(proj_id, "Unknown Project"),
+                    "count": 0,
+                    "amount": 0
+                }
+
+            by_project[proj_id]["count"] += 1
+            by_project[proj_id]["amount"] += amount
+
+        # Sort by count descending
+        project_list = sorted(by_project.values(), key=lambda x: x["count"], reverse=True)
+
+        return {
+            "total_count": len(expenses),
+            "total_amount": round(total_amount, 2),
+            "by_project": project_list[:5],  # Top 5 projects
+            "can_authorize": True,
+            "role": role_name
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting pending authorization summary: {str(e)}")
