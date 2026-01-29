@@ -538,32 +538,80 @@ def search_messages(
 @router.get("/mentions")
 def get_my_mentions(
     unread_only: bool = Query(False),
+    limit: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(get_current_user)
 ):
-    """Get messages where current user was mentioned"""
+    """
+    Get messages where current user was mentioned.
+    Returns a flattened format for easy dashboard display.
+    """
     try:
         user_id = current_user["user_id"]
+        user_name = current_user.get("user_name", "")
 
-        query = supabase.table("message_mentions") \
-            .select("*, messages(*, users!user_id(user_name, avatar_color))") \
-            .eq("user_id", user_id)
+        # Search for messages that contain @username pattern
+        # This is a simple text search - for production, use a dedicated mentions table
+        search_pattern = f"%@{user_name}%"
 
-        if unread_only:
-            query = query.is_("read_at", "null")
+        query = supabase.table("messages") \
+            .select("*, users!user_id(user_name, avatar_color, user_photo)") \
+            .ilike("content", search_pattern) \
+            .neq("user_id", user_id)  # Don't include self-mentions
 
-        result = query.order("created_at", desc=True).limit(50).execute()
+        result = query.order("created_at", desc=True).limit(limit).execute()
 
         mentions = []
         for row in (result.data or []):
-            msg_data = row.get("messages")
-            if msg_data:
-                mention = {
-                    "id": str(row.get("id", "")),
-                    "read_at": row.get("read_at"),
-                    "created_at": row.get("created_at"),
-                    "message": normalize_message(msg_data),
-                }
-                mentions.append(mention)
+            user_data = row.get("users") or {}
+            if isinstance(user_data, list) and user_data:
+                user_data = user_data[0]
+
+            # Get channel name
+            channel_name = ""
+            if row.get("channel_type", "").startswith("project_"):
+                # Get project name
+                if row.get("project_id"):
+                    try:
+                        proj_result = supabase.table("projects") \
+                            .select("project_name") \
+                            .eq("project_id", row["project_id"]) \
+                            .single() \
+                            .execute()
+                        if proj_result.data:
+                            channel_type_label = {
+                                "project_general": "General",
+                                "project_accounting": "Accounting",
+                                "project_receipts": "Receipts"
+                            }.get(row.get("channel_type"), "")
+                            channel_name = f"{proj_result.data.get('project_name', '')} · {channel_type_label}"
+                    except:
+                        pass
+            elif row.get("channel_id"):
+                # Get custom channel name
+                try:
+                    chan_result = supabase.table("channels") \
+                        .select("name") \
+                        .eq("id", row["channel_id"]) \
+                        .single() \
+                        .execute()
+                    if chan_result.data:
+                        channel_name = chan_result.data.get("name", "")
+                except:
+                    pass
+
+            mention = {
+                "message_id": str(row.get("id", "")),
+                "channel_id": str(row.get("channel_id", "")) if row.get("channel_id") else str(row.get("project_id", "")),
+                "channel_type": row.get("channel_type", ""),
+                "channel_name": channel_name,
+                "content": row.get("content", ""),
+                "created_at": row.get("created_at", ""),
+                "sender_id": str(row.get("user_id", "")),
+                "sender_name": user_data.get("user_name") if isinstance(user_data, dict) else None,
+                "sender_photo": user_data.get("user_photo") if isinstance(user_data, dict) else None,
+                "sender_avatar_color": user_data.get("avatar_color") if isinstance(user_data, dict) else None,
+            }
+            mentions.append(mention)
 
         return {"mentions": mentions}
 

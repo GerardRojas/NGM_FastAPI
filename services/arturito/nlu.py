@@ -23,6 +23,10 @@ VALID_INTENTS = [
     "SET_PERSONALITY",      # Cambiar nivel de sarcasmo
     "SMALL_TALK",           # Conversación general
     "GREETING",             # Saludos
+    "NGM_HELP",             # Preguntas sobre cómo usar NGM Hub
+    "NGM_ACTION",           # Ejecutar acciones en NGM Hub (navegar, abrir modal)
+    "COPILOT",              # Comandos copilot para controlar la pagina actual
+    "REPORT_BUG",           # Reportar un bug o problema
     "UNKNOWN",              # No clasificado
 ]
 
@@ -86,6 +90,139 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             "source": "local"
         }
 
+    # ================================
+    # NGM Hub Help Questions
+    # ================================
+
+    # Preguntas sobre dónde/cómo ver algo
+    ngm_help_patterns = [
+        (r'(dónde|donde|como|cómo)\s+(puedo\s+)?(ver|encontrar|buscar)\s+(.+)', 'view'),
+        (r'(dónde|donde)\s+(están?|estan?)\s+(.+)', 'location'),
+        (r'(cómo|como)\s+(funciona|uso|utilizo|trabajo con)\s+(.+)', 'howto'),
+        (r'(qué|que)\s+(es|significa|hace)\s+(.+?)\s+(en|del?)\s+(ngm|hub|sistema)', 'definition'),
+        (r'(explica|explicame|dime)\s+(sobre|acerca|de)\s+(.+)', 'explain'),
+    ]
+
+    for pattern, query_type in ngm_help_patterns:
+        match = re.search(pattern, t)
+        if match:
+            # Extract the topic from the match
+            topic = match.group(match.lastindex) if match.lastindex else ""
+            return {
+                "intent": "NGM_HELP",
+                "entities": {"query_type": query_type, "topic": topic.strip()},
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # Preguntas específicas por módulo
+    module_keywords = {
+        "expenses": ["gastos", "expenses", "facturas", "invoices", "recibos", "receipts"],
+        "pipeline": ["tareas", "tasks", "pipeline", "proyectos activos"],
+        "projects": ["proyectos", "projects", "proyecto"],
+        "vendors": ["vendors", "proveedores", "vendor"],
+        "accounts": ["cuentas", "accounts", "cuenta"],
+        "budgets": ["presupuestos", "budgets", "budget"],
+        "team": ["equipo", "team", "usuarios", "users"],
+    }
+
+    for module, keywords in module_keywords.items():
+        for kw in keywords:
+            if kw in t and re.search(r'(dónde|donde|cómo|como|qué|que|ver|encontrar)', t):
+                return {
+                    "intent": "NGM_HELP",
+                    "entities": {"module": module, "topic": t},
+                    "confidence": 0.85,
+                    "source": "local"
+                }
+
+    # ================================
+    # NGM Hub Actions
+    # ================================
+
+    action_patterns = [
+        # Expenses actions
+        (r'(agregar?|añadir?|crear?|nuevo?)\s+(un\s+)?(gasto|expense)', 'open_add_expense'),
+        (r'(escanear?|scanear?|scan)\s+(un\s+)?(recibo|receipt)', 'open_scan_receipt'),
+        (r'(subir?|upload)\s+(un\s+)?(recibo|receipt|factura)', 'open_scan_receipt'),
+        # Navigation
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(gastos|expenses)', 'navigate_expenses'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(pipeline|tareas)', 'navigate_pipeline'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(proyectos|projects)', 'navigate_projects'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(vendors|proveedores)', 'navigate_vendors'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(cuentas|accounts)', 'navigate_accounts'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(equipo|team)', 'navigate_team'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(presupuestos|budgets)', 'navigate_budgets'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(reportes|reports|reporting)', 'navigate_reporting'),
+        # Pipeline actions
+        (r'(crear?|agregar?|nuevo?)\s+(una?\s+)?(tarea|task)', 'open_add_task'),
+    ]
+
+    for pattern, action in action_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "NGM_ACTION",
+                "entities": {"action": action},
+                "confidence": 0.95,
+                "source": "local"
+            }
+
+    # ================================
+    # Copilot Commands (page-specific filters/actions)
+    # ================================
+
+    copilot_patterns = [
+        # Filtering commands
+        (r'(mostrar?me|muestrame|muestra|show|ver)\s+(solo\s+)?(los?\s+)?(gastos?|tareas?|proyectos?|usuarios?).*(pendiente|autorizado|completad|activo|progreso)', 'filter'),
+        (r'(filtrar?|filter)\s+(por\s+)?(.+)', 'filter'),
+        (r'(solo\s+)(pendientes?|autorizados?|completados?|activos?|en\s+progreso)', 'filter'),
+        # Sorting commands
+        (r'(ordenar?|sort)\s+(por\s+)?(.+)', 'sort'),
+        (r'(de\s+)?(mayor|menor)\s+a\s+(mayor|menor)', 'sort'),
+        (r'(mas\s+)?(recientes?|antiguos?|nuevos?)\s+(primero)?', 'sort'),
+        # Expand/Collapse
+        (r'(expandir?|abrir?|mostrar?)\s+(todo|todos|todas|all|detalles)', 'expand'),
+        (r'(colapsar?|cerrar?|ocultar?|contraer)\s+(todo|todos|todas|all|detalles)', 'collapse'),
+        # Clear filters
+        (r'(limpiar?|quitar?|remover?|reset|clear)\s+(los?\s+)?(filtros?|filters?)', 'clear_filters'),
+        # Search
+        (r'(buscar?|search|encontrar?|find)\s+(.+)', 'search'),
+    ]
+
+    for pattern, command_type in copilot_patterns:
+        match = re.search(pattern, t)
+        if match:
+            return {
+                "intent": "COPILOT",
+                "entities": {
+                    "command_type": command_type,
+                    "raw_command": t,
+                },
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # ================================
+    # Bug Reports
+    # ================================
+
+    bug_patterns = [
+        r'(reportar?|report)\s+(un\s+)?(bug|error|fallo|problema)',
+        r'(encontré|encontre|hay)\s+(un\s+)?(bug|error|fallo|problema)',
+        r'(algo|esto)\s+(está|esta)\s+(fallando|roto|mal)',
+        r'(no\s+funciona|no\s+sirve|está\s+roto|esta\s+roto)',
+        r'(tengo\s+un\s+)(problema|issue|error)',
+    ]
+
+    for pattern in bug_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "REPORT_BUG",
+                "entities": {"description": t},
+                "confidence": 0.9,
+                "source": "local"
+            }
+
     return None
 
 
@@ -112,12 +249,43 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
    - Extrae: 'project', 'question'.
 
 4) INFO
-   - Preguntas sobre funciones o capacidades del sistema.
-   - Ayuda, quién eres, qué puedes hacer.
+   - Preguntas sobre funciones o capacidades del sistema (Arturito).
+   - Ayuda, quién eres, qué puedes hacer como bot.
 
-5) SMALL_TALK
+5) NGM_HELP
+   - Preguntas sobre cómo usar NGM Hub o sus módulos.
+   - Señales: "dónde puedo ver...", "cómo funciona...", "dónde están los...", "qué es X en el sistema".
+   - Preguntas sobre ubicación de funciones: gastos, facturas, tareas, proyectos, etc.
+   - Extrae: 'module' (expenses, pipeline, projects, vendors, etc.), 'topic' (qué busca).
+
+6) NGM_ACTION
+   - Usuario quiere EJECUTAR una acción en el sistema (navegar, abrir modales).
+   - Señales: "agregar gasto", "crear tarea", "llévame a...", "abrir...", "escanear recibo".
+   - Extrae: 'action' (nombre de la acción a ejecutar).
+
+7) COPILOT
+   - Usuario quiere controlar la PAGINA ACTUAL: filtrar, ordenar, buscar, expandir/colapsar.
+   - Señales: "muestrame solo...", "filtrar por...", "ordenar por...", "buscar...", "expandir todo".
+   - Comandos para la UI de la pagina actual sin necesidad de navegar.
+   - Extrae: 'command_type' (filter, sort, search, expand, collapse, clear_filters), 'params' (parametros del comando).
+   - Ejemplos: "muestrame solo gastos pendientes", "filtrar por proyecto Del Rio", "ordenar por fecha".
+
+8) REPORT_BUG
+   - Usuario quiere reportar un bug, error o problema.
+   - Señales: "reportar bug", "encontré un error", "algo no funciona", "hay un problema".
+   - Extrae: 'description' (descripción del problema).
+
+9) SMALL_TALK
    - Conversación general o dudas técnicas simples.
-   - Saludos, chistes, preguntas no relacionadas con proyectos.
+   - Saludos, chistes, preguntas no relacionadas con proyectos ni NGM Hub.
+
+PRIORIDAD DE CLASIFICACIÓN:
+- Si el usuario quiere CONTROLAR la pagina actual (filtrar, ordenar, buscar) → COPILOT
+- Si el usuario pregunta sobre FUNCIONES del sistema NGM Hub → NGM_HELP
+- Si el usuario quiere NAVEGAR o ABRIR modales → NGM_ACTION
+- Si el usuario reporta un PROBLEMA → REPORT_BUG
+- Si pregunta sobre datos de un PROYECTO (budget, actuals) → BUDGET_VS_ACTUALS o CONSULTA_ESPECIFICA
+- Si pregunta sobre Arturito (el bot) → INFO
 
 REGLAS DE RESPUESTA:
 - Devuelve SOLO JSON válido, sin markdown ni explicaciones.
@@ -125,7 +293,7 @@ REGLAS DE RESPUESTA:
 - Formato exacto:
 {
   "intent": "INTENT_NAME",
-  "entities": { "project": "...", "topic": "...", "question": "..." },
+  "entities": { "project": "...", "topic": "...", "module": "...", "action": "...", "description": "..." },
   "confidence": 0.85
 }
 """

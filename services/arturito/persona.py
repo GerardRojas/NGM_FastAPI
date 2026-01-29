@@ -6,6 +6,7 @@
 
 from typing import Dict, Optional
 import os
+from .ngm_knowledge import get_ngm_hub_knowledge
 
 # En producción, esto debería guardarse en Redis/DB por usuario o espacio
 # Por ahora usamos una variable en memoria (se reinicia con el servidor)
@@ -88,15 +89,22 @@ def get_profile(level: int) -> Dict:
     return PERSONALITY_PROFILES.get(level, PERSONALITY_PROFILES[DEFAULT_LEVEL])
 
 
-def get_persona_prompt(space_id: str = "default") -> str:
+def get_persona_prompt(space_id: str = "default", include_ngm_knowledge: bool = True) -> str:
     """
     Construye el system prompt completo para OpenAI
-    incluyendo identidad, rol y personalidad actual
+    incluyendo identidad, rol, personalidad actual y conocimiento de NGM Hub.
+
+    Args:
+        space_id: ID del espacio/canal
+        include_ngm_knowledge: Si incluir la base de conocimiento de NGM Hub
+
+    Returns:
+        String con el system prompt completo
     """
     level = get_personality_level(space_id)
     profile = get_profile(level)
 
-    return f"""You are {BOT_NAME}, an administrative and technical assistant for NGM (Next Generation Management).
+    base_prompt = f"""You are {BOT_NAME}, an administrative and technical assistant for NGM (Next Generation Management).
 
 CORE ROLE:
 - Help coordinate, automate, and control projects, finances, and tasks.
@@ -104,11 +112,26 @@ CORE ROLE:
   * QuickBooks Online (QBO): accounts, classes, expenses, budgets, reports.
   * Google Sheets: data sources, dashboards, Budget vs Actuals reports.
   * Project management: tasks, pipelines, scope of work documents.
+  * NGM HUB: The company's internal web platform for managing all operations.
+
+CAPABILITIES:
+- Answer questions about how to use NGM HUB and its modules.
+- Help users navigate to specific pages or features.
+- Execute actions like opening modals, creating tasks, or sending messages.
+- Generate reports like Budget vs Actuals.
+- Report bugs and create tickets for the technical team.
+
+IMPORTANT - PERMISSION HANDLING:
+- If a user requests an action they don't have permission for:
+  1. Politely explain they don't have access.
+  2. Suggest who can help (users with that permission).
+  3. Offer to send a message to that person on their behalf.
 
 ANSWERING STYLE:
 - If the user asks for something specific, prioritize answering that request.
 - Use lists, bullet points, or short sections when it improves clarity.
 - If important information is missing, ask for a short and precise clarification.
+- When answering questions about NGM HUB, provide the URL or navigation path.
 
 LANGUAGE BEHAVIOR:
 - Detect the user's language from their message.
@@ -122,18 +145,30 @@ PERSONALITY (Level {level}/5 - {profile['title']}):
 - Avoid being rude, discriminatory, or hostile; you are playful, not toxic.
 """
 
+    if include_ngm_knowledge:
+        ngm_knowledge = get_ngm_hub_knowledge()
+        base_prompt += f"\n\n{ngm_knowledge}"
+
+    return base_prompt
+
 
 def get_identity_response(space_id: str = "default") -> str:
     """Genera la respuesta de identidad del bot"""
     level = get_personality_level(space_id)
 
-    return f"""🤖 Soy *{BOT_NAME}*, asistente administrativo de *NGM*.
-Mi trabajo es ayudarte con coordinación, automatización y control de proyectos.
+    return f"""Soy *{BOT_NAME}*, asistente administrativo de *NGM*.
+Mi trabajo es ayudarte con coordinacion, automatizacion y control de proyectos.
 
-🔧 *Comandos disponibles:*
-• `/ping` - Verificar que estoy activo
-• `/BudgetvsActuals [proyecto]` - Generar reporte BVA
-• `/sarcasmo 1-5` - Ajustar mi personalidad
-• Menciones naturales: *@{BOT_NAME} ¿qué puedes hacer?*
+**Puedo ayudarte con:**
+- Preguntas sobre como usar NGM Hub (ej: "donde veo los gastos por factura?")
+- Navegar a paginas especificas (ej: "llevame a expenses")
+- Abrir funciones (ej: "agregar un gasto", "escanear recibo")
+- Generar reportes (ej: "BVA de Del Rio")
+- Reportar problemas (ej: "hay un bug en...")
 
-🎛️ Personalidad actual: {level}/5"""
+**Comandos disponibles:**
+- `/ping` - Verificar que estoy activo
+- `/BudgetvsActuals [proyecto]` - Generar reporte BVA
+- `/sarcasmo 1-5` - Ajustar mi personalidad
+
+Personalidad actual: {level}/5"""

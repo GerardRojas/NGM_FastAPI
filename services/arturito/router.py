@@ -9,6 +9,10 @@ from .handlers import (
     handle_budget_vs_actuals,
     handle_info,
     handle_scope_of_work,
+    handle_ngm_help,
+    handle_ngm_action,
+    handle_bug_report,
+    handle_copilot,
 )
 from .persona import set_personality_level, get_identity_response
 from .responder import generate_small_talk_response
@@ -64,7 +68,35 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "handler": None,  # Usa responder con GPT
         "required_entities": [],
         "optional_entities": [],
-        "description": "Conversación general",
+        "description": "Conversacion general",
+    },
+
+    "NGM_HELP": {
+        "handler": handle_ngm_help,
+        "required_entities": [],
+        "optional_entities": ["module", "topic", "query_type"],
+        "description": "Preguntas sobre como usar NGM Hub",
+    },
+
+    "NGM_ACTION": {
+        "handler": None,  # Manejado directamente en route() (async)
+        "required_entities": [],
+        "optional_entities": ["action"],
+        "description": "Ejecutar acciones en NGM Hub (navegar, abrir modales)",
+    },
+
+    "REPORT_BUG": {
+        "handler": None,  # Manejado directamente en route() (async)
+        "required_entities": [],
+        "optional_entities": ["description"],
+        "description": "Reportar un bug o problema",
+    },
+
+    "COPILOT": {
+        "handler": handle_copilot,
+        "required_entities": [],
+        "optional_entities": ["command_type", "raw_command"],
+        "description": "Comandos copilot para controlar la pagina actual",
     },
 }
 
@@ -168,6 +200,34 @@ def route(
         return {
             "text": response,
             "action": "small_talk"
+        }
+
+    # NGM_ACTION - Needs async handling (delegated to async_route)
+    if intent == "NGM_ACTION":
+        # Return marker for async processing
+        return {
+            "text": None,
+            "action": "ngm_action_pending",
+            "data": {
+                "intent": intent,
+                "entities": entities,
+                "raw_text": raw_text,
+            },
+            "requires_async": True
+        }
+
+    # REPORT_BUG - Needs async handling (delegated to async_route)
+    if intent == "REPORT_BUG":
+        # Return marker for async processing
+        return {
+            "text": None,
+            "action": "report_bug_pending",
+            "data": {
+                "intent": intent,
+                "entities": entities,
+                "raw_text": raw_text,
+            },
+            "requires_async": True
         }
 
     # ================================
@@ -290,6 +350,55 @@ def route_slash_command(
         }
 
     return {
-        "text": f"❓ Comando desconocido: /{command}",
+        "text": f"Comando desconocido: /{command}",
         "action": "unknown_command"
     }
+
+
+# ================================
+# Async Router for NGM Hub Actions
+# ================================
+
+async def route_async(
+    intent_obj: Dict[str, Any],
+    context: Dict[str, Any] = None,
+    db_client=None
+) -> Dict[str, Any]:
+    """
+    Async version of route() that handles NGM_ACTION and REPORT_BUG intents.
+    Falls back to sync route() for other intents.
+
+    Args:
+        intent_obj: Resultado de interpret_message() con intent, entities, confidence
+        context: Contexto adicional (user, space_id, space_name, user_id, current_page, etc.)
+        db_client: Supabase client for permission checking
+
+    Returns:
+        Dict con la respuesta formateada
+    """
+    intent = intent_obj.get("intent", "UNKNOWN").upper()
+    entities = intent_obj.get("entities", {})
+    raw_text = intent_obj.get("raw_text", "")
+
+    # Handle NGM_ACTION
+    if intent == "NGM_ACTION":
+        request = {
+            "intent": intent,
+            "entities": entities,
+            "raw_text": raw_text,
+        }
+        result = await handle_ngm_action(request, context, db_client)
+        return result
+
+    # Handle REPORT_BUG
+    if intent == "REPORT_BUG":
+        request = {
+            "intent": intent,
+            "entities": entities,
+            "raw_text": raw_text,
+        }
+        result = await handle_bug_report(request, context, db_client)
+        return result
+
+    # Fall back to sync route for all other intents
+    return route(intent_obj, context)

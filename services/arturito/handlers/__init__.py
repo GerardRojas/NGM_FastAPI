@@ -4,9 +4,15 @@
 from .bva_handler import handle_budget_vs_actuals
 from .info_handler import handle_info
 from .sow_handler import handle_scope_of_work
+from .ngm_hub_handler import handle_ngm_help, handle_ngm_action, handle_bug_report
+from .copilot_handler import handle_copilot
 
 __all__ = [
     "handle_budget_vs_actuals",
     "handle_info",
     "handle_scope_of_work",
+    "handle_ngm_help",
+    "handle_ngm_action",
+    "handle_bug_report",
+    "handle_copilot",
 ]
