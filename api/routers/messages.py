@@ -10,13 +10,15 @@
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
+import re
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 from api.supabase_client import supabase
 from api.auth import get_current_user
-from api.services.slack_notifications import notify_mentioned_users
+from api.services.firebase_notifications import notify_mentioned_users
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
@@ -143,8 +145,40 @@ def get_attachments_for_message(message_id: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _get_channel_name(channel_type: str, project_id: Optional[str], channel_id: Optional[str]) -> str:
-    """Get human-readable channel name for notifications"""
+def extract_mentioned_user_ids(content: str, sender_user_id: str) -> List[str]:
+    """
+    Extract user IDs from @mentions in message content.
+    Returns list of user IDs that were mentioned (excluding sender).
+    """
+    # Find all @mentions (assuming format @Username)
+    mention_pattern = r"@(\w+)"
+    mentioned_names = re.findall(mention_pattern, content)
+
+    if not mentioned_names:
+        return []
+
+    try:
+        # Look up user IDs by name
+        result = supabase.table("users") \
+            .select("user_id, user_name") \
+            .in_("user_name", mentioned_names) \
+            .execute()
+
+        user_ids = []
+        for user in (result.data or []):
+            user_id = str(user.get("user_id", ""))
+            # Don't notify the sender
+            if user_id and user_id != sender_user_id:
+                user_ids.append(user_id)
+
+        return user_ids
+    except Exception as e:
+        print(f"[Messages] Error extracting mentions: {e}")
+        return []
+
+
+def get_channel_name(channel_type: str, project_id: str = None, channel_id: str = None) -> str:
+    """Get a human-readable channel name for notifications."""
     try:
         if channel_type.startswith("project_") and project_id:
             proj_result = supabase.table("projects") \
@@ -159,7 +193,7 @@ def _get_channel_name(channel_type: str, project_id: Optional[str], channel_id: 
                     "project_accounting": "Accounting",
                     "project_receipts": "Receipts"
                 }.get(channel_type, "")
-                return f"{proj_result.data.get('project_name', 'Project')} - {channel_label}"
+                return f"{proj_result.data.get('project_name', '')} · {channel_label}"
 
         elif channel_id:
             chan_result = supabase.table("channels") \
@@ -169,11 +203,47 @@ def _get_channel_name(channel_type: str, project_id: Optional[str], channel_id: 
                 .execute()
 
             if chan_result.data:
-                return chan_result.data.get("name", "Channel")
+                return chan_result.data.get("name", "Messages")
 
-        return "NGM Hub Messages"
     except Exception:
-        return "NGM Hub Messages"
+        pass
+
+    return "Messages"
+
+
+async def send_mention_notifications(
+    content: str,
+    sender_user_id: str,
+    sender_name: str,
+    sender_avatar_color: str,
+    channel_type: str,
+    project_id: str = None,
+    channel_id: str = None
+):
+    """Background task to send push notifications for mentions."""
+    mentioned_user_ids = extract_mentioned_user_ids(content, sender_user_id)
+
+    if not mentioned_user_ids:
+        return
+
+    channel_name = get_channel_name(channel_type, project_id, channel_id)
+
+    # Build URL for notification click
+    if channel_type.startswith("project_") and project_id:
+        message_url = f"/messages.html?project={project_id}&channel={channel_type}"
+    elif channel_id:
+        message_url = f"/messages.html?channel={channel_id}"
+    else:
+        message_url = "/messages.html"
+
+    await notify_mentioned_users(
+        mentioned_user_ids=mentioned_user_ids,
+        sender_name=sender_name,
+        message_preview=content,
+        channel_name=channel_name,
+        message_url=message_url,
+        avatar_color=sender_avatar_color
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -276,22 +346,26 @@ def create_message(
 
         response = normalize_message(msg)
         sender_name = "Someone"
+        sender_avatar_color = None
+
         if user_result.data:
             response["user_name"] = user_result.data.get("user_name")
             response["avatar_color"] = user_result.data.get("avatar_color")
             sender_name = user_result.data.get("user_name", "Someone")
+            sender_avatar_color = user_result.data.get("avatar_color")
 
-        # Get channel name for Slack notification context
-        channel_name = _get_channel_name(payload.channel_type, payload.project_id, payload.channel_id)
-
-        # Send Slack notifications in background (non-blocking)
+        # Send push notifications for @mentions (in background)
         background_tasks.add_task(
-            notify_mentioned_users,
-            message_id=str(msg["id"]),
-            content=payload.content,
-            sender_id=str(user_id),
-            sender_name=sender_name,
-            channel_name=channel_name
+            asyncio.get_event_loop().run_until_complete,
+            send_mention_notifications(
+                content=payload.content,
+                sender_user_id=user_id,
+                sender_name=sender_name,
+                sender_avatar_color=sender_avatar_color,
+                channel_type=payload.channel_type,
+                project_id=payload.project_id,
+                channel_id=payload.channel_id
+            )
         )
 
         return {"message": response}
@@ -369,6 +443,8 @@ def create_thread_reply(
             raise HTTPException(status_code=500, detail="Failed to create reply")
 
         msg = normalize_message(result.data[0])
+        sender_name = "Someone"
+        sender_avatar_color = None
 
         # Get user info
         user_result = supabase.table("users") \
@@ -377,27 +453,24 @@ def create_thread_reply(
             .single() \
             .execute()
 
-        sender_name = "Someone"
         if user_result.data:
             msg["user_name"] = user_result.data.get("user_name")
             msg["avatar_color"] = user_result.data.get("avatar_color")
             sender_name = user_result.data.get("user_name", "Someone")
+            sender_avatar_color = user_result.data.get("avatar_color")
 
-        # Get channel name for Slack notification context
-        channel_name = _get_channel_name(
-            parent_data["channel_type"],
-            parent_data.get("project_id"),
-            parent_data.get("channel_id")
-        )
-
-        # Send Slack notifications in background (non-blocking)
+        # Send push notifications for @mentions (in background)
         background_tasks.add_task(
-            notify_mentioned_users,
-            message_id=str(result.data[0]["id"]),
-            content=payload.content,
-            sender_id=str(user_id),
-            sender_name=sender_name,
-            channel_name=f"{channel_name} (thread)"
+            asyncio.get_event_loop().run_until_complete,
+            send_mention_notifications(
+                content=payload.content,
+                sender_user_id=user_id,
+                sender_name=sender_name,
+                sender_avatar_color=sender_avatar_color,
+                channel_type=parent_data["channel_type"],
+                project_id=parent_data.get("project_id"),
+                channel_id=parent_data.get("channel_id")
+            )
         )
 
         return {"reply": msg}

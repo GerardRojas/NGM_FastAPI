@@ -44,3 +44,4 @@ pdf2image==1.17.0
 Pillow>=12.1.0
 python-multipart==0.0.20
 reportlab>=4.0.0
+firebase-admin>=6.0.0
