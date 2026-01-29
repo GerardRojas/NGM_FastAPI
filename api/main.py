@@ -38,6 +38,9 @@ from api.routers.arturito import router as arturito_router
 # ========= MESSAGES: Chat Module ==========
 from api.routers.messages import router as messages_router
 
+# ========= SLACK: Push Notifications ==========
+from api.routers.slack import router as slack_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -115,6 +118,9 @@ app.include_router(arturito_router)
 
 # Messages (Chat module - channels, threads, reactions)
 app.include_router(messages_router)
+
+# Slack Integration (Push notifications for @mentions)
+app.include_router(slack_router)
 
 # ========================================
 # Root & Healthcheck

@@ -38,30 +38,38 @@ def handle_info(
     # Información de personalidad actual
     if topic == "personality" or "sarcasmo" in request.get("raw_text", "").lower():
         level = get_personality_level(space_id)
+        modes = {
+            1: "modo corporativo (aburrido)",
+            2: "modo amigable",
+            3: "modo normal",
+            4: "modo sarcastico",
+            5: "modo ultra sarcastico"
+        }
         return {
-            "text": f"🎛️ Mi nivel de personalidad actual es *{level}/5*.\n\nUsa `/sarcasmo 1-5` para cambiarlo.",
+            "text": f"Estoy en nivel **{level}/5** - {modes.get(level, 'normal')}.\n\nSi quieres que sea mas nice (o mas pesado), usa `/sarcasmo 1-5`.",
             "action": "personality_info"
         }
 
     # Ayuda general (default)
-    help_text = """🤖 *Arturito - Asistente NGM*
+    help_text = """A ver, te explico rapido que puedo hacer:
 
-📋 *Comandos disponibles:*
+**Navegacion** (te llevo a donde quieras):
+- "llevame a gastos" / "abre pipeline" / "ir a proyectos"
 
-*Reportes:*
-• `/BudgetvsActuals [proyecto]` - Genera reporte BVA en PDF
-• `@Arturito ¿cuánto tengo en HVAC?` - Consulta específica
+**Acciones** (hago cosas por ti):
+- "agregar un gasto" / "crear tarea" / "escanear recibo"
 
-*Sistema:*
-• `/ping` - Verificar que estoy activo
-• `/sarcasmo 1-5` - Ajustar mi personalidad
-• `/help` - Ver esta ayuda
+**Copilot** (controlo la pagina actual):
+- "filtrar por proyecto X" / "mostrar solo pendientes" / "limpiar filtros"
 
-*Consultas naturales:*
-• Menciónme con `@Arturito` seguido de tu pregunta
-• Puedo responder sobre presupuestos, gastos, y proyectos
+**Preguntas** (se donde estan las cosas):
+- "como agrego un gasto?" / "donde veo mis tareas?"
 
-💡 *Tip:* Si estás en un espacio de proyecto, no necesitas especificar el nombre del proyecto."""
+**Bugs** (creo tickets):
+- "tengo un bug" / "algo no funciona"
+
+Si soy muy sarcastico usa `/sarcasmo 1-5` para bajarle.
+Si soy muy aburrido... tambien."""
 
     return {
         "text": help_text,

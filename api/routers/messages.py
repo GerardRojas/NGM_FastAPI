@@ -10,12 +10,13 @@
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 from api.supabase_client import supabase
 from api.auth import get_current_user
+from api.services.slack_notifications import notify_mentioned_users
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
@@ -142,6 +143,39 @@ def get_attachments_for_message(message_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def _get_channel_name(channel_type: str, project_id: Optional[str], channel_id: Optional[str]) -> str:
+    """Get human-readable channel name for notifications"""
+    try:
+        if channel_type.startswith("project_") and project_id:
+            proj_result = supabase.table("projects") \
+                .select("project_name") \
+                .eq("project_id", project_id) \
+                .single() \
+                .execute()
+
+            if proj_result.data:
+                channel_label = {
+                    "project_general": "General",
+                    "project_accounting": "Accounting",
+                    "project_receipts": "Receipts"
+                }.get(channel_type, "")
+                return f"{proj_result.data.get('project_name', 'Project')} - {channel_label}"
+
+        elif channel_id:
+            chan_result = supabase.table("channels") \
+                .select("name") \
+                .eq("id", channel_id) \
+                .single() \
+                .execute()
+
+            if chan_result.data:
+                return chan_result.data.get("name", "Channel")
+
+        return "NGM Hub Messages"
+    except Exception:
+        return "NGM Hub Messages"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MESSAGES ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -203,6 +237,7 @@ def get_messages(
 @router.post("", status_code=201)
 def create_message(
     payload: MessageCreate,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new message"""
@@ -240,9 +275,24 @@ def create_message(
             .execute()
 
         response = normalize_message(msg)
+        sender_name = "Someone"
         if user_result.data:
             response["user_name"] = user_result.data.get("user_name")
             response["avatar_color"] = user_result.data.get("avatar_color")
+            sender_name = user_result.data.get("user_name", "Someone")
+
+        # Get channel name for Slack notification context
+        channel_name = _get_channel_name(payload.channel_type, payload.project_id, payload.channel_id)
+
+        # Send Slack notifications in background (non-blocking)
+        background_tasks.add_task(
+            notify_mentioned_users,
+            message_id=str(msg["id"]),
+            content=payload.content,
+            sender_id=str(user_id),
+            sender_name=sender_name,
+            channel_name=channel_name
+        )
 
         return {"message": response}
 
@@ -285,6 +335,7 @@ def get_thread_replies(
 def create_thread_reply(
     message_id: str,
     payload: ThreadReplyCreate,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user)
 ):
     """Reply to a message in a thread"""
@@ -326,9 +377,28 @@ def create_thread_reply(
             .single() \
             .execute()
 
+        sender_name = "Someone"
         if user_result.data:
             msg["user_name"] = user_result.data.get("user_name")
             msg["avatar_color"] = user_result.data.get("avatar_color")
+            sender_name = user_result.data.get("user_name", "Someone")
+
+        # Get channel name for Slack notification context
+        channel_name = _get_channel_name(
+            parent_data["channel_type"],
+            parent_data.get("project_id"),
+            parent_data.get("channel_id")
+        )
+
+        # Send Slack notifications in background (non-blocking)
+        background_tasks.add_task(
+            notify_mentioned_users,
+            message_id=str(result.data[0]["id"]),
+            content=payload.content,
+            sender_id=str(user_id),
+            sender_name=sender_name,
+            channel_name=f"{channel_name} (thread)"
+        )
 
         return {"reply": msg}
 
