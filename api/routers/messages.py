@@ -589,6 +589,41 @@ def create_channel(
         if payload.type == "direct" and len(payload.member_ids) == 0:
             raise HTTPException(status_code=400, detail="At least one member required for direct messages")
 
+        # For direct messages, check if a DM already exists with these exact members
+        if payload.type == "direct":
+            all_member_ids = set(payload.member_ids + [user_id])
+
+            # Find existing DM channels where the current user is a member
+            existing_channels = supabase.table("channels") \
+                .select("id, type, name, description, created_by, created_at") \
+                .eq("type", "direct") \
+                .execute()
+
+            for channel in (existing_channels.data or []):
+                # Get members of this channel
+                members_result = supabase.table("channel_members") \
+                    .select("user_id") \
+                    .eq("channel_id", channel["id"]) \
+                    .execute()
+
+                channel_member_ids = set(m["user_id"] for m in (members_result.data or []))
+
+                # If the members match exactly, return existing channel
+                if channel_member_ids == all_member_ids:
+                    existing = normalize_channel(channel)
+                    # Add members info
+                    existing["members"] = []
+                    for mid in channel_member_ids:
+                        user_info = supabase.table("users") \
+                            .select("user_id, user_name, avatar_color") \
+                            .eq("user_id", mid) \
+                            .single() \
+                            .execute()
+                        if user_info.data:
+                            existing["members"].append(user_info.data)
+
+                    return {"channel": existing, "existing": True}
+
         # Create channel
         channel_data = {
             "type": payload.type,
