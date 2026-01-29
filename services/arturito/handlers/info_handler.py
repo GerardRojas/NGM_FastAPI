@@ -26,17 +26,19 @@ def handle_info(
     ctx = context or {}
     space_id = ctx.get("space_id", "default")
 
-    topic = entities.get("topic", "").lower()
+    # Handle None values gracefully (entities.get can return None if key exists with None value)
+    topic = (entities.get("topic") or "").lower()
+    raw_text = (request.get("raw_text") or "").lower()
 
     # Identidad del bot
-    if topic == "identity" or "quien" in request.get("raw_text", "").lower():
+    if topic == "identity" or "quien" in raw_text:
         return {
             "text": get_identity_response(space_id),
             "action": "identity"
         }
 
     # Información de personalidad actual
-    if topic == "personality" or "sarcasmo" in request.get("raw_text", "").lower():
+    if topic == "personality" or "sarcasmo" in raw_text:
         level = get_personality_level(space_id)
         modes = {
             1: "modo corporativo (aburrido)",
