@@ -671,6 +671,45 @@ COPILOT_ACTIONS = {
                     "check for duplicate bills",
                 ],
             },
+            # Filter Duplicates
+            "filter_by_duplicates": {
+                "description": "Filtrar y mostrar solo gastos marcados como posibles duplicados",
+                "command": "filterByDuplicates",
+                "params": [],
+                "keywords": [
+                    "mostrar duplicados", "show duplicates", "solo duplicados",
+                    "only duplicates", "filtrar duplicados", "filter duplicates",
+                    "gastos duplicados", "duplicate expenses", "posibles duplicados",
+                    "ver duplicados", "see duplicates", "parecen duplicados",
+                    "look like duplicates", "duplicates only",
+                ],
+                "examples": [
+                    "muestrame solo gastos que parecen duplicados",
+                    "mostrar gastos duplicados",
+                    "filtrar por duplicados",
+                    "ver solo los duplicados",
+                    "show only duplicate expenses",
+                    "filter by duplicates",
+                ],
+            },
+            # Clear Duplicate Filter
+            "clear_duplicate_filter": {
+                "description": "Quitar filtro de duplicados y mostrar todos los gastos",
+                "command": "clearDuplicateFilter",
+                "params": [],
+                "keywords": [
+                    "quitar filtro duplicados", "limpiar filtro", "clear filter",
+                    "mostrar todos", "show all", "ver todos", "todos los gastos",
+                    "all expenses", "remove duplicate filter", "quitar duplicados",
+                ],
+                "examples": [
+                    "mostrar todos los gastos",
+                    "quitar filtro de duplicados",
+                    "ver todos",
+                    "limpiar filtros",
+                    "show all expenses",
+                ],
+            },
         },
     },
 

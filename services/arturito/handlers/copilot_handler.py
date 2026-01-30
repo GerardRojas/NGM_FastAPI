@@ -93,6 +93,10 @@ def handle_copilot(
             "mismo número pero asignadas a diferentes vendors. Si encuentro conflictos, "
             "los resaltaré en naranja en la tabla."
         ),
+        "filterByDuplicates": (
+            "Filtrando la tabla para mostrar solo los gastos que parecen duplicados. "
+            "Estos son gastos con el mismo número de factura pero asignados a diferentes vendors."
+        ),
     }
 
     if command in custom_messages:

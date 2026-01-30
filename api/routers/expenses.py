@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, File, UploadFile
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form
 from pydantic import BaseModel
 from api.supabase_client import supabase
 from typing import Optional, List
@@ -894,13 +894,20 @@ IMPORTANT:
 
 
 @router.post("/parse-receipt")
-async def parse_receipt(file: UploadFile = File(...)):
+async def parse_receipt(
+    file: UploadFile = File(...),
+    model: str = Form("fast")
+):
     """
     Parsea un recibo/factura usando OpenAI Vision API.
 
     Acepta: imágenes (JPG, PNG, WebP, GIF) y PDFs
 
     Para PDFs, se convierte la primera página a imagen antes de procesarla.
+
+    Args:
+        file: Archivo de imagen o PDF del recibo
+        model: Modelo a usar - "fast" (gpt-4o-mini) o "heavy" (gpt-4o)
 
     Retorna: JSON estructurado con los gastos detectados
 
@@ -918,9 +925,13 @@ async def parse_receipt(file: UploadFile = File(...)):
                 }
             ]
         },
-        "count": 1
+        "count": 1,
+        "model_used": "fast"
     }
     """
+    # Determine which OpenAI model to use
+    openai_model = "gpt-4o" if model == "heavy" else "gpt-4o-mini"
+    print(f"[PARSE-RECEIPT] Using model: {openai_model} (requested: {model})")
     try:
         # Validar tipo de archivo
         allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "application/pdf"]
@@ -1173,7 +1184,7 @@ DO NOT include any text before or after the JSON. ONLY return the JSON object.""
 
         # Llamar a OpenAI Vision API
         response = client.chat.completions.create(
-            model="gpt-4o",  # GPT-4 Vision model
+            model=openai_model,  # Selected based on user preference (fast=gpt-4o-mini, heavy=gpt-4o)
             messages=[
                 {
                     "role": "user",
@@ -1226,7 +1237,8 @@ DO NOT include any text before or after the JSON. ONLY return the JSON object.""
         return {
             "success": True,
             "data": parsed_data,
-            "count": len(parsed_data["expenses"])
+            "count": len(parsed_data["expenses"]),
+            "model_used": model  # "fast" or "heavy"
         }
 
     except HTTPException:

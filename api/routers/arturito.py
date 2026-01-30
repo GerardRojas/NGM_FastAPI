@@ -72,6 +72,7 @@ class WebChatMessage(BaseModel):
     session_id: Optional[str] = None
     personality_level: Optional[int] = 3
     thread_id: Optional[str] = None  # Optional: client can provide existing thread
+    current_page: Optional[str] = None  # Page user is on (e.g., "expenses.html") for copilot context
 
 
 # ================================
@@ -222,6 +223,7 @@ async def web_chat(message: WebChatMessage):
             "space_name": "NGM HUB Web",
             "space_id": session_id,
             "is_mention": True,
+            "current_page": message.current_page,  # Page context for copilot commands
         }
 
         # Establecer personalidad
