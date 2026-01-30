@@ -197,7 +197,11 @@ async def get_valid_access_token(realm_id: str) -> str:
     tokens = result.data
 
     # Check if access token is expired (with 5 min buffer)
-    expires_at = datetime.fromisoformat(tokens["access_token_expires_at"].replace("Z", ""))
+    expires_str = tokens["access_token_expires_at"].replace("Z", "+00:00")
+    expires_at = datetime.fromisoformat(expires_str)
+    # Make naive for comparison with utcnow()
+    if expires_at.tzinfo is not None:
+        expires_at = expires_at.replace(tzinfo=None)
     if datetime.utcnow() >= (expires_at - timedelta(minutes=5)):
         # Token expired or about to expire, refresh it
         await refresh_access_token(realm_id)
@@ -452,11 +456,15 @@ def get_connection_status() -> Dict[str, Any]:
                 refresh_valid = False
 
                 if access_expires_str:
-                    access_expires = datetime.fromisoformat(access_expires_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    access_expires = datetime.fromisoformat(access_expires_str.replace("Z", "+00:00"))
+                    if access_expires.tzinfo is not None:
+                        access_expires = access_expires.replace(tzinfo=None)
                     access_valid = now < access_expires
 
                 if refresh_expires_str:
-                    refresh_expires = datetime.fromisoformat(refresh_expires_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    refresh_expires = datetime.fromisoformat(refresh_expires_str.replace("Z", "+00:00"))
+                    if refresh_expires.tzinfo is not None:
+                        refresh_expires = refresh_expires.replace(tzinfo=None)
                     refresh_valid = now < refresh_expires
 
                 connections.append({
