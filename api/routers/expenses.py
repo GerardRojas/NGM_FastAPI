@@ -461,6 +461,81 @@ def get_expenses_meta():
         raise HTTPException(status_code=500, detail=f"Error leyendo meta de expenses: {e}")
 
 
+# ====== DUPLICATE DETECTION ENDPOINTS ======
+# IMPORTANT: These routes MUST be before /{expense_id} to avoid route conflicts
+
+class DismissDuplicateRequest(BaseModel):
+    user_id: str  # UUID del usuario
+    expense_id_1: str  # UUID del primer expense
+    expense_id_2: str  # UUID del segundo expense
+    reason: Optional[str] = "not_duplicate"
+
+
+@router.get("/dismissed-duplicates")
+def get_dismissed_duplicates(user_id: str):
+    """
+    Obtiene todos los pares de duplicados descartados por un usuario.
+    """
+    try:
+        print(f"[DISMISSED] Fetching for user_id: {user_id}")
+        result = supabase.table("dismissed_expense_duplicates").select(
+            "id, expense_id_1, expense_id_2, dismissed_at, dismissed_reason"
+        ).eq("user_id", user_id).order("dismissed_at", desc=True).execute()
+
+        dismissals = result.data or []
+        print(f"[DISMISSED] Found {len(dismissals)} dismissals")
+
+        return {
+            "data": dismissals,
+            "count": len(dismissals)
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[DISMISSED] ERROR: {str(e)}")
+        print(f"[DISMISSED] TRACEBACK:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error getting dismissed duplicates: {str(e)}")
+
+
+@router.post("/dismissed-duplicates", status_code=201)
+def dismiss_duplicate_pair(payload: DismissDuplicateRequest):
+    """
+    Marca un par de expenses como "no es duplicado".
+    """
+    try:
+        # Ordenar IDs para consistencia
+        id1, id2 = sorted([payload.expense_id_1, payload.expense_id_2])
+
+        # Insertar con ON CONFLICT para idempotencia
+        result = supabase.table("dismissed_expense_duplicates").upsert({
+            "user_id": payload.user_id,
+            "expense_id_1": id1,
+            "expense_id_2": id2,
+            "dismissed_reason": payload.reason
+        }, on_conflict="user_id,expense_id_1,expense_id_2").execute()
+
+        return {
+            "message": "Duplicate pair dismissed successfully",
+            "user_id": payload.user_id
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error dismissing duplicate pair: {str(e)}")
+
+
+@router.delete("/dismissed-duplicates/{dismissal_id}")
+def reactivate_duplicate_alert(dismissal_id: str, user_id: str):
+    """
+    Elimina un dismissal para reactivar la alerta de duplicado.
+    """
+    try:
+        supabase.table("dismissed_expense_duplicates").delete().eq("id", dismissal_id).eq("user_id", user_id).execute()
+        return {"message": "Duplicate alert reactivated successfully", "dismissal_id": dismissal_id}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reactivating duplicate alert: {str(e)}")
+
+
 @router.get("/{expense_id}")
 def get_expense(expense_id: str):
     """
@@ -1406,125 +1481,3 @@ def get_pending_authorization_summary(user_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting pending authorization summary: {str(e)}")
-
-
-# ====== DUPLICATE DETECTION ENDPOINTS ======
-
-class DismissDuplicateRequest(BaseModel):
-    user_id: str  # UUID del usuario
-    expense_id_1: str  # UUID del primer expense
-    expense_id_2: str  # UUID del segundo expense
-    reason: Optional[str] = "not_duplicate"
-
-
-@router.post("/dismissed-duplicates", status_code=201)
-def dismiss_duplicate_pair(payload: DismissDuplicateRequest):
-    """
-    Marca un par de expenses como "no es duplicado" para dejar de alertar sobre ellos.
-
-    Args:
-        user_id: UUID del usuario haciendo el dismissal
-        expense_id_1: UUID del primer expense
-        expense_id_2: UUID del segundo expense
-        reason: Razón del dismissal (opcional, default: "not_duplicate")
-
-    Returns:
-        - id: UUID del registro creado
-        - message: Confirmación
-    """
-    try:
-        # Validar que ambos expenses existen
-        exp1 = supabase.table("expenses_manual_COGS").select("expense_id").eq("expense_id", payload.expense_id_1).single().execute()
-        exp2 = supabase.table("expenses_manual_COGS").select("expense_id").eq("expense_id", payload.expense_id_2).single().execute()
-
-        if not exp1.data or not exp2.data:
-            raise HTTPException(status_code=404, detail="One or both expenses not found")
-
-        # Llamar a la función PostgreSQL que normaliza el orden de IDs
-        result = supabase.rpc(
-            "dismiss_duplicate_pair",
-            {
-                "p_user_id": payload.user_id,
-                "p_expense_id_1": payload.expense_id_1,
-                "p_expense_id_2": payload.expense_id_2,
-                "p_reason": payload.reason
-            }
-        ).execute()
-
-        if not result.data:
-            raise HTTPException(status_code=500, detail="Failed to create dismissal")
-
-        return {
-            "id": result.data,
-            "message": "Duplicate pair dismissed successfully",
-            "user_id": payload.user_id
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error dismissing duplicate pair: {str(e)}")
-
-
-@router.get("/dismissed-duplicates")
-def get_dismissed_duplicates(user_id: str):
-    """
-    Obtiene todos los pares de duplicados descartados por un usuario.
-
-    Args:
-        user_id: UUID del usuario
-
-    Returns:
-        - data: Lista de pares descartados
-        - count: Total de pares
-    """
-    try:
-        # Obtener dismissed duplicates del usuario
-        result = supabase.table("dismissed_expense_duplicates").select(
-            "id, expense_id_1, expense_id_2, dismissed_at, dismissed_reason"
-        ).eq("user_id", user_id).order("dismissed_at", desc=True).execute()
-
-        dismissals = result.data or []
-
-        return {
-            "data": dismissals,
-            "count": len(dismissals)
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting dismissed duplicates: {str(e)}")
-
-
-@router.delete("/dismissed-duplicates/{dismissal_id}")
-def reactivate_duplicate_alert(dismissal_id: str, user_id: str):
-    """
-    Elimina un dismissal para reactivar la alerta de duplicado.
-
-    Args:
-        dismissal_id: UUID del dismissal a eliminar
-        user_id: UUID del usuario (para validar ownership con RLS)
-
-    Returns:
-        - message: Confirmación
-    """
-    try:
-        # Verificar que el dismissal existe y pertenece al usuario
-        existing = supabase.table("dismissed_expense_duplicates").select(
-            "id, user_id"
-        ).eq("id", dismissal_id).eq("user_id", user_id).single().execute()
-
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="Dismissal not found or does not belong to user")
-
-        # Eliminar dismissal (RLS policies aseguran que solo el usuario puede eliminar sus propios dismissals)
-        supabase.table("dismissed_expense_duplicates").delete().eq("id", dismissal_id).eq("user_id", user_id).execute()
-
-        return {
-            "message": "Duplicate alert reactivated successfully",
-            "dismissal_id": dismissal_id
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reactivating duplicate alert: {str(e)}")
