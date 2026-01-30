@@ -9,6 +9,7 @@ import json
 import io
 from pdf2image import convert_from_bytes
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 router = APIRouter(prefix="/expenses", tags=["Expenses"])
 
@@ -315,9 +316,11 @@ def list_all_expenses(limit: Optional[int] = 1000):
     Lista todos los gastos de todos los proyectos.
     Incluye información del proyecto en cada gasto.
     Por defecto limita a 1000 gastos para evitar problemas de rendimiento.
+
+    PERFORMANCE: Metadata queries ejecutadas en paralelo con ThreadPoolExecutor
     """
     try:
-        # Obtener los gastos
+        # Obtener los gastos primero (necesitamos esto antes de enriquecer)
         query = supabase.table("expenses_manual_COGS").select("*")
         query = query.order("TxnDate", desc=True)
 
@@ -327,25 +330,58 @@ def list_all_expenses(limit: Optional[int] = 1000):
         resp = query.execute()
         raw_expenses = resp.data or []
 
-        # Obtener tipos de transacción
-        txn_types_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
-        txn_types_map = {t["TnxType_id"]: t for t in (txn_types_resp.data or [])}
+        if not raw_expenses:
+            return {"data": []}
 
-        # Obtener proyectos
-        projects_resp = supabase.table("projects").select("project_id, project_name").execute()
-        projects_map = {p["project_id"]: p for p in (projects_resp.data or [])}
+        # Define metadata fetch functions
+        def fetch_txn_types():
+            return supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
 
-        # Obtener vendors
-        vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
-        vendors_map = {v["id"]: v for v in (vendors_resp.data or [])}
+        def fetch_projects():
+            return supabase.table("projects").select("project_id, project_name").execute()
 
-        # Obtener métodos de pago
-        payment_resp = supabase.table("paymet_methods").select("id, payment_method_name").execute()
-        payment_map = {p["id"]: p for p in (payment_resp.data or [])}
+        def fetch_vendors():
+            return supabase.table("Vendors").select("id, vendor_name").execute()
 
-        # Obtener cuentas
-        accounts_resp = supabase.table("accounts").select("account_id, Name").execute()
-        accounts_map = {a["account_id"]: a for a in (accounts_resp.data or [])}
+        def fetch_payments():
+            return supabase.table("paymet_methods").select("id, payment_method_name").execute()
+
+        def fetch_accounts():
+            return supabase.table("accounts").select("account_id, Name").execute()
+
+        # Execute all metadata queries in parallel
+        txn_types_map = {}
+        projects_map = {}
+        vendors_map = {}
+        payment_map = {}
+        accounts_map = {}
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(fetch_txn_types): "txn_types",
+                executor.submit(fetch_projects): "projects",
+                executor.submit(fetch_vendors): "vendors",
+                executor.submit(fetch_payments): "payments",
+                executor.submit(fetch_accounts): "accounts",
+            }
+
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    result = future.result()
+                    data = result.data or []
+                    if key == "txn_types":
+                        txn_types_map = {t["TnxType_id"]: t for t in data}
+                    elif key == "projects":
+                        projects_map = {p["project_id"]: p for p in data}
+                    elif key == "vendors":
+                        vendors_map = {v["id"]: v for v in data}
+                    elif key == "payments":
+                        payment_map = {p["id"]: p for p in data}
+                    elif key == "accounts":
+                        accounts_map = {a["account_id"]: a for a in data}
+                except Exception as exc:
+                    print(f"[EXPENSES ALL] Error fetching {key}: {exc}")
 
         # Enriquecer cada gasto con nombres
         expenses = []
@@ -379,30 +415,47 @@ def get_expenses_meta():
       - vendors: proveedores
       - payment_methods: métodos de pago
       - accounts: cuentas contables
+
+    PERFORMANCE: Queries ejecutadas en paralelo usando ThreadPoolExecutor
     """
     try:
-        # Tipos de transacción
-        txn_types_resp = supabase.table("txn_types").select("*").order("TnxType_name").execute()
+        # Define query functions
+        def fetch_txn_types():
+            return supabase.table("txn_types").select("*").order("TnxType_name").execute()
 
-        # Proyectos
-        projects_resp = supabase.table("projects").select("project_id, project_name").order("project_name").execute()
+        def fetch_projects():
+            return supabase.table("projects").select("project_id, project_name").order("project_name").execute()
 
-        # Vendors
-        vendors_resp = supabase.table("Vendors").select("*").order("vendor_name").execute()
+        def fetch_vendors():
+            return supabase.table("Vendors").select("*").order("vendor_name").execute()
 
-        # Métodos de pago
-        payment_methods_resp = supabase.table("paymet_methods").select("*").execute()
+        def fetch_payment_methods():
+            return supabase.table("paymet_methods").select("*").execute()
 
-        # Cuentas
-        accounts_resp = supabase.table("accounts").select("*").execute()
+        def fetch_accounts():
+            return supabase.table("accounts").select("*").execute()
 
-        return {
-            "txn_types": txn_types_resp.data or [],
-            "projects": projects_resp.data or [],
-            "vendors": vendors_resp.data or [],
-            "payment_methods": payment_methods_resp.data or [],
-            "accounts": accounts_resp.data or [],
-        }
+        # Execute all queries in parallel
+        results = {}
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(fetch_txn_types): "txn_types",
+                executor.submit(fetch_projects): "projects",
+                executor.submit(fetch_vendors): "vendors",
+                executor.submit(fetch_payment_methods): "payment_methods",
+                executor.submit(fetch_accounts): "accounts",
+            }
+
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    resp = future.result()
+                    results[key] = resp.data or []
+                except Exception as exc:
+                    print(f"[EXPENSES META] Error fetching {key}: {exc}")
+                    results[key] = []
+
+        return results
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error leyendo meta de expenses: {e}")
