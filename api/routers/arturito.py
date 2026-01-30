@@ -24,6 +24,10 @@ from services.arturito.assistants import (
     clear_thread,
     get_thread_id,
 )
+from services.arturito.failed_commands_logger import (
+    get_failed_commands,
+    get_failed_commands_stats,
+)
 
 router = APIRouter(prefix="/arturito", tags=["arturito"])
 
@@ -529,3 +533,104 @@ async def delegate_task(request: DelegationRequest):
             "requested_by": request.user_name,
         }
     }
+
+
+# ================================
+# FAILED COMMANDS ANALYTICS
+# ================================
+
+class FailedCommandsQuery(BaseModel):
+    """Query parameters for failed commands"""
+    page: int = 1
+    page_size: int = 50
+    current_page: Optional[str] = None
+    error_reason: Optional[str] = None
+    days_back: int = 30
+
+
+@router.get("/failed-commands")
+async def get_failed_commands_endpoint(
+    page: int = 1,
+    page_size: int = 50,
+    current_page: Optional[str] = None,
+    error_reason: Optional[str] = None,
+    days_back: int = 30,
+    user_id: Optional[str] = None  # Admin can filter by user
+):
+    """
+    Get failed copilot commands for analytics.
+
+    Query params:
+    - page: Page number (default: 1)
+    - page_size: Results per page (default: 50, max: 100)
+    - current_page: Filter by page (e.g., 'expenses.html')
+    - error_reason: Filter by error reason
+    - days_back: How many days back to look (default: 30)
+    - user_id: Filter by user (admin only, optional)
+
+    Returns paginated list of failed commands with user info.
+    """
+    try:
+        # TODO: Add auth check - verify user has permission to view failed commands
+        # For now, user can only see their own failures unless they're admin
+
+        # Get supabase client from app state or dependency injection
+        # This is a placeholder - actual implementation will depend on your auth setup
+        from api.db import get_supabase_client
+        supabase = get_supabase_client()
+
+        # Limit page size
+        page_size = min(page_size, 100)
+
+        result = await get_failed_commands(
+            supabase=supabase,
+            user_id=user_id,
+            page=page,
+            page_size=page_size,
+            current_page=current_page,
+            error_reason=error_reason,
+            days_back=days_back
+        )
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/failed-commands/stats")
+async def get_failed_commands_stats_endpoint(
+    days_back: int = 30,
+    user_id: Optional[str] = None
+):
+    """
+    Get aggregated statistics about failed commands.
+
+    Query params:
+    - days_back: How many days back to analyze (default: 30)
+    - user_id: Filter by user (admin only, optional)
+
+    Returns:
+    - total_failures: Total number of failed commands
+    - unique_commands: Number of unique command texts
+    - gpt_attempt_rate: Percentage of failures where GPT was attempted
+    - top_pages: Pages with most failures
+    - top_errors: Most common error reasons
+    - most_common_commands: Most frequently failed commands
+    """
+    try:
+        # TODO: Add auth check - verify user has permission to view stats
+
+        from api.db import get_supabase_client
+        supabase = get_supabase_client()
+
+        stats = await get_failed_commands_stats(
+            supabase=supabase,
+            user_id=user_id,
+            days_back=days_back
+        )
+
+        return stats
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -448,14 +448,14 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
     # ================================
 
     copilot_patterns = [
-        # Filtering commands
+        # Filtering commands (with imperative forms like "filtrame", "muestrame")
         (r'(mostrar?me|muestrame|muestra|show|ver)\s+(solo\s+)?(los?\s+)?(gastos?|tareas?|proyectos?|usuarios?).*(pendiente|autorizado|completad|activo|progreso)', 'filter'),
-        (r'(filtrar?|filter)\s+(por\s+)?(.+)', 'filter'),
+        (r'(filtrar?|filtrame|filtra|filter)\s+(los?\s+)?(gastos?|tareas?|proyectos?|usuarios?)?.*', 'filter'),
         (r'(solo\s+)(pendientes?|autorizados?|completados?|activos?|en\s+progreso)', 'filter'),
         # Sorting commands
         (r'(ordenar?|sort)\s+(por\s+)?(.+)', 'sort'),
         (r'(de\s+)?(mayor|menor)\s+a\s+(mayor|menor)', 'sort'),
-        (r'(mas\s+)?(recientes?|antiguos?|nuevos?)\s+(primero)?', 'sort'),
+        (r'(más\s+|mas\s+)?(recientes?|antiguos?|nuevos?)\s+(primero)?', 'sort'),
         # Expand/Collapse
         (r'(expandir?|abrir?|mostrar?)\s+(todo|todos|todas|all|detalles)', 'expand'),
         (r'(colapsar?|cerrar?|ocultar?|contraer)\s+(todo|todos|todas|all|detalles)', 'collapse'),
@@ -565,10 +565,24 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
 
 7) COPILOT
    - Usuario quiere controlar la PAGINA ACTUAL: filtrar, ordenar, buscar, expandir/colapsar.
-   - Señales: "muestrame solo...", "filtrar por...", "ordenar por...", "buscar...", "expandir todo".
-   - Comandos para la UI de la pagina actual sin necesidad de navegar.
-   - Extrae: 'command_type' (filter, sort, search, expand, collapse, clear_filters), 'params' (parametros del comando).
-   - Ejemplos: "muestrame solo gastos pendientes", "filtrar por proyecto Del Rio", "ordenar por fecha".
+   - Señales: "muestrame solo...", "filtrar por...", "filtrame...", "ordenar por...", "buscar...", "expandir todo", "show only...", "filter by...".
+   - Comandos para la UI de la página actual sin necesidad de navegar.
+   - IMPORTANTE: Extrae parámetros con precisión:
+     * command_type: filter, sort, search, expand, collapse, clear_filters
+     * filter_target: qué se está filtrando (auth_status, project, vendor, date, assignee, priority, status, etc.)
+     * filter_value: el valor del filtro (pending, authorized, nombre del proyecto, etc.)
+     * sort_column: columna a ordenar (date, amount, vendor, etc.)
+     * sort_direction: asc o desc
+     * search_query: texto a buscar
+   - Ejemplos en ESPAÑOL:
+     * "filtrame los gastos pendientes de autorizar" → {command_type: "filter", filter_target: "auth_status", filter_value: "pending"}
+     * "muéstrame solo los autorizados" → {command_type: "filter", filter_target: "auth_status", filter_value: "authorized"}
+     * "filtrar por proyecto Del Rio" → {command_type: "filter", filter_target: "project", filter_value: "Del Rio"}
+     * "ordenar por fecha más reciente" → {command_type: "sort", sort_column: "date", sort_direction: "desc"}
+   - Ejemplos en INGLÉS:
+     * "show me pending expenses" → {command_type: "filter", filter_target: "auth_status", filter_value: "pending"}
+     * "filter by project Arthur Neal" → {command_type: "filter", filter_target: "project", filter_value: "Arthur Neal"}
+     * "sort by amount descending" → {command_type: "sort", sort_column: "amount", sort_direction: "desc"}
 
 8) REPORT_BUG
    - Usuario quiere reportar un bug, error o problema.
@@ -597,12 +611,27 @@ PRIORIDAD DE CLASIFICACIÓN:
 REGLAS DE RESPUESTA:
 - Devuelve SOLO JSON válido, sin markdown ni explicaciones.
 - Si el proyecto no se menciona claramente, usa null.
+- Para COPILOT, extrae TODOS los parámetros relevantes en entities (command_type, filter_target, filter_value, sort_column, sort_direction, search_query).
 - Formato exacto:
 {
   "intent": "INTENT_NAME",
-  "entities": { "project": "...", "topic": "...", "module": "...", "action": "...", "description": "..." },
+  "entities": {
+    "project": "...",
+    "topic": "...",
+    "module": "...",
+    "action": "...",
+    "description": "...",
+    "command_type": "...",
+    "filter_target": "...",
+    "filter_value": "...",
+    "sort_column": "...",
+    "sort_direction": "...",
+    "search_query": "..."
+  },
   "confidence": 0.85
 }
+
+IMPORTANTE: Responde en el idioma que recibas (español o inglés), pero los valores de entities siempre en inglés normalizado.
 """
 
 

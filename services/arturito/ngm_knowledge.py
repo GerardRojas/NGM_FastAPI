@@ -15,7 +15,7 @@ NGM_MODULES = {
     "expenses": {
         "name": "Expenses Engine",
         "url": "expenses.html",
-        "description": "Sistema central para gestionar gastos de proyectos de construccion.",
+        "description": "Sistema central para gestionar gastos de proyectos de construcción.",
         "permissions": {
             "view": "expenses:view",
             "edit": "expenses:edit",
@@ -25,12 +25,12 @@ NGM_MODULES = {
         "features": [
             {
                 "name": "Ver gastos por factura (Bill)",
-                "how": "En la tabla principal, los gastos estan agrupados por Bill (factura). Cada fila es un Bill que puede expandirse para ver sus lineas de detalle. Haz clic en la flecha a la izquierda de cada fila para expandir.",
+                "how": "En la tabla principal, los gastos están agrupados por Bill (factura). Cada fila es un Bill que puede expandirse para ver sus líneas de detalle. Haz clic en la flecha a la izquierda de cada fila para expandir.",
                 "keywords": ["factura", "bill", "agrupados", "expandir", "detalle"],
             },
             {
                 "name": "Ver facturas individuales",
-                "how": "Cada fila en la tabla principal representa una factura (Bill). Puedes ver el numero de factura, vendor, fecha, monto total, proyecto y estado de autorizacion.",
+                "how": "Cada fila en la tabla principal representa una factura (Bill). Puedes ver el número de factura, vendor, fecha, monto total, proyecto y estado de autorización.",
                 "keywords": ["facturas", "bills", "lista"],
             },
             {
@@ -50,7 +50,7 @@ NGM_MODULES = {
             },
             {
                 "name": "Autorizar gastos",
-                "how": "Los gastos tienen un estado de autorizacion (Auth Status). Los usuarios con permiso pueden cambiar el estado haciendo clic en el checkbox de autorizacion en cada gasto.",
+                "how": "Los gastos tienen un estado de autorización (Auth Status). Los usuarios con permiso pueden cambiar el estado haciendo clic en el checkbox de autorización en cada gasto.",
                 "keywords": ["autorizar", "aprobar", "auth", "status", "permiso"],
             },
             {
@@ -66,16 +66,16 @@ NGM_MODULES = {
         ],
         "common_questions": [
             {
-                "q": "Donde veo los gastos agrupados por factura?",
-                "a": "En Expenses Engine, cada fila de la tabla principal es un Bill (factura). Haz clic en la flecha para expandir y ver las lineas individuales de ese Bill.",
+                "q": "¿Dónde veo los gastos agrupados por factura?",
+                "a": "En Expenses Engine, cada fila de la tabla principal es un Bill (factura). Haz clic en la flecha para expandir y ver las líneas individuales de ese Bill.",
             },
             {
-                "q": "Como escaneo un recibo?",
-                "a": "En Expenses Engine, haz clic en 'Scan Receipt'. Sube la imagen y la IA extraera automaticamente los datos del recibo.",
+                "q": "¿Cómo escaneo un recibo?",
+                "a": "En Expenses Engine, haz clic en 'Scan Receipt'. Sube la imagen y la IA extraerá automáticamente los datos del recibo.",
             },
             {
-                "q": "Como filtro por proyecto?",
-                "a": "Usa el dropdown 'Project' en la barra de herramientas de Expenses para seleccionar un proyecto especifico.",
+                "q": "¿Cómo filtro por proyecto?",
+                "a": "Usa el dropdown 'Project' en la barra de herramientas de Expenses para seleccionar un proyecto específico.",
             },
         ],
     },
@@ -118,11 +118,11 @@ NGM_MODULES = {
         ],
         "common_questions": [
             {
-                "q": "Como creo una tarea?",
+                "q": "¿Cómo creo una tarea?",
                 "a": "En Pipeline Manager, haz clic en 'New Task', completa el formulario y guarda.",
             },
             {
-                "q": "Como veo solo mis tareas?",
+                "q": "¿Cómo veo solo mis tareas?",
                 "a": "Usa el filtro 'Assigned to me' en la barra de herramientas del Pipeline.",
             },
         ],
@@ -131,7 +131,7 @@ NGM_MODULES = {
     "projects": {
         "name": "Projects",
         "url": "projects.html",
-        "description": "Gestion centralizada de proyectos de construccion.",
+        "description": "Gestión centralizada de proyectos de construcción.",
         "permissions": {
             "view": "projects:view",
             "edit": "projects:edit",
@@ -156,7 +156,7 @@ NGM_MODULES = {
         ],
         "common_questions": [
             {
-                "q": "Como agrego un nuevo proyecto?",
+                "q": "¿Cómo agrego un nuevo proyecto?",
                 "a": "En Projects, haz clic en 'Add Project', completa el formulario y guarda.",
             },
         ],
@@ -236,12 +236,12 @@ NGM_MODULES = {
         ],
         "common_questions": [
             {
-                "q": "Como agrego un nuevo usuario?",
+                "q": "¿Cómo agrego un nuevo usuario?",
                 "a": "En Team Management, haz clic en 'Add User', completa el formulario con email, nombre, rol y permisos.",
             },
             {
-                "q": "Como cambio los permisos de un rol?",
-                "a": "En Team Management, haz clic en 'Manage Roles'. Se abrira la matriz de permisos donde puedes editar que puede hacer cada rol.",
+                "q": "¿Cómo cambio los permisos de un rol?",
+                "a": "En Team Management, haz clic en 'Manage Roles'. Se abrirá la matriz de permisos donde puedes editar qué puede hacer cada rol.",
             },
         ],
     },
@@ -524,7 +524,7 @@ COPILOT_ACTIONS = {
         "actions": {
             # Filters
             "filter_by_auth_status": {
-                "description": "Filtrar gastos por estado de autorizacion",
+                "description": "Filtrar gastos por estado de autorización",
                 "command": "filterByAuthStatus",
                 "params": ["status"],  # pending, authorized, all
                 "keywords": [
@@ -602,12 +602,12 @@ COPILOT_ACTIONS = {
                 "params": ["column", "direction"],  # asc, desc
                 "keywords": [
                     "ordenar por", "sort by", "de mayor a menor", "de menor a mayor",
-                    "mas recientes", "mas antiguos", "por fecha", "por monto",
+                    "más recientes", "más antiguos", "por fecha", "por monto",
                 ],
                 "examples": [
-                    "ordenar por fecha mas reciente",
+                    "ordenar por fecha más reciente",
                     "ordenar por monto de mayor a menor",
-                    "mostrar los mas recientes primero",
+                    "mostrar los más recientes primero",
                 ],
             },
             # View modes
@@ -617,7 +617,7 @@ COPILOT_ACTIONS = {
                 "params": [],
                 "keywords": [
                     "expandir todo", "expand all", "mostrar detalles",
-                    "ver todas las lineas", "abrir todo",
+                    "ver todas las líneas", "abrir todo",
                 ],
                 "examples": [
                     "expandir todas las facturas",
@@ -966,8 +966,8 @@ def get_ngm_hub_knowledge() -> str:
 ===============================================================================
  NGM HUB - KNOWLEDGE BASE
 ===============================================================================
-NGM HUB es una plataforma web empresarial para gestion de proyectos de construccion.
-Modulos disponibles:
+NGM HUB es una plataforma web empresarial para gestión de proyectos de construcción.
+Módulos disponibles:
 """)
 
     # Modules summary
@@ -980,7 +980,7 @@ Modulos disponibles:
     for module_id, module in NGM_MODULES.items():
         sections.append(f"\n### {module['name'].upper()}")
         sections.append(f"URL: {module['url']}")
-        sections.append(f"Descripcion: {module['description']}")
+        sections.append(f"Descripción: {module['description']}")
 
         if module.get("features"):
             sections.append("\nFuncionalidades:")

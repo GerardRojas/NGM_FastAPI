@@ -44,34 +44,34 @@ def handle_info(
             1: "modo corporativo (aburrido)",
             2: "modo amigable",
             3: "modo normal",
-            4: "modo sarcastico",
-            5: "modo ultra sarcastico"
+            4: "modo sarcástico",
+            5: "modo ultra sarcástico"
         }
         return {
-            "text": f"Estoy en nivel **{level}/5** - {modes.get(level, 'normal')}.\n\nSi quieres que sea mas nice (o mas pesado), usa `/sarcasmo 1-5`.",
+            "text": f"Estoy en nivel **{level}/5** - {modes.get(level, 'normal')}.\n\nSi quieres que sea más nice (o más pesado), usa `/sarcasmo 1-5`.",
             "action": "personality_info"
         }
 
     # Ayuda general (default)
-    help_text = """A ver, te explico rapido que puedo hacer:
+    help_text = """A ver, te explico rápido qué puedo hacer:
 
-**Navegacion** (te llevo a donde quieras):
-- "llevame a gastos" / "abre pipeline" / "ir a proyectos"
+**Navegación** (te llevo a donde quieras):
+- "llévame a gastos" / "abre pipeline" / "ir a proyectos"
 
 **Acciones** (hago cosas por ti):
 - "agregar un gasto" / "crear tarea" / "escanear recibo"
 
-**Copilot** (controlo la pagina actual):
+**Copilot** (controlo la página actual):
 - "filtrar por proyecto X" / "mostrar solo pendientes" / "limpiar filtros"
 
-**Preguntas** (se donde estan las cosas):
-- "como agrego un gasto?" / "donde veo mis tareas?"
+**Preguntas** (sé dónde están las cosas):
+- "¿cómo agrego un gasto?" / "¿dónde veo mis tareas?"
 
 **Bugs** (creo tickets):
 - "tengo un bug" / "algo no funciona"
 
-Si soy muy sarcastico usa `/sarcasmo 1-5` para bajarle.
-Si soy muy aburrido... tambien."""
+Si soy muy sarcástico usa `/sarcasmo 1-5` para bajarle.
+Si soy muy aburrido... también."""
 
     return {
         "text": help_text,

@@ -22,13 +22,17 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html'),
+    ('my_work', 'My Work', 'my-work.html'),
     ('expenses', 'Expenses', 'expenses.html'),
+    ('budget_monitor', 'Budget Monitor', 'budget_monitor.html'),
     ('pipeline', 'Pipeline Manager', 'pipeline.html'),
     ('projects', 'Projects', 'projects.html'),
     ('vendors', 'Vendors', 'vendors.html'),
     ('accounts', 'Accounts', 'accounts.html'),
     ('estimator', 'Estimator Suite', 'estimator.html'),
     ('team', 'Team Management', 'team.html'),
+    ('messages', 'Messages', 'messages.html'),
+    ('arturito', 'Arturito', 'arturito.html'),
     ('god_view', 'God View', 'god-view.html'),
     ('reporting', 'Reporting', 'reporting.html'),
     ('budgets', 'Budgets', 'budgets.html'),
@@ -58,13 +62,17 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html'),
+    ('my_work', 'My Work', 'my-work.html'),
     ('expenses', 'Expenses', 'expenses.html'),
+    ('budget_monitor', 'Budget Monitor', 'budget_monitor.html'),
     ('pipeline', 'Pipeline Manager', 'pipeline.html'),
     ('projects', 'Projects', 'projects.html'),
     ('vendors', 'Vendors', 'vendors.html'),
     ('accounts', 'Accounts', 'accounts.html'),
     ('estimator', 'Estimator Suite', 'estimator.html'),
     ('team', 'Team Management', 'team.html'),
+    ('messages', 'Messages', 'messages.html'),
+    ('arturito', 'Arturito', 'arturito.html'),
     ('god_view', 'God View', 'god-view.html'),
     ('reporting', 'Reporting', 'reporting.html'),
     ('budgets', 'Budgets', 'budgets.html'),
@@ -79,7 +87,7 @@ ON CONFLICT (rol_id, module_key) DO UPDATE SET
   can_delete = EXCLUDED.can_delete;
 
 -- ========================================
--- 3. KD COO - Solo Dashboard y Expenses
+-- 3. KD COO - Dashboard, My Work, Expenses, Messages, Arturito
 -- ========================================
 INSERT INTO public.role_permissions (rol_id, module_key, module_name, module_url, can_view, can_edit, can_delete)
 SELECT
@@ -94,7 +102,10 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'true', 'true'),
-    ('expenses', 'Expenses', 'expenses.html', 'true', 'true', 'true')
+    ('my_work', 'My Work', 'my-work.html', 'true', 'true', 'true'),
+    ('expenses', 'Expenses', 'expenses.html', 'true', 'true', 'true'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'KD COO'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -118,13 +129,16 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
+    ('my_work', 'My Work', 'my-work.html', 'true', 'true', 'false'),
     ('expenses', 'Expenses', 'expenses.html', 'true', 'true', 'false'),
     ('pipeline', 'Pipeline Manager', 'pipeline.html', 'true', 'true', 'false'),
     ('projects', 'Projects', 'projects.html', 'true', 'true', 'false'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'false', 'false'),
     ('accounts', 'Accounts', 'accounts.html', 'true', 'false', 'false'),
     ('estimator', 'Estimator Suite', 'estimator.html', 'true', 'false', 'false'),
-    ('team', 'Team Management', 'team.html', 'true', 'true', 'false')
+    ('team', 'Team Management', 'team.html', 'true', 'true', 'false'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'General Coordinator'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -148,13 +162,16 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
+    ('my_work', 'My Work', 'my-work.html', 'true', 'true', 'false'),
     ('expenses', 'Expenses', 'expenses.html', 'true', 'true', 'false'),
     ('pipeline', 'Pipeline Manager', 'pipeline.html', 'true', 'true', 'false'),
     ('projects', 'Projects', 'projects.html', 'true', 'true', 'false'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'false', 'false'),
     ('accounts', 'Accounts', 'accounts.html', 'true', 'false', 'false'),
     ('estimator', 'Estimator Suite', 'estimator.html', 'true', 'false', 'false'),
-    ('team', 'Team Management', 'team.html', 'true', 'true', 'false')
+    ('team', 'Team Management', 'team.html', 'true', 'true', 'false'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'Project Coordinator'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -178,10 +195,13 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
+    ('my_work', 'My Work', 'my-work.html', 'true', 'true', 'false'),
     ('expenses', 'Expenses', 'expenses.html', 'true', 'true', 'true'),
     ('projects', 'Projects', 'projects.html', 'true', 'true', 'true'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'true', 'true'),
-    ('accounts', 'Accounts', 'accounts.html', 'true', 'true', 'true')
+    ('accounts', 'Accounts', 'accounts.html', 'true', 'true', 'true'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'Accounting Manager'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -205,10 +225,13 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
+    ('my_work', 'My Work', 'my-work.html', 'true', 'true', 'false'),
     ('expenses', 'Expenses', 'expenses.html', 'true', 'true', 'true'),
     ('projects', 'Projects', 'projects.html', 'true', 'true', 'true'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'true', 'true'),
-    ('accounts', 'Accounts', 'accounts.html', 'true', 'true', 'true')
+    ('accounts', 'Accounts', 'accounts.html', 'true', 'true', 'true'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'Bookkeeper'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -232,11 +255,14 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
+    ('my_work', 'My Work', 'my-work.html', 'true', 'true', 'false'),
     ('expenses', 'Expenses', 'expenses.html', 'true', 'true', 'true'),
     ('projects', 'Projects', 'projects.html', 'true', 'true', 'true'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'true', 'true'),
     ('accounts', 'Accounts', 'accounts.html', 'true', 'true', 'true'),
-    ('estimator', 'Estimator Suite', 'estimator.html', 'true', 'true', 'false')
+    ('estimator', 'Estimator Suite', 'estimator.html', 'true', 'true', 'false'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'Estimator'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -245,7 +271,7 @@ ON CONFLICT (rol_id, module_key) DO UPDATE SET
   can_delete = EXCLUDED.can_delete;
 
 -- ========================================
--- 9. Architect - Solo Dashboard por ahora
+-- 9. Architect
 -- ========================================
 INSERT INTO public.role_permissions (rol_id, module_key, module_name, module_url, can_view, can_edit, can_delete)
 SELECT
@@ -259,7 +285,10 @@ SELECT
 FROM public.rols r
 CROSS JOIN (
   VALUES
-    ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false')
+    ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
+    ('my_work', 'My Work', 'my-work.html', 'true', 'true', 'false'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'Architect'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -283,10 +312,13 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
+    ('my_work', 'My Work', 'my-work.html', 'true', 'false', 'false'),
     ('expenses', 'Expenses', 'expenses.html', 'true', 'false', 'false'),
     ('projects', 'Projects', 'projects.html', 'true', 'false', 'false'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'false', 'false'),
-    ('accounts', 'Accounts', 'accounts.html', 'true', 'false', 'false')
+    ('accounts', 'Accounts', 'accounts.html', 'true', 'false', 'false'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'Financial Analyst'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
@@ -295,7 +327,7 @@ ON CONFLICT (rol_id, module_key) DO UPDATE SET
   can_delete = EXCLUDED.can_delete;
 
 -- ========================================
--- 11. Admin Guest - Dashboard y Expenses solo lectura
+-- 11. Admin Guest - Dashboard, Expenses, Messages, Arturito solo lectura
 -- ========================================
 INSERT INTO public.role_permissions (rol_id, module_key, module_name, module_url, can_view, can_edit, can_delete)
 SELECT
@@ -310,7 +342,10 @@ FROM public.rols r
 CROSS JOIN (
   VALUES
     ('dashboard', 'Dashboard', 'dashboard.html', 'true', 'false', 'false'),
-    ('expenses', 'Expenses', 'expenses.html', 'true', 'false', 'false')
+    ('my_work', 'My Work', 'my-work.html', 'true', 'false', 'false'),
+    ('expenses', 'Expenses', 'expenses.html', 'true', 'false', 'false'),
+    ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
+    ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
 WHERE r.rol_name = 'Admin Guest'
 ON CONFLICT (rol_id, module_key) DO UPDATE SET
