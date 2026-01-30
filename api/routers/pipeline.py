@@ -52,6 +52,7 @@ class TaskUpdate(BaseModel):
     time_finish: Optional[str] = None
     status: Optional[str] = None
     priority: Optional[str] = None
+    estimated_hours: Optional[float] = None  # Estimated duration in hours
 
 
 # ====== CATALOG ENDPOINTS ======
@@ -356,6 +357,7 @@ FIELD_TO_COLUMN = {
     "time_finish": "time_finish",
     "status": "task_status",
     "priority": "task_priority",
+    "estimated_hours": "estimated_hours",
 }
 
 
@@ -989,6 +991,337 @@ def _run_pending_expenses_automation() -> tuple:
         print(f"[AUTOMATIONS] ERROR in pending_expenses_auth: {repr(e)}")
         print(traceback.format_exc())
         raise
+
+
+# ====== MY WORK / WORKLOAD ENDPOINTS ======
+
+class WorkloadSettings(BaseModel):
+    """Settings for workload calculation."""
+    hours_per_day: float = 8.0
+    days_per_week: int = 6
+
+
+@router.get("/my-work/{user_id}")
+def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: int = 6) -> Dict[str, Any]:
+    """
+    Devuelve las tareas del usuario para la página My Work con cálculo de workload.
+
+    Solo incluye tareas con status "Not Started" o "Working on It".
+    Calcula:
+    - Carga de trabajo total (horas asignadas)
+    - Capacidad disponible basada en hours_per_day y days_per_week
+    - Indicadores de sobrecarga/subcarga
+
+    Args:
+        user_id: UUID del usuario
+        hours_per_day: Horas de trabajo por día (default 8)
+        days_per_week: Días de trabajo por semana (default 6)
+    """
+    print(f"[MY-WORK] GET /pipeline/my-work/{user_id}")
+
+    try:
+        from datetime import datetime, timedelta
+
+        # 1. Obtener status IDs para filtrar
+        statuses_response = supabase.table("tasks_status").select(
+            "task_status_id, task_status"
+        ).execute()
+
+        status_map = {s["task_status"].lower(): s["task_status_id"] for s in (statuses_response.data or [])}
+        status_name_map = {s["task_status_id"]: s["task_status"] for s in (statuses_response.data or [])}
+
+        not_started_id = status_map.get("not started")
+        working_id = status_map.get("working on it")
+
+        valid_status_ids = [s for s in [not_started_id, working_id] if s]
+
+        if not valid_status_ids:
+            return {"tasks": [], "workload": {}}
+
+        # 2. Obtener tareas del usuario con status válidos
+        query = supabase.table("tasks").select("*").eq("Owner_id", user_id)
+        query = query.in_("task_status", valid_status_ids)
+        tasks_response = query.order("deadline", desc=False).execute()
+        tasks = tasks_response.data or []
+
+        print(f"[MY-WORK] Found {len(tasks)} tasks for user")
+
+        if not tasks:
+            return {
+                "tasks": [],
+                "workload": {
+                    "total_hours": 0,
+                    "capacity_hours_week": hours_per_day * days_per_week,
+                    "utilization_percent": 0,
+                    "status": "underloaded",
+                    "overdue_count": 0,
+                    "due_soon_count": 0,
+                }
+            }
+
+        # 3. Obtener datos relacionados
+        project_ids = list(set(t.get("project_id") for t in tasks if t.get("project_id")))
+        projects_map = {}
+        if project_ids:
+            projects_response = supabase.table("projects").select(
+                "project_id, project_name"
+            ).in_("project_id", project_ids).execute()
+            projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
+
+        priority_ids = list(set(t.get("task_priority") for t in tasks if t.get("task_priority")))
+        priorities_map = {}
+        if priority_ids:
+            priorities_response = supabase.table("tasks_priority").select(
+                "priority_id, priority"
+            ).in_("priority_id", priority_ids).execute()
+            priorities_map = {p["priority_id"]: p for p in (priorities_response.data or [])}
+
+        # Task types
+        type_ids = list(set(t.get("task_type") for t in tasks if t.get("task_type")))
+        types_map = {}
+        if type_ids:
+            types_response = supabase.table("task_types").select(
+                "type_id, type_name"
+            ).in_("type_id", type_ids).execute()
+            types_map = {t["type_id"]: t for t in (types_response.data or [])}
+
+        # 4. Calcular workload
+        now = datetime.utcnow()
+        today = now.date()
+        week_from_now = today + timedelta(days=7)
+
+        total_estimated_hours = 0
+        overdue_count = 0
+        due_soon_count = 0
+
+        enriched_tasks = []
+        for task in tasks:
+            project_id = task.get("project_id")
+            priority_id = task.get("task_priority")
+            status_id = task.get("task_status")
+            type_id = task.get("task_type")
+
+            project_info = projects_map.get(project_id, {})
+            priority_info = priorities_map.get(priority_id, {})
+            type_info = types_map.get(type_id, {})
+
+            # Check if task is automated (has [AUTOMATED] in notes or specific type)
+            task_notes = task.get("task_notes") or ""
+            type_name = type_info.get("type_name", "")
+            is_automated = "[AUTOMATED]" in task_notes or type_name.lower() == "automated"
+
+            # Duración estimada (default 2 horas si no está especificada)
+            duration = task.get("estimated_hours") or 2.0
+            total_estimated_hours += duration
+
+            # Verificar fechas
+            deadline_str = task.get("deadline") or task.get("due_date")
+            is_overdue = False
+            is_due_soon = False
+
+            if deadline_str:
+                try:
+                    deadline_date = datetime.fromisoformat(deadline_str.replace("Z", "")).date()
+                    if deadline_date < today:
+                        is_overdue = True
+                        overdue_count += 1
+                    elif deadline_date <= week_from_now:
+                        is_due_soon = True
+                        due_soon_count += 1
+                except:
+                    pass
+
+            enriched_tasks.append({
+                "task_id": task.get("task_id"),
+                "task_description": task.get("task_description"),
+                "project_id": project_id,
+                "project_name": project_info.get("project_name"),
+                "priority_id": priority_id,
+                "priority_name": priority_info.get("priority"),
+                "status_id": status_id,
+                "status_name": status_name_map.get(status_id),
+                "type_id": type_id,
+                "type_name": type_name,
+                "is_automated": is_automated,
+                "due_date": task.get("due_date"),
+                "deadline": task.get("deadline"),
+                "estimated_hours": duration,
+                "time_start": task.get("time_start"),
+                "is_overdue": is_overdue,
+                "is_due_soon": is_due_soon,
+                "created_at": task.get("created_at"),
+                # Position data for canvas (stored or default)
+                "canvas_x": task.get("canvas_x"),
+                "canvas_y": task.get("canvas_y"),
+            })
+
+        # 5. Calcular métricas de workload
+        capacity_hours_week = hours_per_day * days_per_week
+        utilization_percent = (total_estimated_hours / capacity_hours_week * 100) if capacity_hours_week > 0 else 0
+
+        # Determinar status de carga
+        if utilization_percent > 120:
+            workload_status = "critical"  # Sobrecargado severamente
+        elif utilization_percent > 100:
+            workload_status = "overloaded"  # Sobrecargado
+        elif utilization_percent > 80:
+            workload_status = "optimal"  # Carga óptima
+        elif utilization_percent > 50:
+            workload_status = "normal"  # Normal
+        else:
+            workload_status = "underloaded"  # Subcargado
+
+        # 6. Generar lista de tipos únicos para filtros
+        unique_types = {}
+        automated_count = 0
+        for t in enriched_tasks:
+            type_id = t.get("type_id")
+            type_name = t.get("type_name") or "Unknown"
+            if type_id and type_id not in unique_types:
+                unique_types[type_id] = type_name
+            if t.get("is_automated"):
+                automated_count += 1
+
+        task_types = [{"id": k, "name": v} for k, v in unique_types.items()]
+        task_types.sort(key=lambda x: x["name"])
+
+        return {
+            "tasks": enriched_tasks,
+            "task_types": task_types,
+            "workload": {
+                "total_hours": round(total_estimated_hours, 1),
+                "capacity_hours_week": capacity_hours_week,
+                "utilization_percent": round(utilization_percent, 1),
+                "status": workload_status,
+                "overdue_count": overdue_count,
+                "due_soon_count": due_soon_count,
+                "automated_count": automated_count,
+                "hours_per_day": hours_per_day,
+                "days_per_week": days_per_week,
+            }
+        }
+
+    except Exception as e:
+        print(f"[MY-WORK] ERROR: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error: {e}") from e
+
+
+@router.get("/my-work/team-overview")
+def get_team_workload_overview(hours_per_day: float = 8.0, days_per_week: int = 6) -> Dict[str, Any]:
+    """
+    Devuelve resumen de carga de trabajo de todo el equipo.
+    Solo accesible por Coordination/Management roles.
+
+    Returns:
+        Lista de usuarios con su carga de trabajo actual.
+    """
+    print("[MY-WORK] GET /pipeline/my-work/team-overview")
+
+    try:
+        from datetime import datetime, timedelta
+
+        # 1. Obtener todos los usuarios activos
+        users_response = supabase.table("users").select(
+            "user_id, user_name, avatar_color, user_photo"
+        ).execute()
+        users = users_response.data or []
+
+        if not users:
+            return {"team": []}
+
+        # 2. Obtener status válidos
+        statuses_response = supabase.table("tasks_status").select(
+            "task_status_id, task_status"
+        ).execute()
+        status_map = {s["task_status"].lower(): s["task_status_id"] for s in (statuses_response.data or [])}
+
+        not_started_id = status_map.get("not started")
+        working_id = status_map.get("working on it")
+        valid_status_ids = [s for s in [not_started_id, working_id] if s]
+
+        if not valid_status_ids:
+            return {"team": [{"user_id": u["user_id"], "user_name": u["user_name"], "tasks_count": 0, "total_hours": 0, "status": "underloaded"} for u in users]}
+
+        # 3. Obtener todas las tareas activas
+        tasks_response = supabase.table("tasks").select(
+            "task_id, Owner_id, estimated_hours, deadline, due_date"
+        ).in_("task_status", valid_status_ids).execute()
+        tasks = tasks_response.data or []
+
+        # 4. Agrupar por usuario
+        now = datetime.utcnow()
+        today = now.date()
+        capacity_hours_week = hours_per_day * days_per_week
+
+        user_workload: Dict[str, Dict] = {u["user_id"]: {
+            "user_id": u["user_id"],
+            "user_name": u["user_name"],
+            "avatar_color": u.get("avatar_color"),
+            "photo": u.get("user_photo"),
+            "tasks_count": 0,
+            "total_hours": 0,
+            "overdue_count": 0,
+        } for u in users}
+
+        for task in tasks:
+            owner_id = task.get("Owner_id")
+            if owner_id not in user_workload:
+                continue
+
+            duration = task.get("estimated_hours") or 2.0
+            user_workload[owner_id]["tasks_count"] += 1
+            user_workload[owner_id]["total_hours"] += duration
+
+            # Check overdue
+            deadline_str = task.get("deadline") or task.get("due_date")
+            if deadline_str:
+                try:
+                    deadline_date = datetime.fromisoformat(deadline_str.replace("Z", "")).date()
+                    if deadline_date < today:
+                        user_workload[owner_id]["overdue_count"] += 1
+                except:
+                    pass
+
+        # 5. Calcular status para cada usuario
+        team_data = []
+        for user_id, data in user_workload.items():
+            utilization = (data["total_hours"] / capacity_hours_week * 100) if capacity_hours_week > 0 else 0
+
+            if utilization > 120:
+                status = "critical"
+            elif utilization > 100:
+                status = "overloaded"
+            elif utilization > 80:
+                status = "optimal"
+            elif utilization > 50:
+                status = "normal"
+            else:
+                status = "underloaded"
+
+            team_data.append({
+                **data,
+                "total_hours": round(data["total_hours"], 1),
+                "utilization_percent": round(utilization, 1),
+                "status": status,
+            })
+
+        # Ordenar por utilización (más cargados primero)
+        team_data.sort(key=lambda x: x["utilization_percent"], reverse=True)
+
+        return {
+            "team": team_data,
+            "settings": {
+                "hours_per_day": hours_per_day,
+                "days_per_week": days_per_week,
+                "capacity_hours_week": capacity_hours_week,
+            }
+        }
+
+    except Exception as e:
+        print(f"[MY-WORK] ERROR in team-overview: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
 @router.get("/automations/status")
