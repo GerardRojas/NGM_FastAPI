@@ -53,6 +53,7 @@ class ExpenseUpdate(BaseModel):
     account_id: Optional[str] = None
     auth_status: Optional[bool] = None
     auth_by: Optional[str] = None
+    receipt_url: Optional[str] = None  # URL del recibo/factura en Storage
 
 
 class ExpenseUpdateItem(BaseModel):
