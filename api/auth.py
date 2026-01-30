@@ -189,6 +189,11 @@ def login(payload: LoginRequest):
             "access_token": access_token,
             "token_type": "bearer",
             "user": {
+                # Frontend expects these exact field names
+                "user_id": user.get("user_id"),       # ← cambio: id -> user_id
+                "user_name": user.get("user_name"),   # ← cambio: username -> user_name
+
+                # Legacy/compatibility names
                 "id": user.get("user_id"),
                 "username": user.get("user_name"),
 
