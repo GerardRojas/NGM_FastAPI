@@ -598,6 +598,97 @@ async def get_failed_commands_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ================================
+# EXPENSE FILTER INTERPRETATION
+# ================================
+
+class FilterInterpretRequest(BaseModel):
+    """Request for GPT filter interpretation"""
+    text: str
+
+
+class FilterInterpretResponse(BaseModel):
+    """Response from GPT filter interpretation"""
+    action: Optional[str] = None  # 'clear_filters', 'filter_bill', 'filter_vendor', 'search', 'summary'
+    value: Optional[str] = None
+    message: Optional[str] = None
+    understood: bool = False
+
+
+@router.post("/interpret-filter", response_model=FilterInterpretResponse)
+async def interpret_filter_command(request: FilterInterpretRequest):
+    """
+    Use GPT to interpret a natural language expense filter command.
+    Returns the detected action and parameters.
+    """
+    from openai import OpenAI
+    import os
+    import json
+
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return FilterInterpretResponse(understood=False)
+
+        client = OpenAI(api_key=api_key)
+
+        # System prompt for filter interpretation
+        system_prompt = """You are a command interpreter for an expense management system.
+Your job is to interpret natural language commands and return structured actions.
+
+Available actions:
+- clear_filters: Remove all active filters (e.g., "quita los filtros", "clear filters", "mostrar todo")
+- filter_bill: Filter by bill/invoice number (e.g., "filtra el bill 1439", "muestra factura 234")
+- filter_vendor: Filter by vendor/supplier name (e.g., "gastos de Home Depot", "filtra vendor Wayfair")
+- search: Search for text in expenses (e.g., "busca pintura", "search for materials")
+- summary: Show expense summary (e.g., "cuantos gastos tengo", "resumen de gastos")
+
+Respond ONLY with a JSON object:
+{"action": "action_name", "value": "extracted_value_or_null", "message": "friendly_response_in_spanish"}
+
+If you can't interpret the command as a filter action, return:
+{"action": null, "value": null, "message": null}"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.text}
+            ],
+            temperature=0,
+            max_tokens=150
+        )
+
+        result_text = response.choices[0].message.content.strip()
+
+        # Parse JSON response
+        try:
+            # Remove markdown code blocks if present
+            if result_text.startswith("```"):
+                result_text = result_text.split("```")[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+                result_text = result_text.strip()
+
+            result = json.loads(result_text)
+
+            if result.get("action"):
+                return FilterInterpretResponse(
+                    action=result.get("action"),
+                    value=result.get("value"),
+                    message=result.get("message"),
+                    understood=True
+                )
+        except json.JSONDecodeError:
+            pass
+
+        return FilterInterpretResponse(understood=False)
+
+    except Exception as e:
+        print(f"[ARTURITO] Filter interpretation error: {e}")
+        return FilterInterpretResponse(understood=False)
+
+
 @router.get("/failed-commands/stats")
 async def get_failed_commands_stats_endpoint(
     days_back: int = 30,
