@@ -16,7 +16,8 @@ from services.qbo_service import (
     fetch_all_vendor_credits,
     fetch_all_journal_entries,
     fetch_project_catalog,
-    fetch_accounts_metadata
+    fetch_accounts_metadata,
+    fetch_budgets
 )
 
 router = APIRouter(prefix="/qbo", tags=["QBO Integration"])
@@ -912,6 +913,642 @@ def auto_match_projects():
             "total_unmapped": len(unmapped),
             "matched": matched_count,
             "remaining_unmapped": len(unmapped) - matched_count
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====== BUDGET SYNC ENDPOINT ======
+
+@router.post("/budgets/sync/{realm_id}")
+async def qbo_sync_budgets(
+    realm_id: str,
+    project_id: str,
+    fiscal_year: Optional[str] = None
+):
+    """
+    Syncs budgets from QuickBooks to the local database.
+
+    QuickBooks budgets are divided into 12 monthly amounts per account.
+    This endpoint sums all 12 months for each account line.
+
+    Parameters:
+    - realm_id: The QuickBooks company realm ID
+    - project_id: The NGM project ID to associate the budget with
+    - fiscal_year: Optional fiscal year filter (e.g., "2024")
+    """
+    try:
+        # Fetch budgets from QBO
+        qbo_budgets = await fetch_budgets(realm_id, fiscal_year)
+
+        if not qbo_budgets:
+            return {
+                "message": "No budgets found in QuickBooks",
+                "realm_id": realm_id,
+                "total_imported": 0
+            }
+
+        # Fetch accounts metadata for enrichment
+        accounts_meta = await fetch_accounts_metadata(realm_id)
+
+        # Process each budget
+        imported_records = []
+        now = datetime.utcnow().isoformat()
+
+        for budget in qbo_budgets:
+            budget_id = str(budget.get("Id", ""))
+            budget_name = budget.get("Name", "Unnamed Budget")
+            start_date = budget.get("StartDate")
+            end_date = budget.get("EndDate")
+            is_active = budget.get("Active", True)
+
+            # Extract fiscal year from StartDate if not provided
+            budget_year = fiscal_year
+            if not budget_year and start_date:
+                try:
+                    budget_year = start_date.split("-")[0]
+                except:
+                    budget_year = str(datetime.utcnow().year)
+
+            # Get budget lines - each line has monthly amounts
+            budget_details = budget.get("BudgetDetail", [])
+
+            if not budget_details:
+                continue
+
+            # Group by account and sum all monthly amounts
+            # Key: account_id -> {account_name, total_amount, months_data}
+            account_totals = {}
+
+            for detail in budget_details:
+                account_ref = detail.get("AccountRef", {})
+                account_id = str(account_ref.get("value", ""))
+                account_name = account_ref.get("name", "")
+
+                if not account_id:
+                    continue
+
+                # Enrich with account metadata
+                if account_id in accounts_meta:
+                    meta = accounts_meta[account_id]
+                    account_name = account_name or meta.get("Name", "")
+
+                # Get the amount for this period
+                amount = float(detail.get("Amount", 0) or 0)
+
+                if account_id not in account_totals:
+                    account_totals[account_id] = {
+                        "account_name": account_name,
+                        "total_amount": 0,
+                        "line_count": 0
+                    }
+
+                account_totals[account_id]["total_amount"] += amount
+                account_totals[account_id]["line_count"] += 1
+
+            # Create budget records for each account
+            for account_id, data in account_totals.items():
+                record = {
+                    "ngm_project_id": project_id,
+                    "budget_id_qbo": budget_id,
+                    "budget_name": budget_name,
+                    "year": int(budget_year) if budget_year else None,
+                    "account_id": account_id,
+                    "account_name": data["account_name"],
+                    "amount_sum": data["total_amount"],
+                    "lines_count": data["line_count"],
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "active": is_active,
+                    "imported_at": now,
+                    "import_source": "qbo_api"
+                }
+                imported_records.append(record)
+
+        # Delete existing QBO API budgets for this project before importing
+        supabase.table("budgets_qbo") \
+            .delete() \
+            .eq("ngm_project_id", project_id) \
+            .eq("import_source", "qbo_api") \
+            .execute()
+
+        # Insert new records in batches
+        batch_size = 100
+        total_inserted = 0
+
+        for i in range(0, len(imported_records), batch_size):
+            batch = imported_records[i:i + batch_size]
+            supabase.table("budgets_qbo").insert(batch).execute()
+            total_inserted += len(batch)
+
+        return {
+            "message": "Budget sync completed",
+            "realm_id": realm_id,
+            "project_id": project_id,
+            "qbo_budgets_found": len(qbo_budgets),
+            "total_imported": total_inserted,
+            "accounts_processed": len(set(r["account_id"] for r in imported_records))
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====== BUDGET MAPPING ENDPOINTS ======
+
+class BudgetMappingCreate(BaseModel):
+    """Create a QBO budget -> NGM project mapping"""
+    qbo_budget_id: str
+    qbo_budget_name: Optional[str] = None
+    qbo_fiscal_year: Optional[int] = None
+    ngm_project_id: str
+
+
+class BudgetMappingUpdate(BaseModel):
+    """Update a budget mapping"""
+    ngm_project_id: Optional[str] = None
+    qbo_budget_name: Optional[str] = None
+
+
+@router.get("/budgets/preview/{realm_id}")
+async def preview_qbo_budgets(realm_id: str):
+    """
+    Preview available budgets from QuickBooks without importing.
+    Shows which budgets are mapped and which are unmapped.
+    """
+    try:
+        # Fetch budgets from QBO
+        qbo_budgets = await fetch_budgets(realm_id)
+
+        if not qbo_budgets:
+            return {
+                "data": [],
+                "count": 0,
+                "message": "No budgets found in QuickBooks"
+            }
+
+        # Get existing mappings
+        mappings_resp = supabase.table("qbo_budget_mapping").select("*").execute()
+        mappings = {m["qbo_budget_id"]: m for m in (mappings_resp.data or [])}
+
+        # Build preview data
+        preview = []
+        for budget in qbo_budgets:
+            budget_id = str(budget.get("Id", ""))
+            budget_name = budget.get("Name", "Unnamed Budget")
+            start_date = budget.get("StartDate", "")
+
+            # Extract fiscal year
+            fiscal_year = None
+            if start_date:
+                try:
+                    fiscal_year = int(start_date.split("-")[0])
+                except:
+                    pass
+
+            # Check if mapped
+            mapping = mappings.get(budget_id)
+
+            preview_item = {
+                "qbo_budget_id": budget_id,
+                "qbo_budget_name": budget_name,
+                "qbo_fiscal_year": fiscal_year,
+                "start_date": start_date,
+                "end_date": budget.get("EndDate"),
+                "active": budget.get("Active", True),
+                "is_mapped": mapping is not None,
+                "ngm_project_id": mapping.get("ngm_project_id") if mapping else None,
+                "auto_matched": mapping.get("auto_matched") if mapping else False
+            }
+            preview.append(preview_item)
+
+        return {
+            "data": preview,
+            "count": len(preview),
+            "mapped_count": sum(1 for p in preview if p["is_mapped"]),
+            "unmapped_count": sum(1 for p in preview if not p["is_mapped"])
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/budgets/mapping")
+def get_budget_mappings(unmapped_only: Optional[bool] = False):
+    """
+    Get all QBO budget -> NGM project mappings.
+
+    - unmapped_only=true: only return unmapped budgets
+    """
+    try:
+        query = supabase.table("qbo_budget_mapping").select("*")
+
+        if unmapped_only:
+            query = query.is_("ngm_project_id", "null")
+
+        query = query.order("qbo_budget_name")
+
+        resp = query.execute()
+        mappings = resp.data or []
+
+        # Enrich with NGM project names
+        if mappings:
+            ngm_ids = [m.get("ngm_project_id") for m in mappings if m.get("ngm_project_id")]
+            if ngm_ids:
+                projects_resp = supabase.table("projects") \
+                    .select("project_id, project_name") \
+                    .in_("project_id", ngm_ids) \
+                    .execute()
+
+                projects_map = {p["project_id"]: p["project_name"] for p in (projects_resp.data or [])}
+
+                for m in mappings:
+                    if m.get("ngm_project_id"):
+                        m["ngm_project_name"] = projects_map.get(m["ngm_project_id"])
+
+        return {
+            "data": mappings,
+            "count": len(mappings)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/budgets/mapping", status_code=201)
+def create_budget_mapping(payload: BudgetMappingCreate):
+    """
+    Create a new QBO budget -> NGM project mapping.
+    """
+    try:
+        # Verify NGM project exists
+        project_check = supabase.table("projects") \
+            .select("project_id") \
+            .eq("project_id", payload.ngm_project_id) \
+            .single() \
+            .execute()
+
+        if not project_check.data:
+            raise HTTPException(status_code=400, detail="NGM project not found")
+
+        # Check if mapping already exists
+        existing = supabase.table("qbo_budget_mapping") \
+            .select("id") \
+            .eq("qbo_budget_id", payload.qbo_budget_id) \
+            .execute()
+
+        if existing.data:
+            # Update existing
+            res = supabase.table("qbo_budget_mapping") \
+                .update({
+                    "ngm_project_id": payload.ngm_project_id,
+                    "qbo_budget_name": payload.qbo_budget_name,
+                    "qbo_fiscal_year": payload.qbo_fiscal_year,
+                    "auto_matched": False
+                }) \
+                .eq("qbo_budget_id", payload.qbo_budget_id) \
+                .execute()
+
+            return {
+                "message": "Mapping updated",
+                "data": res.data[0] if res.data else None
+            }
+
+        # Create new
+        res = supabase.table("qbo_budget_mapping").insert({
+            "qbo_budget_id": payload.qbo_budget_id,
+            "qbo_budget_name": payload.qbo_budget_name,
+            "qbo_fiscal_year": payload.qbo_fiscal_year,
+            "ngm_project_id": payload.ngm_project_id,
+            "auto_matched": False
+        }).execute()
+
+        return {
+            "message": "Mapping created",
+            "data": res.data[0] if res.data else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/budgets/mapping/{qbo_budget_id}")
+def update_budget_mapping(qbo_budget_id: str, payload: BudgetMappingUpdate):
+    """
+    Update an existing budget mapping.
+    """
+    try:
+        # Check if exists
+        existing = supabase.table("qbo_budget_mapping") \
+            .select("id") \
+            .eq("qbo_budget_id", qbo_budget_id) \
+            .execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Mapping not found")
+
+        # Prepare update data
+        data = {}
+        if payload.ngm_project_id is not None:
+            if payload.ngm_project_id:
+                # Verify project exists
+                project_check = supabase.table("projects") \
+                    .select("project_id") \
+                    .eq("project_id", payload.ngm_project_id) \
+                    .single() \
+                    .execute()
+
+                if not project_check.data:
+                    raise HTTPException(status_code=400, detail="NGM project not found")
+
+            data["ngm_project_id"] = payload.ngm_project_id
+
+        if payload.qbo_budget_name is not None:
+            data["qbo_budget_name"] = payload.qbo_budget_name
+
+        if not data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        data["auto_matched"] = False  # Manual update
+
+        res = supabase.table("qbo_budget_mapping") \
+            .update(data) \
+            .eq("qbo_budget_id", qbo_budget_id) \
+            .execute()
+
+        return {
+            "message": "Mapping updated",
+            "data": res.data[0] if res.data else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/budgets/mapping/{qbo_budget_id}")
+def delete_budget_mapping(qbo_budget_id: str):
+    """
+    Delete a budget mapping.
+    """
+    try:
+        supabase.table("qbo_budget_mapping") \
+            .delete() \
+            .eq("qbo_budget_id", qbo_budget_id) \
+            .execute()
+
+        return {"message": "Mapping deleted"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/budgets/mapping/auto-match")
+async def auto_match_budgets(realm_id: str):
+    """
+    Attempt to automatically match QBO budgets to NGM projects by name similarity.
+    """
+    try:
+        # Fetch budgets from QBO
+        qbo_budgets = await fetch_budgets(realm_id)
+
+        if not qbo_budgets:
+            return {"message": "No budgets in QBO", "matched": 0}
+
+        # Get all NGM projects
+        projects_resp = supabase.table("projects") \
+            .select("project_id, project_name") \
+            .execute()
+
+        projects = projects_resp.data or []
+
+        if not projects:
+            return {"message": "No NGM projects found", "matched": 0}
+
+        # Normalize function
+        def normalize(s):
+            if not s:
+                return ""
+            return s.lower().strip().replace("-", " ").replace("_", " ")
+
+        # Create normalized project map
+        projects_normalized = {
+            normalize(p["project_name"]): p for p in projects
+        }
+
+        matched_count = 0
+        created_count = 0
+
+        for budget in qbo_budgets:
+            budget_id = str(budget.get("Id", ""))
+            budget_name = budget.get("Name", "")
+            start_date = budget.get("StartDate", "")
+
+            if not budget_id:
+                continue
+
+            # Extract fiscal year
+            fiscal_year = None
+            if start_date:
+                try:
+                    fiscal_year = int(start_date.split("-")[0])
+                except:
+                    pass
+
+            budget_normalized = normalize(budget_name)
+
+            # Try exact match first
+            matched_project = None
+            if budget_normalized in projects_normalized:
+                matched_project = projects_normalized[budget_normalized]
+            else:
+                # Try partial match
+                for norm_name, project in projects_normalized.items():
+                    if norm_name in budget_normalized or budget_normalized in norm_name:
+                        matched_project = project
+                        break
+
+            # Check if mapping exists
+            existing = supabase.table("qbo_budget_mapping") \
+                .select("id, ngm_project_id") \
+                .eq("qbo_budget_id", budget_id) \
+                .execute()
+
+            if existing.data:
+                # Already has mapping - only update if currently unmapped and we found a match
+                if not existing.data[0].get("ngm_project_id") and matched_project:
+                    supabase.table("qbo_budget_mapping") \
+                        .update({
+                            "ngm_project_id": matched_project["project_id"],
+                            "auto_matched": True
+                        }) \
+                        .eq("qbo_budget_id", budget_id) \
+                        .execute()
+                    matched_count += 1
+            else:
+                # Create new mapping
+                supabase.table("qbo_budget_mapping").insert({
+                    "qbo_budget_id": budget_id,
+                    "qbo_budget_name": budget_name,
+                    "qbo_fiscal_year": fiscal_year,
+                    "ngm_project_id": matched_project["project_id"] if matched_project else None,
+                    "auto_matched": matched_project is not None
+                }).execute()
+                created_count += 1
+                if matched_project:
+                    matched_count += 1
+
+        return {
+            "message": "Auto-match completed",
+            "total_budgets": len(qbo_budgets),
+            "new_mappings_created": created_count,
+            "matched": matched_count
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/budgets/sync-mapped/{realm_id}")
+async def sync_mapped_budgets(realm_id: str):
+    """
+    Sync budgets from QBO using the established mappings.
+    Only imports budgets that have been mapped to NGM projects.
+    """
+    try:
+        # Fetch budgets from QBO
+        qbo_budgets = await fetch_budgets(realm_id)
+
+        if not qbo_budgets:
+            return {
+                "message": "No budgets found in QuickBooks",
+                "total_imported": 0
+            }
+
+        # Get mappings
+        mappings_resp = supabase.table("qbo_budget_mapping") \
+            .select("*") \
+            .not_.is_("ngm_project_id", "null") \
+            .execute()
+
+        mappings = {m["qbo_budget_id"]: m for m in (mappings_resp.data or [])}
+
+        if not mappings:
+            return {
+                "message": "No mapped budgets found. Please map budgets to projects first.",
+                "total_imported": 0
+            }
+
+        # Fetch accounts metadata
+        accounts_meta = await fetch_accounts_metadata(realm_id)
+
+        imported_records = []
+        now = datetime.utcnow().isoformat()
+
+        for budget in qbo_budgets:
+            budget_id = str(budget.get("Id", ""))
+
+            # Skip if not mapped
+            if budget_id not in mappings:
+                continue
+
+            mapping = mappings[budget_id]
+            project_id = mapping["ngm_project_id"]
+
+            budget_name = budget.get("Name", "Unnamed Budget")
+            start_date = budget.get("StartDate")
+            end_date = budget.get("EndDate")
+            is_active = budget.get("Active", True)
+
+            # Extract fiscal year
+            budget_year = None
+            if start_date:
+                try:
+                    budget_year = int(start_date.split("-")[0])
+                except:
+                    pass
+
+            budget_details = budget.get("BudgetDetail", [])
+            if not budget_details:
+                continue
+
+            # Sum by account
+            account_totals = {}
+            for detail in budget_details:
+                account_ref = detail.get("AccountRef", {})
+                account_id = str(account_ref.get("value", ""))
+                account_name = account_ref.get("name", "")
+
+                if not account_id:
+                    continue
+
+                if account_id in accounts_meta:
+                    meta = accounts_meta[account_id]
+                    account_name = account_name or meta.get("Name", "")
+
+                amount = float(detail.get("Amount", 0) or 0)
+
+                if account_id not in account_totals:
+                    account_totals[account_id] = {
+                        "account_name": account_name,
+                        "total_amount": 0,
+                        "line_count": 0
+                    }
+
+                account_totals[account_id]["total_amount"] += amount
+                account_totals[account_id]["line_count"] += 1
+
+            # Create records
+            for account_id, data in account_totals.items():
+                record = {
+                    "ngm_project_id": project_id,
+                    "budget_id_qbo": budget_id,
+                    "budget_name": budget_name,
+                    "year": budget_year,
+                    "account_id": account_id,
+                    "account_name": data["account_name"],
+                    "amount_sum": data["total_amount"],
+                    "lines_count": data["line_count"],
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "active": is_active,
+                    "imported_at": now,
+                    "import_source": "qbo_api"
+                }
+                imported_records.append(record)
+
+        if not imported_records:
+            return {
+                "message": "No budget data to import",
+                "total_imported": 0
+            }
+
+        # Delete existing QBO API budgets for mapped projects
+        project_ids = list(set(r["ngm_project_id"] for r in imported_records))
+        for pid in project_ids:
+            supabase.table("budgets_qbo") \
+                .delete() \
+                .eq("ngm_project_id", pid) \
+                .eq("import_source", "qbo_api") \
+                .execute()
+
+        # Insert
+        batch_size = 100
+        total_inserted = 0
+        for i in range(0, len(imported_records), batch_size):
+            batch = imported_records[i:i + batch_size]
+            supabase.table("budgets_qbo").insert(batch).execute()
+            total_inserted += len(batch)
+
+        return {
+            "message": "Sync completed using mappings",
+            "total_imported": total_inserted,
+            "projects_updated": len(project_ids),
+            "budgets_synced": len(mappings)
         }
 
     except Exception as e:

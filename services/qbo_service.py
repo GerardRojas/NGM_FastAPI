@@ -512,3 +512,23 @@ def disconnect(realm_id: str) -> bool:
     """
     supabase.table("qbo_tokens").delete().eq("realm_id", realm_id).execute()
     return True
+
+
+# ====== BUDGET FETCHING ======
+
+async def fetch_budgets(
+    realm_id: str,
+    fiscal_year: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all Budget records from QBO.
+    QuickBooks budgets are divided into 12 monthly periods.
+    """
+    query = "SELECT * FROM Budget"
+    if fiscal_year:
+        query += f" WHERE FiscalYear = '{fiscal_year}'"
+
+    query += " MAXRESULTS 1000"
+
+    result = await qbo_query(realm_id, query)
+    return result.get("QueryResponse", {}).get("Budget", [])
