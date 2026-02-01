@@ -1546,11 +1546,14 @@ async def sync_mapped_budgets(realm_id: str):
             supabase.table("budgets_qbo").insert(batch).execute()
             total_inserted += len(batch)
 
+        # Count unique projects updated
+        project_ids_updated = set(r["ngm_project_id"] for r in imported_records)
+
         return {
             "message": "Sync completed using mappings",
             "total_imported": total_inserted,
-            "projects_updated": len(project_ids),
-            "budgets_synced": len(mappings)
+            "projects_updated": len(project_ids_updated),
+            "budgets_synced": len(budget_ids_to_import)
         }
 
     except Exception as e:
