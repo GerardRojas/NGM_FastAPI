@@ -1026,12 +1026,14 @@ async def qbo_sync_budgets(
                 }
                 imported_records.append(record)
 
-        # Delete existing QBO API budgets for this project before importing
-        supabase.table("budgets_qbo") \
-            .delete() \
-            .eq("ngm_project_id", project_id) \
-            .eq("import_source", "qbo_api") \
-            .execute()
+        # Delete existing records for the specific QBO budget IDs being imported
+        # This prevents duplicates when re-importing the same budget
+        budget_ids_to_import = list(set(r["budget_id_qbo"] for r in imported_records))
+        for bid in budget_ids_to_import:
+            supabase.table("budgets_qbo") \
+                .delete() \
+                .eq("budget_id_qbo", bid) \
+                .execute()
 
         # Insert new records in batches
         batch_size = 100
@@ -1527,13 +1529,13 @@ async def sync_mapped_budgets(realm_id: str):
                 "total_imported": 0
             }
 
-        # Delete existing QBO API budgets for mapped projects
-        project_ids = list(set(r["ngm_project_id"] for r in imported_records))
-        for pid in project_ids:
+        # Delete existing records for the specific QBO budget IDs being imported
+        # This prevents duplicates when re-importing the same budget
+        budget_ids_to_import = list(set(r["budget_id_qbo"] for r in imported_records))
+        for bid in budget_ids_to_import:
             supabase.table("budgets_qbo") \
                 .delete() \
-                .eq("ngm_project_id", pid) \
-                .eq("import_source", "qbo_api") \
+                .eq("budget_id_qbo", bid) \
                 .execute()
 
         # Insert
