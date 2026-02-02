@@ -15,7 +15,7 @@ from api.services.process_parser import (
     merge_with_database_processes,
     calculate_layout
 )
-from api.database import supabase
+from api.supabase_client import supabase
 
 router = APIRouter(prefix="/processes", tags=["Process Manager"])
 
