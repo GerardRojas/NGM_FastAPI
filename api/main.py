@@ -26,6 +26,13 @@ from api.routers.permissions import router as permissions_router
 from api.routers.budgets import router as budgets_router
 from api.routers.payment_methods import router as payment_methods_router
 from api.routers.reconciliations import router as reconciliations_router
+
+# ========= MATERIALS DATABASE =========
+from api.routers.materials import router as materials_router
+from api.routers.material_categories import router as material_categories_router
+from api.routers.material_classes import router as material_classes_router
+from api.routers.units import router as units_router
+from api.routers.concepts import router as concepts_router
 from api.routers.qbo import router as qbo_router
 from api.routers.bills import router as bills_router
 
@@ -46,6 +53,9 @@ from api.routers.budget_alerts import router as budget_alerts_router
 
 # ========= PENDING RECEIPTS: Receipt Management ==========
 from api.routers.pending_receipts import router as pending_receipts_router
+
+# ========= PROCESS MANAGER: Code-based Process Documentation ==========
+from api.routers.processes import router as processes_router
 
 
 # ========================================
@@ -133,6 +143,16 @@ app.include_router(budget_alerts_router)
 
 # Pending Receipts (receipt management for expenses)
 app.include_router(pending_receipts_router)
+
+# Materials Database (materiales, categorias, clases, unidades, conceptos)
+app.include_router(materials_router)
+app.include_router(material_categories_router)
+app.include_router(material_classes_router)
+app.include_router(units_router)
+app.include_router(concepts_router)
+
+# Process Manager (code-based process documentation)
+app.include_router(processes_router)
 
 # ========================================
 # Root & Healthcheck

@@ -1,3 +1,47 @@
+# =============================================================================
+# @process: QBO_Reconciliation
+# @process_name: QuickBooks Expense Reconciliation
+# @process_category: bookkeeping
+# @process_trigger: manual
+# @process_description: Match manual COGS expenses with QuickBooks Online transactions for accounting reconciliation
+# @process_owner: Accountant
+#
+# @step: 1
+# @step_name: Load QBO Transactions
+# @step_type: action
+# @step_description: Fetch unreconciled transactions from QuickBooks for project
+# @step_connects_to: 2
+#
+# @step: 2
+# @step_name: Load Manual Expenses
+# @step_type: action
+# @step_description: Get unreconciled manual COGS entries for matching
+# @step_connects_to: 3
+#
+# @step: 3
+# @step_name: Match Expenses
+# @step_type: condition
+# @step_description: Compare amounts and dates to find matching pairs
+# @step_connects_to: 4, 5
+#
+# @step: 4
+# @step_name: Create Link
+# @step_type: action
+# @step_description: Create reconciliation record linking QBO to manual expense
+# @step_connects_to: 6
+#
+# @step: 5
+# @step_name: Flag Unmatched
+# @step_type: notification
+# @step_description: Alert accountant about expenses that couldn't be matched
+# @step_connects_to: 6
+#
+# @step: 6
+# @step_name: Update Status
+# @step_type: action
+# @step_description: Mark both expenses as reconciled
+# =============================================================================
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from api.supabase_client import supabase

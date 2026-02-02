@@ -3,6 +3,55 @@
 # Pending Receipts API Router
 # ================================
 # Manages receipts uploaded to project channels for expense processing
+#
+# =============================================================================
+# @process: Receipt_Processing
+# @process_name: Receipt Processing Workflow
+# @process_category: bookkeeping
+# @process_trigger: event
+# @process_description: Process uploaded receipts from project channels into expense entries
+# @process_owner: Bookkeeper
+#
+# @step: 1
+# @step_name: Receipt Upload
+# @step_type: action
+# @step_description: User uploads receipt image/PDF to project channel
+# @step_connects_to: 2
+#
+# @step: 2
+# @step_name: Store in Bucket
+# @step_type: action
+# @step_description: Save file to pending-expenses storage bucket
+# @step_connects_to: 3
+#
+# @step: 3
+# @step_name: OCR Analysis
+# @step_type: action
+# @step_description: Extract vendor, amount, date using OpenAI Vision
+# @step_connects_to: 4
+#
+# @step: 4
+# @step_name: Create Pending Record
+# @step_type: action
+# @step_description: Store extracted data in pending_receipts table
+# @step_connects_to: 5
+#
+# @step: 5
+# @step_name: Await Review
+# @step_type: wait
+# @step_description: Receipt waits for bookkeeper review and approval
+# @step_connects_to: 6, 7
+#
+# @step: 6
+# @step_name: Create Expense
+# @step_type: action
+# @step_description: Convert approved receipt into expenses_manual_COGS entry
+#
+# @step: 7
+# @step_name: Reject Receipt
+# @step_type: action
+# @step_description: Mark receipt as rejected if invalid
+# =============================================================================
 
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query
 from pydantic import BaseModel
