@@ -3181,3 +3181,8 @@ def get_next_available_slot(user_id: str, estimated_hours: float = 2.0) -> Dict[
             "days_until_available": (available_date - today).days,
             "effective_hours_per_day": round(effective_hours, 1),
         }
+
+    except Exception as e:
+        print(f"[WORKLOAD] ERROR in next-available: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error: {e}") from e

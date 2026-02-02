@@ -156,7 +156,8 @@ WITH task_stats AS (
         COUNT(CASE WHEN t.deadline < CURRENT_DATE AND ts.task_status NOT IN ('Done', 'Completed') THEN 1 END) as overdue_count,
         COUNT(CASE WHEN t.deadline BETWEEN CURRENT_DATE AND CURRENT_DATE + 7
             AND ts.task_status NOT IN ('Done', 'Completed') THEN 1 END) as due_soon_count,
-        MIN(CASE WHEN ts.task_status = 'Working on It' THEN t.task_id END) as current_task_id,
+        -- Use text cast for UUID comparison, then cast back
+        (MIN(CASE WHEN ts.task_status = 'Working on It' THEN t.task_id::text END))::uuid as current_task_id,
         MIN(t.scheduled_end_date) FILTER (WHERE ts.task_status = 'Working on It') as current_task_ends
     FROM tasks t
     LEFT JOIN tasks_status ts ON ts.task_status_id = t.task_status
@@ -166,7 +167,7 @@ WITH task_stats AS (
 capacity AS (
     SELECT
         u.user_id,
-        u.username,
+        u.user_name,
         COALESCE(ucs.hours_per_day, 8) as hours_per_day,
         COALESCE(ucs.days_per_week, 5) as days_per_week,
         COALESCE(ucs.buffer_percent, 20) as buffer_percent,
@@ -178,7 +179,7 @@ capacity AS (
 )
 SELECT
     c.user_id,
-    c.username,
+    c.user_name,
     c.hours_per_day,
     c.days_per_week,
     c.weekly_capacity,
