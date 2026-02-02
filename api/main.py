@@ -56,6 +56,7 @@ from api.routers.pending_receipts import router as pending_receipts_router
 
 # ========= PROCESS MANAGER: Code-based Process Documentation ==========
 from api.routers.processes import router as processes_router
+from api.routers.process_manager import router as process_manager_router
 
 
 # ========================================
@@ -153,6 +154,9 @@ app.include_router(concepts_router)
 
 # Process Manager (code-based process documentation)
 app.include_router(processes_router)
+
+# Process Manager Visual State (shared state for process manager UI)
+app.include_router(process_manager_router)
 
 # ========================================
 # Root & Healthcheck

@@ -353,3 +353,4 @@ async def get_step_types():
             {"id": "approval", "name": "Approval", "description": "Require approval to continue", "icon": "check"},
         ]
     }
+
