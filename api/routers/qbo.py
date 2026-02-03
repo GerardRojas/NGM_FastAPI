@@ -15,6 +15,8 @@ from services.qbo_service import (
     fetch_all_bills,
     fetch_all_vendor_credits,
     fetch_all_journal_entries,
+    fetch_all_invoices,
+    fetch_all_sales_receipts,
     fetch_project_catalog,
     fetch_accounts_metadata,
     fetch_budgets
@@ -1554,6 +1556,410 @@ async def sync_mapped_budgets(realm_id: str):
             "total_imported": total_inserted,
             "projects_updated": len(project_ids_updated),
             "budgets_synced": len(budget_ids_to_import)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====== ENDPOINTS: QBO ACCOUNTS SYNC ======
+
+@router.post("/accounts/sync/{realm_id}")
+async def sync_qbo_accounts(realm_id: str):
+    """
+    Sincroniza todas las cuentas desde QBO a la tabla qbo_accounts.
+    Incluye AccountType, AccountSubType, is_cogs, is_income, etc.
+    """
+    try:
+        # Fetch all accounts from QBO
+        accounts_meta = await fetch_accounts_metadata(realm_id)
+
+        if not accounts_meta:
+            return {
+                "message": "No accounts found in QBO",
+                "total_synced": 0
+            }
+
+        now = datetime.utcnow().isoformat()
+        records = []
+
+        for qbo_id, meta in accounts_meta.items():
+            account_type = meta.get("AccountType", "")
+            account_sub_type = meta.get("AccountSubType", "")
+
+            # Determine is_cogs based on AccountType
+            is_cogs = (account_type == "Cost of Goods Sold")
+
+            # Determine is_income based on AccountType
+            is_income = (account_type in ["Income", "Other Income"])
+
+            # Determine is_expense based on AccountType
+            is_expense = (account_type in ["Expense", "Other Expense"])
+
+            records.append({
+                "qbo_account_id": qbo_id,
+                "name": meta.get("Name", ""),
+                "account_type": account_type,
+                "account_sub_type": account_sub_type,
+                "is_cogs": is_cogs,
+                "is_income": is_income,
+                "is_expense": is_expense,
+                "realm_id": realm_id,
+                "synced_at": now
+            })
+
+        # Upsert all accounts
+        if records:
+            supabase.table("qbo_accounts").upsert(
+                records,
+                on_conflict="qbo_account_id"
+            ).execute()
+
+        return {
+            "message": "Accounts sync completed",
+            "realm_id": realm_id,
+            "total_synced": len(records),
+            "cogs_accounts": sum(1 for r in records if r["is_cogs"]),
+            "income_accounts": sum(1 for r in records if r["is_income"]),
+            "expense_accounts": sum(1 for r in records if r["is_expense"])
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/accounts")
+def get_qbo_accounts(
+    account_type: Optional[str] = None,
+    is_cogs: Optional[bool] = None,
+    is_income: Optional[bool] = None,
+    is_expense: Optional[bool] = None
+):
+    """
+    Obtiene cuentas de QBO sincronizadas.
+
+    Filtros:
+    - account_type: filtrar por tipo (Income, Expense, Cost of Goods Sold, etc.)
+    - is_cogs: true para solo COGS
+    - is_income: true para solo Income
+    - is_expense: true para solo Expense
+    """
+    try:
+        query = supabase.table("qbo_accounts").select("*")
+
+        if account_type:
+            query = query.eq("account_type", account_type)
+
+        if is_cogs is not None:
+            query = query.eq("is_cogs", is_cogs)
+
+        if is_income is not None:
+            query = query.eq("is_income", is_income)
+
+        if is_expense is not None:
+            query = query.eq("is_expense", is_expense)
+
+        query = query.order("name")
+
+        resp = query.execute()
+
+        return {
+            "data": resp.data or [],
+            "count": len(resp.data or [])
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====== ENDPOINTS: QBO REVENUE (INVOICES/SALES) ======
+
+def extract_revenue_lines(txns, txn_type, project_ids, project_catalog, accounts_meta):
+    """
+    Extract revenue lines from QBO Invoice/SalesReceipt transactions.
+    Revenue is treated as POSITIVE signed_amount.
+    """
+    lines = []
+    if not txns:
+        return lines
+
+    for txn in txns:
+        txn_id = str(txn.get("Id", ""))
+        if not txn_id:
+            continue
+
+        txn_date = str(txn.get("TxnDate", "") or "")
+
+        # Customer info (this is the project/job for Invoices)
+        customer_id = ""
+        customer_name = ""
+        if txn.get("CustomerRef"):
+            customer_id = str(txn["CustomerRef"].get("value", "") or "")
+            customer_name = str(txn["CustomerRef"].get("name", "") or "")
+
+        # Bucket assignment
+        bucket = ""
+        if not customer_id:
+            bucket = "UNASSIGNED"
+        elif customer_id in project_ids:
+            bucket = "PROJECT"
+        else:
+            bucket = "NOT_A_PROJECT"
+
+        # Total amount (for Invoices, TotalAmt is the invoice total)
+        total_amount = float(txn.get("TotalAmt", 0) or 0)
+
+        # For simple revenue tracking, we create one line per invoice/receipt
+        # Revenue is POSITIVE
+        global_line_uid = f"{txn_type}:{txn_id}:TOTAL"
+
+        lines.append({
+            "global_line_uid": global_line_uid,
+            "qbo_customer_id": customer_id or None,
+            "qbo_customer_name": customer_name or None,
+            "bucket": bucket,
+            "txn_type": txn_type,
+            "txn_id": txn_id,
+            "line_id": "TOTAL",
+            "txn_date": txn_date or None,
+            "vendor_name": None,  # No vendor for sales
+            "payment_type": str(txn.get("PaymentType", "") or "") or None,
+            "account_id": None,  # Income account determined by QBO
+            "account_name": "Sales/Revenue",
+            "account_type": "Income",
+            "account_sub_type": None,
+            "is_cogs": False,
+            "is_income": True,
+            "amount": total_amount,
+            "sign": 1,  # Revenue is positive
+            "signed_amount": total_amount,
+            "line_description": f"{txn_type} #{txn.get('DocNumber', txn_id)}"
+        })
+
+    return lines
+
+
+@router.post("/revenue/sync/{realm_id}")
+async def sync_qbo_revenue(
+    realm_id: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+):
+    """
+    Sincroniza ingresos (Invoices y SalesReceipts) desde QBO.
+    Los almacena en qbo_expenses con signed_amount positivo y is_income=true.
+    """
+    try:
+        # Fetch project catalog for bucketing
+        project_catalog = await fetch_project_catalog(realm_id)
+        project_ids = set(project_catalog.keys())
+
+        # Fetch account metadata
+        accounts_meta = await fetch_accounts_metadata(realm_id)
+
+        all_lines = []
+
+        # Invoices
+        invoices = await fetch_all_invoices(realm_id, start_date, end_date)
+        all_lines.extend(extract_revenue_lines(invoices, "Invoice", project_ids, project_catalog, accounts_meta))
+
+        # Sales Receipts
+        sales_receipts = await fetch_all_sales_receipts(realm_id, start_date, end_date)
+        all_lines.extend(extract_revenue_lines(sales_receipts, "SalesReceipt", project_ids, project_catalog, accounts_meta))
+
+        # Deduplicate
+        seen = set()
+        deduped = []
+        for line in all_lines:
+            uid = line.get("global_line_uid")
+            if uid and uid not in seen:
+                seen.add(uid)
+                deduped.append(line)
+
+        # Upsert
+        now = datetime.utcnow().isoformat()
+        batch_size = 500
+        imported_count = 0
+
+        for i in range(0, len(deduped), batch_size):
+            batch = deduped[i:i + batch_size]
+            for row in batch:
+                row["imported_at"] = now
+
+            supabase.table("qbo_expenses").upsert(
+                batch,
+                on_conflict="global_line_uid"
+            ).execute()
+            imported_count += len(batch)
+
+        return {
+            "message": "Revenue sync completed",
+            "realm_id": realm_id,
+            "total_imported": len(deduped),
+            "transactions": {
+                "invoices": len(invoices),
+                "sales_receipts": len(sales_receipts)
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/revenue")
+def get_qbo_revenue(
+    project: Optional[str] = None,
+    qbo_customer_id: Optional[str] = None,
+    limit: Optional[int] = None
+):
+    """
+    Obtiene ingresos (revenue) de QBO.
+    Filtra por is_income=true o txn_type IN (Invoice, SalesReceipt).
+    """
+    try:
+        query = supabase.table("qbo_expenses").select("*")
+
+        # Filter for revenue only
+        query = query.in_("txn_type", ["Invoice", "SalesReceipt"])
+
+        # Filter by project if provided
+        if project:
+            mapping_resp = supabase.table("qbo_project_mapping") \
+                .select("qbo_customer_id") \
+                .eq("ngm_project_id", project) \
+                .execute()
+
+            if mapping_resp.data:
+                qbo_ids = [m["qbo_customer_id"] for m in mapping_resp.data]
+                query = query.in_("qbo_customer_id", qbo_ids)
+            else:
+                return {"data": [], "count": 0}
+
+        if qbo_customer_id:
+            query = query.eq("qbo_customer_id", qbo_customer_id)
+
+        query = query.order("txn_date", desc=True)
+
+        if limit:
+            query = query.limit(limit)
+
+        resp = query.execute()
+
+        return {
+            "data": resp.data or [],
+            "count": len(resp.data or [])
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====== ENDPOINT: P&L DATA ======
+
+@router.get("/pnl")
+def get_pnl_data(project: str):
+    """
+    Obtiene datos para el reporte P&L de un proyecto.
+    Combina Revenue, COGS y Operating Expenses.
+
+    Retorna:
+    - revenue: total de ingresos (Invoices, SalesReceipts con signed_amount > 0)
+    - cogs: gastos COGS agrupados por cuenta
+    - operating_expenses: gastos non-COGS agrupados por cuenta
+    - gross_profit: revenue - cogs
+    - net_income: gross_profit - operating_expenses
+    """
+    try:
+        # Get QBO customer IDs for this project
+        mapping_resp = supabase.table("qbo_project_mapping") \
+            .select("qbo_customer_id") \
+            .eq("ngm_project_id", project) \
+            .execute()
+
+        if not mapping_resp.data:
+            return {
+                "message": "No QBO mapping found for this project",
+                "revenue": {"total": 0, "items": []},
+                "cogs": {"total": 0, "by_account": {}},
+                "operating_expenses": {"total": 0, "by_account": {}},
+                "gross_profit": 0,
+                "gross_margin": 0,
+                "net_income": 0,
+                "net_margin": 0
+            }
+
+        qbo_ids = [m["qbo_customer_id"] for m in mapping_resp.data]
+
+        # Fetch all transactions for this project
+        resp = supabase.table("qbo_expenses") \
+            .select("*") \
+            .in_("qbo_customer_id", qbo_ids) \
+            .execute()
+
+        transactions = resp.data or []
+
+        # Separate by type
+        revenue_total = 0
+        revenue_items = []
+        cogs_total = 0
+        cogs_by_account = {}
+        opex_total = 0
+        opex_by_account = {}
+
+        for txn in transactions:
+            signed_amount = float(txn.get("signed_amount", 0) or 0)
+            account_name = txn.get("account_name", "Unknown")
+            is_cogs = txn.get("is_cogs", False)
+            txn_type = txn.get("txn_type", "")
+
+            # Revenue: Invoices, SalesReceipts, or positive signed_amount
+            if txn_type in ["Invoice", "SalesReceipt"] or signed_amount > 0:
+                revenue_total += abs(signed_amount)
+                revenue_items.append({
+                    "description": txn.get("line_description"),
+                    "amount": abs(signed_amount),
+                    "date": txn.get("txn_date")
+                })
+            elif signed_amount < 0 or signed_amount > 0:
+                # Expenses (negative signed_amount or positive from expense txn types)
+                expense_amount = abs(signed_amount)
+
+                if is_cogs:
+                    cogs_total += expense_amount
+                    if account_name not in cogs_by_account:
+                        cogs_by_account[account_name] = 0
+                    cogs_by_account[account_name] += expense_amount
+                else:
+                    # Non-COGS = Operating Expense
+                    opex_total += expense_amount
+                    if account_name not in opex_by_account:
+                        opex_by_account[account_name] = 0
+                    opex_by_account[account_name] += expense_amount
+
+        # Calculate P&L metrics
+        gross_profit = revenue_total - cogs_total
+        gross_margin = (gross_profit / revenue_total * 100) if revenue_total > 0 else 0
+        net_income = gross_profit - opex_total
+        net_margin = (net_income / revenue_total * 100) if revenue_total > 0 else 0
+
+        return {
+            "project_id": project,
+            "revenue": {
+                "total": revenue_total,
+                "items": revenue_items
+            },
+            "cogs": {
+                "total": cogs_total,
+                "by_account": cogs_by_account
+            },
+            "operating_expenses": {
+                "total": opex_total,
+                "by_account": opex_by_account
+            },
+            "gross_profit": gross_profit,
+            "gross_margin": round(gross_margin, 2),
+            "net_income": net_income,
+            "net_margin": round(net_margin, 2)
         }
 
     except Exception as e:

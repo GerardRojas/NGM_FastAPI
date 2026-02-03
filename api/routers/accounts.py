@@ -28,12 +28,14 @@ class AccountCreate(BaseModel):
     AcctNum: Optional[int] = None
     AccountCategory: Optional[str] = None
     account_id: Optional[str] = None  # Si es auto-generado por Supabase, hacerlo opcional
+    is_cogs: Optional[bool] = False  # True si es cuenta COGS (Cost of Goods Sold)
 
 
 class AccountUpdate(BaseModel):
     Name: Optional[str] = None
     AcctNum: Optional[int] = None
     AccountCategory: Optional[str] = None
+    is_cogs: Optional[bool] = None  # True si es cuenta COGS
 
 
 # ========================================
@@ -89,6 +91,8 @@ async def create_account(account: AccountCreate):
             insert_data["AccountCategory"] = account.AccountCategory
         if account.account_id:
             insert_data["account_id"] = account.account_id
+        if account.is_cogs is not None:
+            insert_data["is_cogs"] = account.is_cogs
 
         response = supabase.table("accounts").insert(insert_data).execute()
 
@@ -125,6 +129,9 @@ async def update_account(account_id: str, account: AccountUpdate):
 
         if account.AccountCategory is not None:
             update_data["AccountCategory"] = account.AccountCategory
+
+        if account.is_cogs is not None:
+            update_data["is_cogs"] = account.is_cogs
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")

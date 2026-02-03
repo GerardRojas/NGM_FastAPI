@@ -391,6 +391,50 @@ async def fetch_all_journal_entries(
     return result.get("QueryResponse", {}).get("JournalEntry", [])
 
 
+async def fetch_all_invoices(
+    realm_id: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all Invoice transactions from QBO (Revenue/Income).
+    """
+    query = "SELECT * FROM Invoice"
+    if start_date:
+        query += f" WHERE TxnDate >= '{start_date}'"
+        if end_date:
+            query += f" AND TxnDate <= '{end_date}'"
+    elif end_date:
+        query += f" WHERE TxnDate <= '{end_date}'"
+
+    query += " MAXRESULTS 1000"
+
+    result = await qbo_query(realm_id, query)
+    return result.get("QueryResponse", {}).get("Invoice", [])
+
+
+async def fetch_all_sales_receipts(
+    realm_id: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all SalesReceipt transactions from QBO (Revenue/Income).
+    """
+    query = "SELECT * FROM SalesReceipt"
+    if start_date:
+        query += f" WHERE TxnDate >= '{start_date}'"
+        if end_date:
+            query += f" AND TxnDate <= '{end_date}'"
+    elif end_date:
+        query += f" WHERE TxnDate <= '{end_date}'"
+
+    query += " MAXRESULTS 1000"
+
+    result = await qbo_query(realm_id, query)
+    return result.get("QueryResponse", {}).get("SalesReceipt", [])
+
+
 async def fetch_project_catalog(realm_id: str) -> Dict[str, str]:
     """
     Fetch all Jobs/Projects from QBO (Customers where Job=true).
