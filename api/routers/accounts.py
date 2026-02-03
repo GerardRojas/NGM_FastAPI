@@ -159,7 +159,7 @@ async def delete_account(account_id: str):
             raise HTTPException(status_code=404, detail="Account not found")
 
         # Verificar si hay expenses asociados
-        expenses_check = supabase.table("qbo_expenses").select("expense_id").eq("account_id", account_id).limit(1).execute()
+        expenses_check = supabase.table("qbo_expenses").select("id").eq("account_id", account_id).limit(1).execute()
 
         if expenses_check.data and len(expenses_check.data) > 0:
             raise HTTPException(
