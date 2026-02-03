@@ -8,7 +8,7 @@ All authorized users share the same state.
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Union, List, Any
 
 from api.supabase_client import supabase
 
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/process-manager", tags=["Process Manager State"])
 # ========================================
 
 class ProcessManagerStateUpdate(BaseModel):
-    state_data: dict
+    state_data: Union[dict, List[Any]]  # Accept both objects and arrays
     updated_by: Optional[str] = None
 
 
