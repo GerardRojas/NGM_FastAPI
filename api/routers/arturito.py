@@ -639,10 +639,24 @@ Your job is to interpret natural language commands and return structured actions
 Available actions:
 - clear_filters: Remove all active filters (e.g., "quita los filtros", "clear filters", "mostrar todo")
 - filter_bill: Filter by bill/invoice number (e.g., "filtra el bill 1439", "muestra factura 234")
-- filter_vendor: Filter by vendor/supplier name (e.g., "gastos de Home Depot", "filtra vendor Wayfair")
-- filter_account: Filter by account/category name (e.g., "gastos de hauling and dump", "muestra solo materials", "filtra labor costs")
+- filter_vendor: Filter by COMPANY/SUPPLIER NAME (e.g., "gastos de Home Depot", "filtra vendor Wayfair", "solo The Home Depot")
+- filter_account: Filter by EXPENSE CATEGORY/TYPE (e.g., "gastos de hauling and dump", "muestra solo materials", "filtra labor costs", "solo hauling", "dump fees")
+- filter_status: Filter by authorization status - value should be "pending", "auth", or "review" (e.g., "muestrame solo gastos autorizados", "gastos pendientes", "solo pending", "expenses in review", "authorized only")
 - search: Search for text in expenses (e.g., "busca pintura", "search for materials")
 - summary: Show expense summary (e.g., "cuantos gastos tengo", "resumen de gastos")
+
+IMPORTANT DISTINCTION:
+- filter_vendor = Company names (Home Depot, Wayfair, Lowe's, ABC Construction, etc.)
+- filter_account = Expense categories/types (hauling and dump, materials, labor, equipment rental, permits, etc.)
+
+Examples:
+- "muestrame solo los gastos de hauling and dump" → filter_account (hauling and dump is a category, not a company)
+- "gastos de Home Depot" → filter_vendor (Home Depot is a company)
+- "solo materials" → filter_account (materials is a category)
+- "filtra Wayfair" → filter_vendor (Wayfair is a company)
+- "muestrame solo gastos autorizados" → filter_status with value "auth"
+- "gastos pendientes" → filter_status with value "pending"
+- "expenses in review" → filter_status with value "review"
 
 Respond ONLY with a JSON object:
 {"action": "action_name", "value": "extracted_value_or_null", "message": "friendly_response_in_spanish"}
