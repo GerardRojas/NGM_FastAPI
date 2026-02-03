@@ -622,9 +622,9 @@ def update_expense(expense_id: str, payload: ExpenseUpdate):
 
 
 @router.patch("/{expense_id}")
-def patch_expense(expense_id: str, payload: ExpenseUpdate):
+def patch_expense(expense_id: str, payload: ExpenseUpdate, user_id: Optional[str] = None, change_reason: Optional[str] = None):
     """
-    Actualiza parcialmente un gasto existente.
+    Actualiza parcialmente un gasto existente con logging de cambios.
     Solo se actualizan los campos proporcionados en el body.
 
     Campos actualizables:
@@ -632,16 +632,24 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate):
     - txn_type: UUID del tipo de transacción
     - vendor_id: UUID del vendor
     - payment_type: UUID del método de pago
+    - account_id: UUID de la cuenta/categoría
     - Amount: monto del gasto
     - LineDescription: descripción del gasto
-    - auth_status: estado de autorización (boolean)
+    - auth_status: estado de autorización (boolean) - DEPRECATED, use /status endpoint
     - auth_by: UUID del usuario que autorizó
+
+    Query params:
+    - user_id: UUID of user making changes (required for audit log)
+    - change_reason: Optional reason for changes (e.g., "Client correction", "Categorization error")
     """
     try:
-        # Verificar que el gasto existe
-        existing = supabase.table("expenses_manual_COGS").select("expense_id").eq("expense_id", expense_id).single().execute()
-        if not existing.data:
+        # Verificar que el gasto existe y obtener datos actuales
+        existing_resp = supabase.table("expenses_manual_COGS").select("*").eq("expense_id", expense_id).single().execute()
+        if not existing_resp.data:
             raise HTTPException(status_code=404, detail="Expense not found")
+
+        existing = existing_resp.data
+        current_status = existing.get("status") or ("auth" if existing.get("auth_status") else "pending")
 
         # Preparar datos para actualizar (solo campos proporcionados)
         data = {k: v for k, v in payload.model_dump().items() if v is not None}
@@ -667,12 +675,46 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate):
             if not payment.data:
                 raise HTTPException(status_code=400, detail="Invalid payment_type")
 
+        # Validar account_id si se está actualizando
+        if "account_id" in data:
+            account = supabase.table("accounts").select("account_id").eq("account_id", data["account_id"]).single().execute()
+            if not account.data:
+                raise HTTPException(status_code=400, detail="Invalid account_id")
+
+        # Log field changes if expense is in 'review' or 'auth' status
+        if current_status in ['review', 'auth'] and user_id:
+            change_logs = []
+
+            # Important fields to track
+            tracked_fields = ['account_id', 'Amount', 'LineDescription', 'txn_type', 'vendor_id', 'payment_type', 'TxnDate']
+
+            for field in tracked_fields:
+                if field in data:
+                    old_value = str(existing.get(field)) if existing.get(field) is not None else None
+                    new_value = str(data[field]) if data[field] is not None else None
+
+                    if old_value != new_value:
+                        change_logs.append({
+                            "expense_id": expense_id,
+                            "field_name": field,
+                            "old_value": old_value,
+                            "new_value": new_value,
+                            "changed_by": user_id,
+                            "expense_status": current_status,
+                            "change_reason": change_reason or "Manual correction"
+                        })
+
+            # Insert change logs
+            if change_logs:
+                supabase.table("expense_change_log").insert(change_logs).execute()
+
         # Actualizar
         res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
 
         return {
             "message": "Expense updated successfully",
             "expense": res.data[0] if res.data else None,
+            "changes_logged": len(change_logs) if current_status in ['review', 'auth'] and user_id else 0
         }
 
     except HTTPException:
@@ -682,25 +724,334 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate):
 
 
 @router.delete("/{expense_id}")
-def delete_expense(expense_id: str):
+def delete_expense(expense_id: str, user_id: Optional[str] = None, delete_reason: Optional[str] = None):
     """
-    Elimina un gasto
+    Elimina un gasto con logging si estaba autorizado.
+
+    Query params:
+    - user_id: UUID of user deleting the expense (required for authorized expenses)
+    - delete_reason: Reason for deletion (required for authorized expenses)
     """
     try:
-        # Verificar que el gasto existe
-        existing = supabase.table("expenses_manual_COGS").select("expense_id").eq("expense_id", expense_id).single().execute()
-        if not existing.data:
+        # Verificar que el gasto existe y obtener status
+        existing_resp = supabase.table("expenses_manual_COGS").select(
+            "expense_id, status, auth_status, Amount, LineDescription, account_id"
+        ).eq("expense_id", expense_id).single().execute()
+
+        if not existing_resp.data:
             raise HTTPException(status_code=404, detail="Expense not found")
+
+        existing = existing_resp.data
+        current_status = existing.get("status") or ("auth" if existing.get("auth_status") else "pending")
+
+        # If expense is authorized or in review, require user_id and reason
+        if current_status in ['auth', 'review']:
+            if not user_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="user_id is required when deleting authorized expenses"
+                )
+            if not delete_reason:
+                raise HTTPException(
+                    status_code=400,
+                    detail="delete_reason is required when deleting authorized expenses"
+                )
+
+            # Log the deletion
+            log_data = {
+                "expense_id": expense_id,
+                "old_status": current_status,
+                "new_status": "deleted",
+                "changed_by": user_id,
+                "reason": delete_reason,
+                "metadata": {
+                    "deleted": True,
+                    "amount": existing.get("Amount"),
+                    "description": existing.get("LineDescription"),
+                    "account_id": existing.get("account_id")
+                }
+            }
+
+            supabase.table("expense_status_log").insert(log_data).execute()
 
         # Eliminar
         supabase.table("expenses_manual_COGS").delete().eq("expense_id", expense_id).execute()
 
-        return {"message": "Expense deleted"}
+        return {
+            "message": "Expense deleted",
+            "was_authorized": current_status in ['auth', 'review'],
+            "logged": current_status in ['auth', 'review']
+        }
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====== STATUS MANAGEMENT ======
+
+class ExpenseStatusUpdate(BaseModel):
+    status: str  # 'pending', 'auth', 'review'
+    reason: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+@router.patch("/{expense_id}/status")
+def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id: str):
+    """
+    Update expense status with audit logging.
+
+    Status flow:
+    - pending -> auth (manager approval)
+    - auth -> review (flagged by manager/COO/CEO for categorization review)
+    - review -> auth (after correction)
+
+    Only manager, COO, or CEO can set status to 'review'.
+
+    Args:
+        expense_id: UUID of the expense
+        payload: New status and optional reason/metadata
+        user_id: UUID of user making the change
+
+    Returns:
+        Updated expense with log entry
+    """
+    try:
+        # Validate status
+        valid_statuses = ['pending', 'auth', 'review']
+        if payload.status not in valid_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
+            )
+
+        # Get current expense data
+        expense_resp = supabase.table("expenses_manual_COGS").select(
+            "expense_id, status, auth_status"
+        ).eq("expense_id", expense_id).single().execute()
+
+        if not expense_resp.data:
+            raise HTTPException(status_code=404, detail="Expense not found")
+
+        current_expense = expense_resp.data
+        old_status = current_expense.get("status") or ("auth" if current_expense.get("auth_status") else "pending")
+
+        # Permission check for 'review' status
+        if payload.status == 'review':
+            user_resp = supabase.table("users").select(
+                "user_id, rols!users_user_rol_fkey(rol_name)"
+            ).eq("user_id", user_id).single().execute()
+
+            if not user_resp.data:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            role_info = user_resp.data.get("rols") or {}
+            role_name = role_info.get("rol_name", "")
+
+            REVIEW_ALLOWED_ROLES = ["CEO", "COO", "Accounting Manager", "Project Manager"]
+
+            if role_name not in REVIEW_ALLOWED_ROLES:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Only {', '.join(REVIEW_ALLOWED_ROLES)} can set status to 'review'"
+                )
+
+        # Update expense status
+        update_data = {"status": payload.status}
+
+        # Also update legacy auth_status for backwards compatibility
+        if payload.status == 'auth':
+            update_data["auth_status"] = True
+            update_data["auth_by"] = user_id
+        elif payload.status == 'pending':
+            update_data["auth_status"] = False
+            update_data["auth_by"] = None
+
+        supabase.table("expenses_manual_COGS").update(update_data).eq(
+            "expense_id", expense_id
+        ).execute()
+
+        # Log the status change
+        log_data = {
+            "expense_id": expense_id,
+            "old_status": old_status,
+            "new_status": payload.status,
+            "changed_by": user_id,
+            "reason": payload.reason,
+            "metadata": payload.metadata or {}
+        }
+
+        supabase.table("expense_status_log").insert(log_data).execute()
+
+        return {
+            "message": "Status updated successfully",
+            "expense_id": expense_id,
+            "old_status": old_status,
+            "new_status": payload.status,
+            "logged": True
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating status: {str(e)}")
+
+
+@router.get("/{expense_id}/status-history")
+def get_expense_status_history(expense_id: str):
+    """
+    Get status change history for an expense.
+
+    Returns chronological list of all status changes with user info.
+    """
+    try:
+        # Verify expense exists
+        expense_resp = supabase.table("expenses_manual_COGS").select(
+            "expense_id"
+        ).eq("expense_id", expense_id).single().execute()
+
+        if not expense_resp.data:
+            raise HTTPException(status_code=404, detail="Expense not found")
+
+        # Get status log with user info
+        log_resp = supabase.table("expense_status_log").select(
+            """
+            id,
+            old_status,
+            new_status,
+            changed_at,
+            reason,
+            metadata,
+            changed_by,
+            users!expense_status_log_changed_by_fkey(user_name, avatar_color)
+            """
+        ).eq("expense_id", expense_id).order("changed_at", desc=False).execute()
+
+        history = []
+        for entry in (log_resp.data or []):
+            user_info = entry.get("users") or {}
+            history.append({
+                "id": entry["id"],
+                "old_status": entry["old_status"],
+                "new_status": entry["new_status"],
+                "changed_at": entry["changed_at"],
+                "reason": entry.get("reason"),
+                "metadata": entry.get("metadata", {}),
+                "changed_by": {
+                    "id": entry.get("changed_by"),
+                    "name": user_info.get("user_name"),
+                    "avatar_color": user_info.get("avatar_color")
+                }
+            })
+
+        return {"expense_id": expense_id, "history": history}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting status history: {str(e)}")
+
+
+@router.get("/{expense_id}/audit-trail")
+def get_expense_audit_trail(expense_id: str):
+    """
+    Get complete audit trail for an expense (status changes + field changes).
+
+    Returns chronological list of all changes with user info.
+    Useful for manager review and client accountability.
+    """
+    try:
+        # Verify expense exists
+        expense_resp = supabase.table("expenses_manual_COGS").select(
+            "expense_id"
+        ).eq("expense_id", expense_id).single().execute()
+
+        if not expense_resp.data:
+            raise HTTPException(status_code=404, detail="Expense not found")
+
+        # Get status changes
+        status_resp = supabase.table("expense_status_log").select(
+            """
+            id,
+            old_status,
+            new_status,
+            changed_at,
+            reason,
+            metadata,
+            changed_by,
+            users!expense_status_log_changed_by_fkey(user_name, avatar_color)
+            """
+        ).eq("expense_id", expense_id).execute()
+
+        # Get field changes
+        field_resp = supabase.table("expense_change_log").select(
+            """
+            id,
+            field_name,
+            old_value,
+            new_value,
+            changed_at,
+            expense_status,
+            change_reason,
+            changed_by,
+            users!expense_change_log_changed_by_fkey(user_name, avatar_color)
+            """
+        ).eq("expense_id", expense_id).execute()
+
+        # Combine and sort by date
+        all_changes = []
+
+        # Add status changes
+        for entry in (status_resp.data or []):
+            user_info = entry.get("users") or {}
+            all_changes.append({
+                "type": "status_change",
+                "id": entry["id"],
+                "timestamp": entry["changed_at"],
+                "old_status": entry["old_status"],
+                "new_status": entry["new_status"],
+                "reason": entry.get("reason"),
+                "metadata": entry.get("metadata", {}),
+                "changed_by": {
+                    "id": entry.get("changed_by"),
+                    "name": user_info.get("user_name"),
+                    "avatar_color": user_info.get("avatar_color")
+                }
+            })
+
+        # Add field changes
+        for entry in (field_resp.data or []):
+            user_info = entry.get("users") or {}
+            all_changes.append({
+                "type": "field_change",
+                "id": entry["id"],
+                "timestamp": entry["changed_at"],
+                "field_name": entry["field_name"],
+                "old_value": entry["old_value"],
+                "new_value": entry["new_value"],
+                "expense_status": entry["expense_status"],
+                "reason": entry.get("change_reason"),
+                "changed_by": {
+                    "id": entry.get("changed_by"),
+                    "name": user_info.get("user_name"),
+                    "avatar_color": user_info.get("avatar_color")
+                }
+            })
+
+        # Sort by timestamp
+        all_changes.sort(key=lambda x: x["timestamp"] or "")
+
+        return {
+            "expense_id": expense_id,
+            "audit_trail": all_changes,
+            "total_changes": len(all_changes)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting audit trail: {str(e)}")
 
 
 @router.get("/summary/by-txn-type")
@@ -1367,13 +1718,13 @@ def get_pending_authorization_count(user_id: str):
                 "message": "User role does not have authorization permissions"
             }
 
-        # Get pending expenses (auth_status is false or null)
+        # Get pending expenses (status = 'pending')
         # For CEO/COO: All pending expenses
         # For Project Manager: Only their assigned projects (future enhancement)
 
         query = supabase.table("expenses_manual_COGS").select(
             "expense_id", count="exact"
-        ).or_("auth_status.is.null,auth_status.eq.false")
+        ).eq("status", "pending")
 
         # Execute query
         result = query.execute()
@@ -1437,8 +1788,8 @@ def get_pending_authorization_summary(user_id: str):
 
         # Get pending expenses with project info
         query = supabase.table("expenses_manual_COGS").select(
-            "expense_id, project, Amount"
-        ).or_("auth_status.is.null,auth_status.eq.false")
+            "expense_id, project, Amount, status"
+        ).eq("status", "pending")
 
         result = query.execute()
         expenses = result.data or []
@@ -1482,3 +1833,107 @@ def get_pending_authorization_summary(user_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting pending authorization summary: {str(e)}")
+
+
+@router.get("/metrics/categorization-errors")
+def get_categorization_error_metrics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user_id: Optional[str] = None
+):
+    """
+    Get metrics on categorization errors based on expenses flagged for review.
+
+    Calculates:
+    - Total expenses reviewed
+    - Error rate (% flagged as 'review')
+    - Breakdown by reason
+    - Trend over time
+
+    Args:
+        start_date: Filter from this date (ISO format)
+        end_date: Filter until this date (ISO format)
+        user_id: Optional filter by user who flagged for review
+
+    Returns:
+        Metrics object with error rates and trends
+    """
+    try:
+        # Build query for status log
+        query = supabase.table("expense_status_log").select(
+            "id, expense_id, old_status, new_status, changed_at, reason, metadata, changed_by"
+        )
+
+        if start_date:
+            query = query.gte("changed_at", start_date)
+        if end_date:
+            query = query.lte("changed_at", end_date)
+        if user_id:
+            query = query.eq("changed_by", user_id)
+
+        log_resp = query.execute()
+        logs = log_resp.data or []
+
+        # Calculate metrics
+        total_reviewed = 0  # Total expenses that went through auth
+        flagged_for_review = 0  # Expenses marked as 'review'
+        reasons = {}  # Breakdown by reason
+        by_month = {}  # Trend by month
+
+        for log in logs:
+            new_status = log.get("new_status")
+            old_status = log.get("old_status")
+            reason = log.get("reason") or "Not specified"
+            changed_at = log.get("changed_at", "")
+
+            # Count transitions to auth (approved)
+            if new_status == "auth" and old_status == "pending":
+                total_reviewed += 1
+
+            # Count transitions to review (flagged)
+            if new_status == "review":
+                flagged_for_review += 1
+
+                # Count by reason
+                if reason not in reasons:
+                    reasons[reason] = 0
+                reasons[reason] += 1
+
+                # Count by month
+                if changed_at:
+                    month_key = changed_at[:7]  # YYYY-MM
+                    if month_key not in by_month:
+                        by_month[month_key] = 0
+                    by_month[month_key] += 1
+
+        # Calculate error rate
+        error_rate = 0.0
+        if total_reviewed > 0:
+            error_rate = round((flagged_for_review / total_reviewed) * 100, 2)
+
+        # Sort reasons by count
+        reason_list = [
+            {"reason": k, "count": v}
+            for k, v in sorted(reasons.items(), key=lambda x: x[1], reverse=True)
+        ]
+
+        # Sort months chronologically
+        trend_list = [
+            {"month": k, "count": v}
+            for k, v in sorted(by_month.items())
+        ]
+
+        return {
+            "total_reviewed": total_reviewed,
+            "flagged_for_review": flagged_for_review,
+            "error_rate_percent": error_rate,
+            "by_reason": reason_list,
+            "trend_by_month": trend_list,
+            "date_range": {
+                "start": start_date,
+                "end": end_date
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting categorization metrics: {str(e)}")

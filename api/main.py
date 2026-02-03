@@ -12,6 +12,8 @@ load_dotenv(env_path)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.supabase_client import supabase
+
 # ========= ROUTERS EXISTENTES =========
 from api.schema import router as schema_router
 from api.routers.projects import router as projects_router
@@ -169,3 +171,17 @@ async def root():
 @app.get("/health", include_in_schema=False)
 async def health():
     return {"status": "ok"}
+
+@app.get("/departments")
+async def get_departments():
+    """
+    Get list of all departments.
+    Used by various modules for department selection dropdowns.
+    """
+    try:
+        response = supabase.table("task_departments").select(
+            "department_id, department_name"
+        ).order("department_name").execute()
+        return {"departments": response.data or []}
+    except Exception as e:
+        return {"departments": []}

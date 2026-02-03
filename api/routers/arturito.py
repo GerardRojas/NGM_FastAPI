@@ -640,12 +640,14 @@ Available actions:
 - clear_filters: Remove all active filters (e.g., "quita los filtros", "clear filters", "mostrar todo")
 - filter_bill: Filter by bill/invoice number (e.g., "filtra el bill 1439", "muestra factura 234")
 - filter_vendor: Filter by vendor/supplier name (e.g., "gastos de Home Depot", "filtra vendor Wayfair")
+- filter_account: Filter by account/category name (e.g., "gastos de hauling and dump", "muestra solo materials", "filtra labor costs")
 - search: Search for text in expenses (e.g., "busca pintura", "search for materials")
 - summary: Show expense summary (e.g., "cuantos gastos tengo", "resumen de gastos")
 
 Respond ONLY with a JSON object:
 {"action": "action_name", "value": "extracted_value_or_null", "message": "friendly_response_in_spanish"}
 
+For filter_account, extract the account/category name from the command.
 If you can't interpret the command as a filter action, return:
 {"action": null, "value": null, "message": null}"""
 
@@ -687,6 +689,77 @@ If you can't interpret the command as a filter action, return:
     except Exception as e:
         print(f"[ARTURITO] Filter interpretation error: {e}")
         return FilterInterpretResponse(understood=False)
+
+
+@router.get("/search-accounts")
+async def search_accounts(query: str, limit: int = 5):
+    """
+    Search for accounts using fuzzy matching.
+    Returns best matches for natural language account queries.
+
+    Args:
+        query: Search term (e.g., "hauling", "materials", "labor")
+        limit: Maximum number of results (default: 5)
+
+    Returns:
+        List of matching accounts with similarity scores
+    """
+    try:
+        # Get all accounts
+        from api.supabase_client import supabase
+        response = supabase.table("accounts").select(
+            "account_id, Name, AcctNum, FullyQualifiedName"
+        ).execute()
+
+        accounts = response.data or []
+
+        if not accounts:
+            return {"matches": []}
+
+        # Fuzzy matching using simple scoring
+        query_lower = query.lower()
+        scored_accounts = []
+
+        for account in accounts:
+            name = account.get("Name", "").lower()
+            full_name = account.get("FullyQualifiedName", "").lower()
+
+            # Calculate similarity score
+            score = 0
+
+            # Exact match gets highest score
+            if query_lower == name:
+                score = 100
+            elif query_lower in name:
+                score = 80
+            elif query_lower in full_name:
+                score = 60
+            else:
+                # Word-based matching
+                query_words = query_lower.split()
+                name_words = name.split()
+
+                matching_words = sum(1 for qw in query_words if any(qw in nw for nw in name_words))
+                if matching_words > 0:
+                    score = (matching_words / len(query_words)) * 50
+
+            if score > 0:
+                scored_accounts.append({
+                    "account_id": account["account_id"],
+                    "name": account["Name"],
+                    "account_num": account.get("AcctNum"),
+                    "full_name": account.get("FullyQualifiedName"),
+                    "score": round(score, 2)
+                })
+
+        # Sort by score descending
+        scored_accounts.sort(key=lambda x: x["score"], reverse=True)
+
+        return {"matches": scored_accounts[:limit]}
+
+    except Exception as e:
+        print(f"[ARTURITO] Account search error: {e}")
+        return {"matches": []}
 
 
 @router.get("/failed-commands/stats")
