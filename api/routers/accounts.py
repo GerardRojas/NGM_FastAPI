@@ -149,7 +149,7 @@ async def update_account(account_id: str, account: AccountUpdate):
 async def delete_account(account_id: str):
     """
     Elimina una cuenta
-    NOTA: Esto fallará si hay gastos (expenses) asociados a esta cuenta debido a foreign key constraint
+    NOTA: Esto fallará si hay gastos (qbo_expenses) asociados a esta cuenta debido a foreign key constraint
     """
     try:
         # Verificar que la cuenta exista
@@ -159,7 +159,7 @@ async def delete_account(account_id: str):
             raise HTTPException(status_code=404, detail="Account not found")
 
         # Verificar si hay expenses asociados
-        expenses_check = supabase.table("expenses").select("expense_id").eq("account_id", account_id).limit(1).execute()
+        expenses_check = supabase.table("qbo_expenses").select("expense_id").eq("account_id", account_id).limit(1).execute()
 
         if expenses_check.data and len(expenses_check.data) > 0:
             raise HTTPException(
