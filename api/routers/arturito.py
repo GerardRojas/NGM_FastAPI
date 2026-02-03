@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import re
+import json
 
 # Importar el engine de Arturito
 from services.arturito import (
@@ -644,10 +645,18 @@ Available actions:
 - filter_status: Filter by authorization status - value should be "pending", "auth", or "review" (e.g., "muestrame solo gastos autorizados", "gastos pendientes", "solo pending", "expenses in review", "authorized only")
 - search: Search for text in expenses (e.g., "busca pintura", "search for materials")
 - summary: Show expense summary (e.g., "cuantos gastos tengo", "resumen de gastos")
+- list_accounts: List all available expense accounts/categories (e.g., "ver cuentas", "lista de cuentas", "que cuentas hay", "show accounts")
 
 IMPORTANT DISTINCTION:
 - filter_vendor = Company names (Home Depot, Wayfair, Lowe's, ABC Construction, etc.)
 - filter_account = Expense categories/types (hauling and dump, materials, labor, equipment rental, permits, etc.)
+
+CONFIRMATION RESPONSES:
+When user confirms an account choice (after seeing options), interpret as filter_account:
+- "Hauling And Dump" → filter_account with value "Hauling And Dump"
+- "filtrar hauling and dump" → filter_account with value "hauling and dump"
+- "la primera" / "opción 1" / "1" → (cannot handle numbers - return null to let widget handle)
+- Just an account name without "filtrar" keyword → filter_account
 
 Examples:
 - "muestrame solo los gastos de hauling and dump" → filter_account (hauling and dump is a category, not a company)
@@ -657,6 +666,8 @@ Examples:
 - "muestrame solo gastos autorizados" → filter_status with value "auth"
 - "gastos pendientes" → filter_status with value "pending"
 - "expenses in review" → filter_status with value "review"
+- "Hauling And Dump" (after seeing options) → filter_account with value "Hauling And Dump"
+- "filtrar equipment rental" → filter_account with value "equipment rental"
 
 Respond ONLY with a JSON object:
 {"action": "action_name", "value": "extracted_value_or_null", "message": "friendly_response_in_spanish"}
@@ -705,14 +716,101 @@ If you can't interpret the command as a filter action, return:
         return FilterInterpretResponse(understood=False)
 
 
+async def semantic_account_search(query: str, accounts: list, limit: int = 5):
+    """
+    Use GPT to find semantically matching accounts.
+    Handles synonyms and related concepts (e.g., "basura" → "Hauling And Dump").
+    """
+    try:
+        # Create account list for GPT
+        account_list = "\n".join([
+            f"- {acc.get('Name')} (ID: {acc.get('account_id')})"
+            for acc in accounts[:50]  # Limit to avoid token limits
+        ])
+
+        system_prompt = f"""You are an expense categorization assistant.
+Your task is to find which expense account(s) best match a given search query.
+
+Available accounts:
+{account_list}
+
+Return a JSON array of matching account IDs, ordered by relevance (most relevant first).
+Consider synonyms and semantic relationships:
+- "basura", "desechos", "desperdicios" → "Hauling And Dump"
+- "materiales", "materials" → material-related accounts
+- "mano de obra", "labor" → labor-related accounts
+- etc.
+
+If multiple accounts could match a general concept, include all relevant ones.
+
+Response format:
+{{"matches": ["account_id_1", "account_id_2", ...], "reasoning": "brief explanation"}}
+
+If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}}"""
+
+        client = get_openai_client()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Find accounts matching: {query}"}
+            ],
+            temperature=0,
+            max_tokens=200
+        )
+
+        result_text = response.choices[0].message.content.strip()
+
+        # Parse JSON response
+        if result_text.startswith("```"):
+            result_text = result_text.split("```")[1]
+            if result_text.startswith("json"):
+                result_text = result_text[4:]
+            result_text = result_text.strip()
+
+        result = json.loads(result_text)
+        matched_ids = result.get("matches", [])
+
+        if matched_ids:
+            # Build response with matched accounts
+            matched_accounts = []
+            for acc in accounts:
+                if acc.get("account_id") in matched_ids:
+                    matched_accounts.append({
+                        "account_id": acc["account_id"],
+                        "name": acc["Name"],
+                        "account_num": acc.get("AcctNum"),
+                        "full_name": acc.get("FullyQualifiedName"),
+                        "score": 90,  # Semantic matches get high score
+                        "semantic": True,
+                        "reasoning": result.get("reasoning", "")
+                    })
+
+            # Sort by original order from GPT (relevance)
+            ordered_matches = []
+            for match_id in matched_ids:
+                for acc in matched_accounts:
+                    if acc["account_id"] == match_id:
+                        ordered_matches.append(acc)
+                        break
+
+            return ordered_matches[:limit]
+
+        return []
+
+    except Exception as e:
+        print(f"[ARTURITO] Semantic search error: {e}")
+        return []
+
+
 @router.get("/search-accounts")
 async def search_accounts(query: str, limit: int = 5):
     """
-    Search for accounts using fuzzy matching.
+    Search for accounts using hybrid fuzzy + semantic matching.
     Returns best matches for natural language account queries.
 
     Args:
-        query: Search term (e.g., "hauling", "materials", "labor")
+        query: Search term (e.g., "hauling", "basura", "desechos")
         limit: Maximum number of results (default: 5)
 
     Returns:
@@ -730,28 +828,32 @@ async def search_accounts(query: str, limit: int = 5):
         if not accounts:
             return {"matches": []}
 
-        # Fuzzy matching using simple scoring
-        query_lower = query.lower()
+        # Normalize query for better matching
+        import re
+        query_normalized = re.sub(r'\s+', ' ', query.lower().strip())
+
+        # Phase 1: Fuzzy matching with improved scoring
         scored_accounts = []
 
         for account in accounts:
-            name = account.get("Name", "").lower()
+            name = account.get("Name", "")
+            name_normalized = re.sub(r'\s+', ' ', name.lower().strip())
             full_name = account.get("FullyQualifiedName", "").lower()
 
             # Calculate similarity score
             score = 0
 
-            # Exact match gets highest score
-            if query_lower == name:
+            # Exact match (normalized) gets highest score
+            if query_normalized == name_normalized:
                 score = 100
-            elif query_lower in name:
+            elif query_normalized in name_normalized:
                 score = 80
-            elif query_lower in full_name:
+            elif query_normalized in full_name:
                 score = 60
             else:
                 # Word-based matching
-                query_words = query_lower.split()
-                name_words = name.split()
+                query_words = query_normalized.split()
+                name_words = name_normalized.split()
 
                 matching_words = sum(1 for qw in query_words if any(qw in nw for nw in name_words))
                 if matching_words > 0:
@@ -769,7 +871,16 @@ async def search_accounts(query: str, limit: int = 5):
         # Sort by score descending
         scored_accounts.sort(key=lambda x: x["score"], reverse=True)
 
-        return {"matches": scored_accounts[:limit]}
+        # Phase 2: If no good match found (best score < 70), try GPT semantic search
+        if not scored_accounts or scored_accounts[0]["score"] < 70:
+            print(f"[ARTURITO] Fuzzy match weak (best: {scored_accounts[0]['score'] if scored_accounts else 0}), trying GPT semantic search...")
+
+            semantic_matches = await semantic_account_search(query, accounts)
+            if semantic_matches:
+                print(f"[ARTURITO] GPT found {len(semantic_matches)} semantic matches")
+                return {"matches": semantic_matches[:limit], "method": "semantic"}
+
+        return {"matches": scored_accounts[:limit], "method": "fuzzy"}
 
     except Exception as e:
         print(f"[ARTURITO] Account search error: {e}")
