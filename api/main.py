@@ -60,6 +60,9 @@ from api.routers.pending_receipts import router as pending_receipts_router
 from api.routers.processes import router as processes_router
 from api.routers.process_manager import router as process_manager_router
 
+# ========= ADU CALCULATOR: Allowance ADU Calculator ==========
+from api.routers.adu_calculator import router as adu_calculator_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -159,6 +162,9 @@ app.include_router(processes_router)
 
 # Process Manager Visual State (shared state for process manager UI)
 app.include_router(process_manager_router)
+
+# ADU Calculator (allowance calculator with GPT screenshot analysis)
+app.include_router(adu_calculator_router)
 
 # ========================================
 # Root & Healthcheck
