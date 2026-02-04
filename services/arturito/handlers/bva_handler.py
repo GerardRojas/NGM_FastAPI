@@ -137,14 +137,12 @@ def handle_budget_vs_actuals(
         totals = report_data["totals"]
         balance_emoji = "✅" if totals["balance"] >= 0 else "⚠️"
 
-        response_text = f"""📊 *Budget vs Actuals: {project_name}*
+        response_text = f"""Budget vs Actuals: {project_name}
 
-💰 Budget: ${totals['budget']:,.2f}
-💸 Actual: ${totals['actual']:,.2f}
+Budget: ${totals['budget']:,.2f}
+Actual: ${totals['actual']:,.2f}
 {balance_emoji} Balance: ${totals['balance']:,.2f}
-📈 % Used: {totals['percent_of_budget']:.1f}%
-
-📄 *[Ver Reporte PDF]({pdf_url})*"""
+% Used: {totals['percent_of_budget']:.1f}%"""
 
         return {
             "ok": True,
@@ -711,11 +709,11 @@ def handle_consulta_especifica(
         expenses = fetch_expenses(project_id)
         accounts = fetch_accounts()
 
-        # Buscar la categoría en los datos
-        category_data = find_category_data(category_input, budgets, expenses, accounts)
+        # Buscar grupo de cuentas (por AccountCategory)
+        group_data = find_group_data(category_input, budgets, expenses, accounts)
 
-        if not category_data:
-            # Sugerir categorías similares usando TODAS las cuentas de la tabla accounts
+        if not group_data:
+            # Sugerir categorias similares usando TODAS las cuentas de la tabla accounts
             available_categories = get_available_categories(budgets, expenses, accounts, only_with_data=False)
             suggestions = find_similar_categories(category_input, available_categories)
 
@@ -723,19 +721,19 @@ def handle_consulta_especifica(
                 suggestion_text = ", ".join(suggestions[:5])
                 return {
                     "ok": False,
-                    "text": f"No encontré '{category_input}' en {project_name}.\n\n¿Quisiste decir: {suggestion_text}?",
+                    "text": f"No encontre '{category_input}' en {project_name}.\n\nQuisiste decir: {suggestion_text}?",
                     "action": "category_not_found",
                     "data": {"suggestions": suggestions}
                 }
             else:
                 return {
                     "ok": False,
-                    "text": f"No encontré la categoría '{category_input}' en {project_name}.",
+                    "text": f"No encontre la categoria '{category_input}' en {project_name}.",
                     "action": "category_not_found"
                 }
 
-        # Formatear respuesta
-        response = format_category_response(project_name, category_input, category_data)
+        # Formatear respuesta agrupada
+        response = format_group_response(project_name, group_data)
 
         return {
             "ok": True,
@@ -744,11 +742,10 @@ def handle_consulta_especifica(
             "data": {
                 "project_id": project_id,
                 "project_name": project_name,
-                "category": category_data["matched_name"],
-                "budget": category_data["budget"],
-                "actual": category_data["actual"],
-                "balance": category_data["balance"],
-                "percent_used": category_data["percent_of_budget"]
+                "group_name": group_data.get("group_name"),
+                "match_type": group_data.get("match_type"),
+                "accounts": group_data.get("accounts"),
+                "group_totals": group_data.get("group_totals")
             }
         }
 
@@ -1084,3 +1081,253 @@ def format_category_response(project_name: str, category_query: str, data: Dict[
         response += f"\n\n💡 Apenas se ha utilizado esta categoría."
 
     return header + response if header else response
+
+
+# ================================
+# GROUP-LEVEL QUERIES (AccountCategory)
+# ================================
+
+def find_group_data(
+    category_input: str,
+    budgets: List[Dict[str, Any]],
+    expenses: List[Dict[str, Any]],
+    accounts: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """
+    Finds BvA data grouped by AccountCategory.
+
+    Logic:
+    1. Try matching input against AccountCategory names (group-level match).
+    2. If no group match, find the individual account via find_category_data(),
+       then look up its AccountCategory to get the full group.
+    3. In both cases, return all accounts in the group with individual BvA + totals.
+
+    Returns dict with: matched_name, searched_term, group_name, match_type,
+                       accounts[], group_totals{}
+    """
+    input_lower = category_input.lower().strip()
+
+    # -- Build lookups --
+    account_info = {}
+    for acc in accounts:
+        aid = acc.get("account_id") or acc.get("id")
+        name = acc.get("Name") or acc.get("account_name") or "Unknown"
+        group = acc.get("AccountCategory") or ""
+        account_info[aid] = {"name": name, "category": group}
+
+    # AccountCategory -> [account_names]
+    groups = {}
+    for acc in accounts:
+        cat = acc.get("AccountCategory")
+        name = acc.get("Name") or acc.get("account_name")
+        if cat and name:
+            groups.setdefault(cat, []).append(name)
+
+    # -- Expand search with aliases (reuse same map as find_category_data) --
+    CATEGORY_ALIASES = {
+        "ventanas": ["window", "windows", "ventana"],
+        "hvac": ["hvac", "heating", "cooling", "aire acondicionado", "calefaccion"],
+        "plomeria": ["plumbing", "plomeria", "plumber"],
+        "electricidad": ["electrical", "electric", "electricidad", "electrico"],
+        "framing": ["framing", "frame", "estructura"],
+        "drywall": ["drywall", "sheetrock"],
+        "pintura": ["paint", "painting", "pintura"],
+        "piso": ["flooring", "floor", "piso", "pisos"],
+        "techo": ["roof", "roofing", "techo"],
+        "cocina": ["kitchen", "cocina", "cabinets", "gabinetes"],
+        "bano": ["bathroom", "bath", "bano"],
+        "puertas": ["door", "doors", "puerta", "puertas"],
+        "concreto": ["concrete", "concreto", "foundation", "cimentacion"],
+        "landscaping": ["landscaping", "landscape", "jardineria", "jardin"],
+        "appliances": ["appliances", "appliance", "electrodomesticos"],
+        "insulation": ["insulation", "aislamiento"],
+    }
+
+    search_terms = [input_lower]
+    for alias_key, alias_values in CATEGORY_ALIASES.items():
+        if input_lower in alias_values or input_lower == alias_key:
+            search_terms.extend(alias_values)
+            search_terms.append(alias_key)
+    search_terms = list(set(search_terms))
+
+    # -- Step 1: Try matching an AccountCategory name directly --
+    matched_group = None
+    match_type = None   # "group" or "account"
+    matched_account_name = None
+
+    for group_name in groups:
+        group_lower = group_name.lower()
+        for term in search_terms:
+            if term == group_lower or term in group_lower or group_lower in term:
+                matched_group = group_name
+                match_type = "group"
+                break
+        if matched_group:
+            break
+
+    # -- Step 2: If no group match, find account then its group --
+    if not matched_group:
+        single = find_category_data(category_input, budgets, expenses, accounts)
+        if not single:
+            return None
+
+        matched_account_name = single["matched_name"]
+
+        # Look up the AccountCategory of the matched account
+        for acc in accounts:
+            name = acc.get("Name") or acc.get("account_name")
+            if name and name.lower() == matched_account_name.lower():
+                matched_group = acc.get("AccountCategory")
+                match_type = "account"
+                break
+
+        # Account has no group — return single account wrapped in group format
+        if not matched_group:
+            return {
+                "matched_name": matched_account_name,
+                "searched_term": category_input,
+                "is_approximate": single.get("is_approximate", False),
+                "group_name": None,
+                "match_type": "account",
+                "accounts": [{**single, "is_matched": True}],
+                "group_totals": {
+                    "budget": single["budget"],
+                    "actual": single["actual"],
+                    "balance": single["balance"],
+                    "percent_of_budget": single["percent_of_budget"]
+                }
+            }
+
+    # -- Step 3: Build BvA for every account in the group --
+    group_account_names = groups.get(matched_group, [])
+
+    def get_account_name(account_id, account_name=None):
+        if account_name:
+            return account_name
+        info = account_info.get(account_id)
+        return info["name"] if info else "Unknown"
+
+    budgets_by_acc = {}
+    for b in budgets:
+        name = get_account_name(b.get("account_id"), b.get("account_name"))
+        budgets_by_acc[name] = budgets_by_acc.get(name, 0) + float(b.get("amount_sum") or 0)
+
+    expenses_by_acc = {}
+    for e in expenses:
+        name = get_account_name(e.get("account_id"), e.get("account_name"))
+        amount = float(e.get("Amount") or e.get("amount") or 0)
+        expenses_by_acc[name] = expenses_by_acc.get(name, 0) + amount
+
+    account_details = []
+    total_budget = 0
+    total_actual = 0
+
+    for acc_name in sorted(group_account_names):
+        b = budgets_by_acc.get(acc_name, 0)
+        a = expenses_by_acc.get(acc_name, 0)
+        if b == 0 and a == 0:
+            continue  # Skip accounts with no data in this project
+
+        bal = b - a
+        pct = (a / b * 100) if b > 0 else 0
+
+        account_details.append({
+            "matched_name": acc_name,
+            "budget": round(b, 2),
+            "actual": round(a, 2),
+            "balance": round(bal, 2),
+            "percent_of_budget": round(pct, 2),
+            "has_data": True,
+            "is_matched": (
+                matched_account_name is not None
+                and acc_name.lower() == matched_account_name.lower()
+            )
+        })
+        total_budget += b
+        total_actual += a
+
+    if not account_details:
+        return None  # Group exists but no data for this project
+
+    total_balance = total_budget - total_actual
+    total_pct = (total_actual / total_budget * 100) if total_budget > 0 else 0
+
+    is_approximate = (
+        match_type == "account"
+        and matched_account_name is not None
+        and matched_account_name.lower() != category_input.lower()
+    )
+
+    return {
+        "matched_name": matched_account_name or matched_group,
+        "searched_term": category_input,
+        "is_approximate": is_approximate,
+        "group_name": matched_group,
+        "match_type": match_type,
+        "accounts": account_details,
+        "group_totals": {
+            "budget": round(total_budget, 2),
+            "actual": round(total_actual, 2),
+            "balance": round(total_balance, 2),
+            "percent_of_budget": round(total_pct, 2)
+        }
+    }
+
+
+def format_group_response(project_name: str, data: Dict[str, Any]) -> str:
+    """Formats a grouped BvA query response for the chat widget."""
+    def fmt(amount: float) -> str:
+        if amount < 0:
+            return f"-${abs(amount):,.2f}"
+        return f"${amount:,.2f}"
+
+    group_name = data.get("group_name")
+    accts = data.get("accounts", [])
+    totals = data.get("group_totals", {})
+    searched = data.get("searched_term", "")
+    matched = data.get("matched_name", "")
+    is_approx = data.get("is_approximate", False)
+    match_type = data.get("match_type", "account")
+
+    lines = []
+
+    # -- Header --
+    if group_name:
+        if match_type == "group":
+            lines.append(f"**{group_name}** en **{project_name}**")
+        else:
+            if is_approx:
+                lines.append(f'"{searched}" -> **{matched}**')
+            lines.append(f"Grupo **{group_name}** en **{project_name}**")
+    else:
+        lines.append(f"**{matched}** en **{project_name}**")
+
+    lines.append("")
+
+    # -- Per-account lines --
+    for acc in accts:
+        name = acc["matched_name"]
+        bal = acc["balance"]
+        marker = " <--" if acc.get("is_matched") else ""
+        over = " (!)" if bal < 0 else ""
+        lines.append(f"**{name}**{marker}")
+        lines.append(f"  Budget: {fmt(acc['budget'])}  |  Gastado: {fmt(acc['actual'])}  |  Disp: {fmt(bal)}{over}")
+        lines.append("")
+
+    # -- Group total (only if multiple accounts) --
+    if len(accts) > 1:
+        total_bal = totals["balance"]
+        over_msg = " (sobre presupuesto)" if total_bal < 0 else ""
+        lines.append(f"--- **TOTAL {group_name or matched}** ---")
+        lines.append(f"Budget: {fmt(totals['budget'])}  |  Gastado: {fmt(totals['actual'])}  |  Disp: {fmt(total_bal)}{over_msg}")
+        lines.append(f"Usado: {totals['percent_of_budget']:.1f}%")
+    else:
+        # Single account — add status context
+        total_bal = totals["balance"]
+        pct = totals["percent_of_budget"]
+        if total_bal < 0:
+            lines.append(f"Sobre presupuesto por {fmt(abs(total_bal))}")
+        elif pct >= 90:
+            lines.append(f"Casi agotado - queda {100 - pct:.1f}%")
+
+    return "\n".join(lines)

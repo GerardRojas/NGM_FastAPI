@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 import re
 import json
+import time
 
 # Importar el engine de Arturito
 from services.arturito import (
@@ -600,7 +601,260 @@ async def get_failed_commands_endpoint(
 
 
 # ================================
-# EXPENSE FILTER INTERPRETATION
+# INTENT INTERPRETER (GPT-first architecture)
+# ================================
+
+class IntentRequest(BaseModel):
+    """Request for GPT intent interpretation"""
+    text: str
+    current_page: Optional[str] = "dashboard.html"
+
+
+class IntentResponse(BaseModel):
+    """Structured intent response from GPT"""
+    type: str  # copilot, navigate, modal, report, chat
+    action: Optional[str] = None
+    params: Optional[Dict[str, Any]] = None
+
+
+# --- Entity cache for interpret-intent (projects + vendors) ---
+
+_entity_cache = {
+    "projects": {"data": [], "ts": 0},
+    "vendors": {"data": [], "ts": 0},
+    "account_groups": {"data": [], "ts": 0},
+}
+_ENTITY_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_cached_entities():
+    """Fetch and cache project/vendor/account-group names from Supabase with 5-min TTL."""
+    now = time.time()
+    p_cache = _entity_cache["projects"]
+    v_cache = _entity_cache["vendors"]
+    g_cache = _entity_cache["account_groups"]
+
+    needs_refresh = (
+        (now - p_cache["ts"] > _ENTITY_CACHE_TTL)
+        or (now - v_cache["ts"] > _ENTITY_CACHE_TTL)
+        or (now - g_cache["ts"] > _ENTITY_CACHE_TTL)
+    )
+
+    if needs_refresh:
+        try:
+            from api.supabase_client import supabase
+
+            p_resp = supabase.table("projects").select("project_name").execute()
+            p_cache["data"] = sorted(set(
+                p.get("project_name") for p in (p_resp.data or []) if p.get("project_name")
+            ))
+            p_cache["ts"] = now
+
+            v_resp = supabase.table("Vendors").select("vendor_name").execute()
+            v_cache["data"] = sorted(set(
+                v.get("vendor_name") for v in (v_resp.data or []) if v.get("vendor_name")
+            ))
+            v_cache["ts"] = now
+
+            a_resp = supabase.table("accounts").select("AccountCategory").execute()
+            g_cache["data"] = sorted(set(
+                a.get("AccountCategory") for a in (a_resp.data or []) if a.get("AccountCategory")
+            ))
+            g_cache["ts"] = now
+        except Exception as e:
+            print(f"[ARTURITO] Entity cache refresh error: {e}")
+
+    return p_cache["data"], v_cache["data"], g_cache["data"]
+
+
+# --- Modular prompt blocks ---
+
+_INTENT_BASE_PROMPT = """You classify user messages in a project management app called NGM Hub. The user is currently on page "{page}".
+Return ONLY valid JSON. No explanation, no markdown.
+
+Response format: {{"type":"<TYPE>","action":"<ACTION>","params":{{...}}}}
+Omit the "params" key entirely when there are no parameters.
+
+Types:
+- "copilot" = control the current page (filter, sort, search, expand, etc.)
+- "navigate" = go to another page
+- "modal" = open a dialog/form
+- "report" = generate a report (BVA, bug report)
+- "chat" = general conversation, question, or help request
+
+RULES:
+- If the message looks like it controls the CURRENT page, prefer "copilot" over "chat".
+- User may write in English or Spanish. Normalize all param values to English.
+- When the user mentions a project or vendor/company name (even with typos, abbreviations, or partial names), match it to the closest entry from the KNOWN PROJECTS or KNOWN VENDORS lists below and use the EXACT name from the list.
+- If no close match exists in the lists, preserve the user's original text.
+"""
+
+_INTENT_PAGE_PROMPTS = {
+    "expenses.html": """
+CURRENT PAGE: Expenses Engine (expense tracking table with filters)
+
+COPILOT ACTIONS (type="copilot"):
+- action="filter", params: {{"field":"<FIELD>","value":"<VAL>"}}
+  Fields:
+    vendor = company/supplier name (Home Depot, Lowe's, Wayfair, etc.)
+    bill_id = invoice/bill number (numeric)
+    account = expense category (Hauling And Dump, Materials, Labor, Equipment Rental, Permits, etc.)
+    type = expense type
+    payment = payment method. Normalize: efectivo/cash=Cash, tarjeta/card/credit=Card, cheque/check=Check, transferencia/transfer/wire=Transfer, zelle=Zelle, venmo=Venmo, paypal=PayPal
+    auth = authorization status. Values: Pending, Authorized, Review
+    date = date filter (YYYY-MM-DD format, or {{"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}})
+- action="search", params: {{"query":"<text>"}}
+- action="clear_filters" (no params)
+- action="summary" (no params)
+- action="show_filters" (no params)
+- action="expand_all" (no params)
+- action="collapse_all" (no params)
+- action="health_check" (no params)
+- action="sort", params: {{"column":"<date|amount|vendor|bill>","direction":"<asc|desc>"}}
+
+IMPORTANT CONTEXT:
+- If user types just a company/store name (e.g. "home depot", "lowes", "wayfair"), it IS a vendor filter.
+- If user types just a number with 3+ digits (e.g. "1439", "456"), it IS a bill_id filter.
+- If user types a payment method word alone (e.g. "cheque", "cash", "tarjeta"), it IS a payment filter.
+- "pendientes"/"pending" alone = auth filter Pending. "autorizados"/"authorized" alone = auth filter Authorized.
+- "basura", "dump" = account filter for "Hauling And Dump". Use semantic understanding for account names.
+""",
+
+    "pipeline.html": """
+CURRENT PAGE: Pipeline Manager (task/workflow management with filters)
+
+COPILOT ACTIONS (type="copilot"):
+- action="filter", params: {{"field":"<FIELD>","value":"<VAL>"}}
+  Fields:
+    status = task status. Values: not_started, in_progress, review, done
+    assignee = person name. If user says "my tasks"/"mis tareas", use value "__CURRENT_USER__"
+    priority = task priority. Values: high, medium, low
+    project = project name
+- action="search", params: {{"query":"<text>"}}
+- action="clear_filters" (no params)
+""",
+
+    "projects.html": """
+CURRENT PAGE: Projects (project list with search and filters)
+
+COPILOT ACTIONS (type="copilot"):
+- action="filter", params: {{"field":"status","value":"<active|completed|on_hold|cancelled>"}}
+- action="search", params: {{"query":"<text>"}}
+- action="clear_filters" (no params)
+""",
+
+    "team.html": """
+CURRENT PAGE: Team Management (user list with role filters)
+
+COPILOT ACTIONS (type="copilot"):
+- action="filter", params: {{"field":"role","value":"<role name>"}}
+- action="search", params: {{"query":"<text>"}}
+- action="clear_filters" (no params)
+""",
+
+    "vendors.html": """
+CURRENT PAGE: Vendors (vendor/supplier list)
+
+COPILOT ACTIONS (type="copilot"):
+- action="search", params: {{"query":"<text>"}}
+""",
+}
+
+_INTENT_GLOBAL_PROMPT = """
+NAVIGATION (type="navigate"):
+- action="goto", params: {{"page":"<PAGE_NAME>"}}
+  Page names: expenses, pipeline, projects, team, vendors, budgets, dashboard, messages, accounts, estimator, reporting, budget_monitor, company_expenses, arturito, settings
+  Spanish aliases: gastos=expenses, tareas=pipeline, proyectos=projects, equipo=team, proveedores=vendors, presupuestos=budgets, cuentas=accounts, reportes=reporting, monitor=budget_monitor, configuracion=settings
+
+MODALS (type="modal"):
+- action="open", params: {{"id":"<MODAL_ID>"}}
+  Modal IDs: add_expense, scan_receipt, new_task, add_project, add_user
+  Triggers: "agregar gasto"=add_expense, "escanear recibo"/"scan receipt"=scan_receipt, "nueva tarea"/"new task"=new_task, "nuevo proyecto"=add_project, "agregar usuario"=add_user
+
+REPORTS (type="report"):
+- action="bva", params: {{"project":"<project name or null>"}}
+  Full BVA report (PDF). Triggers: "bva", "budget vs actuals", "reporte bva", "genera bva de [project]"
+- action="query", params: {{"project":"<project name or null>","category":"<budget category or group>"}}
+  Specific budget question about an account or account group.
+  Triggers: questions about how much budget is left/used for a category.
+  Examples: "cuanto tengo para ventanas en Thrasher", "how much HVAC budget in Del Rio", "what did we spend on plumbing", "show me finishes for Willowbrook"
+  Category can be an account name (Windows, HVAC, Plumbing) or a group name (Finishes, Site Work, MEP).
+  Category should be in the user's language (Spanish or English). Project must be normalized to KNOWN PROJECTS.
+- action="bug", params: {{"description":"<bug description>"}}
+  Triggers: "reportar bug", "hay un error", "something is broken"
+
+For anything else (questions, greetings, help, general conversation): type="chat"
+"""
+
+
+@router.post("/interpret-intent", response_model=IntentResponse)
+async def interpret_intent(request: IntentRequest):
+    """
+    GPT-first intent interpreter. Classifies user messages based on
+    the current page context and returns structured action JSON.
+    """
+    from openai import OpenAI
+    import os
+
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return IntentResponse(type="chat")
+
+        client = OpenAI(api_key=api_key)
+
+        # Normalize page name
+        page = request.current_page or "dashboard.html"
+        if "/" in page:
+            page = page.split("/")[-1]
+
+        # Assemble prompt: BASE + PAGE_BLOCK + GLOBAL
+        system_prompt = _INTENT_BASE_PROMPT.format(page=page)
+
+        page_block = _INTENT_PAGE_PROMPTS.get(page, "")
+        if page_block:
+            system_prompt += page_block
+
+        system_prompt += _INTENT_GLOBAL_PROMPT
+
+        # Inject known entity lists for fuzzy matching
+        project_names, vendor_names, account_groups = _get_cached_entities()
+        if project_names:
+            system_prompt += f"\nKNOWN PROJECTS: {', '.join(project_names)}\n"
+        if vendor_names:
+            system_prompt += f"\nKNOWN VENDORS: {', '.join(vendor_names)}\n"
+        if account_groups:
+            system_prompt += f"\nACCOUNT GROUPS (budget categories): {', '.join(account_groups)}\n"
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request.text},
+            ],
+            temperature=0,
+            max_tokens=200,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        # Parse JSON
+        parsed = json.loads(raw)
+
+        return IntentResponse(
+            type=parsed.get("type", "chat"),
+            action=parsed.get("action"),
+            params=parsed.get("params"),
+        )
+
+    except Exception as e:
+        print(f"[ARTURITO] interpret-intent error: {e}")
+        return IntentResponse(type="chat")
+
+
+# ================================
+# EXPENSE FILTER INTERPRETATION (legacy, kept for backwards compatibility)
 # ================================
 
 class FilterInterpretRequest(BaseModel):
