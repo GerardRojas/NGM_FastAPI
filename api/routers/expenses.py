@@ -54,6 +54,8 @@ class ExpenseUpdate(BaseModel):
     auth_status: Optional[bool] = None
     auth_by: Optional[str] = None
     receipt_url: Optional[str] = None  # URL del recibo/factura en Storage
+    status: Optional[str] = None  # 'pending', 'auth', 'review' - for auto-review on field changes
+    status_reason: Optional[str] = None  # Reason for status change (used with auto-review)
 
 
 class ExpenseUpdateItem(BaseModel):
@@ -681,10 +683,29 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, user_id: Optional[str
             if not account.data:
                 raise HTTPException(status_code=400, detail="Invalid account_id")
 
-        # Log field changes if expense is in 'review' or 'auth' status
-        if current_status in ['review', 'auth'] and user_id:
-            change_logs = []
+        # Handle status change if included in payload
+        status_reason = data.pop("status_reason", None)
+        new_status = data.get("status")
+        status_changed = False
 
+        if new_status:
+            valid_statuses = ['pending', 'auth', 'review']
+            if new_status not in valid_statuses:
+                raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
+
+            if new_status != current_status:
+                status_changed = True
+                # Update auth_status for backwards compatibility
+                if new_status == 'auth':
+                    data["auth_status"] = True
+                    data["auth_by"] = user_id
+                elif new_status in ['review', 'pending']:
+                    data["auth_status"] = False
+                    data["auth_by"] = None
+
+        # Log field changes if expense is in 'review' or 'auth' status
+        change_logs = []
+        if current_status in ['review', 'auth'] and user_id:
             # Important fields to track
             tracked_fields = ['account_id', 'Amount', 'LineDescription', 'txn_type', 'vendor_id', 'payment_type', 'TxnDate']
 
@@ -701,12 +722,24 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, user_id: Optional[str
                             "new_value": new_value,
                             "changed_by": user_id,
                             "expense_status": current_status,
-                            "change_reason": change_reason or "Manual correction"
+                            "change_reason": change_reason or status_reason or "Manual correction"
                         })
 
             # Insert change logs
             if change_logs:
                 supabase.table("expense_change_log").insert(change_logs).execute()
+
+        # Log status change in expense_status_log
+        if status_changed and user_id:
+            log_data = {
+                "expense_id": expense_id,
+                "old_status": current_status,
+                "new_status": new_status,
+                "changed_by": user_id,
+                "reason": status_reason or change_reason or "Field modification",
+                "metadata": {"via_patch": True}
+            }
+            supabase.table("expense_status_log").insert(log_data).execute()
 
         # Actualizar
         res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
@@ -714,7 +747,8 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, user_id: Optional[str
         return {
             "message": "Expense updated successfully",
             "expense": res.data[0] if res.data else None,
-            "changes_logged": len(change_logs) if current_status in ['review', 'auth'] and user_id else 0
+            "changes_logged": len(change_logs),
+            "status_changed": status_changed
         }
 
     except HTTPException:
@@ -896,6 +930,76 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating status: {str(e)}")
+
+
+@router.post("/{expense_id}/soft-delete")
+def soft_delete_expense(expense_id: str, user_id: str):
+    """
+    Soft-delete: cambia el status a 'review' para que un manager confirme la eliminacion.
+    Cualquier usuario puede solicitar soft-delete (no requiere rol de manager).
+
+    Query params:
+        user_id: UUID del usuario que solicita la eliminacion
+    """
+    try:
+        # Verificar que el gasto existe
+        existing_resp = supabase.table("expenses_manual_COGS").select(
+            "expense_id, status, auth_status, Amount, LineDescription, account_id"
+        ).eq("expense_id", expense_id).single().execute()
+
+        if not existing_resp.data:
+            raise HTTPException(status_code=404, detail="Expense not found")
+
+        existing = existing_resp.data
+        old_status = existing.get("status") or ("auth" if existing.get("auth_status") else "pending")
+
+        # Si ya esta en review, no hacer nada
+        if old_status == "review":
+            return {
+                "message": "Expense is already in review",
+                "expense_id": expense_id,
+                "status": "review"
+            }
+
+        # Cambiar status a review
+        update_data = {
+            "status": "review",
+            "auth_status": False,
+            "auth_by": None
+        }
+
+        supabase.table("expenses_manual_COGS").update(update_data).eq(
+            "expense_id", expense_id
+        ).execute()
+
+        # Log the soft-delete
+        log_data = {
+            "expense_id": expense_id,
+            "old_status": old_status,
+            "new_status": "review",
+            "changed_by": user_id,
+            "reason": "Deletion requested (soft-delete)",
+            "metadata": {
+                "soft_delete": True,
+                "amount": existing.get("Amount"),
+                "description": existing.get("LineDescription"),
+                "account_id": existing.get("account_id")
+            }
+        }
+
+        supabase.table("expense_status_log").insert(log_data).execute()
+
+        return {
+            "message": "Expense marked for review (soft-delete)",
+            "expense_id": expense_id,
+            "old_status": old_status,
+            "new_status": "review"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error soft-deleting expense: {str(e)}")
 
 
 @router.get("/{expense_id}/status-history")
