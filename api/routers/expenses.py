@@ -984,7 +984,7 @@ def get_expense_audit_trail(expense_id: str):
             """
         ).eq("expense_id", expense_id).execute()
 
-        # Get field changes
+        # Get field changes (no FK to users, resolve names separately)
         field_resp = supabase.table("expense_change_log").select(
             """
             id,
@@ -994,10 +994,24 @@ def get_expense_audit_trail(expense_id: str):
             changed_at,
             expense_status,
             change_reason,
-            changed_by,
-            users!expense_change_log_changed_by_fkey(user_name, avatar_color)
+            changed_by
             """
         ).eq("expense_id", expense_id).execute()
+
+        # Collect unique user IDs from field changes to resolve names in one query
+        field_user_ids = set()
+        for entry in (field_resp.data or []):
+            uid = entry.get("changed_by")
+            if uid:
+                field_user_ids.add(uid)
+
+        user_lookup = {}
+        if field_user_ids:
+            users_resp = supabase.table("users").select(
+                "user_id, user_name, avatar_color"
+            ).in_("user_id", list(field_user_ids)).execute()
+            for u in (users_resp.data or []):
+                user_lookup[u["user_id"]] = u
 
         # Combine and sort by date
         all_changes = []
@@ -1022,7 +1036,8 @@ def get_expense_audit_trail(expense_id: str):
 
         # Add field changes
         for entry in (field_resp.data or []):
-            user_info = entry.get("users") or {}
+            uid = entry.get("changed_by")
+            user_info = user_lookup.get(uid, {})
             all_changes.append({
                 "type": "field_change",
                 "id": entry["id"],
@@ -1033,7 +1048,7 @@ def get_expense_audit_trail(expense_id: str):
                 "expense_status": entry["expense_status"],
                 "reason": entry.get("change_reason"),
                 "changed_by": {
-                    "id": entry.get("changed_by"),
+                    "id": uid,
                     "name": user_info.get("user_name"),
                     "avatar_color": user_info.get("avatar_color")
                 }
