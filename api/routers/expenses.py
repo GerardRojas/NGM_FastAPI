@@ -1186,12 +1186,15 @@ async def auto_categorize_expenses(payload: dict):
         # Initialize OpenAI client
         client = OpenAI(api_key=openai_api_key)
 
-        # Build accounts list for GPT prompt
+        # Build accounts list for GPT prompt (exclude Labor accounts)
         accounts_list = []
         for acc in accounts:
+            acc_name = acc.get("Name", "")
+            if "Labor" in acc_name:
+                continue
             acc_info = {
                 "account_id": acc.get("account_id"),
-                "name": acc.get("Name"),
+                "name": acc_name,
                 "number": acc.get("AcctNum")
             }
             accounts_list.append(acc_info)
