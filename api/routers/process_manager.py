@@ -35,6 +35,7 @@ VALID_STATE_KEYS = [
     'orgchart_positions',  # Position of user nodes in org chart
     'orgchart_connections',# Connections between user nodes
     'orgchart_groups',     # Group areas in org chart
+    'orgchart_hidden_users', # Hidden user IDs in org chart
 ]
 
 
@@ -67,7 +68,7 @@ async def get_process_manager_state(state_key: str):
             # Return empty default if not found
             return {
                 "state_key": state_key,
-                "state_data": [] if state_key in ('custom_modules', 'orgchart_connections', 'orgchart_groups') else {},
+                "state_data": [] if state_key in ('custom_modules', 'orgchart_connections', 'orgchart_groups', 'orgchart_hidden_users') else {},
                 "updated_at": None,
                 "updated_by": None
             }
