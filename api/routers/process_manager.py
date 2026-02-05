@@ -30,7 +30,11 @@ VALID_STATE_KEYS = [
     'custom_modules',      # User-created custom modules
     'flow_positions',      # Position of nodes in flowcharts
     'draft_states',        # Draft/Live toggle states
-    'module_connections'   # Module connection states
+    'module_connections',  # Module connection states
+    # Team Org Chart keys
+    'orgchart_positions',  # Position of user nodes in org chart
+    'orgchart_connections',# Connections between user nodes
+    'orgchart_groups',     # Group areas in org chart
 ]
 
 
@@ -63,7 +67,7 @@ async def get_process_manager_state(state_key: str):
             # Return empty default if not found
             return {
                 "state_key": state_key,
-                "state_data": [] if state_key == 'custom_modules' else {},
+                "state_data": [] if state_key in ('custom_modules', 'orgchart_connections', 'orgchart_groups') else {},
                 "updated_at": None,
                 "updated_by": None
             }
