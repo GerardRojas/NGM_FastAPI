@@ -489,8 +489,13 @@ def get_my_tasks(user_id: str) -> Dict[str, Any]:
     """
     Devuelve las tareas asignadas a un usuario para mostrar en su Dashboard.
 
-    Solo devuelve tareas que NO están en status "Done".
-    Incluye información del proyecto y prioridad.
+    Incluye tareas donde el usuario es:
+    - Owner (Owner_id)
+    - Collaborator (collaborators_ids array o Colaborators_id legacy)
+    - Manager (managers_ids array o manager legacy)
+
+    Solo devuelve tareas que NO estan en status "Done".
+    Incluye informacion del proyecto y prioridad.
     """
     print(f"[PIPELINE] GET /pipeline/tasks/my-tasks/{user_id}")
 
@@ -504,18 +509,77 @@ def get_my_tasks(user_id: str) -> Dict[str, Any]:
         if done_status_response.data:
             done_status_id = done_status_response.data[0]["task_status_id"]
 
-        # 2. Obtener tareas del usuario (como owner)
-        query = supabase.table("tasks").select("*").eq("Owner_id", user_id)
+        # 2. Obtener tareas del usuario desde multiples roles
+        # Supabase no soporta OR queries directamente, hacemos queries separadas
 
-        # Excluir tareas completadas si encontramos el status
+        all_tasks = []
+        seen_task_ids = set()
+
+        # 2a. Tareas como Owner
+        owner_query = supabase.table("tasks").select("*").eq("Owner_id", user_id)
         if done_status_id:
-            query = query.neq("task_status", done_status_id)
+            owner_query = owner_query.neq("task_status", done_status_id)
+        owner_response = owner_query.execute()
+        for task in (owner_response.data or []):
+            task_id = task.get("task_id")
+            if task_id and task_id not in seen_task_ids:
+                task["_role"] = "owner"
+                all_tasks.append(task)
+                seen_task_ids.add(task_id)
 
-        # Ordenar por fecha de creación (más recientes primero)
-        tasks_response = query.order("created_at", desc=True).execute()
-        tasks = tasks_response.data or []
+        # 2b. Tareas como Collaborator (array field)
+        collab_query = supabase.table("tasks").select("*").contains("collaborators_ids", [user_id])
+        if done_status_id:
+            collab_query = collab_query.neq("task_status", done_status_id)
+        collab_response = collab_query.execute()
+        for task in (collab_response.data or []):
+            task_id = task.get("task_id")
+            if task_id and task_id not in seen_task_ids:
+                task["_role"] = "collaborator"
+                all_tasks.append(task)
+                seen_task_ids.add(task_id)
 
-        print(f"[PIPELINE] Found {len(tasks)} tasks for user {user_id}")
+        # 2c. Tareas como Collaborator (legacy single field)
+        collab_legacy_query = supabase.table("tasks").select("*").eq("Colaborators_id", user_id)
+        if done_status_id:
+            collab_legacy_query = collab_legacy_query.neq("task_status", done_status_id)
+        collab_legacy_response = collab_legacy_query.execute()
+        for task in (collab_legacy_response.data or []):
+            task_id = task.get("task_id")
+            if task_id and task_id not in seen_task_ids:
+                task["_role"] = "collaborator"
+                all_tasks.append(task)
+                seen_task_ids.add(task_id)
+
+        # 2d. Tareas como Manager (array field)
+        manager_query = supabase.table("tasks").select("*").contains("managers_ids", [user_id])
+        if done_status_id:
+            manager_query = manager_query.neq("task_status", done_status_id)
+        manager_response = manager_query.execute()
+        for task in (manager_response.data or []):
+            task_id = task.get("task_id")
+            if task_id and task_id not in seen_task_ids:
+                task["_role"] = "manager"
+                all_tasks.append(task)
+                seen_task_ids.add(task_id)
+
+        # 2e. Tareas como Manager (legacy single field)
+        manager_legacy_query = supabase.table("tasks").select("*").eq("manager", user_id)
+        if done_status_id:
+            manager_legacy_query = manager_legacy_query.neq("task_status", done_status_id)
+        manager_legacy_response = manager_legacy_query.execute()
+        for task in (manager_legacy_response.data or []):
+            task_id = task.get("task_id")
+            if task_id and task_id not in seen_task_ids:
+                task["_role"] = "manager"
+                all_tasks.append(task)
+                seen_task_ids.add(task_id)
+
+        # Ordenar por fecha de creacion (mas recientes primero)
+        all_tasks.sort(key=lambda t: t.get("created_at") or "", reverse=True)
+        tasks = all_tasks
+
+        print(f"[PIPELINE] Found {len(tasks)} tasks for user {user_id} (owner + collaborator + manager)")
 
         if not tasks:
             return {"tasks": []}
@@ -574,6 +638,7 @@ def get_my_tasks(user_id: str) -> Dict[str, Any]:
                 "time_finish": task.get("time_finish"),
                 "task_notes": task.get("task_notes"),
                 "created_at": task.get("created_at"),
+                "role": task.get("_role", "owner"),  # owner, collaborator, or manager
             })
 
         return {"tasks": enriched_tasks}
@@ -620,9 +685,12 @@ def start_task(task_id: str) -> Dict[str, Any]:
         from datetime import datetime
         now = datetime.utcnow().isoformat()
 
+        old_status = task.get("task_status")
+
         update_data = {
             "task_status": working_status_id,
             "time_start": now,
+            "workflow_state": "active",
         }
 
         # Solo actualizar start_date si no tiene uno
@@ -638,10 +706,22 @@ def start_task(task_id: str) -> Dict[str, Any]:
 
         updated_task = response.data[0]
 
+        # Log the workflow event
+        try:
+            _log_workflow_event(
+                task_id=task_id,
+                event_type="started",
+                old_status=old_status,
+                new_status=working_status_id,
+                metadata={"time_start": now}
+            )
+        except Exception as log_error:
+            print(f"[PIPELINE] Warning: Could not log start event: {log_error}")
+
         return {
             "success": True,
             "task": updated_task,
-            "status_changed": task.get("task_status") != working_status_id,
+            "status_changed": old_status != working_status_id,
             "new_status": "Working on It"
         }
 
@@ -655,6 +735,9 @@ def start_task(task_id: str) -> Dict[str, Any]:
 
 class SendToReviewRequest(BaseModel):
     notes: Optional[str] = None  # Optional notes from the user
+    result_link: Optional[str] = None  # Link to deliverable/result
+    attachments: Optional[List[str]] = None  # Additional file links
+    performed_by: Optional[str] = None  # UUID of owner submitting
 
 
 @router.post("/tasks/{task_id}/send-to-review")
@@ -695,13 +778,20 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
 
         approval_status_id = approval_status_response.data[0]["task_status_id"]
 
+        old_status = task.get("task_status")
+
         # 3. Actualizar la tarea original
         now = datetime.utcnow().isoformat()
 
         update_data = {
             "task_status": approval_status_id,
             "time_finish": now,
+            "workflow_state": "in_review",
         }
+
+        # Agregar result_link si se proporciono
+        if payload.result_link:
+            update_data["result_link"] = payload.result_link
 
         # Agregar notas si se proporcionaron
         if payload.notes:
@@ -725,24 +815,50 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
         reviewer_task_id = None
 
         try:
-            reviewer_task_id = _create_reviewer_task(task, payload.notes)
+            reviewer_task_id = _create_reviewer_task(task, payload.notes, task_id)
             if reviewer_task_id:
                 reviewer_task_created = True
+                # Link the review task to original task
+                supabase.table("tasks").update({
+                    "review_task_id": reviewer_task_id
+                }).eq("task_id", task_id).execute()
         except Exception as e:
             print(f"[PIPELINE] Warning: Could not create reviewer task: {e}")
 
         # 5. Calcular tiempo trabajado
         time_start = task.get("time_start")
         elapsed_time = None
+        elapsed_seconds = None
         if time_start:
             try:
                 start_dt = datetime.fromisoformat(time_start.replace("Z", "+00:00"))
                 end_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
                 diff = end_dt - start_dt
-                hours = diff.total_seconds() / 3600
+                elapsed_seconds = diff.total_seconds()
+                hours = elapsed_seconds / 3600
                 elapsed_time = f"{hours:.2f} hours"
             except:
                 pass
+
+        # 6. Log the workflow event
+        try:
+            _log_workflow_event(
+                task_id=task_id,
+                event_type="submitted_for_review",
+                performed_by=payload.performed_by,
+                old_status=old_status,
+                new_status=approval_status_id,
+                related_task_id=reviewer_task_id,
+                notes=payload.notes,
+                attachments=payload.attachments,
+                metadata={
+                    "time_finish": now,
+                    "elapsed_seconds": elapsed_seconds,
+                    "result_link": payload.result_link
+                }
+            )
+        except Exception as log_error:
+            print(f"[PIPELINE] Warning: Could not log review submission: {log_error}")
 
         return {
             "success": True,
@@ -761,13 +877,19 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
-def _create_reviewer_task(original_task: dict, submission_notes: str) -> Optional[str]:
+def _create_reviewer_task(original_task: dict, submission_notes: str, original_task_id: str = None) -> Optional[str]:
     """
     Crea una tarea para el autorizador basado en el proyecto de la tarea original.
 
     El autorizador se determina por:
-    1. El manager del proyecto
-    2. Si no hay manager, busca usuarios con rol CEO/COO
+    1. Managers asignados a la tarea (managers_ids o manager)
+    2. Manager del proyecto
+    3. Si no hay manager, busca usuarios con rol CEO/COO
+
+    Args:
+        original_task: Task data dictionary
+        submission_notes: Notes from the owner
+        original_task_id: UUID of the original task (for parent_task_id link)
 
     Returns:
         task_id del task creado, o None si no se pudo crear
@@ -788,8 +910,16 @@ def _create_reviewer_task(original_task: dict, submission_notes: str) -> Optiona
     # Determinar el reviewer (autorizador)
     reviewer_id = None
 
-    # Opción 1: Manager del proyecto
-    if project_id:
+    # Opcion 1: Managers asignados a la tarea
+    task_managers_ids = original_task.get("managers_ids")
+    task_manager = original_task.get("manager")
+    if task_managers_ids and len(task_managers_ids) > 0:
+        reviewer_id = task_managers_ids[0]
+    elif task_manager:
+        reviewer_id = task_manager
+
+    # Opcion 2: Manager del proyecto
+    if not reviewer_id and project_id:
         project_response = supabase.table("projects").select(
             "project_name, project_manager"
         ).eq("project_id", project_id).execute()
@@ -798,7 +928,7 @@ def _create_reviewer_task(original_task: dict, submission_notes: str) -> Optiona
             project_data = project_response.data[0]
             reviewer_id = project_data.get("project_manager")
 
-    # Opción 2: Si no hay manager, buscar CEO/COO
+    # Opcion 3: Si no hay manager, buscar CEO/COO
     if not reviewer_id:
         # Buscar roles de CEO/COO
         roles_response = supabase.table("roles").select("role_id").or_(
@@ -828,13 +958,22 @@ def _create_reviewer_task(original_task: dict, submission_notes: str) -> Optiona
     if status_response.data:
         not_started_id = status_response.data[0]["task_status_id"]
 
-    # Crear la tarea de revisión
+    # Crear la tarea de revision
+    result_link = original_task.get("result_link")
+    docs_link = original_task.get("docs_link")
+
     review_task_data = {
         "task_description": f"Review: {task_description} (submitted by {owner_name})",
         "project_id": project_id,
+        "company": original_task.get("company"),
         "Owner_id": reviewer_id,
         "task_status": not_started_id,
-        "task_notes": f"[AUTO-REVIEW] Task pending approval.\n\nOriginal task: {task_description}\nSubmitted by: {owner_name}\n\n{f'Notes: {submission_notes}' if submission_notes else ''}",
+        "task_department": original_task.get("task_department"),
+        "parent_task_id": original_task_id or original_task.get("task_id"),
+        "workflow_state": "active",
+        "task_notes": f"[AUTO-REVIEW] Task pending approval.\n\nOriginal task: {task_description}\nSubmitted by: {owner_name}\n{f'Result: {result_link}' if result_link else ''}\n{f'Docs: {docs_link}' if docs_link else ''}\n\n{f'Notes: {submission_notes}' if submission_notes else ''}",
+        "result_link": result_link,
+        "docs_link": docs_link,
     }
 
     response = supabase.table("tasks").insert(review_task_data).execute()
@@ -3186,3 +3325,619 @@ def get_next_available_slot(user_id: str, estimated_hours: float = 2.0) -> Dict[
         print(f"[WORKLOAD] ERROR in next-available: {repr(e)}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
+
+
+# ====== TASK WORKFLOW ENDPOINTS ======
+
+def _log_workflow_event(
+    task_id: str,
+    event_type: str,
+    performed_by: Optional[str] = None,
+    old_status: Optional[str] = None,
+    new_status: Optional[str] = None,
+    related_task_id: Optional[str] = None,
+    notes: Optional[str] = None,
+    attachments: Optional[List[str]] = None,
+    metadata: Optional[dict] = None
+) -> Optional[str]:
+    """
+    Helper to log workflow events to task_workflow_log table.
+
+    event_type values:
+    - 'started': Task work began
+    - 'submitted_for_review': Owner sent task for approval
+    - 'approved': Manager approved the task
+    - 'rejected': Manager rejected with feedback
+    - 'converted_to_coordination': Approved task became coordination task
+    - 'status_changed': General status change
+    - 'reassigned': Task was reassigned
+
+    Returns: log_id if successful, None otherwise
+    """
+    try:
+        log_data = {
+            "task_id": task_id,
+            "event_type": event_type,
+        }
+
+        if performed_by:
+            log_data["performed_by"] = performed_by
+        if old_status:
+            log_data["old_status"] = old_status
+        if new_status:
+            log_data["new_status"] = new_status
+        if related_task_id:
+            log_data["related_task_id"] = related_task_id
+        if notes:
+            log_data["notes"] = notes
+        if attachments:
+            log_data["attachments"] = attachments
+        if metadata:
+            log_data["metadata"] = metadata
+
+        response = supabase.table("task_workflow_log").insert(log_data).execute()
+
+        if response.data:
+            log_id = response.data[0].get("log_id")
+            print(f"[WORKFLOW LOG] Created log {log_id} for task {task_id}: {event_type}")
+            return log_id
+        return None
+    except Exception as e:
+        print(f"[WORKFLOW LOG] Warning: Could not create log: {e}")
+        return None
+
+
+class TaskApproveRequest(BaseModel):
+    reviewer_notes: Optional[str] = None
+    performed_by: Optional[str] = None  # UUID of manager approving
+
+
+class TaskRejectRequest(BaseModel):
+    rejection_notes: str  # Required feedback for rejection
+    attachments: Optional[List[str]] = None  # Reference files/links
+    performed_by: Optional[str] = None  # UUID of manager rejecting
+
+
+class SendToReviewRequestV2(BaseModel):
+    notes: Optional[str] = None
+    result_link: Optional[str] = None  # Link to deliverable
+    attachments: Optional[List[str]] = None  # Additional files
+    performed_by: Optional[str] = None  # UUID of owner submitting
+
+
+@router.post("/tasks/{task_id}/approve")
+def approve_task(task_id: str, payload: TaskApproveRequest) -> Dict[str, Any]:
+    """
+    Manager approves a task:
+    - Changes original task status to "Good to Go"
+    - Marks review task as completed
+    - Logs the approval event
+    - Updates workflow_state to 'completed'
+
+    Returns:
+        - task: The approved task
+        - review_task_completed: True if review task was marked done
+    """
+    print(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/approve")
+
+    try:
+        from datetime import datetime
+
+        # 1. Get the task (could be the review task or original task)
+        existing = supabase.table("tasks").select("*").eq("task_id", task_id).execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = existing.data[0]
+        original_task_id = task.get("parent_task_id") or task_id
+        review_task_id = task_id if task.get("parent_task_id") else task.get("review_task_id")
+
+        # 2. Get "Good to Go" status
+        good_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "good to go").execute()
+
+        if not good_status_response.data:
+            raise HTTPException(status_code=500, detail="Status 'Good to Go' not found")
+
+        good_status_id = good_status_response.data[0]["task_status_id"]
+
+        # Get "Done" status for review task
+        done_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).or_("task_status.ilike.done,task_status.ilike.completed").execute()
+
+        done_status_id = None
+        if done_status_response.data:
+            done_status_id = done_status_response.data[0]["task_status_id"]
+
+        old_status = task.get("task_status")
+
+        # 3. Update original task to "Good to Go"
+        original_update = {
+            "task_status": good_status_id,
+            "workflow_state": "completed",
+            "reviewer_notes": payload.reviewer_notes,
+            "review_task_id": None,  # Clear the review link
+        }
+
+        original_response = supabase.table("tasks").update(original_update).eq(
+            "task_id", original_task_id
+        ).execute()
+
+        if not original_response.data:
+            raise HTTPException(status_code=500, detail="Failed to update original task")
+
+        updated_task = original_response.data[0]
+
+        # 4. Mark review task as done (if exists and different from original)
+        review_task_completed = False
+        if review_task_id and review_task_id != original_task_id and done_status_id:
+            try:
+                review_update = {
+                    "task_status": done_status_id,
+                    "workflow_state": "completed",
+                }
+                supabase.table("tasks").update(review_update).eq(
+                    "task_id", review_task_id
+                ).execute()
+                review_task_completed = True
+            except Exception as e:
+                print(f"[WORKFLOW] Warning: Could not complete review task: {e}")
+
+        # 5. Log the approval event
+        _log_workflow_event(
+            task_id=original_task_id,
+            event_type="approved",
+            performed_by=payload.performed_by,
+            old_status=old_status,
+            new_status=good_status_id,
+            related_task_id=review_task_id if review_task_id != original_task_id else None,
+            notes=payload.reviewer_notes,
+            metadata={"approved_at": datetime.utcnow().isoformat()}
+        )
+
+        return {
+            "success": True,
+            "task": updated_task,
+            "new_status": "Good to Go",
+            "review_task_completed": review_task_completed,
+            "message": "Task approved successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/approve: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.post("/tasks/{task_id}/reject")
+def reject_task(task_id: str, payload: TaskRejectRequest) -> Dict[str, Any]:
+    """
+    Manager rejects a task:
+    - Returns original task to "Working on It" status
+    - Increments rejection_count
+    - Stores reviewer_notes with feedback
+    - Marks review task as done (rejection processed)
+    - Logs the rejection event
+
+    Returns:
+        - task: The rejected task (now back with owner)
+        - rejection_count: Total times this task was rejected
+    """
+    print(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/reject")
+
+    try:
+        from datetime import datetime
+
+        # 1. Get the task
+        existing = supabase.table("tasks").select("*").eq("task_id", task_id).execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = existing.data[0]
+        original_task_id = task.get("parent_task_id") or task_id
+        review_task_id = task_id if task.get("parent_task_id") else task.get("review_task_id")
+
+        # 2. Get original task data if we're on the review task
+        if task.get("parent_task_id"):
+            original_response = supabase.table("tasks").select("*").eq(
+                "task_id", original_task_id
+            ).execute()
+            if original_response.data:
+                original_task = original_response.data[0]
+            else:
+                original_task = task
+        else:
+            original_task = task
+
+        # 3. Get "Working on It" status
+        working_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "working on it").execute()
+
+        if not working_status_response.data:
+            raise HTTPException(status_code=500, detail="Status 'Working on It' not found")
+
+        working_status_id = working_status_response.data[0]["task_status_id"]
+
+        # Get "Done" status for review task
+        done_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).or_("task_status.ilike.done,task_status.ilike.completed").execute()
+
+        done_status_id = None
+        if done_status_response.data:
+            done_status_id = done_status_response.data[0]["task_status_id"]
+
+        old_status = original_task.get("task_status")
+        current_rejection_count = original_task.get("rejection_count") or 0
+
+        # 4. Update original task
+        rejection_note_entry = f"[Rejection #{current_rejection_count + 1}] {payload.rejection_notes}"
+        existing_notes = original_task.get("reviewer_notes") or ""
+        combined_notes = f"{existing_notes}\n\n{rejection_note_entry}" if existing_notes else rejection_note_entry
+
+        original_update = {
+            "task_status": working_status_id,
+            "workflow_state": "active",
+            "reviewer_notes": combined_notes.strip(),
+            "rejection_count": current_rejection_count + 1,
+            "review_task_id": None,
+            "time_start": datetime.utcnow().isoformat(),  # Reset timer
+            "time_finish": None,
+        }
+
+        original_response = supabase.table("tasks").update(original_update).eq(
+            "task_id", original_task_id
+        ).execute()
+
+        if not original_response.data:
+            raise HTTPException(status_code=500, detail="Failed to update original task")
+
+        updated_task = original_response.data[0]
+
+        # 5. Mark review task as done (rejection processed)
+        if review_task_id and review_task_id != original_task_id and done_status_id:
+            try:
+                review_update = {
+                    "task_status": done_status_id,
+                    "workflow_state": "completed",
+                    "task_notes": f"{task.get('task_notes', '')}\n\n[REJECTED] Task returned to owner with feedback."
+                }
+                supabase.table("tasks").update(review_update).eq(
+                    "task_id", review_task_id
+                ).execute()
+            except Exception as e:
+                print(f"[WORKFLOW] Warning: Could not complete review task: {e}")
+
+        # 6. Log the rejection event
+        _log_workflow_event(
+            task_id=original_task_id,
+            event_type="rejected",
+            performed_by=payload.performed_by,
+            old_status=old_status,
+            new_status=working_status_id,
+            related_task_id=review_task_id if review_task_id != original_task_id else None,
+            notes=payload.rejection_notes,
+            attachments=payload.attachments,
+            metadata={
+                "rejected_at": datetime.utcnow().isoformat(),
+                "rejection_count": current_rejection_count + 1
+            }
+        )
+
+        return {
+            "success": True,
+            "task": updated_task,
+            "new_status": "Working on It",
+            "rejection_count": current_rejection_count + 1,
+            "message": "Task returned to owner with feedback"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/reject: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.post("/tasks/{task_id}/convert-to-coordination")
+def convert_to_coordination(task_id: str) -> Dict[str, Any]:
+    """
+    Convert an approved task (Good to Go) to a coordination task.
+    Creates a new task in coordination with reference to original.
+
+    Returns:
+        - coordination_task: The new coordination task
+        - original_task: The original task (marked as converted)
+    """
+    print(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/convert-to-coordination")
+
+    try:
+        from datetime import datetime
+
+        # 1. Get the original task
+        existing = supabase.table("tasks").select("*").eq("task_id", task_id).execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = existing.data[0]
+
+        # 2. Verify task is in "Good to Go" status
+        good_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "good to go").execute()
+
+        if good_status_response.data:
+            good_status_id = good_status_response.data[0]["task_status_id"]
+            if task.get("task_status") != good_status_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Task must be in 'Good to Go' status to convert to coordination"
+                )
+
+        # 3. Get "Not Started" status for new coordination task
+        not_started_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "not started").execute()
+
+        not_started_id = None
+        if not_started_response.data:
+            not_started_id = not_started_response.data[0]["task_status_id"]
+
+        # 4. Get Coordination department ID
+        coord_dept_response = supabase.table("task_departments").select(
+            "department_id"
+        ).ilike("department", "%coordination%").execute()
+
+        coord_dept_id = None
+        if coord_dept_response.data:
+            coord_dept_id = coord_dept_response.data[0]["department_id"]
+
+        # 5. Create coordination task
+        coordination_task_data = {
+            "task_description": f"[COORD] {task.get('task_description', 'Task')}",
+            "project_id": task.get("project_id"),
+            "company": task.get("company"),
+            "task_status": not_started_id,
+            "task_department": coord_dept_id or task.get("task_department"),
+            "is_coordination_task": True,
+            "converted_from_task_id": task_id,
+            "workflow_state": "active",
+            "task_notes": f"[AUTO-CONVERTED] From approved task.\n\nOriginal: {task.get('task_description')}\nResult: {task.get('result_link', 'N/A')}\nDocs: {task.get('docs_link', 'N/A')}",
+            "docs_link": task.get("docs_link"),
+            "result_link": task.get("result_link"),
+        }
+
+        # Copy managers as they coordinate
+        if task.get("managers_ids"):
+            coordination_task_data["Owner_id"] = task.get("managers_ids")[0] if task.get("managers_ids") else None
+        elif task.get("manager"):
+            coordination_task_data["Owner_id"] = task.get("manager")
+
+        coord_response = supabase.table("tasks").insert(coordination_task_data).execute()
+
+        if not coord_response.data:
+            raise HTTPException(status_code=500, detail="Failed to create coordination task")
+
+        coordination_task = coord_response.data[0]
+
+        # 6. Update original task as converted
+        done_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).or_("task_status.ilike.done,task_status.ilike.completed").execute()
+
+        done_status_id = None
+        if done_status_response.data:
+            done_status_id = done_status_response.data[0]["task_status_id"]
+
+        original_update = {
+            "workflow_state": "converted",
+        }
+        if done_status_id:
+            original_update["task_status"] = done_status_id
+
+        supabase.table("tasks").update(original_update).eq("task_id", task_id).execute()
+
+        # 7. Log the conversion
+        _log_workflow_event(
+            task_id=task_id,
+            event_type="converted_to_coordination",
+            related_task_id=coordination_task.get("task_id"),
+            metadata={
+                "converted_at": datetime.utcnow().isoformat(),
+                "coordination_task_id": coordination_task.get("task_id")
+            }
+        )
+
+        return {
+            "success": True,
+            "coordination_task": coordination_task,
+            "original_task_id": task_id,
+            "message": "Task converted to coordination successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/convert-to-coordination: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.get("/tasks/{task_id}/workflow-history")
+def get_task_workflow_history(task_id: str) -> Dict[str, Any]:
+    """
+    Get the complete workflow history/audit log for a task.
+
+    Returns:
+        - history: List of workflow events in chronological order
+        - task: Current task data
+    """
+    print(f"[WORKFLOW] GET /pipeline/tasks/{task_id}/workflow-history")
+
+    try:
+        # 1. Get task info
+        task_response = supabase.table("tasks").select("*").eq("task_id", task_id).execute()
+
+        if not task_response.data:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        task = task_response.data[0]
+
+        # 2. Get workflow logs for this task
+        logs_response = supabase.table("task_workflow_log").select(
+            "*, performed_by_user:users!task_workflow_log_performed_by_fkey(user_name)"
+        ).eq("task_id", task_id).order("performed_at", desc=False).execute()
+
+        history = []
+        for log in (logs_response.data or []):
+            entry = {
+                "log_id": log.get("log_id"),
+                "event_type": log.get("event_type"),
+                "performed_at": log.get("performed_at"),
+                "performed_by": log.get("performed_by"),
+                "performed_by_name": log.get("performed_by_user", {}).get("user_name") if log.get("performed_by_user") else None,
+                "notes": log.get("notes"),
+                "attachments": log.get("attachments"),
+                "old_status": log.get("old_status"),
+                "new_status": log.get("new_status"),
+                "related_task_id": log.get("related_task_id"),
+                "metadata": log.get("metadata"),
+            }
+            history.append(entry)
+
+        return {
+            "success": True,
+            "task_id": task_id,
+            "task": task,
+            "history": history,
+            "total_events": len(history)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[WORKFLOW] ERROR in GET /pipeline/tasks/{task_id}/workflow-history: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+
+
+@router.get("/tasks/pending-reviews/{user_id}")
+def get_pending_reviews(user_id: str) -> Dict[str, Any]:
+    """
+    Get all tasks pending review by a specific manager.
+
+    This includes tasks where:
+    - User is the manager and task is in "Awaiting Approval" status
+    - User is in managers_ids array and task is in "Awaiting Approval"
+    - Review tasks assigned to the user
+
+    Returns:
+        - tasks: List of tasks awaiting this user's review
+    """
+    print(f"[WORKFLOW] GET /pipeline/tasks/pending-reviews/{user_id}")
+
+    try:
+        # 1. Get "Awaiting Approval" status ID
+        approval_status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "awaiting approval").execute()
+
+        if not approval_status_response.data:
+            return {"success": True, "tasks": [], "total": 0}
+
+        approval_status_id = approval_status_response.data[0]["task_status_id"]
+
+        all_tasks = []
+        seen_task_ids = set()
+
+        # 2a. Tasks where user is single manager
+        manager_query = supabase.table("tasks").select("*").eq(
+            "manager", user_id
+        ).eq("task_status", approval_status_id).execute()
+
+        for task in (manager_query.data or []):
+            if task.get("task_id") not in seen_task_ids:
+                task["_review_role"] = "manager"
+                all_tasks.append(task)
+                seen_task_ids.add(task.get("task_id"))
+
+        # 2b. Tasks where user is in managers_ids array
+        managers_array_query = supabase.table("tasks").select("*").contains(
+            "managers_ids", [user_id]
+        ).eq("task_status", approval_status_id).execute()
+
+        for task in (managers_array_query.data or []):
+            if task.get("task_id") not in seen_task_ids:
+                task["_review_role"] = "manager"
+                all_tasks.append(task)
+                seen_task_ids.add(task.get("task_id"))
+
+        # 2c. Review tasks assigned to this user (created by workflow)
+        review_query = supabase.table("tasks").select("*").eq(
+            "Owner_id", user_id
+        ).not_.is_("parent_task_id", "null").execute()
+
+        for task in (review_query.data or []):
+            if task.get("task_id") not in seen_task_ids:
+                # Only include if not already completed
+                task["_review_role"] = "reviewer"
+                all_tasks.append(task)
+                seen_task_ids.add(task.get("task_id"))
+
+        # 3. Get additional info for each task
+        enriched_tasks = []
+        for task in all_tasks:
+            # Get owner info
+            owner_name = None
+            if task.get("Owner_id"):
+                owner_response = supabase.table("users").select("user_name").eq(
+                    "user_id", task.get("Owner_id")
+                ).execute()
+                if owner_response.data:
+                    owner_name = owner_response.data[0].get("user_name")
+
+            # Get project info
+            project_name = None
+            if task.get("project_id"):
+                project_response = supabase.table("projects").select("project_name").eq(
+                    "project_id", task.get("project_id")
+                ).execute()
+                if project_response.data:
+                    project_name = project_response.data[0].get("project_name")
+
+            # Get original task info if this is a review task
+            original_task = None
+            if task.get("parent_task_id"):
+                original_response = supabase.table("tasks").select("*").eq(
+                    "task_id", task.get("parent_task_id")
+                ).execute()
+                if original_response.data:
+                    original_task = original_response.data[0]
+
+            enriched_tasks.append({
+                **task,
+                "owner_name": owner_name,
+                "project_name": project_name,
+                "original_task": original_task,
+                "review_role": task.get("_review_role"),
+            })
+
+        return {
+            "success": True,
+            "tasks": enriched_tasks,
+            "total": len(enriched_tasks)
+        }
+
+    except Exception as e:
+        print(f"[WORKFLOW] ERROR in GET /pipeline/tasks/pending-reviews/{user_id}: {repr(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e

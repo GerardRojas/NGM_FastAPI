@@ -102,8 +102,8 @@ async def list_concepts(
         query = supabase.table("concepts").select(
             "*,"
             "material_categories!concepts_category_id_fkey(name),"
-            "material_classes(name),"
-            "units(unit_name)",
+            "material_classes!concepts_class_id_fkey(name),"
+            "units!concepts_unit_id_fkey(unit_name)",
             count="exact"
         )
 
@@ -177,8 +177,8 @@ async def get_concept(concept_id: str):
         response = supabase.table("concepts").select(
             "*,"
             "material_categories!concepts_category_id_fkey(name),"
-            "material_classes(name),"
-            "units(unit_name)"
+            "material_classes!concepts_class_id_fkey(name),"
+            "units!concepts_unit_id_fkey(unit_name)"
         ).eq("id", concept_id).single().execute()
 
         if not response.data:
