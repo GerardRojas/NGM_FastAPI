@@ -964,6 +964,7 @@ def soft_delete_expense(expense_id: str, user_id: str):
         # Cambiar status a review
         update_data = {
             "status": "review",
+            "status_reason": "Deletion requested",
             "auth_status": False,
             "auth_by": None
         }
