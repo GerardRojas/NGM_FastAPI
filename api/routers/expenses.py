@@ -1835,12 +1835,15 @@ IMPORTANT RULES:
 1. ALWAYS USE LINE TOTALS - CRITICAL:
    - For each line item, ALWAYS use the LINE TOTAL (extended/calculated amount), NOT the unit price
    - Common column names for line totals: EXTENSION, EXT, AMOUNT, LINE TOTAL, TOTAL, SUBTOTAL (per line)
-   - The line total is typically the RIGHTMOST dollar amount on each line
+   - The line total is typically the LARGEST dollar amount associated with each item
    - Examples:
      * "QTY: 80, PRICE EACH: $1.84, EXTENSION: $147.20" -> amount is $147.20
      * "2 x $5.00 = $10.00" -> amount is $10.00
      * "Widget (3 @ $25.00) ... $75.00" -> amount is $75.00
-   - NEVER use unit prices like "PRICE EACH", "UNIT PRICE", "per each", "@ $X.XX each"
+     * "Artisan Frost 512 pieces $1,479.68 ... $2.89/piece" -> amount is $1,479.68 (NOT $2.89)
+     * "Item Name 1 $115.49 piece $115.49/piece" -> amount is $115.49
+   - NEVER use: "PRICE EACH", "UNIT PRICE", "/piece", "/each", "@ $X.XX each"
+   - If you see both a total AND a per-unit price, ALWAYS use the total (larger amount)
 
 2. DOCUMENT STRUCTURE - Adapt to ANY format:
    A) SIMPLE RECEIPTS: item name followed by price on same line
@@ -1866,11 +1869,16 @@ IMPORTANT RULES:
 5. TAX DISTRIBUTION - CRITICAL:
    - If the receipt shows Sales Tax, DO NOT create a separate tax line item
    - DISTRIBUTE the tax proportionally across all product/service line items
-   - Example: Subtotal $100, Item A $60 (60%), Item B $40 (40%), Tax $8:
-     * Item A final = $60 + ($8 x 0.60) = $64.80
-     * Item B final = $40 + ($8 x 0.40) = $43.20
-   - The sum of all final amounts MUST equal the receipt's TOTAL (including tax)
-   - Add "tax_included" field to each item showing the tax amount added
+   - Calculate each item's percentage of the subtotal, then apply that % to the tax
+   - Example: Subtotal $1595.17, Item A $1479.68, Item B $115.49, Tax $123.63:
+     * Item A: $1479.68 / $1595.17 = 92.76% -> tax = $123.63 x 0.9276 = $114.68
+     * Item B: $115.49 / $1595.17 = 7.24% -> tax = $123.63 x 0.0724 = $8.95
+     * Item A final amount = $1479.68 + $114.68 = $1594.36
+     * Item B final amount = $115.49 + $8.95 = $124.44
+     * Total = $1594.36 + $124.44 = $1718.80 (matches invoice!)
+   - PRECISION: Round tax_included to 2 decimal places
+   - The sum of all "amount" fields MUST equal the receipt's GRAND TOTAL exactly
+   - Add "tax_included" field to each item showing the tax amount added to it
 
 6. FEES ARE LINE ITEMS (not distributed):
    - These are NOT taxes and should be separate line items:
