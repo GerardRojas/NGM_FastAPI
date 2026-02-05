@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS public.process_manager_state (
     state_data jsonb NOT NULL DEFAULT '{}',
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    updated_by uuid REFERENCES auth.users(id)
+    updated_by uuid REFERENCES public.users(user_id)
 );
 
 -- Index for fast lookups
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS public.process_manager_history (
     id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
     state_key text NOT NULL,
     state_data jsonb NOT NULL,
-    changed_by uuid REFERENCES auth.users(id),
+    changed_by uuid REFERENCES public.users(user_id),
     changed_at timestamp with time zone DEFAULT now(),
     change_type text NOT NULL  -- 'create', 'update', 'delete'
 );

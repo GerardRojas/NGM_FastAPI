@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS public.expense_status_log (
     expense_id uuid NOT NULL REFERENCES public."expenses_manual_COGS"(expense_id) ON DELETE CASCADE,
     old_status text,
     new_status text NOT NULL,
-    changed_by uuid REFERENCES auth.users(id),
+    changed_by uuid REFERENCES public.users(user_id),
     changed_at timestamp with time zone DEFAULT now(),
     reason text,
     metadata jsonb DEFAULT '{}'
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS public.expense_change_log (
     field_name text NOT NULL,
     old_value text,
     new_value text,
-    changed_by uuid REFERENCES auth.users(id),
+    changed_by uuid REFERENCES public.users(user_id),
     changed_at timestamp with time zone DEFAULT now(),
     expense_status text NOT NULL,
     change_reason text

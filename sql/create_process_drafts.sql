@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS public.process_drafts (
     steps jsonb DEFAULT '[]'::jsonb,
     position jsonb,  -- {x, y} for canvas positioning
     status text NOT NULL DEFAULT 'draft',  -- draft, proposed, approved, rejected
-    created_by uuid REFERENCES auth.users(id),
+    created_by uuid REFERENCES public.users(user_id),
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
 
