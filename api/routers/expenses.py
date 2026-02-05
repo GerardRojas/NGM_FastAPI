@@ -9,6 +9,7 @@ import json
 import io
 from pdf2image import convert_from_bytes
 from PIL import Image
+import pdfplumber
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 router = APIRouter(prefix="/expenses", tags=["Expenses"])
@@ -1443,6 +1444,60 @@ IMPORTANT:
         raise HTTPException(status_code=500, detail=f"Error auto-categorizing expenses: {str(e)}")
 
 
+# ====== PDF TEXT EXTRACTION HELPER ======
+
+def extract_text_from_pdf(file_content: bytes, min_chars: int = 100) -> tuple[bool, str]:
+    """
+    Intenta extraer texto de un PDF usando pdfplumber.
+
+    Args:
+        file_content: Contenido del PDF en bytes
+        min_chars: Minimo de caracteres para considerar extraccion exitosa
+
+    Returns:
+        tuple: (success: bool, text: str)
+        - Si success=True, text contiene el texto extraido
+        - Si success=False, text contiene el motivo del fallo
+    """
+    try:
+        print("[PDF-TEXT] Intentando extraer texto con pdfplumber...")
+
+        # Abrir PDF desde bytes
+        with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+            all_text = []
+            total_pages = len(pdf.pages)
+            print(f"[PDF-TEXT] PDF tiene {total_pages} pagina(s)")
+
+            for i, page in enumerate(pdf.pages):
+                page_text = page.extract_text() or ""
+                all_text.append(page_text)
+                char_count = len(page_text.strip())
+                print(f"[PDF-TEXT] Pagina {i+1}: {char_count} caracteres extraidos")
+
+            combined_text = "\n\n--- PAGE BREAK ---\n\n".join(all_text)
+            total_chars = len(combined_text.strip())
+
+            print(f"[PDF-TEXT] Total caracteres extraidos: {total_chars}")
+
+            # Verificar si hay suficiente texto
+            if total_chars < min_chars:
+                print(f"[PDF-TEXT] FALLBACK: Texto insuficiente ({total_chars} < {min_chars})")
+                return False, f"Texto insuficiente: {total_chars} caracteres"
+
+            # Verificar que no sea solo espacios/newlines
+            meaningful_text = combined_text.replace(" ", "").replace("\n", "").replace("\t", "")
+            if len(meaningful_text) < min_chars:
+                print(f"[PDF-TEXT] FALLBACK: Texto no significativo ({len(meaningful_text)} chars utiles)")
+                return False, "Texto no significativo (solo espacios/newlines)"
+
+            print(f"[PDF-TEXT] EXITO: Texto extraido correctamente ({total_chars} chars)")
+            return True, combined_text
+
+    except Exception as e:
+        print(f"[PDF-TEXT] ERROR: {str(e)}")
+        return False, f"Error pdfplumber: {str(e)}"
+
+
 @router.post("/parse-receipt")
 async def parse_receipt(
     file: UploadFile = File(...),
@@ -1530,54 +1585,94 @@ async def parse_receipt(
             if p.get("payment_method_name")
         ]
 
-        # Procesar PDF o imagen
-        # base64_images es una lista para soportar PDFs multi-página
+        # ====== BIFURCACION SEGUN MODO ======
+        # FAST: pdfplumber (texto) -> Vision fallback (gpt-4o-mini)
+        # HEAVY: Directo a Vision (gpt-4o) - maxima precision para docs dificiles
+        use_text_mode = False
+        extraction_method = "vision"  # default
+        extracted_text = ""
         base64_images = []
         media_type = file.content_type
 
-        if file.content_type == "application/pdf":
-            # Convertir PDF a imágenes (TODAS las páginas)
-            try:
-                # Detectar sistema operativo para path de Poppler
-                import platform
-                poppler_path = None
-                if platform.system() == "Windows":
-                    # Windows: usar instalación local
-                    poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin'
-                # En Linux (Render), poppler-utils está en PATH por defecto
+        # HEAVY MODE: Bypass directo a Vision con gpt-4o
+        if model == "heavy":
+            print(f"[PARSE-RECEIPT] MODO HEAVY: Directo a Vision (gpt-4o)")
+            extraction_method = "vision_direct"
 
-                # Convertir TODAS las páginas del PDF (sin límite de first_page/last_page)
-                images = convert_from_bytes(
-                    file_content,
-                    dpi=200,
-                    poppler_path=poppler_path
-                )
-                if not images:
-                    raise HTTPException(status_code=400, detail="Could not convert PDF to image")
+            if file.content_type == "application/pdf":
+                try:
+                    import platform
+                    poppler_path = None
+                    if platform.system() == "Windows":
+                        poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin'
 
-                # Convertir CADA página a base64
-                for img in images:
-                    buffer = io.BytesIO()
-                    img.save(buffer, format='PNG')
-                    buffer.seek(0)
-                    base64_images.append(base64.b64encode(buffer.getvalue()).decode('utf-8'))
+                    images = convert_from_bytes(file_content, dpi=200, poppler_path=poppler_path)
+                    if not images:
+                        raise HTTPException(status_code=400, detail="Could not convert PDF to image")
 
-                media_type = "image/png"
-                print(f"PDF processed: {len(base64_images)} page(s) converted to images")
+                    for img in images:
+                        buffer = io.BytesIO()
+                        img.save(buffer, format='PNG')
+                        base64_images.append(base64.b64encode(buffer.getvalue()).decode('utf-8'))
 
-            except Exception as pdf_error:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Error processing PDF: {str(pdf_error)}"
-                )
+                    media_type = "image/png"
+                    print(f"[PARSE-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
+
+                except Exception as pdf_error:
+                    raise HTTPException(status_code=400, detail=f"Error processing PDF: {str(pdf_error)}")
+            else:
+                base64_images = [base64.b64encode(file_content).decode('utf-8')]
+                print(f"[PARSE-RECEIPT] Imagen lista para Vision")
+
+        # FAST MODE: pdfplumber -> Vision fallback
         else:
-            # Imagen directa (solo 1 imagen)
-            base64_images = [base64.b64encode(file_content).decode('utf-8')]
+            print(f"[PARSE-RECEIPT] MODO FAST: pdfplumber -> Vision")
 
-        # Prompt para OpenAI - Instrucciones muy específicas
-        # Indicar si es un documento multi-página
+            if file.content_type == "application/pdf":
+                print(f"[PARSE-RECEIPT] Archivo PDF detectado")
+
+                # Intentar extraer texto con pdfplumber
+                print(f"[PARSE-RECEIPT] Intentando pdfplumber...")
+                text_success, text_result = extract_text_from_pdf(file_content)
+
+                if text_success:
+                    use_text_mode = True
+                    extraction_method = "pdfplumber"
+                    extracted_text = text_result
+                    print(f"[PARSE-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
+                else:
+                    # Fallback a Vision
+                    print(f"[PARSE-RECEIPT] pdfplumber fallo ({text_result}), usando Vision...")
+                    extraction_method = "vision"
+                    try:
+                        import platform
+                        poppler_path = None
+                        if platform.system() == "Windows":
+                            poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin'
+
+                        images = convert_from_bytes(file_content, dpi=200, poppler_path=poppler_path)
+                        if not images:
+                            raise HTTPException(status_code=400, detail="Could not convert PDF to image")
+
+                        for img in images:
+                            buffer = io.BytesIO()
+                            img.save(buffer, format='PNG')
+                            base64_images.append(base64.b64encode(buffer.getvalue()).decode('utf-8'))
+
+                        media_type = "image/png"
+                        print(f"[PARSE-RECEIPT] PDF convertido a {len(images)} imagen(es) para Vision")
+
+                    except Exception as pdf_error:
+                        raise HTTPException(status_code=400, detail=f"Error processing PDF: {str(pdf_error)}")
+            else:
+                # Imagen directa - siempre Vision
+                print(f"[PARSE-RECEIPT] Imagen detectada ({file.content_type}) - usando Vision")
+                extraction_method = "vision"
+                base64_images = [base64.b64encode(file_content).decode('utf-8')]
+
+        # ====== PREPARAR PROMPT SEGUN MODO ======
         page_count_hint = ""
-        if len(base64_images) > 1:
+        if not use_text_mode and len(base64_images) > 1:
             page_count_hint = f"\n\nIMPORTANT: This document has {len(base64_images)} pages. Analyze ALL pages and combine the data from all of them into a single response. The images are provided in page order (Page 1, Page 2, etc.).\n"
 
         prompt = f"""You are an expert at extracting expense data from receipts, invoices, and bills.
@@ -1717,33 +1812,171 @@ IMPORTANT:
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object."""
 
-        # Construir contenido del mensaje con TODAS las imágenes (para PDFs multi-página)
-        message_content = [{"type": "text", "text": prompt}]
+        # ====== LLAMADA A OPENAI SEGUN MODO ======
+        if use_text_mode:
+            # MODO TEXTO: Prompt simplificado con texto extraido
+            print(f"[PARSE-RECEIPT] Enviando texto a OpenAI ({len(extracted_text)} chars)...")
 
-        # Agregar cada imagen/página al contenido
-        for i, base64_img in enumerate(base64_images):
-            message_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{media_type};base64,{base64_img}",
-                    "detail": "high"  # Alta calidad para mejor OCR
-                }
-            })
+            text_prompt = f"""You are an expert at extracting expense data from receipts, invoices, and bills.
 
-        print(f"Sending {len(base64_images)} image(s) to OpenAI Vision API")
+Below is the TEXT extracted from a receipt/invoice PDF. Analyze it and extract ALL expense items in JSON format.
 
-        # Llamar a OpenAI Vision API
-        response = client.chat.completions.create(
-            model=openai_model,  # Selected based on user preference (fast=gpt-4o-mini, heavy=gpt-4o)
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ],
-            max_tokens=4000,  # Aumentado para documentos multi-página
-            temperature=0.1  # Baja temperatura para respuestas más deterministas
-        )
+AVAILABLE VENDORS (you MUST match to one of these, or use "Unknown"):
+{json.dumps(vendors_list, indent=2)}
+
+AVAILABLE TRANSACTION TYPES (you MUST match to one of these by name, or use "Unknown"):
+{json.dumps(transaction_types_list, indent=2)}
+
+AVAILABLE PAYMENT METHODS (you MUST match to one of these by name, or use "Unknown"):
+{json.dumps(payment_methods_list, indent=2)}
+
+IMPORTANT RULES:
+
+1. ALWAYS USE LINE TOTALS - CRITICAL:
+   - For each line item, ALWAYS use the LINE TOTAL (extended/calculated amount), NOT the unit price
+   - Common column names for line totals: EXTENSION, EXT, AMOUNT, LINE TOTAL, TOTAL, SUBTOTAL (per line)
+   - The line total is typically the RIGHTMOST dollar amount on each line
+   - Examples:
+     * "QTY: 80, PRICE EACH: $1.84, EXTENSION: $147.20" -> amount is $147.20
+     * "2 x $5.00 = $10.00" -> amount is $10.00
+     * "Widget (3 @ $25.00) ... $75.00" -> amount is $75.00
+   - NEVER use unit prices like "PRICE EACH", "UNIT PRICE", "per each", "@ $X.XX each"
+
+2. DOCUMENT STRUCTURE - Adapt to ANY format:
+   A) SIMPLE RECEIPTS: item name followed by price on same line
+   B) ITEMIZED INVOICES: Use the AMOUNT column (rightmost), not Rate
+   C) COMPLEX MULTI-SECTION INVOICES (Home Depot, Lowe's):
+      - May have multiple sections: "CARRY OUT", "DELIVERY #1", "DELIVERY #2"
+      - Extract items from ALL sections
+      - Don't stop at section subtotals (MERCHANDISE TOTAL)
+   D) STATEMENTS: Extract each category as a line item
+
+3. Extract EVERY line item as a separate expense (don't combine items)
+
+4. For each item, extract:
+   - date: Transaction date in YYYY-MM-DD format
+   - bill_id: Invoice/Receipt number (same for all items in one receipt)
+   - description: Item description (include quantity if shown, e.g., "80x PGT2 Pipe Grip Tie")
+   - vendor: Match to AVAILABLE VENDORS list. If not found, use "Unknown"
+   - amount: The LINE TOTAL as a number (no currency symbols) - NOT the unit price!
+   - category: Expense category (Materials, Labor, Office Supplies, etc.)
+   - transaction_type: Match to AVAILABLE TRANSACTION TYPES or use "Unknown"
+   - payment_method: Match to AVAILABLE PAYMENT METHODS or use "Unknown"
+
+5. TAX DISTRIBUTION - CRITICAL:
+   - If the receipt shows Sales Tax, DO NOT create a separate tax line item
+   - DISTRIBUTE the tax proportionally across all product/service line items
+   - Example: Subtotal $100, Item A $60 (60%), Item B $40 (40%), Tax $8:
+     * Item A final = $60 + ($8 x 0.60) = $64.80
+     * Item B final = $40 + ($8 x 0.40) = $43.20
+   - The sum of all final amounts MUST equal the receipt's TOTAL (including tax)
+   - Add "tax_included" field to each item showing the tax amount added
+
+6. FEES ARE LINE ITEMS (not distributed):
+   - These are NOT taxes and should be separate line items:
+     * Delivery Fee, Shipping, Freight
+     * Service Fee, Convenience Fee
+     * Environmental fees (CA LUMBER FEE, recycling fee, etc.)
+     * Tip, Gratuity
+   - Only actual TAX amounts (Sales Tax, VAT, GST) get distributed
+
+7. SINGLE TOTAL FALLBACK:
+   - If the receipt shows only ONE total with no itemization, create ONE expense
+
+8. CRITICAL: vendor, transaction_type, payment_method MUST exactly match one from their lists, or use "Unknown"
+
+VALIDATION - MANDATORY:
+1. Find the GRAND TOTAL / TOTAL DUE shown on the receipt - this is "invoice_total"
+2. Calculate the sum of all your expense amounts - this is "calculated_sum"
+3. Compare them:
+   - If they match (within $0.02 tolerance), set "validation_passed" to true
+   - If they DON'T match, set "validation_passed" to false and include "validation_warning"
+
+Return ONLY valid JSON in this exact format:
+{{
+  "expenses": [
+    {{
+      "date": "2025-01-17",
+      "bill_id": "INV-12345",
+      "description": "Item name or description",
+      "vendor": "Exact vendor name from list or Unknown",
+      "amount": 45.99,
+      "category": "Category name",
+      "transaction_type": "Exact name from list or Unknown",
+      "payment_method": "Exact name from list or Unknown",
+      "tax_included": 3.45
+    }}
+  ],
+  "tax_summary": {{
+    "total_tax_detected": 8.00,
+    "tax_label": "Sales Tax",
+    "subtotal": 100.00,
+    "grand_total": 108.00,
+    "distribution": [
+      {{"description": "Item A", "original_amount": 60.00, "tax_added": 4.80, "final_amount": 64.80}},
+      {{"description": "Item B", "original_amount": 40.00, "tax_added": 3.20, "final_amount": 43.20}}
+    ]
+  }},
+  "validation": {{
+    "invoice_total": 108.00,
+    "calculated_sum": 108.00,
+    "validation_passed": true,
+    "validation_warning": null
+  }}
+}}
+
+IMPORTANT:
+- If NO tax was detected, set "tax_summary" to null
+- The "tax_included" field should be the tax added to that item (0 for fees)
+- The "invoice_total" MUST be the exact total shown on the receipt
+- If validation fails, explain in "validation_warning" why
+
+DO NOT include any text before or after the JSON. ONLY return the JSON object.
+
+--- RECEIPT TEXT START ---
+{extracted_text}
+--- RECEIPT TEXT END ---"""
+
+            response = client.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": text_prompt
+                    }
+                ],
+                max_tokens=4000,
+                temperature=0.1
+            )
+            print(f"[PARSE-RECEIPT] Respuesta recibida de OpenAI (modo texto)")
+
+        else:
+            # MODO VISION: Sistema original con imagenes
+            message_content = [{"type": "text", "text": prompt}]
+
+            for i, base64_img in enumerate(base64_images):
+                message_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{base64_img}",
+                        "detail": "high"
+                    }
+                })
+
+            print(f"[PARSE-RECEIPT] Enviando {len(base64_images)} imagen(es) a OpenAI Vision API...")
+
+            response = client.chat.completions.create(
+                model=openai_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": message_content
+                    }
+                ],
+                max_tokens=4000,
+                temperature=0.1
+            )
+            print(f"[PARSE-RECEIPT] Respuesta recibida de OpenAI (modo vision)")
 
         # Extraer respuesta
         result_text = response.choices[0].message.content.strip()
@@ -1784,16 +2017,20 @@ DO NOT include any text before or after the JSON. ONLY return the JSON object.""
                     detail="Some expenses are missing required fields (date, description, amount)"
                 )
 
+        print(f"[PARSE-RECEIPT] COMPLETADO - metodo: {extraction_method}, items: {len(parsed_data['expenses'])}")
+
         return {
             "success": True,
             "data": parsed_data,
             "count": len(parsed_data["expenses"]),
-            "model_used": model  # "fast" or "heavy"
+            "model_used": model,  # "fast" or "heavy"
+            "extraction_method": extraction_method  # "pdfplumber", "paddleocr", or "vision"
         }
 
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[PARSE-RECEIPT] ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error parsing receipt: {str(e)}")
 
 
