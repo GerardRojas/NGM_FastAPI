@@ -96,6 +96,11 @@ def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
             r'^(?:presupuesto|budget|gastado|disponible|balance)\s+(?:de|para|en)\s+',
             '', topic
         ).strip()
+        # Clean verb phrases that leaked into topic (e.g. "gastar en ventanas" -> "ventanas")
+        topic = re.sub(
+            r'^(?:gastar|invertir|usar|meter|poner)\s+(?:en|para|de)\s+',
+            '', topic
+        ).strip()
         if topic and project and len(topic.split()) <= 5 and len(project.split()) <= 5:
             return {
                 "intent": "CONSULTA_ESPECIFICA",
@@ -114,6 +119,11 @@ def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
         topic = topic_only.group(1).strip().rstrip('?! ')
         topic = re.sub(
             r'^(?:presupuesto|budget|gastado|disponible|balance)\s+(?:de|para|en)\s+',
+            '', topic
+        )
+        # Clean verb phrases (e.g. "gastar en ventanas" -> "ventanas")
+        topic = re.sub(
+            r'^(?:gastar|invertir|usar|meter|poner)\s+(?:en|para|de)\s+',
             '', topic
         )
         topic = re.sub(r'\s+(?:por\s+favor|please|pls)$', '', topic).strip()

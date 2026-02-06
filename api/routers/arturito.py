@@ -779,6 +779,7 @@ REPORTS (type="report"):
   Triggers: questions about how much budget is left/used for a category.
   Examples: "cuanto tengo para ventanas en Thrasher", "how much HVAC budget in Del Rio", "what did we spend on plumbing", "show me finishes for Willowbrook"
   Category can be an account name (Windows, HVAC, Plumbing) or a group name (Finishes, Site Work, MEP).
+  IMPORTANT: Category must be ONLY the trade/account name (e.g. "ventanas", "HVAC", "plumbing", "Windows"). Do NOT include verbs or prepositions like "gastar en", "disponible para", "budget for" in the category value. Strip them and keep only the noun.
   Category should be in the user's language (Spanish or English). Project must be normalized to KNOWN PROJECTS.
 - action="bug", params: {{"description":"<bug description>"}}
   Triggers: "reportar bug", "hay un error", "something is broken"

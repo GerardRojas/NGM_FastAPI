@@ -1501,7 +1501,8 @@ def extract_text_from_pdf(file_content: bytes, min_chars: int = 100) -> tuple[bo
 @router.post("/parse-receipt")
 async def parse_receipt(
     file: UploadFile = File(...),
-    model: str = Form("fast")
+    model: str = Form("fast"),
+    correction_context: str = Form(None)
 ):
     """
     Parsea un recibo/factura usando OpenAI Vision API.
@@ -1587,6 +1588,21 @@ async def parse_receipt(
             for p in (payment_methods_resp.data or [])
             if p.get("payment_method_name")
         ]
+
+        # ====== PARSE CORRECTION CONTEXT IF PROVIDED ======
+        correction_data = None
+        if correction_context:
+            try:
+                correction_data = json.loads(correction_context)
+                print(f"[PARSE-RECEIPT] CORRECTION MODE: invoice_total={correction_data.get('invoice_total')}, "
+                      f"calculated_sum={correction_data.get('calculated_sum')}, "
+                      f"items={len(correction_data.get('items', []))}")
+                # Force heavy model + vision for correction pass
+                openai_model = "gpt-4o"
+                model = "heavy"
+            except json.JSONDecodeError:
+                print(f"[PARSE-RECEIPT] WARNING: Invalid correction_context JSON, ignoring")
+                correction_data = None
 
         # ====== BIFURCACION SEGUN MODO ======
         # FAST: pdfplumber (texto) -> Vision fallback (gpt-4o-mini)
@@ -1823,6 +1839,77 @@ IMPORTANT:
 - REMEMBER: Each expense "amount" should be the FINAL amount (with tax distributed). The sum of ALL "amount" fields = invoice_total.
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object."""
+
+        # ====== CORRECTION MODE: Override prompt if correction_context provided ======
+        if correction_data:
+            use_text_mode = False  # Force vision mode for correction
+            extraction_method = "correction"
+            items_json = json.dumps(correction_data.get("items", []), indent=2)
+            invoice_total = correction_data.get("invoice_total", 0)
+            calculated_sum = correction_data.get("calculated_sum", 0)
+            difference = round(abs(invoice_total - calculated_sum), 2)
+
+            prompt = f"""You are an expert at verifying and correcting expense data extracted from receipts.
+
+A fast OCR pass already extracted the items below from this receipt, but the amounts DO NOT add up correctly.
+
+KNOWN INVOICE TOTAL (printed on the receipt): ${invoice_total:.2f}
+OCR EXTRACTED SUM: ${calculated_sum:.2f}
+DIFFERENCE: ${difference:.2f}
+
+ITEMS EXTRACTED BY OCR (may have errors in amounts):
+{items_json}
+
+YOUR TASK:
+1. Look at the receipt image carefully
+2. Compare each OCR item amount against what is actually printed on the receipt
+3. Find which amount(s) are wrong and correct them
+4. Make sure the corrected amounts sum to exactly ${invoice_total:.2f}
+5. If the OCR missed an item entirely, add it
+6. If the OCR added a phantom item, remove it
+
+AVAILABLE VENDORS: {json.dumps(vendors_list)}
+AVAILABLE TRANSACTION TYPES: {json.dumps([t["name"] for t in transaction_types_list])}
+AVAILABLE PAYMENT METHODS: {json.dumps([p["name"] for p in payment_methods_list])}
+
+TAX RULES:
+- If the receipt shows a separate tax line, distribute tax proportionally across items
+- Each expense "amount" = final amount WITH tax included
+- The sum of ALL "amount" fields MUST equal the invoice total (${invoice_total:.2f})
+
+Return ONLY valid JSON in this exact format:
+{{
+  "expenses": [
+    {{
+      "date": "YYYY-MM-DD",
+      "bill_id": "invoice number",
+      "description": "item description",
+      "vendor": "vendor name from list or Unknown",
+      "amount": 0.00,
+      "category": "category",
+      "transaction_type": "from list or Unknown",
+      "payment_method": "from list or Unknown",
+      "tax_included": 0.00
+    }}
+  ],
+  "tax_summary": {{
+    "total_tax_detected": 0.00,
+    "tax_label": "Sales Tax",
+    "subtotal": 0.00,
+    "grand_total": {invoice_total:.2f},
+    "distribution": []
+  }},
+  "validation": {{
+    "invoice_total": {invoice_total:.2f},
+    "calculated_sum": 0.00,
+    "validation_passed": true,
+    "validation_warning": null,
+    "corrections_made": "describe what you corrected"
+  }}
+}}
+
+DO NOT include any text before or after the JSON. ONLY return the JSON object."""
+            print(f"[PARSE-RECEIPT] CORRECTION PROMPT built: invoice=${invoice_total}, ocr_sum=${calculated_sum}, diff=${difference}")
 
         # ====== LLAMADA A OPENAI SEGUN MODO ======
         if use_text_mode:

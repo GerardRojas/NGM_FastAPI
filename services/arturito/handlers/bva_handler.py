@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import io
 import os
+import re
 
 from openai import OpenAI
 from api.supabase_client import supabase
@@ -408,9 +409,16 @@ def fetch_budgets(project_id: str) -> List[Dict[str, Any]]:
 
 
 def fetch_expenses(project_id: str) -> List[Dict[str, Any]]:
-    """Obtiene expenses autorizados del proyecto"""
+    """Obtiene expenses autorizados del proyecto desde expenses_manual_COGS"""
     try:
-        result = supabase.table("expenses").select("*").eq("project", project_id).eq("auth_status", True).execute()
+        result = (
+            supabase.table("expenses_manual_COGS")
+            .select("*")
+            .eq("project", project_id)
+            .eq("auth_status", True)
+            .neq("status", "review")
+            .execute()
+        )
         return result.data or []
     except Exception as e:
         print(f"[BVA] Error fetching expenses: {e}")
@@ -951,6 +959,15 @@ def find_category_data(
             search_terms.append(alias_key)
             used_alias = True
 
+    # Fallback: if no alias matched, try individual words from the input
+    if not used_alias and len(category_lower.split()) > 1:
+        for word in category_lower.split():
+            for alias_key, alias_values in CATEGORY_ALIASES.items():
+                if word in alias_values or word == alias_key:
+                    search_terms.extend(alias_values)
+                    search_terms.append(alias_key)
+                    used_alias = True
+
     search_terms = list(set(search_terms))
 
     # Helper para obtener nombre de cuenta
@@ -1301,6 +1318,14 @@ def find_group_data(
         if input_lower in alias_values or input_lower == alias_key:
             search_terms.extend(alias_values)
             search_terms.append(alias_key)
+    # Fallback: if no alias matched, try individual words from the input
+    # (e.g. "gastar en ventanas" -> check "ventanas" against aliases)
+    if len(search_terms) == 1 and len(input_lower.split()) > 1:
+        for word in input_lower.split():
+            for alias_key, alias_values in CATEGORY_ALIASES.items():
+                if word in alias_values or word == alias_key:
+                    search_terms.extend(alias_values)
+                    search_terms.append(alias_key)
     search_terms = list(set(search_terms))
 
     # -- Step 1: Try matching an AccountCategory name directly --
