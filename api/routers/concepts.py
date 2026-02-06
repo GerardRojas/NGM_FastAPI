@@ -182,18 +182,33 @@ async def get_concept(concept_id: str):
     Obtiene un concepto especifico con sus materiales.
     """
     try:
-        # Obtener concepto
-        response = supabase.table("concepts").select(
-            "*,"
-            "material_categories!concepts_category_id_fkey(name),"
-            "material_classes!concepts_class_id_fkey(name),"
-            "units!concepts_unit_id_fkey(unit_name)"
-        ).eq("id", concept_id).single().execute()
+        # Obtener concepto (sin joins problematicos)
+        response = supabase.table("concepts").select("*").eq("id", concept_id).single().execute()
 
         if not response.data:
             raise HTTPException(status_code=404, detail="Concept not found")
 
         c = response.data
+
+        # Obtener nombres de relaciones por separado
+        category_name = None
+        class_name = None
+        unit_name = None
+
+        if c.get("category_id"):
+            cat_resp = supabase.table("material_categories").select("name").eq("id", c["category_id"]).execute()
+            if cat_resp.data:
+                category_name = cat_resp.data[0].get("name")
+
+        if c.get("class_id"):
+            cls_resp = supabase.table("material_classes").select("name").eq("id", c["class_id"]).execute()
+            if cls_resp.data:
+                class_name = cls_resp.data[0].get("name")
+
+        if c.get("unit_id"):
+            unit_resp = supabase.table("units").select("unit_name").eq("id_unit", c["unit_id"]).execute()
+            if unit_resp.data:
+                unit_name = unit_resp.data[0].get("unit_name")
 
         # Obtener materiales del concepto
         materials_resp = supabase.table("concept_materials").select(
@@ -256,9 +271,9 @@ async def get_concept(concept_id: str):
             # Builder state (inline items, labor, etc.)
             "builder": c.get("builder"),
             # Nombres de relaciones
-            "category_name": c.get("material_categories", {}).get("name") if c.get("material_categories") else None,
-            "class_name": c.get("material_classes", {}).get("name") if c.get("material_classes") else None,
-            "unit_name": c.get("units", {}).get("unit_name") if c.get("units") else None,
+            "category_name": category_name,
+            "class_name": class_name,
+            "unit_name": unit_name,
             # Materiales
             "materials": materials,
             "materials_count": len(materials),
