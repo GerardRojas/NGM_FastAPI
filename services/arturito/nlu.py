@@ -171,9 +171,12 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
     # BVA con proyecto: "bva del rio", "budgetvsactuals arthur neal"
     match_bva = re.match(r'^(bva|budgetvsactuals)\s+(.+)$', t)
     if match_bva:
+        # Preserve original case from user input (important for DB lookups)
+        prefix_len = match_bva.end(1)
+        original_project = text.strip()[prefix_len:].strip()
         return {
             "intent": "BUDGET_VS_ACTUALS",
-            "entities": {"project": match_bva.group(2).strip()},
+            "entities": {"project": original_project},
             "confidence": 1.0,
             "source": "local"
         }

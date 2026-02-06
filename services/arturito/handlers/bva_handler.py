@@ -183,25 +183,28 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
     3. Busqueda por palabras (substring + typo tolerance via edit distance)
     4. GPT fallback
 
-    Ejemplos:
-    - "arthur neal court" -> "1519 Arthur Neal Court"
-    - "del rio" -> "Del Rio Residence"
-    - "trahser" -> "251 Thrasher Way" (typo tolerance)
-    - "1519" -> "1519 Arthur Neal Court"
+    Each step is isolated so a failure in one (e.g. UUID type mismatch)
+    does not prevent subsequent steps from running.
     """
+    # 1. Busqueda exacta por ID (may fail if project_id is UUID and input is text)
     try:
-        # 1. Busqueda exacta por ID
         result = supabase.table("projects").select("*").eq("project_id", project_input).execute()
         if result.data:
             return result.data[0]
+    except Exception as e:
+        print(f"[BVA] resolve_project step 1 (ID lookup) skipped: {e}")
 
-        # 2. Buscar por nombre directo (case-insensitive, parcial)
+    # 2. Buscar por nombre directo (case-insensitive, parcial)
+    try:
         result = supabase.table("projects").select("*").ilike("project_name", f"%{project_input}%").execute()
         if result.data:
             matches = sorted(result.data, key=lambda x: len(x.get("project_name", "")))
             return matches[0]
+    except Exception as e:
+        print(f"[BVA] resolve_project step 2 (ilike) error: {e}")
 
-        # 3. Busqueda fuzzy por palabras (substring + typo tolerance)
+    # 3. Busqueda fuzzy por palabras (substring + typo tolerance)
+    try:
         search_words = [w.strip().lower() for w in project_input.split() if w.strip()]
         if not search_words:
             return None
@@ -263,7 +266,7 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
 
         return None
     except Exception as e:
-        print(f"[BVA] Error resolving project: {e}")
+        print(f"[BVA] resolve_project step 3/4 (fuzzy/GPT) error: {e}")
         return None
 
 
