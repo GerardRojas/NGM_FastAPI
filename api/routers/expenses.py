@@ -1535,6 +1535,9 @@ async def parse_receipt(
     }
     """
     # Determine which OpenAI model to use
+    import time
+    start_time = time.time()
+
     openai_model = "gpt-4o" if model == "heavy" else "gpt-4o-mini"
     print(f"[PARSE-RECEIPT] Using model: {openai_model} (requested: {model})")
     try:
@@ -2025,14 +2028,16 @@ DO NOT include any text before or after the JSON. ONLY return the JSON object.
                     detail="Some expenses are missing required fields (date, description, amount)"
                 )
 
-        print(f"[PARSE-RECEIPT] COMPLETADO - metodo: {extraction_method}, items: {len(parsed_data['expenses'])}")
+        execution_time = round(time.time() - start_time, 2)
+        print(f"[PARSE-RECEIPT] COMPLETADO - metodo: {extraction_method}, items: {len(parsed_data['expenses'])}, tiempo: {execution_time}s")
 
         return {
             "success": True,
             "data": parsed_data,
             "count": len(parsed_data["expenses"]),
             "model_used": model,  # "fast" or "heavy"
-            "extraction_method": extraction_method  # "pdfplumber", "paddleocr", or "vision"
+            "extraction_method": extraction_method,  # "pdfplumber" or "vision"
+            "execution_time_seconds": execution_time
         }
 
     except HTTPException:
