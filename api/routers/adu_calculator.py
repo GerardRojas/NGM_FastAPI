@@ -8,8 +8,9 @@
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends
 from fastapi.security import HTTPBearer
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 from api.auth import get_current_user
+from api.supabase_client import supabase
 import base64
 import os
 import json
@@ -486,3 +487,60 @@ async def calculate_cost(
     except Exception as e:
         print(f"[ADU_CALC] Error calculating cost: {repr(e)}")
         raise HTTPException(status_code=500, detail=f"Calculation failed: {str(e)}")
+
+
+# ====== PRICING CONFIG ENDPOINTS ======
+
+class PricingConfigUpdate(BaseModel):
+    pricing_data: Dict[str, Any]
+
+
+@router.get("/pricing-config")
+async def get_pricing_config(current_user: dict = Depends(get_current_user)):
+    """Load the pricing configuration from the database."""
+    try:
+        result = supabase.table("adu_pricing_config") \
+            .select("pricing_data") \
+            .eq("config_key", "main") \
+            .single() \
+            .execute()
+
+        if result.data and result.data.get("pricing_data"):
+            return {"data": result.data["pricing_data"]}
+
+        return {"data": None}
+
+    except Exception as e:
+        print(f"[ADU_CALC] Error loading pricing config: {repr(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to load pricing config: {str(e)}")
+
+
+@router.put("/pricing-config")
+async def update_pricing_config(
+    payload: PricingConfigUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Save the pricing configuration to the database."""
+    try:
+        result = supabase.table("adu_pricing_config") \
+            .update({
+                "pricing_data": payload.pricing_data,
+                "updated_at": "now()"
+            }) \
+            .eq("config_key", "main") \
+            .execute()
+
+        if not result.data:
+            # Row doesn't exist yet — insert it
+            supabase.table("adu_pricing_config") \
+                .insert({
+                    "config_key": "main",
+                    "pricing_data": payload.pricing_data
+                }) \
+                .execute()
+
+        return {"message": "Pricing configuration saved"}
+
+    except Exception as e:
+        print(f"[ADU_CALC] Error saving pricing config: {repr(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save pricing config: {str(e)}")

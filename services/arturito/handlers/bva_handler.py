@@ -9,6 +9,7 @@ from datetime import datetime
 import io
 import os
 
+from openai import OpenAI
 from api.supabase_client import supabase
 
 # Para generación de PDF
@@ -64,26 +65,27 @@ def handle_budget_vs_actuals(
         project_input = ctx.get("space_name", "")
 
     # Validar que tenemos proyecto
-    if not project_input or project_input.lower() in ["default", "general", "random", "none"]:
-        # Obtener lista de proyectos recientes para sugerir
-        recent_projects = fetch_recent_projects(limit=8)
+    raw_text = request.get("raw_text", "")
+    space_id = ctx.get("space_id", "default")
 
+    if not project_input or project_input.lower() in ["default", "general", "random", "none", "ngm hub web"]:
+        recent_projects = fetch_recent_projects(limit=8)
+        hint = ""
+        data = None
         if recent_projects:
-            project_list = "\n".join([f"• {p.get('project_name', 'Sin nombre')}" for p in recent_projects])
-            return {
-                "ok": False,
-                "text": f"📊 ¿De qué proyecto necesitas el reporte BVA?\n\nProyectos disponibles:\n{project_list}\n\n💡 Ejemplo: *bva Del Rio*",
-                "action": "ask_project",
-                "data": {
-                    "projects": [{"id": p.get("project_id"), "name": p.get("project_name")} for p in recent_projects]
-                }
+            hint = ", ".join([p.get("project_name", "") for p in recent_projects[:4]])
+            data = {
+                "projects": [{"id": p.get("project_id"), "name": p.get("project_name")} for p in recent_projects]
             }
-        else:
-            return {
-                "ok": False,
-                "text": "📊 ¿De qué proyecto necesitas el reporte BVA?\n\n💡 Ejemplo: *bva Del Rio*",
-                "action": "ask_project"
-            }
+        text = _gpt_ask_missing_entity(raw_text, "project", hint, space_id)
+        result = {
+            "ok": False,
+            "text": text,
+            "action": "ask_project"
+        }
+        if data:
+            result["data"] = data
+        return result
 
     try:
         # 1. Resolver proyecto (buscar por nombre o ID)
@@ -157,11 +159,11 @@ Actual: ${totals['actual']:,.2f}
         }
 
     except Exception as e:
+        print(f"[BVA] Error generating report: {e}")
         return {
             "ok": False,
-            "text": f"⚠️ Error generando el reporte: {str(e)}",
-            "action": "bva_error",
-            "error": str(e)
+            "text": "Error generando el reporte. Intenta de nuevo.",
+            "action": "bva_error"
         }
 
 
@@ -236,10 +238,122 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
         if best_match and best_score >= 0.5:
             return best_match
 
+        # 4. GPT fallback: ask GPT to pick the best match from project names
+        project_names = [p.get("project_name", "") for p in all_projects.data if p.get("project_name")]
+        gpt_match_name = _gpt_fuzzy_match(project_input, project_names)
+        if gpt_match_name:
+            for p in all_projects.data:
+                if p.get("project_name") == gpt_match_name:
+                    return p
+
         return None
     except Exception as e:
         print(f"[BVA] Error resolving project: {e}")
         return None
+
+
+def _gpt_fuzzy_match(query: str, candidates: List[str]) -> Optional[str]:
+    """
+    Uses GPT as a last-resort fuzzy matcher.
+    Given a user query and a list of candidate names, asks GPT which one
+    (if any) the user most likely meant.
+    Returns the exact candidate string or None.
+    """
+    if not candidates:
+        return None
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        client = OpenAI(api_key=api_key, timeout=10.0)
+        candidates_str = "\n".join(f"- {c}" for c in candidates[:40])
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": (
+                    "You are a fuzzy-matching helper. The user typed a name that may contain "
+                    "typos, abbreviations, or be in a different language. Pick the BEST match "
+                    "from the candidate list. Reply with ONLY the exact candidate string, or "
+                    "\"NONE\" if nothing is a reasonable match. No explanation."
+                )},
+                {"role": "user", "content": f"User typed: \"{query}\"\n\nCandidates:\n{candidates_str}"}
+            ],
+            temperature=0,
+            max_tokens=80
+        )
+        answer = resp.choices[0].message.content.strip().strip('"')
+        if answer.upper() == "NONE" or answer not in candidates:
+            return None
+        return answer
+    except Exception as e:
+        print(f"[BVA] GPT fuzzy match error: {e}")
+        return None
+
+
+def _gpt_ask_missing_entity(
+    raw_text: str,
+    missing: str,
+    hint: str,
+    space_id: str = "default"
+) -> str:
+    """
+    Uses GPT + persona to generate a natural follow-up question
+    when the user didn't specify a required entity (project or category).
+
+    Args:
+        raw_text: The user's original message
+        missing: What's missing ("project" or "category")
+        hint: Extra context like available project names
+        space_id: For personality level lookup
+    """
+    from services.arturito.persona import get_persona_prompt
+
+    # Simple language detection for fallback messages
+    is_spanish = any(w in raw_text.lower().split() for w in [
+        "cuanto", "cuánto", "tengo", "tenemos", "hay", "para", "presupuesto", "gastado"
+    ]) if raw_text else False
+
+    def _fallback(missing_key: str, hint_str: str) -> str:
+        if missing_key == "project":
+            if is_spanish:
+                return f"Para cual proyecto? {hint_str}" if hint_str else "Para cual proyecto?"
+            return f"For which project? {hint_str}" if hint_str else "For which project?"
+        if is_spanish:
+            return f"Que categoria? {hint_str}" if hint_str else "Que categoria?"
+        return f"Which category? {hint_str}" if hint_str else "Which category?"
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return _fallback(missing, hint)
+
+    try:
+        persona = get_persona_prompt(space_id)
+        client = OpenAI(api_key=api_key, timeout=8.0)
+
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": (
+                    f"{persona}\n\n"
+                    f"The user asked a budget question but didn't specify the {missing}. "
+                    f"Generate a SHORT follow-up question asking for the {missing}. "
+                    f"Reply in the SAME LANGUAGE the user wrote in. "
+                    f"Keep it to 1-2 sentences max. "
+                    f"If there's a hint with options, weave them in naturally."
+                )},
+                {"role": "user", "content": (
+                    f"User said: \"{raw_text}\"\n"
+                    f"Missing: {missing}\n"
+                    f"Options hint: {hint}"
+                )}
+            ],
+            temperature=0.7,
+            max_tokens=100
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[BVA] GPT ask missing entity error: {e}")
+        return _fallback(missing, hint)
 
 
 def fetch_recent_projects(limit: int = 8) -> List[Dict[str, Any]]:
@@ -668,26 +782,35 @@ def handle_consulta_especifica(
         project_input = ctx.get("space_name", "")
 
     # Validar proyecto
-    if not project_input or project_input.lower() in ["default", "general", "random", "none"]:
+    raw_text = request.get("raw_text", "")
+    space_id = ctx.get("space_id", "default")
+
+    if not project_input or project_input.lower() in ["default", "general", "random", "none", "ngm hub web"]:
         recent_projects = fetch_recent_projects(limit=6)
+        hint = ""
+        data = None
         if recent_projects:
-            project_list = ", ".join([p.get("project_name", "") for p in recent_projects[:4]])
-            return {
-                "ok": False,
-                "text": f"¿De qué proyecto? Por ejemplo: {project_list}",
-                "action": "ask_project"
+            hint = ", ".join([p.get("project_name", "") for p in recent_projects[:4]])
+            data = {
+                "projects": [{"id": p.get("project_id"), "name": p.get("project_name")} for p in recent_projects]
             }
-        return {
+        text = _gpt_ask_missing_entity(raw_text, "project", hint, space_id)
+        result = {
             "ok": False,
-            "text": "¿De qué proyecto necesitas la información?",
+            "text": text,
             "action": "ask_project"
         }
+        if data:
+            result["data"] = data
+        return result
 
-    # Validar categoría
+    # Validar categoria
     if not category_input:
+        hint = "windows, HVAC, plumbing, framing, labor, materials"
+        text = _gpt_ask_missing_entity(raw_text, "category", hint, space_id)
         return {
             "ok": False,
-            "text": f"¿Qué categoría te interesa del proyecto? Por ejemplo: ventanas, HVAC, plomería, framing, etc.",
+            "text": text,
             "action": "ask_category"
         }
 
@@ -750,11 +873,11 @@ def handle_consulta_especifica(
         }
 
     except Exception as e:
+        print(f"[BVA] Error in consulta especifica: {e}")
         return {
             "ok": False,
-            "text": f"⚠️ Error consultando los datos: {str(e)}",
-            "action": "query_error",
-            "error": str(e)
+            "text": "Error consultando los datos. Intenta de nuevo.",
+            "action": "query_error"
         }
 
 
@@ -789,6 +912,8 @@ def find_category_data(
         "landscaping": ["landscaping", "landscape", "jardineria", "jardin"],
         "appliances": ["appliances", "appliance", "electrodomesticos"],
         "insulation": ["insulation", "aislamiento"],
+        "labor": ["labor", "mano de obra", "trabajadores"],
+        "materials": ["materials", "materiales", "material"],
     }
 
     # Expandir términos de búsqueda
@@ -1141,6 +1266,8 @@ def find_group_data(
         "landscaping": ["landscaping", "landscape", "jardineria", "jardin"],
         "appliances": ["appliances", "appliance", "electrodomesticos"],
         "insulation": ["insulation", "aislamiento"],
+        "labor": ["labor", "mano de obra", "trabajadores"],
+        "materials": ["materials", "materiales", "material"],
     }
 
     search_terms = [input_lower]
@@ -1165,24 +1292,131 @@ def find_group_data(
         if matched_group:
             break
 
+    # -- Step 1b: Keyword aggregation --
+    # Keywords like "labor" or "materials" appear across many accounts
+    # (e.g. "Rough Framing Labor", "Plumbing Labor", "HVAC Labor").
+    # If the search term matches multiple account names as a substring,
+    # build a virtual group from all of them.
+    if not matched_group:
+        KEYWORD_ALIASES = {
+            "labor": ["labor", "mano de obra", "trabajadores"],
+            "materials": ["materials", "materiales", "material"],
+        }
+        keyword_terms = list(search_terms)
+        for kw_key, kw_values in KEYWORD_ALIASES.items():
+            if input_lower in kw_values or input_lower == kw_key:
+                keyword_terms.append(kw_key)
+                keyword_terms.extend(kw_values)
+        keyword_terms = list(set(keyword_terms))
+
+        # Collect all account names that contain any keyword term
+        keyword_matched_names = []
+        for acc in accounts:
+            acc_name = acc.get("Name") or acc.get("account_name") or ""
+            acc_lower = acc_name.lower()
+            for term in keyword_terms:
+                if term in acc_lower:
+                    keyword_matched_names.append(acc_name)
+                    break
+
+        # Only use keyword aggregation if we match 2+ accounts
+        if len(keyword_matched_names) >= 2:
+            # Build BVA for each matching account (reuse Step 3 logic inline)
+            def _get_acc_name(account_id, account_name=None):
+                if account_name:
+                    return account_name
+                info = account_info.get(account_id)
+                return info["name"] if info else "Unknown"
+
+            bba = {}
+            for b in budgets:
+                n = _get_acc_name(b.get("account_id"), b.get("account_name"))
+                bba[n] = bba.get(n, 0) + float(b.get("amount_sum") or 0)
+            eba = {}
+            for e in expenses:
+                n = _get_acc_name(e.get("account_id"), e.get("account_name"))
+                amt = float(e.get("Amount") or e.get("amount") or 0)
+                eba[n] = eba.get(n, 0) + amt
+
+            kw_details = []
+            kw_budget = 0
+            kw_actual = 0
+            for acc_name in sorted(keyword_matched_names):
+                b = bba.get(acc_name, 0)
+                a = eba.get(acc_name, 0)
+                if b == 0 and a == 0:
+                    continue
+                bal = b - a
+                pct = (a / b * 100) if b > 0 else 0
+                kw_details.append({
+                    "matched_name": acc_name,
+                    "budget": round(b, 2),
+                    "actual": round(a, 2),
+                    "balance": round(bal, 2),
+                    "percent_of_budget": round(pct, 2),
+                    "has_data": True,
+                    "is_matched": False,
+                })
+                kw_budget += b
+                kw_actual += a
+
+            if kw_details:
+                kw_balance = kw_budget - kw_actual
+                kw_pct = (kw_actual / kw_budget * 100) if kw_budget > 0 else 0
+                # Capitalize the keyword for display
+                display_name = category_input.strip().title()
+                return {
+                    "matched_name": display_name,
+                    "searched_term": category_input,
+                    "is_approximate": False,
+                    "group_name": display_name,
+                    "match_type": "keyword",
+                    "accounts": kw_details,
+                    "group_totals": {
+                        "budget": round(kw_budget, 2),
+                        "actual": round(kw_actual, 2),
+                        "balance": round(kw_balance, 2),
+                        "percent_of_budget": round(kw_pct, 2),
+                    }
+                }
+
     # -- Step 2: If no group match, find account then its group --
     if not matched_group:
         single = find_category_data(category_input, budgets, expenses, accounts)
+
+        # Step 2b: GPT fallback - ask GPT to match against group + account names
         if not single:
+            all_names = list(groups.keys()) + [
+                acc.get("Name") or acc.get("account_name") or ""
+                for acc in accounts if acc.get("Name") or acc.get("account_name")
+            ]
+            gpt_match = _gpt_fuzzy_match(category_input, list(set(all_names)))
+            if gpt_match:
+                # Check if GPT matched a group name
+                if gpt_match in groups:
+                    matched_group = gpt_match
+                    match_type = "group"
+                else:
+                    # Re-run find_category_data with the GPT-resolved name
+                    single = find_category_data(gpt_match, budgets, expenses, accounts)
+
+        if not single and not matched_group:
             return None
 
-        matched_account_name = single["matched_name"]
+        # If we matched a group via GPT, skip account lookup (single is None)
+        if single:
+            matched_account_name = single["matched_name"]
 
-        # Look up the AccountCategory of the matched account
-        for acc in accounts:
-            name = acc.get("Name") or acc.get("account_name")
-            if name and name.lower() == matched_account_name.lower():
-                matched_group = acc.get("AccountCategory")
-                match_type = "account"
-                break
+            # Look up the AccountCategory of the matched account
+            for acc in accounts:
+                name = acc.get("Name") or acc.get("account_name")
+                if name and name.lower() == matched_account_name.lower():
+                    matched_group = acc.get("AccountCategory")
+                    match_type = "account"
+                    break
 
         # Account has no group — return single account wrapped in group format
-        if not matched_group:
+        if not matched_group and single:
             return {
                 "matched_name": matched_account_name,
                 "searched_term": category_input,
@@ -1293,7 +1527,7 @@ def format_group_response(project_name: str, data: Dict[str, Any]) -> str:
 
     # -- Header --
     if group_name:
-        if match_type == "group":
+        if match_type in ("group", "keyword"):
             lines.append(f"**{group_name}** en **{project_name}**")
         else:
             if is_approx:

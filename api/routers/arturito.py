@@ -5,13 +5,15 @@
 # Entry point para mensajes desde Google Chat y NGM HUB Web.
 # Usa OpenAI Assistants API para memoria contextual eficiente.
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import re
 import json
 import time
+
+from api.auth import get_current_user
 
 # Importar el engine de Arturito
 from services.arturito import (
@@ -139,10 +141,10 @@ async def receive_message(message: ChatMessage):
         )
 
     except Exception as e:
+        print(f"[ARTURITO] /message error: {e}")
         return BotResponse(
-            text="⚠️ Ocurrió un error procesando tu mensaje.",
+            text="Ocurrio un error procesando tu mensaje.",
             action="error",
-            error=str(e)
         )
 
 
@@ -167,10 +169,10 @@ async def receive_slash_command(command: SlashCommand):
         )
 
     except Exception as e:
+        print(f"[ARTURITO] /slash error: {e}")
         return BotResponse(
-            text=f"⚠️ Error ejecutando /{command.command}",
+            text=f"Error ejecutando /{command.command}",
             action="error",
-            error=str(e)
         )
 
 
@@ -262,29 +264,32 @@ async def web_chat(message: WebChatMessage):
                 thread_id=message.thread_id
             )
 
+            if error:
+                print(f"[ARTURITO] Assistants API error: {error}")
             return BotResponse(
                 text=response_text,
                 action="chat_response",
                 thread_id=thread_id,
-                error=error
             )
 
         # Para otros intents (BVA, SOW, etc.), rutear al handler
         response = route(intent_result, context)
 
+        if response.get("error"):
+            print(f"[ARTURITO] Route handler error: {response.get('error')}")
+
         return BotResponse(
             text=response.get("text", ""),
             action=response.get("action"),
             data=response.get("data"),
-            error=response.get("error"),
             thread_id=message.thread_id or get_thread_id(session_id)
         )
 
     except Exception as e:
+        print(f"[ARTURITO] /web-chat error: {e}")
         return BotResponse(
-            text="⚠️ Ocurrió un error procesando tu mensaje. Por favor intenta de nuevo.",
+            text="Ocurrio un error procesando tu mensaje. Por favor intenta de nuevo.",
             action="error",
-            error=str(e)
         )
 
 
@@ -388,7 +393,8 @@ async def google_chat_webhook(payload: Dict[str, Any]):
         return {"text": ""}
 
     except Exception as e:
-        return {"text": f"⚠️ Error: {str(e)}"}
+        print(f"[ARTURITO] /webhook error: {e}")
+        return {"text": "Ocurrio un error procesando tu mensaje."}
 
 
 # ================================
@@ -416,16 +422,15 @@ class PermissionUpdate(BaseModel):
 
 
 @router.patch("/permissions")
-async def update_permission(update: PermissionUpdate):
+async def update_permission(update: PermissionUpdate, current_user: dict = Depends(get_current_user)):
     """
     Actualiza un permiso específico de Arturito.
-
-    Body:
-    {
-        "intent": "CREATE_VENDOR",
-        "enabled": true
-    }
+    Requires CEO, COO, or KD COO role.
     """
+    allowed_roles = ["CEO", "COO", "KD COO"]
+    if current_user.get("role") not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Only CEO/COO can modify Arturito permissions")
+
     from services.arturito.permissions import ARTURITO_PERMISSIONS
 
     intent = update.intent.upper()
@@ -448,10 +453,14 @@ async def update_permission(update: PermissionUpdate):
 
 
 @router.post("/permissions/reset")
-async def reset_permissions():
+async def reset_permissions(current_user: dict = Depends(get_current_user)):
     """
     Resetea todos los permisos a sus valores por defecto.
+    Requires CEO, COO, or KD COO role.
     """
+    allowed_roles = ["CEO", "COO", "KD COO"]
+    if current_user.get("role") not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Only CEO/COO can reset Arturito permissions")
     from services.arturito.permissions import ARTURITO_PERMISSIONS
 
     # Valores por defecto
@@ -499,7 +508,7 @@ class DelegationRequest(BaseModel):
 
 
 @router.post("/delegate-task")
-async def delegate_task(request: DelegationRequest):
+async def delegate_task(request: DelegationRequest, current_user: dict = Depends(get_current_user)):
     """
     Envía una solicitud de tarea a otro equipo.
     Por ahora, simula el envío (en producción se integraría con
@@ -557,27 +566,18 @@ async def get_failed_commands_endpoint(
     current_page: Optional[str] = None,
     error_reason: Optional[str] = None,
     days_back: int = 30,
-    user_id: Optional[str] = None  # Admin can filter by user
+    user_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Get failed copilot commands for analytics.
-
-    Query params:
-    - page: Page number (default: 1)
-    - page_size: Results per page (default: 50, max: 100)
-    - current_page: Filter by page (e.g., 'expenses.html')
-    - error_reason: Filter by error reason
-    - days_back: How many days back to look (default: 30)
-    - user_id: Filter by user (admin only, optional)
-
-    Returns paginated list of failed commands with user info.
+    Requires CEO, COO, or KD COO role.
     """
     try:
-        # TODO: Add auth check - verify user has permission to view failed commands
-        # For now, user can only see their own failures unless they're admin
+        allowed_roles = ["CEO", "COO", "KD COO"]
+        if current_user.get("role") not in allowed_roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-        # Get supabase client from app state or dependency injection
-        # This is a placeholder - actual implementation will depend on your auth setup
         from api.db import get_supabase_client
         supabase = get_supabase_client()
 
@@ -788,7 +788,7 @@ For anything else (questions, greetings, help, general conversation): type="chat
 
 
 @router.post("/interpret-intent", response_model=IntentResponse)
-async def interpret_intent(request: IntentRequest):
+async def interpret_intent(request: IntentRequest, current_user: dict = Depends(get_current_user)):
     """
     GPT-first intent interpreter. Classifies user messages based on
     the current page context and returns structured action JSON.
@@ -801,7 +801,7 @@ async def interpret_intent(request: IntentRequest):
         if not api_key:
             return IntentResponse(type="chat")
 
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, timeout=30.0)
 
         # Normalize page name
         page = request.current_page or "dashboard.html"
@@ -830,7 +830,7 @@ async def interpret_intent(request: IntentRequest):
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request.text},
+                {"role": "user", "content": request.text[:500]},  # Limit input length
             ],
             temperature=0,
             max_tokens=200,
@@ -885,7 +885,7 @@ async def interpret_filter_command(request: FilterInterpretRequest):
         if not api_key:
             return FilterInterpretResponse(understood=False)
 
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=api_key, timeout=30.0)
 
         # System prompt for filter interpretation
         system_prompt = """You are a command interpreter for an expense management system.
@@ -934,7 +934,7 @@ If you can't interpret the command as a filter action, return:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request.text}
+                {"role": "user", "content": request.text[:500]}
             ],
             temperature=0,
             max_tokens=150
@@ -1002,12 +1002,14 @@ Response format:
 
 If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}}"""
 
-        client = get_openai_client()
+        from openai import OpenAI
+        import os
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=30.0)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Find accounts matching: {query}"}
+                {"role": "user", "content": f"Find accounts matching: {query[:200]}"}
             ],
             temperature=0,
             max_tokens=200
@@ -1144,25 +1146,17 @@ async def search_accounts(query: str, limit: int = 5):
 @router.get("/failed-commands/stats")
 async def get_failed_commands_stats_endpoint(
     days_back: int = 30,
-    user_id: Optional[str] = None
+    user_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Get aggregated statistics about failed commands.
-
-    Query params:
-    - days_back: How many days back to analyze (default: 30)
-    - user_id: Filter by user (admin only, optional)
-
-    Returns:
-    - total_failures: Total number of failed commands
-    - unique_commands: Number of unique command texts
-    - gpt_attempt_rate: Percentage of failures where GPT was attempted
-    - top_pages: Pages with most failures
-    - top_errors: Most common error reasons
-    - most_common_commands: Most frequently failed commands
+    Requires CEO, COO, or KD COO role.
     """
     try:
-        # TODO: Add auth check - verify user has permission to view stats
+        allowed_roles = ["CEO", "COO", "KD COO"]
+        if current_user.get("role") not in allowed_roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
 
         from api.db import get_supabase_client
         supabase = get_supabase_client()

@@ -38,6 +38,115 @@ VALID_INTENTS = [
 
 
 # ================================
+# Consulta Especifica - Multi-step Detection
+# ================================
+
+def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
+    """
+    Detects CONSULTA_ESPECIFICA with a consolidated multi-step approach.
+    Replaces the 4 separate regex patterns with a unified system.
+
+    Steps:
+      1. Detect budget signal (ES + EN)
+      2. Extract topic + project (uses en/in as separator, multi-word topics)
+      3. Extract topic only (no project, validated against construction terms)
+      4. Log and return None if signal detected but extraction failed
+    """
+
+    # ---- Step 1: Budget signal detection ----
+    budget_signals = [
+        # ES: "cuanto tengo/hay/queda/tenemos..."
+        r'(?:cu[aá]nto)\s+(?:tengo|hay|queda|tenemos|tienen|llevo|llevamos)',
+        # ES: "cuanto hemos/han/he gastado/usado..."
+        r'(?:cu[aá]nto)\s+(?:hemos|han|he)\s+(?:gastado|usado|invertido)',
+        # ES: "cuanto de/para/en X" (direct)
+        r'(?:cu[aá]nto)\s+(?:de|para|en)\s+',
+        # ES: "presupuesto/budget/gastado de/para/en..."
+        r'(?:presupuesto|budget|gastado|disponible|balance)\s+(?:de|para|en)',
+        # EN: "how much do we have / have we spent / for / on..."
+        r'how\s+much\s+(?:do\s+(?:we|i)\s+have|is\s+(?:left|available|remaining)|have\s+(?:we|i)\s+spent|for|in|on)',
+        # EN: "what's the budget/balance..."
+        r'what(?:\'s|\s+is)\s+(?:the\s+)?(?:budget|balance|available|remaining)',
+        # EN: "budget/spent for/on/in..."
+        r'(?:budget|spent|available|remaining)\s+(?:for|on|in)',
+    ]
+
+    has_signal = any(re.search(p, t) for p in budget_signals)
+    if not has_signal:
+        return None
+
+    # ---- Step 2: Extract topic + project ----
+    # Uses "en"/"in" as the ONLY separator between topic and project.
+    # Avoids ambiguity with project names containing "del" (e.g. "Del Rio").
+    # Greedy (.+) for topic captures multi-word phrases; backtracking finds the last en/in.
+    topic_project = re.search(
+        r'\b(?:para|de|del|en|on|for|about)\s+'
+        r'(.+)'
+        r'\s+(?:en|in)\s+'
+        r'(?:el\s+)?(?:proyecto\s+)?(?:project\s+)?'
+        r'(.+)',
+        t
+    )
+
+    if topic_project:
+        topic = topic_project.group(1).strip()
+        project = topic_project.group(2).strip().rstrip('?! ')
+        # Clean budget-related words that leaked into topic
+        topic = re.sub(
+            r'^(?:presupuesto|budget|gastado|disponible|balance)\s+(?:de|para|en)\s+',
+            '', topic
+        ).strip()
+        if topic and project and len(topic.split()) <= 5 and len(project.split()) <= 5:
+            return {
+                "intent": "CONSULTA_ESPECIFICA",
+                "entities": {"topic": topic, "project": project},
+                "confidence": 0.95,
+                "source": "local"
+            }
+
+    # ---- Step 3: Topic only (no project mentioned) ----
+    topic_only = re.search(
+        r'\b(?:para|de|del|en|on|for|about)\s+(.+)',
+        t
+    )
+
+    if topic_only:
+        topic = topic_only.group(1).strip().rstrip('?! ')
+        topic = re.sub(
+            r'^(?:presupuesto|budget|gastado|disponible|balance)\s+(?:de|para|en)\s+',
+            '', topic
+        )
+        topic = re.sub(r'\s+(?:por\s+favor|please|pls)$', '', topic).strip()
+
+        if topic and len(topic.split()) <= 5:
+            construction_terms = [
+                "ventanas", "windows", "hvac", "plomeria", "plumbing",
+                "electricidad", "electrical", "framing", "drywall",
+                "pintura", "paint", "piso", "flooring", "techo", "roof",
+                "cocina", "kitchen", "bathroom", "puertas", "doors",
+                "concreto", "concrete", "landscaping", "appliances",
+                "insulation", "cabinets", "labor", "mano de obra",
+                "materials", "materiales", "demolition", "demolicion",
+                "siding", "stucco", "tile", "countertops", "fixtures",
+                "permits", "cleanup", "lumber", "plywood", "gutters",
+                "garage", "fence", "deck", "patio",
+            ]
+            if any(term in topic.lower() for term in construction_terms):
+                return {
+                    "intent": "CONSULTA_ESPECIFICA",
+                    "entities": {"topic": topic, "project": None},
+                    "confidence": 0.85,
+                    "source": "local"
+                }
+
+    # ---- Step 4: Signal detected but extraction failed ----
+    # Regex detected a budget question but couldn't parse entities.
+    # Log for diagnostics; GPT will handle via normal fallback.
+    print(f"[NLU] Budget signal detected but entity extraction failed: '{t}'")
+    return None
+
+
+# ================================
 # Interpretación Local (regex rápido)
 # ================================
 
@@ -88,84 +197,9 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
     # ================================
     # Consulta específica de categoría del BVA
     # ================================
-    # Patrones: "cuanto tengo para ventanas en del rio", "cuanto hemos gastado en hvac en thrasher"
-
-    # Patrón 1: "cuanto [tengo/hay/queda] [disponible/de presupuesto] para/de [categoria] en [proyecto]"
-    consulta_pattern1 = re.search(
-        r'(?:cuánto|cuanto|cuál|cual|qué|que)\s+(?:tengo|hay|queda|tenemos|tienen)?\s*'
-        r'(?:disponible|de\s+presupuesto|de\s+budget|gastado|usado)?\s*'
-        r'(?:para|de|en)\s+(\w+(?:\s+\w+)?)\s+'
-        r'(?:en|del?|para)\s+(.+?)(?:\?|$)',
-        t
-    )
-    if consulta_pattern1:
-        category = consulta_pattern1.group(1).strip()
-        project = consulta_pattern1.group(2).strip()
-        return {
-            "intent": "CONSULTA_ESPECIFICA",
-            "entities": {"topic": category, "project": project},
-            "confidence": 0.95,
-            "source": "local"
-        }
-
-    # Patrón 2: "[categoria] en [proyecto]" al final de pregunta
-    consulta_pattern2 = re.search(
-        r'(?:presupuesto|budget|gastado|disponible|balance)\s+'
-        r'(?:de|para|en)\s+(\w+(?:\s+\w+)?)\s+'
-        r'(?:en|del?|para)\s+(.+?)(?:\?|$)',
-        t
-    )
-    if consulta_pattern2:
-        category = consulta_pattern2.group(1).strip()
-        project = consulta_pattern2.group(2).strip()
-        return {
-            "intent": "CONSULTA_ESPECIFICA",
-            "entities": {"topic": category, "project": project},
-            "confidence": 0.9,
-            "source": "local"
-        }
-
-    # Patrón 3: "cuanto hemos gastado en [categoria] en [proyecto]"
-    consulta_pattern3 = re.search(
-        r'(?:cuánto|cuanto)\s+(?:hemos|han|he)\s+(?:gastado|usado|invertido)\s+'
-        r'(?:en|para|de)\s+(\w+(?:\s+\w+)?)\s+'
-        r'(?:en|del?|para)\s+(.+?)(?:\?|$)',
-        t
-    )
-    if consulta_pattern3:
-        category = consulta_pattern3.group(1).strip()
-        project = consulta_pattern3.group(2).strip()
-        return {
-            "intent": "CONSULTA_ESPECIFICA",
-            "entities": {"topic": category, "project": project},
-            "confidence": 0.95,
-            "source": "local"
-        }
-
-    # Patrón 4: Consulta de categoría sin proyecto (preguntar después)
-    consulta_sin_proyecto = re.search(
-        r'(?:cuánto|cuanto|cuál|cual)\s+(?:tengo|hay|queda|tenemos)?\s*'
-        r'(?:disponible|de\s+presupuesto|gastado)?\s*'
-        r'(?:para|de|en)\s+(\w+(?:\s+\w+)?)(?:\?|$)',
-        t
-    )
-    # Solo si parece una consulta de presupuesto específica (no general)
-    if consulta_sin_proyecto:
-        category = consulta_sin_proyecto.group(1).strip().lower()
-        # Verificar que sea una categoría de construcción, no una pregunta general
-        construction_terms = [
-            "ventanas", "windows", "hvac", "plomeria", "plumbing", "electricidad",
-            "electrical", "framing", "drywall", "pintura", "paint", "piso", "flooring",
-            "techo", "roof", "cocina", "kitchen", "baño", "bathroom", "puertas", "doors",
-            "concreto", "concrete", "landscaping", "appliances", "insulation", "cabinets"
-        ]
-        if any(term in category for term in construction_terms):
-            return {
-                "intent": "CONSULTA_ESPECIFICA",
-                "entities": {"topic": consulta_sin_proyecto.group(1).strip(), "project": None},
-                "confidence": 0.85,
-                "source": "local"
-            }
+    consulta = _detect_consulta_especifica(t)
+    if consulta:
+        return consulta
 
     # Ayuda / Help
     if re.search(r'\b(ayuda|help|qué puedes hacer|what can you do)\b', t):
@@ -738,7 +772,7 @@ def interpret_message(text: str, context: Dict[str, Any] = None) -> Dict[str, An
         if context and context.get("space_name"):
             # Solo usar el nombre del espacio si parece un proyecto
             space_name = context["space_name"]
-            if space_name and space_name.lower() not in ["default", "general", "random"]:
+            if space_name and space_name.lower() not in ["default", "general", "random", "ngm hub web"]:
                 gpt_result.setdefault("entities", {})["project"] = space_name
                 gpt_result["project_inferred"] = True
 
