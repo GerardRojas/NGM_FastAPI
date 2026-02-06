@@ -32,8 +32,8 @@ from .responder import generate_small_talk_response
 ROUTES: Dict[str, Dict[str, Any]] = {
     "BUDGET_VS_ACTUALS": {
         "handler": handle_budget_vs_actuals,
-        "required_entities": ["project"],
-        "optional_entities": ["category"],
+        "required_entities": [],  # Handler manages missing project internally (ask_project flow)
+        "optional_entities": ["project", "category"],
         "description": "Genera reporte Budget vs Actuals de un proyecto",
     },
 
@@ -333,7 +333,7 @@ def route(
     missing = _check_required_entities(route_def, entities)
     if missing:
         return {
-            "text": f"⚠️ Me falta información: {', '.join(missing)}",
+            "text": f"I need more information: {', '.join(missing)}",
             "action": "missing_entities",
             "data": {"missing": missing}
         }
