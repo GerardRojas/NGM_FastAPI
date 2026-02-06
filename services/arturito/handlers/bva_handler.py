@@ -167,23 +167,30 @@ Actual: ${totals['actual']:,.2f}
         }
 
 
+def _word_similarity(a: str, b: str) -> float:
+    """Simple character-level similarity ratio (0-1) using SequenceMatcher."""
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
     """
-    Busca el proyecto por nombre o ID con búsqueda fuzzy mejorada.
+    Busca el proyecto por nombre o ID con busqueda fuzzy mejorada.
 
-    Algoritmo de búsqueda:
-    1. Búsqueda exacta por ID
-    2. Búsqueda directa por nombre (ilike)
-    3. Búsqueda por todas las palabras (cada palabra debe estar presente)
-    4. Búsqueda por scoring (la mayoría de palabras coinciden)
+    Algoritmo de busqueda:
+    1. Busqueda exacta por ID
+    2. Busqueda directa por nombre (ilike)
+    3. Busqueda por palabras (substring + typo tolerance via edit distance)
+    4. GPT fallback
 
     Ejemplos:
-    - "arthur neal court" -> "1519 Arthur Neal Court" ✓
-    - "del rio" -> "Del Rio Residence" ✓
-    - "1519" -> "1519 Arthur Neal Court" ✓
+    - "arthur neal court" -> "1519 Arthur Neal Court"
+    - "del rio" -> "Del Rio Residence"
+    - "trahser" -> "251 Thrasher Way" (typo tolerance)
+    - "1519" -> "1519 Arthur Neal Court"
     """
     try:
-        # 1. Intentar búsqueda exacta por ID
+        # 1. Busqueda exacta por ID
         result = supabase.table("projects").select("*").eq("project_id", project_input).execute()
         if result.data:
             return result.data[0]
@@ -191,54 +198,62 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
         # 2. Buscar por nombre directo (case-insensitive, parcial)
         result = supabase.table("projects").select("*").ilike("project_name", f"%{project_input}%").execute()
         if result.data:
-            # Ordenar por longitud (preferir nombres más cortos/exactos)
             matches = sorted(result.data, key=lambda x: len(x.get("project_name", "")))
             return matches[0]
 
-        # 3. Si no encontró, intentar búsqueda por palabras individuales
-        # Esto permite que "arthur neal court" encuentre "1519 Arthur Neal Court"
+        # 3. Busqueda fuzzy por palabras (substring + typo tolerance)
         search_words = [w.strip().lower() for w in project_input.split() if w.strip()]
-
         if not search_words:
             return None
 
-        # Obtener todos los proyectos para búsqueda fuzzy
         all_projects = supabase.table("projects").select("*").execute()
         if not all_projects.data:
             return None
 
-        # Buscar proyectos donde TODAS las palabras de búsqueda estén presentes
         best_match = None
         best_score = 0
 
         for project in all_projects.data:
             project_name = project.get("project_name", "").lower()
+            project_words = project_name.split()
 
-            # Contar cuántas palabras de búsqueda están en el nombre del proyecto
-            matches = sum(1 for word in search_words if word in project_name)
+            exact_hits = 0
+            fuzzy_hits = 0
 
-            if matches == 0:
+            for sw in search_words:
+                # Exact substring match
+                if sw in project_name:
+                    exact_hits += 1
+                    continue
+                # Typo tolerance: compare each search word to each project word
+                best_sim = max(
+                    (_word_similarity(sw, pw) for pw in project_words),
+                    default=0
+                )
+                if best_sim >= 0.7:
+                    fuzzy_hits += 1
+
+            total_hits = exact_hits + fuzzy_hits
+            if total_hits == 0:
                 continue
 
-            # Calcular score: palabras encontradas / palabras buscadas
-            score = matches / len(search_words)
-
-            # Bonus si TODAS las palabras coinciden
-            if matches == len(search_words):
+            score = total_hits / len(search_words)
+            # Bonus for exact substring hits
+            score += exact_hits * 0.1
+            # Bonus if ALL words matched
+            if total_hits == len(search_words):
                 score += 0.5
-
-            # Bonus si el nombre es más corto (más específico)
+            # Prefer shorter names (more specific)
             score += 0.1 / (len(project_name) + 1)
 
             if score > best_score:
                 best_score = score
                 best_match = project
 
-        # Solo retornar si al menos 50% de las palabras coinciden
         if best_match and best_score >= 0.5:
             return best_match
 
-        # 4. GPT fallback: ask GPT to pick the best match from project names
+        # 4. GPT fallback
         project_names = [p.get("project_name", "") for p in all_projects.data if p.get("project_name")]
         gpt_match_name = _gpt_fuzzy_match(project_input, project_names)
         if gpt_match_name:
@@ -359,10 +374,18 @@ def _gpt_ask_missing_entity(
 def fetch_recent_projects(limit: int = 8) -> List[Dict[str, Any]]:
     """Obtiene lista de proyectos recientes/activos para sugerir."""
     try:
-        # Obtener proyectos ordenados por fecha de creación (más recientes primero)
         result = supabase.table("projects") \
             .select("project_id, project_name") \
             .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+        return result.data or []
+    except Exception:
+        pass
+    # Fallback: sin ordenamiento si created_at no existe
+    try:
+        result = supabase.table("projects") \
+            .select("project_id, project_name") \
             .limit(limit) \
             .execute()
         return result.data or []
