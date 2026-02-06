@@ -41,6 +41,22 @@ VALID_INTENTS = [
 # Consulta Especifica - Multi-step Detection
 # ================================
 
+
+# Shared topic cleanup - strips budget verbs/nouns that leak into topic extraction
+def _clean_topic(topic: str) -> str:
+    """Strip budget-related verbs/phrases from extracted topic."""
+    topic = re.sub(
+        r'^(?:presupuesto|budget|gastado|gastando|disponible|balance|'
+        r'gastar|invertir|invertido|usar|usado|meter|poner|'
+        r'tener|tenemos|tengo|hay|queda|quedan)'
+        r'\s+(?:en|para|de|del|on|for|in|about)\s+',
+        '', topic
+    ).strip()
+    # Strip orphan preposition at start
+    topic = re.sub(r'^(?:de|para|en|del)\s+', '', topic).strip()
+    return topic
+
+
 def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
     """
     Detects CONSULTA_ESPECIFICA with a consolidated multi-step approach.
@@ -91,16 +107,8 @@ def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
     if topic_project:
         topic = topic_project.group(1).strip()
         project = topic_project.group(2).strip().rstrip('?! ')
-        # Clean budget-related words that leaked into topic
-        topic = re.sub(
-            r'^(?:presupuesto|budget|gastado|disponible|balance)\s+(?:de|para|en)\s+',
-            '', topic
-        ).strip()
-        # Clean verb phrases that leaked into topic (e.g. "gastar en ventanas" -> "ventanas")
-        topic = re.sub(
-            r'^(?:gastar|invertir|usar|meter|poner)\s+(?:en|para|de)\s+',
-            '', topic
-        ).strip()
+        # Clean budget verbs/nouns leaked into topic
+        topic = _clean_topic(topic)
         if topic and project and len(topic.split()) <= 5 and len(project.split()) <= 5:
             return {
                 "intent": "CONSULTA_ESPECIFICA",
@@ -117,15 +125,7 @@ def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
 
     if topic_only:
         topic = topic_only.group(1).strip().rstrip('?! ')
-        topic = re.sub(
-            r'^(?:presupuesto|budget|gastado|disponible|balance)\s+(?:de|para|en)\s+',
-            '', topic
-        )
-        # Clean verb phrases (e.g. "gastar en ventanas" -> "ventanas")
-        topic = re.sub(
-            r'^(?:gastar|invertir|usar|meter|poner)\s+(?:en|para|de)\s+',
-            '', topic
-        )
+        topic = _clean_topic(topic)
         topic = re.sub(r'\s+(?:por\s+favor|please|pls)$', '', topic).strip()
 
         if topic and len(topic.split()) <= 5:
@@ -587,7 +587,10 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
 2) CONSULTA_ESPECIFICA
    - Pregunta sobre un grupo/categoría/cuenta ESPECÍFICA del BVA (HVAC, framing, windows, plumbing, etc.).
    - Mide métricas: budget, actuals, gastado, disponible, diferencia.
-   - Extrae: 'topic' (trade), 'project' (si aparece).
+   - Extrae: 'topic' (SOLO el sustantivo del trade/cuenta, ej: "windows", "hvac", "plumbing"), 'project' (si aparece).
+   - IMPORTANTE para 'topic': extraer SOLO el nombre del trade, SIN verbos de presupuesto.
+     Ejemplo: "cuanto tengo para gastar en ventanas" -> topic: "windows" (NO "gastar en ventanas").
+     Ejemplo: "budget disponible para hvac" -> topic: "hvac" (NO "disponible para hvac").
    - REGLA: Si aparece trade + budget/actuals/gastado → SIEMPRE es CONSULTA_ESPECIFICA.
 
 3) SCOPE_OF_WORK

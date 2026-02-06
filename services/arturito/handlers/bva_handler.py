@@ -779,6 +779,32 @@ def format_bva_response(project_name: str, report_data: Dict[str, Any]) -> str:
 # CONSULTA ESPECÍFICA Handler
 # ================================
 
+def _clean_category_input(raw: str) -> str:
+    """
+    Strip budget-related verbs/phrases from category input, keeping only the trade name.
+    Safety net for when NLU (local or GPT) leaks budget verbs into the topic entity.
+    E.g. "gastar en ventanas" -> "ventanas", "disponible para hvac" -> "hvac"
+    """
+    cleaned = raw.strip()
+    # Strip leading budget verbs/nouns + preposition
+    cleaned = re.sub(
+        r'^(?:gastar|gastado|invertir|invertido|usar|usado|meter|poner|'
+        r'tener|tenemos|tengo|hay|queda|quedan|'
+        r'presupuesto|budget|disponible|balance|spent|available|remaining)\s+'
+        r'(?:en|para|de|del|on|for|in|about)\s+',
+        '', cleaned, flags=re.IGNORECASE
+    ).strip()
+    # Strip "cuanto/how much" phrases that leaked
+    cleaned = re.sub(
+        r'^(?:cu[aá]nto|how\s+much)\s+(?:tengo|tenemos|hay|queda|hemos|he|have\s+we|do\s+we\s+have)\s+'
+        r'(?:gastado\s+)?(?:disponible\s+)?(?:en|para|de|del|on|for|in|about)\s+',
+        '', cleaned, flags=re.IGNORECASE
+    ).strip()
+    # Strip orphan prepositions at start
+    cleaned = re.sub(r'^(?:de|para|en|del)\s+', '', cleaned, flags=re.IGNORECASE).strip()
+    return cleaned if cleaned else raw
+
+
 def handle_consulta_especifica(
     request: Dict[str, Any],
     context: Dict[str, Any] = None
@@ -806,10 +832,10 @@ def handle_consulta_especifica(
     if project_input:
         project_input = str(project_input).strip()
 
-    # Extraer categoría/topic
+    # Extraer categoría/topic and clean budget-verb noise
     category_input = entities.get("topic") or entities.get("category") or entities.get("trade")
     if category_input:
-        category_input = str(category_input).strip()
+        category_input = _clean_category_input(str(category_input))
 
     # Fallback: usar nombre del espacio si no hay proyecto
     if not project_input:
