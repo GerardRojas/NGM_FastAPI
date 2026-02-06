@@ -904,14 +904,14 @@ def handle_consulta_especifica(
                 suggestion_text = ", ".join(suggestions[:5])
                 return {
                     "ok": False,
-                    "text": f"No encontre '{category_input}' en {project_name}.\n\nQuisiste decir: {suggestion_text}?",
+                    "text": f"Could not find '{category_input}' in {project_name}.\n\nDid you mean: {suggestion_text}?",
                     "action": "category_not_found",
                     "data": {"suggestions": suggestions}
                 }
             else:
                 return {
                     "ok": False,
-                    "text": f"No encontre la categoria '{category_input}' en {project_name}.",
+                    "text": f"Could not find category '{category_input}' in {project_name}.",
                     "action": "category_not_found"
                 }
 
@@ -936,7 +936,7 @@ def handle_consulta_especifica(
         print(f"[BVA] Error in consulta especifica: {e}")
         return {
             "ok": False,
-            "text": "Error consultando los datos. Intenta de nuevo.",
+            "text": "Error querying data. Please try again.",
             "action": "query_error"
         }
 
@@ -1233,46 +1233,43 @@ def format_category_response(project_name: str, category_query: str, data: Dict[
     percent = data["percent_of_budget"]
     has_data = data.get("has_data", True)
 
-    # Construir header con mensaje de coincidencia aproximada si aplica
+    # Build header with approximate match message if applicable
     if is_approximate:
-        header = f"🔍 No encontré exactamente *{searched_term}*, pero encontré *{matched_name}*:\n\n"
+        header = f"No exact match for *{searched_term}*, closest: *{matched_name}*:\n\n"
     else:
         header = ""
 
-    # Caso especial: categoría existe pero no tiene datos
+    # Special case: category exists but has no data
     if not has_data:
-        no_data_msg = f"""📊 *{matched_name}* en *{project_name}*
+        no_data_msg = f"""*{matched_name}* in *{project_name}*
 
-ℹ️ Esta categoría existe pero aún no tiene presupuesto ni gastos registrados.
+This category exists but has no budget or expenses recorded yet.
 
-💡 Puedes agregar un budget desde la página de Reporting."""
+You can add a budget from the Reporting page."""
         return header + no_data_msg if header else no_data_msg
 
-    # Determinar estado
+    # Determine status
     if balance > 0:
-        status_emoji = "✅"
-        status_text = "disponible"
+        status_text = "available"
     elif balance == 0:
-        status_emoji = "⚠️"
-        status_text = "agotado"
+        status_text = "depleted"
     else:
-        status_emoji = "🔴"
-        status_text = "sobre presupuesto"
+        status_text = "over budget"
 
-    response = f"""📊 *{matched_name}* en *{project_name}*
+    response = f"""*{matched_name}* in *{project_name}*
 
-💰 Presupuesto: {fmt(budget)}
-💸 Gastado: {fmt(actual)}
-{status_emoji} Disponible: {fmt(balance)} ({status_text})
-📈 Usado: {percent:.1f}%"""
+Budget: {fmt(budget)}
+Actual: {fmt(actual)}
+Available: {fmt(balance)} ({status_text})
+Used: {percent:.1f}%"""
 
-    # Agregar contexto según el estado
+    # Add context based on status
     if balance < 0:
-        response += f"\n\n⚠️ Esta categoría está *{fmt(abs(balance))}* sobre presupuesto."
+        response += f"\n\nThis category is *{fmt(abs(balance))}* over budget."
     elif percent >= 90:
-        response += f"\n\n💡 Casi agotado - solo queda {100-percent:.1f}% del presupuesto."
+        response += f"\n\nAlmost depleted - only {100-percent:.1f}% remaining."
     elif percent <= 10 and budget > 0:
-        response += f"\n\n💡 Apenas se ha utilizado esta categoría."
+        response += f"\n\nBarely used so far."
 
     return header + response if header else response
 
@@ -1605,13 +1602,13 @@ def format_group_response(project_name: str, data: Dict[str, Any]) -> str:
     # -- Header --
     if group_name:
         if match_type in ("group", "keyword"):
-            lines.append(f"**{group_name}** en **{project_name}**")
+            lines.append(f"**{group_name}** in **{project_name}**")
         else:
             if is_approx:
                 lines.append(f'"{searched}" -> **{matched}**')
-            lines.append(f"Grupo **{group_name}** en **{project_name}**")
+            lines.append(f"Group **{group_name}** in **{project_name}**")
     else:
-        lines.append(f"**{matched}** en **{project_name}**")
+        lines.append(f"**{matched}** in **{project_name}**")
 
     lines.append("")
 
@@ -1622,23 +1619,23 @@ def format_group_response(project_name: str, data: Dict[str, Any]) -> str:
         marker = " <--" if acc.get("is_matched") else ""
         over = " (!)" if bal < 0 else ""
         lines.append(f"**{name}**{marker}")
-        lines.append(f"  Budget: {fmt(acc['budget'])}  |  Gastado: {fmt(acc['actual'])}  |  Disp: {fmt(bal)}{over}")
+        lines.append(f"  Budget: {fmt(acc['budget'])}  |  Actual: {fmt(acc['actual'])}  |  Avail: {fmt(bal)}{over}")
         lines.append("")
 
     # -- Group total (only if multiple accounts) --
     if len(accts) > 1:
         total_bal = totals["balance"]
-        over_msg = " (sobre presupuesto)" if total_bal < 0 else ""
+        over_msg = " (over budget)" if total_bal < 0 else ""
         lines.append(f"--- **TOTAL {group_name or matched}** ---")
-        lines.append(f"Budget: {fmt(totals['budget'])}  |  Gastado: {fmt(totals['actual'])}  |  Disp: {fmt(total_bal)}{over_msg}")
-        lines.append(f"Usado: {totals['percent_of_budget']:.1f}%")
+        lines.append(f"Budget: {fmt(totals['budget'])}  |  Actual: {fmt(totals['actual'])}  |  Avail: {fmt(total_bal)}{over_msg}")
+        lines.append(f"Used: {totals['percent_of_budget']:.1f}%")
     else:
         # Single account — add status context
         total_bal = totals["balance"]
         pct = totals["percent_of_budget"]
         if total_bal < 0:
-            lines.append(f"Sobre presupuesto por {fmt(abs(total_bal))}")
+            lines.append(f"Over budget by {fmt(abs(total_bal))}")
         elif pct >= 90:
-            lines.append(f"Casi agotado - queda {100 - pct:.1f}%")
+            lines.append(f"Almost depleted - {100 - pct:.1f}% remaining")
 
     return "\n".join(lines)
