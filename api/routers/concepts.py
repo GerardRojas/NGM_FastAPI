@@ -98,14 +98,8 @@ async def list_concepts(
     try:
         offset = (page - 1) * page_size
 
-        # Query con joins
-        query = supabase.table("concepts").select(
-            "*,"
-            "material_categories!concepts_category_id_fkey(name),"
-            "material_classes!concepts_class_id_fkey(name),"
-            "units!concepts_unit_id_fkey(unit_name)",
-            count="exact"
-        )
+        # Query simple sin joins (evita problemas de FK ambiguos)
+        query = supabase.table("concepts").select("*", count="exact")
 
         # Filtros
         if not include_inactive:
@@ -132,23 +126,38 @@ async def list_concepts(
 
         response = query.execute()
 
+        # Obtener nombres de categorias, clases y unidades en batch
+        category_ids = list(set(c.get("category_id") for c in (response.data or []) if c.get("category_id")))
+        class_ids = list(set(c.get("class_id") for c in (response.data or []) if c.get("class_id")))
+        unit_ids = list(set(c.get("unit_id") for c in (response.data or []) if c.get("unit_id")))
+
+        # Fetch lookups
+        categories_map = {}
+        classes_map = {}
+        units_map = {}
+
+        if category_ids:
+            cats = supabase.table("material_categories").select("id, name").in_("id", category_ids).execute()
+            categories_map = {c["id"]: c["name"] for c in (cats.data or [])}
+
+        if class_ids:
+            cls = supabase.table("material_classes").select("id, name").in_("id", class_ids).execute()
+            classes_map = {c["id"]: c["name"] for c in (cls.data or [])}
+
+        if unit_ids:
+            uns = supabase.table("units").select("id_unit, unit_name").in_("id_unit", unit_ids).execute()
+            units_map = {u["id_unit"]: u["unit_name"] for u in (uns.data or [])}
+
         # Formatear respuesta
         concepts = []
         for c in response.data or []:
-            # Contar materiales
-            materials_count_resp = supabase.table("concept_materials").select("id", count="exact").eq("concept_id", c["id"]).execute()
-
             concept = {
                 **c,
-                "category_name": c.get("material_categories", {}).get("name") if c.get("material_categories") else None,
-                "class_name": c.get("material_classes", {}).get("name") if c.get("material_classes") else None,
-                "unit_name": c.get("units", {}).get("unit_name") if c.get("units") else None,
-                "materials_count": materials_count_resp.count or 0
+                "category_name": categories_map.get(c.get("category_id")),
+                "class_name": classes_map.get(c.get("class_id")),
+                "unit_name": units_map.get(c.get("unit_id")),
+                "materials_count": 0  # Skip individual count queries for performance
             }
-            # Limpiar campos de join
-            concept.pop("material_categories", None)
-            concept.pop("material_classes", None)
-            concept.pop("units", None)
             concepts.append(concept)
 
         total = response.count or 0
