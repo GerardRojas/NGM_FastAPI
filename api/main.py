@@ -36,6 +36,7 @@ from api.routers.material_categories import router as material_categories_router
 from api.routers.material_classes import router as material_classes_router
 from api.routers.units import router as units_router
 from api.routers.concepts import router as concepts_router
+from api.routers.percentage_items import router as percentage_items_router
 from api.routers.qbo import router as qbo_router
 from api.routers.bills import router as bills_router
 
@@ -160,6 +161,7 @@ app.include_router(material_categories_router)
 app.include_router(material_classes_router)
 app.include_router(units_router)
 app.include_router(concepts_router)
+app.include_router(percentage_items_router)
 
 # Process Manager (code-based process documentation)
 app.include_router(processes_router)
