@@ -1748,6 +1748,12 @@ IMPORTANT RULES:
    - Add "tax_included" field to each item showing the tax amount added to it
    - NOTE: Even if tax rate shows 0%, check for actual tax line amounts
 
+   TAX-INCLUSIVE DETECTION - Use these criteria to determine if prices already include tax:
+   a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. In this case set tax_included=0 for all items and use the amounts as-is.
+   b) If the receipt shows a SUBTOTAL + TAX LINE + GRAND TOTAL structure, the line item prices are PRE-TAX. You MUST add the distributed tax to each item so the amounts sum to the GRAND TOTAL (not the subtotal).
+   c) If item prices already look like they include tax (e.g., the sum of line items already equals the grand total), do NOT add tax again. Set tax_included=0.
+   d) SELF-CHECK: After computing all amounts, verify SUM(all expense amounts) == GRAND TOTAL on receipt. If your sum equals the SUBTOTAL instead of the GRAND TOTAL, you forgot to distribute the tax - go back and fix it.
+
 6. FEES ARE LINE ITEMS (not distributed):
    - These are NOT taxes and should be separate line items:
      * Delivery Fee, Shipping, Freight
@@ -1766,13 +1772,15 @@ IMPORTANT RULES:
 
 9. CRITICAL: vendor, transaction_type, and payment_method MUST exactly match one from their respective lists, or use "Unknown"
 
-VALIDATION - MANDATORY:
+VALIDATION - MANDATORY (do this BEFORE returning your response):
 1. Find the GRAND TOTAL / TOTAL DUE / AMOUNT DUE shown on the receipt - this is "invoice_total"
 2. Calculate the arithmetic sum of all your expense amounts - this is "calculated_sum"
 3. Compare them:
    - If they match (within $0.02 tolerance), set "validation_passed" to true
    - If they DON'T match, set "validation_passed" to false and include a "validation_warning" message
 4. The "invoice_total" must be the EXACT value printed on the receipt, not your calculation
+5. CRITICAL TAX SELF-CHECK: If calculated_sum equals the SUBTOTAL (pre-tax) instead of the GRAND TOTAL, you have NOT distributed the tax. Go back, recalculate each item's amount with its proportional tax share, and try again. The final amounts MUST sum to the GRAND TOTAL.
+6. If there is a tax line on the receipt, the sum of all "tax_included" values across items must equal the total tax amount shown on the receipt (within $0.02).
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -1812,6 +1820,7 @@ IMPORTANT:
 - The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
 - The "invoice_total" MUST be the exact total shown on the receipt/invoice document
 - If validation fails, explain in "validation_warning" why the numbers don't match (e.g., "Calculated sum $105.00 does not match invoice total $108.00 - possible missing item or rounding issue")
+- REMEMBER: Each expense "amount" should be the FINAL amount (with tax distributed). The sum of ALL "amount" fields = invoice_total.
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object."""
 
@@ -1883,6 +1892,12 @@ IMPORTANT RULES:
    - The sum of all "amount" fields MUST equal the receipt's GRAND TOTAL exactly
    - Add "tax_included" field to each item showing the tax amount added to it
 
+   TAX-INCLUSIVE DETECTION - Use these criteria:
+   a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. Set tax_included=0 for all items and use amounts as-is.
+   b) If the receipt shows SUBTOTAL + TAX LINE + GRAND TOTAL, line item prices are PRE-TAX. You MUST add distributed tax so amounts sum to GRAND TOTAL (not subtotal).
+   c) If item prices already sum to the grand total, do NOT add tax again. Set tax_included=0.
+   d) SELF-CHECK: After computing all amounts, verify SUM(all expense amounts) == GRAND TOTAL. If your sum equals SUBTOTAL instead, you forgot to distribute tax - go back and fix it.
+
 6. FEES ARE LINE ITEMS (not distributed):
    - These are NOT taxes and should be separate line items:
      * Delivery Fee, Shipping, Freight
@@ -1896,12 +1911,14 @@ IMPORTANT RULES:
 
 8. CRITICAL: vendor, transaction_type, payment_method MUST exactly match one from their lists, or use "Unknown"
 
-VALIDATION - MANDATORY:
+VALIDATION - MANDATORY (do this BEFORE returning your response):
 1. Find the GRAND TOTAL / TOTAL DUE shown on the receipt - this is "invoice_total"
 2. Calculate the sum of all your expense amounts - this is "calculated_sum"
 3. Compare them:
    - If they match (within $0.02 tolerance), set "validation_passed" to true
    - If they DON'T match, set "validation_passed" to false and include "validation_warning"
+4. CRITICAL TAX SELF-CHECK: If calculated_sum equals the SUBTOTAL (pre-tax) instead of the GRAND TOTAL, you have NOT distributed the tax. Go back, recalculate each item's amount with its proportional tax share, and try again.
+5. If there is a tax line on the receipt, the sum of all "tax_included" values must equal the total tax amount shown (within $0.02).
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -1941,6 +1958,7 @@ IMPORTANT:
 - The "tax_included" field should be the tax added to that item (0 for fees)
 - The "invoice_total" MUST be the exact total shown on the receipt
 - If validation fails, explain in "validation_warning" why
+- REMEMBER: Each expense "amount" should be the FINAL amount (with tax distributed). The sum of ALL "amount" fields = invoice_total.
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object.
 
