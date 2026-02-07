@@ -4,7 +4,15 @@
       "Bash(find:*)",
       "Bash(wc:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(grep:*)",
+      "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" log --oneline --all)",
+      "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" log --name-status --all)",
+      "Bash(dir:*)",
+      "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" log --diff-filter=D --summary)",
+      "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" show --name-only HEAD~5..HEAD)",
+      "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" log --all --oneline)",
+      "Bash(git add:*)"
     ]
   }
 }

@@ -91,14 +91,21 @@ def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
     if not has_signal:
         return None
 
+    # ---- Pre-clean: strip budget verbs that consume the separator ----
+    # "para gastar en ventanas" → "para ventanas"
+    t = re.sub(
+        r'\b(?:gastar|invertir|usar|meter|poner|spend|use)\s+(?:en|para|de|on|in|for)\s+',
+        '', t
+    )
+
     # ---- Step 2: Extract topic + project ----
-    # Uses "en"/"in" as the ONLY separator between topic and project.
+    # Uses "en"/"in"/"para"/"for" as separator between topic and project.
     # Avoids ambiguity with project names containing "del" (e.g. "Del Rio").
-    # Greedy (.+) for topic captures multi-word phrases; backtracking finds the last en/in.
+    # Greedy (.+) for topic captures multi-word phrases; backtracking finds the last separator.
     topic_project = re.search(
         r'\b(?:para|de|del|en|on|for|about)\s+'
         r'(.+)'
-        r'\s+(?:en|in)\s+'
+        r'\s+(?:en|in|para|for)\s+'
         r'(?:el\s+)?(?:proyecto\s+)?(?:project\s+)?'
         r'(.+)',
         t
@@ -417,13 +424,14 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
     # NGM Hub Help Questions
     # ================================
 
-    # Preguntas sobre dónde/cómo ver algo
+    # Preguntas sobre dónde/cómo ver algo EN EL SISTEMA
+    # NOTE: Patterns broad como "como funciona X" o "explica sobre X" se eliminaron
+    # porque capturaban preguntas generales de construcción (ej: "como funciona un ADU").
+    # GPT las clasifica mejor. Solo mantenemos patterns con señal clara de UI/sistema.
     ngm_help_patterns = [
-        (r'(dónde|donde|como|cómo)\s+(puedo\s+)?(ver|encontrar|buscar)\s+(.+)', 'view'),
+        (r'(dónde|donde)\s+(puedo\s+)?(ver|encontrar|buscar)\s+(.+)', 'view'),
         (r'(dónde|donde)\s+(están?|estan?)\s+(.+)', 'location'),
-        (r'(cómo|como)\s+(funciona|uso|utilizo|trabajo con)\s+(.+)', 'howto'),
         (r'(qué|que)\s+(es|significa|hace)\s+(.+?)\s+(en|del?)\s+(ngm|hub|sistema)', 'definition'),
-        (r'(explica|explicame|dime)\s+(sobre|acerca|de)\s+(.+)', 'explain'),
     ]
 
     for pattern, query_type in ngm_help_patterns:
@@ -646,8 +654,10 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
    - Extrae: 'message' (mensaje original del usuario).
 
 10) SMALL_TALK
-   - Conversación general o dudas técnicas simples.
-   - Saludos, chistes, preguntas no relacionadas con proyectos ni NGM Hub.
+   - Conversación general, preguntas de conocimiento, o dudas técnicas de construcción.
+   - Preguntas de conocimiento general sobre construcción: "qué es un ADU?", "cuánto cuesta un permit en San Diego?", "qué incluye el framing?", etc.
+   - Saludos, chistes, preguntas no relacionadas con datos específicos de proyectos en el sistema.
+   - IMPORTANTE: Si la pregunta es sobre un CONCEPTO o DEFINICIÓN (no sobre datos de un proyecto del sistema), es SMALL_TALK.
 
 PRIORIDAD DE CLASIFICACIÓN:
 - Si el usuario quiere CONTROLAR la pagina actual (filtrar, ordenar, buscar) → COPILOT
