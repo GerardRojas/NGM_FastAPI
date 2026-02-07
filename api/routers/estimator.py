@@ -7,16 +7,20 @@
 # Bucket Structure:
 # - estimates/
 #     {estimate-id}/
-#         estimate.ngm          (JSON with project data, categories, quantities)
-#         materials_snapshot.csv (full materials DB at time of save)
-#         concepts_snapshot.csv  (full concepts DB at time of save)
+#         estimate.ngm                    (JSON with project data, categories, quantities)
+#         materials_snapshot.json          (full materials DB at time of save)
+#         concepts_snapshot.json           (full concepts DB at time of save)
+#         concept_materials_snapshot.json  (concept-material junction at time of save)
 #
 # - templates/
 #     {template-id}/
-#         template.ngm          (JSON with structure, NO quantities)
-#         materials_snapshot.csv
-#         concepts_snapshot.csv
-#         template_meta.json    (name, description, created_at, etc.)
+#         template.ngm              (JSON with structure, NO quantities)
+#         materials_snapshot.json
+#         concepts_snapshot.json
+#         concept_materials_snapshot.json
+#         template_meta.json        (name, description, created_at, etc.)
+#
+# Note: Legacy estimates/templates may have .csv snapshots - backward compatible
 
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -114,34 +118,6 @@ def generate_template_id(template_name: str) -> str:
     timestamp = int(datetime.now().timestamp() * 1000)
     return f"{safe_name}-{timestamp}"
 
-
-def list_to_csv(data: List[Dict[str, Any]]) -> str:
-    """Convert list of dicts to CSV string"""
-    if not data:
-        return ""
-
-    # Get all unique keys
-    keys = set()
-    for item in data:
-        keys.update(item.keys())
-    keys = sorted(list(keys))
-
-    # Build CSV
-    lines = [",".join(keys)]
-    for item in data:
-        row = []
-        for key in keys:
-            val = item.get(key, "")
-            # Escape commas and quotes
-            if val is None:
-                val = ""
-            val = str(val).replace('"', '""')
-            if "," in val or '"' in val or "\n" in val:
-                val = f'"{val}"'
-            row.append(val)
-        lines.append(",".join(row))
-
-    return "\n".join(lines)
 
 
 # ============================================
@@ -265,8 +241,9 @@ async def save_estimate(request: EstimateSaveRequest):
     Save an estimate to the estimates bucket.
     Creates a folder with:
     - estimate.ngm (main JSON file)
-    - materials_snapshot.csv (optional)
-    - concepts_snapshot.csv (optional)
+    - materials_snapshot.json (optional)
+    - concepts_snapshot.json (optional)
+    - concept_materials_snapshot.json (optional)
     """
     try:
         ensure_bucket_exists(ESTIMATES_BUCKET)
@@ -295,31 +272,31 @@ async def save_estimate(request: EstimateSaveRequest):
             file_options={"content-type": "application/json", "upsert": "true"}
         )
 
-        # Upload materials snapshot if provided
+        # Upload materials snapshot if provided (JSON format)
         if request.materials_snapshot:
-            csv_content = list_to_csv(request.materials_snapshot)
+            snapshot_json = json.dumps(request.materials_snapshot)
             supabase.storage.from_(ESTIMATES_BUCKET).upload(
-                path=f"{estimate_id}/materials_snapshot.csv",
-                file=csv_content.encode("utf-8"),
-                file_options={"content-type": "text/csv", "upsert": "true"}
+                path=f"{estimate_id}/materials_snapshot.json",
+                file=snapshot_json.encode("utf-8"),
+                file_options={"content-type": "application/json", "upsert": "true"}
             )
 
-        # Upload concepts snapshot if provided
+        # Upload concepts snapshot if provided (JSON format)
         if request.concepts_snapshot:
-            csv_content = list_to_csv(request.concepts_snapshot)
+            snapshot_json = json.dumps(request.concepts_snapshot)
             supabase.storage.from_(ESTIMATES_BUCKET).upload(
-                path=f"{estimate_id}/concepts_snapshot.csv",
-                file=csv_content.encode("utf-8"),
-                file_options={"content-type": "text/csv", "upsert": "true"}
+                path=f"{estimate_id}/concepts_snapshot.json",
+                file=snapshot_json.encode("utf-8"),
+                file_options={"content-type": "application/json", "upsert": "true"}
             )
 
-        # Upload concept_materials snapshot if provided
+        # Upload concept_materials snapshot if provided (JSON format)
         if request.concept_materials_snapshot:
-            csv_content = list_to_csv(request.concept_materials_snapshot)
+            snapshot_json = json.dumps(request.concept_materials_snapshot)
             supabase.storage.from_(ESTIMATES_BUCKET).upload(
-                path=f"{estimate_id}/concept_materials_snapshot.csv",
-                file=csv_content.encode("utf-8"),
-                file_options={"content-type": "text/csv", "upsert": "true"}
+                path=f"{estimate_id}/concept_materials_snapshot.json",
+                file=snapshot_json.encode("utf-8"),
+                file_options={"content-type": "application/json", "upsert": "true"}
             )
 
         return {
@@ -460,8 +437,9 @@ async def save_template(request: TemplateSaveRequest):
     Creates a folder with:
     - template.ngm (main JSON file - NO quantities)
     - template_meta.json (name, description)
-    - materials_snapshot.csv (optional)
-    - concepts_snapshot.csv (optional)
+    - materials_snapshot.json (optional)
+    - concepts_snapshot.json (optional)
+    - concept_materials_snapshot.json (optional)
     """
     try:
         ensure_bucket_exists(TEMPLATES_BUCKET)
@@ -505,31 +483,31 @@ async def save_template(request: TemplateSaveRequest):
             file_options={"content-type": "application/json", "upsert": "true"}
         )
 
-        # Upload materials snapshot if provided
+        # Upload materials snapshot if provided (JSON format)
         if request.materials_snapshot:
-            csv_content = list_to_csv(request.materials_snapshot)
+            snapshot_json = json.dumps(request.materials_snapshot)
             supabase.storage.from_(TEMPLATES_BUCKET).upload(
-                path=f"{template_id}/materials_snapshot.csv",
-                file=csv_content.encode("utf-8"),
-                file_options={"content-type": "text/csv", "upsert": "true"}
+                path=f"{template_id}/materials_snapshot.json",
+                file=snapshot_json.encode("utf-8"),
+                file_options={"content-type": "application/json", "upsert": "true"}
             )
 
-        # Upload concepts snapshot if provided
+        # Upload concepts snapshot if provided (JSON format)
         if request.concepts_snapshot:
-            csv_content = list_to_csv(request.concepts_snapshot)
+            snapshot_json = json.dumps(request.concepts_snapshot)
             supabase.storage.from_(TEMPLATES_BUCKET).upload(
-                path=f"{template_id}/concepts_snapshot.csv",
-                file=csv_content.encode("utf-8"),
-                file_options={"content-type": "text/csv", "upsert": "true"}
+                path=f"{template_id}/concepts_snapshot.json",
+                file=snapshot_json.encode("utf-8"),
+                file_options={"content-type": "application/json", "upsert": "true"}
             )
 
-        # Upload concept_materials snapshot if provided
+        # Upload concept_materials snapshot if provided (JSON format)
         if request.concept_materials_snapshot:
-            csv_content = list_to_csv(request.concept_materials_snapshot)
+            snapshot_json = json.dumps(request.concept_materials_snapshot)
             supabase.storage.from_(TEMPLATES_BUCKET).upload(
-                path=f"{template_id}/concept_materials_snapshot.csv",
-                file=csv_content.encode("utf-8"),
-                file_options={"content-type": "text/csv", "upsert": "true"}
+                path=f"{template_id}/concept_materials_snapshot.json",
+                file=snapshot_json.encode("utf-8"),
+                file_options={"content-type": "application/json", "upsert": "true"}
             )
 
         return {
