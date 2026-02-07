@@ -1351,38 +1351,27 @@ def find_group_data(
                     search_terms.append(alias_key)
     search_terms = list(set(search_terms))
 
-    # -- Step 1: Try matching an AccountCategory name directly --
-    matched_group = None
-    match_type = None   # "group" or "account"
-    matched_account_name = None
-
-    for group_name in groups:
-        group_lower = group_name.lower()
-        for term in search_terms:
-            if term == group_lower or term in group_lower or group_lower in term:
-                matched_group = group_name
-                match_type = "group"
-                break
-        if matched_group:
-            break
-
-    # -- Step 1b: Keyword aggregation --
+    # -- Step 1: Keyword aggregation (checked FIRST) --
     # Keywords like "labor" or "materials" appear across many accounts
     # (e.g. "Rough Framing Labor", "Plumbing Labor", "HVAC Labor").
     # If the search term matches multiple account names as a substring,
     # build a virtual group from all of them.
-    if not matched_group:
-        KEYWORD_ALIASES = {
-            "labor": ["labor", "mano de obra", "trabajadores"],
-            "materials": ["materials", "materiales", "material"],
-        }
-        keyword_terms = list(search_terms)
-        for kw_key, kw_values in KEYWORD_ALIASES.items():
-            if input_lower in kw_values or input_lower == kw_key:
-                keyword_terms.append(kw_key)
-                keyword_terms.extend(kw_values)
-        keyword_terms = list(set(keyword_terms))
+    # This runs before group matching so that cross-category keywords
+    # return ALL matching accounts, not just one AccountCategory group.
+    KEYWORD_ALIASES = {
+        "labor": ["labor", "mano de obra", "trabajadores"],
+        "materials": ["materials", "materiales", "material"],
+    }
+    is_keyword_search = False
+    keyword_terms = list(search_terms)
+    for kw_key, kw_values in KEYWORD_ALIASES.items():
+        if input_lower in kw_values or input_lower == kw_key:
+            keyword_terms.append(kw_key)
+            keyword_terms.extend(kw_values)
+            is_keyword_search = True
+    keyword_terms = list(set(keyword_terms))
 
+    if is_keyword_search:
         # Collect all account names that contain any keyword term
         keyword_matched_names = []
         for acc in accounts:
@@ -1393,9 +1382,8 @@ def find_group_data(
                     keyword_matched_names.append(acc_name)
                     break
 
-        # Only use keyword aggregation if we match 2+ accounts
-        if len(keyword_matched_names) >= 2:
-            # Build BVA for each matching account (reuse Step 3 logic inline)
+        # Use keyword aggregation if we match 1+ accounts
+        if keyword_matched_names:
             def _get_acc_name(account_id, account_name=None):
                 if account_name:
                     return account_name
@@ -1437,7 +1425,6 @@ def find_group_data(
             if kw_details:
                 kw_balance = kw_budget - kw_actual
                 kw_pct = (kw_actual / kw_budget * 100) if kw_budget > 0 else 0
-                # Capitalize the keyword for display
                 display_name = category_input.strip().title()
                 return {
                     "matched_name": display_name,
@@ -1454,11 +1441,26 @@ def find_group_data(
                     }
                 }
 
-    # -- Step 2: If no group match, find account then its group --
+    # -- Step 2: Try matching an AccountCategory name directly --
+    matched_group = None
+    match_type = None   # "group" or "account"
+    matched_account_name = None
+
+    for group_name in groups:
+        group_lower = group_name.lower()
+        for term in search_terms:
+            if term == group_lower or term in group_lower or group_lower in term:
+                matched_group = group_name
+                match_type = "group"
+                break
+        if matched_group:
+            break
+
+    # -- Step 3: If no group match, find account then its group --
     if not matched_group:
         single = find_category_data(category_input, budgets, expenses, accounts)
 
-        # Step 2b: GPT fallback - ask GPT to match against group + account names
+        # Step 3b: GPT fallback - ask GPT to match against group + account names
         if not single:
             all_names = list(groups.keys()) + [
                 acc.get("Name") or acc.get("account_name") or ""
@@ -1506,7 +1508,7 @@ def find_group_data(
                 }
             }
 
-    # -- Step 3: Build BvA for every account in the group --
+    # -- Step 4: Build BvA for every account in the group --
     group_account_names = groups.get(matched_group, [])
 
     def get_account_name(account_id, account_name=None):
