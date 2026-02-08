@@ -33,6 +33,7 @@ class MessageCreate(BaseModel):
     channel_id: Optional[str] = None  # For custom/direct channels
     project_id: Optional[str] = None  # For project channels
     reply_to_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class MessageResponse(BaseModel):
@@ -320,6 +321,9 @@ def create_message(
             "user_id": user_id,
             "reply_to_id": payload.reply_to_id,
         }
+
+        if payload.metadata:
+            data["metadata"] = payload.metadata
 
         # Set channel reference
         if payload.channel_type in ["custom", "direct"]:

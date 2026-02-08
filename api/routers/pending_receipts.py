@@ -253,7 +253,7 @@ def get_project_receipts(
     """
     try:
         query = supabase.table("pending_receipts") \
-            .select("*, users!uploaded_by(user_name, avatar_url)") \
+            .select("*, users!uploaded_by(user_name, avatar_color)") \
             .eq("project_id", project_id) \
             .order("created_at", desc=True) \
             .range(offset, offset + limit - 1)
@@ -293,7 +293,7 @@ def get_receipt(receipt_id: str):
     """Get a single pending receipt by ID"""
     try:
         result = supabase.table("pending_receipts") \
-            .select("*, users!uploaded_by(user_name, avatar_url), projects(project_name)") \
+            .select("*, users!uploaded_by(user_name, avatar_color), projects(project_name)") \
             .eq("id", receipt_id) \
             .single() \
             .execute()
@@ -362,9 +362,9 @@ async def process_receipt(receipt_id: str):
             ai_client = OpenAI(api_key=openai_api_key)
 
             # Get vendors list for matching
-            vendors_resp = supabase.table("Vendors").select("vendor_id, vendor_name").execute()
+            vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
             vendors_list = [
-                {"id": v.get("vendor_id"), "name": v.get("vendor_name")}
+                {"id": v.get("id"), "name": v.get("vendor_name")}
                 for v in (vendors_resp.data or [])
                 if v.get("vendor_name")
             ]
@@ -738,9 +738,9 @@ async def agent_process_receipt(receipt_id: str):
         ai_client = OpenAI(api_key=openai_api_key)
 
         # Get vendor and account lists for matching
-        vendors_resp = supabase.table("Vendors").select("vendor_id, vendor_name").execute()
+        vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
         vendors_list = [
-            {"id": v.get("vendor_id"), "name": v.get("vendor_name")}
+            {"id": v.get("id"), "name": v.get("vendor_name")}
             for v in (vendors_resp.data or []) if v.get("vendor_name")
         ]
 
