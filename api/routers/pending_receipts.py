@@ -56,7 +56,7 @@
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query
 from pydantic import BaseModel
 from api.supabase_client import supabase
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import base64
 import hashlib
 import os
@@ -106,6 +106,14 @@ class CreateExpenseFromReceiptRequest(BaseModel):
     account_id: Optional[str] = None
     payment_type: Optional[str] = None
     created_by: str
+
+
+class CheckActionRequest(BaseModel):
+    """User action in the check processing conversation"""
+    action: str  # confirm_check, deny_check, submit_amount, split_yes, split_no,
+                 # submit_description, submit_split_line, split_done, confirm_categories, cancel
+    payload: Optional[Dict[str, Any]] = None
+    user_id: Optional[str] = None
 
 
 # ====== HELPERS ======
@@ -623,7 +631,10 @@ def _build_agent_message(parsed_data, categorize_data, warnings, lang="en"):
 # ====== AGENT ENDPOINT ======
 
 @router.post("/{receipt_id}/agent-process")
-async def agent_process_receipt(receipt_id: str):
+async def agent_process_receipt(
+    receipt_id: str,
+    force: bool = Query(False, description="Force processing even if duplicate detected")
+):
     """
     Full automated processing pipeline for material receipts.
 
@@ -687,9 +698,9 @@ async def agent_process_receipt(receipt_id: str):
                 .execute()
 
         # Check exact file duplicate
-        print(f"[Agent] Step 2: Checking file hash duplicate | hash={file_hash[:16]}...")
+        print(f"[Agent] Step 2: Checking file hash duplicate | hash={file_hash[:16]}... | force={force}")
         hash_dup = _check_file_hash_duplicate(file_hash, project_id, receipt_id)
-        if hash_dup:
+        if hash_dup and not force:
             print(f"[Agent] Step 2: DUPLICATE FOUND | matches receipt {hash_dup.get('id')}")
             supabase.table("pending_receipts") \
                 .update({
@@ -707,17 +718,17 @@ async def agent_process_receipt(receipt_id: str):
             post_bot_message(
                 content=(
                     "**Duplicate receipt detected**\n"
-                    f"This receipt matches an existing entry:\n"
-                    f"- Receipt from {dup_vendor}, ${dup_amount:,.2f} ({dup_date})\n"
-                    f"- Status: {hash_dup.get('status')}\n\n"
-                    "Flagged for review."
+                    f"This file matches an existing receipt:\n"
+                    f"- {dup_vendor}, ${dup_amount:,.2f} ({dup_date}) - {hash_dup.get('status')}\n\n"
+                    "Would you like to process it anyway? Click **Process Anyway** below."
                 ),
                 project_id=project_id,
                 metadata={
                     "agent_message": True,
                     "pending_receipt_id": receipt_id,
                     "receipt_status": "duplicate",
-                    "duplicate_of": hash_dup.get("id")
+                    "duplicate_of": hash_dup.get("id"),
+                    "allow_force_process": True
                 }
             )
 
@@ -726,6 +737,54 @@ async def agent_process_receipt(receipt_id: str):
                 "status": "duplicate",
                 "message": "Duplicate receipt detected",
                 "duplicate_of": hash_dup
+            }
+        elif hash_dup and force:
+            print(f"[Agent] Step 2: DUPLICATE FOUND but force=True, continuing...")
+
+        # ===== STEP 2.5: Check Detection (Heuristic) =====
+        file_name = receipt_data.get("file_name", "")
+        is_image = (file_type or "").startswith("image/")
+        is_likely_check = is_image and "check" in file_name.lower()
+
+        if is_likely_check:
+            print(f"[Agent] Step 2.5: CHECK DETECTED by filename heuristic: {file_name}")
+
+            check_flow = {
+                "state": "check_detected",
+                "detected_at": datetime.utcnow().isoformat(),
+                "amount": None,
+                "is_split": None,
+                "splits": [],
+                "description": None,
+                "categorizations": [],
+            }
+
+            supabase.table("pending_receipts").update({
+                "status": "check_review",
+                "parsed_data": {"check_flow": check_flow},
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", receipt_id).execute()
+
+            post_bot_message(
+                content=(
+                    "**Check detected**\n\n"
+                    f"The uploaded file \"{file_name}\" looks like it might be a check.\n"
+                    "Is this a check?"
+                ),
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "check_review",
+                    "check_flow_state": "check_detected",
+                    "check_flow_active": True,
+                }
+            )
+
+            return {
+                "success": True,
+                "status": "check_review",
+                "message": "Check detected - awaiting user confirmation",
             }
 
         # ===== STEP 3: OCR Extraction =====
@@ -1052,6 +1111,664 @@ Return ONLY valid JSON:
             )
 
         raise HTTPException(status_code=500, detail=f"Agent processing error: {str(e)}")
+
+
+# ====== CHECK FLOW HELPERS ======
+
+def _parse_amount(text: str) -> Optional[float]:
+    """Parse dollar amount from user text. Handles $1,250.00 or 1250 or 1250.50"""
+    if not text:
+        return None
+    cleaned = re.sub(r'[$,\s]', '', text.strip())
+    try:
+        amount = float(cleaned)
+        return amount if amount > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _get_labor_accounts() -> list:
+    """Fetch accounts with 'Labor' in the name from the database."""
+    try:
+        accounts_resp = supabase.table("accounts").select("account_id, Name").execute()
+        return [
+            {"account_id": a["account_id"], "name": a["Name"]}
+            for a in (accounts_resp.data or [])
+            if a.get("Name") and "labor" in a["Name"].lower()
+        ]
+    except Exception as e:
+        print(f"[CheckFlow] Error fetching labor accounts: {e}")
+        return []
+
+
+def _fuzzy_match_labor_account(description: str, accounts: list) -> Optional[dict]:
+    """
+    Word-overlap fuzzy matching for Labor accounts.
+    Returns best match {account_id, name, score} or None if below threshold.
+    """
+    THRESHOLD = 0.4
+    desc_words = set(description.lower().split())
+    best_match = None
+    best_score = 0
+
+    for account in accounts:
+        account_words = set(account["name"].lower().split())
+        if not account_words:
+            continue
+        overlap = desc_words & account_words
+        score = len(overlap) / len(account_words) if account_words else 0
+        if score > best_score:
+            best_score = score
+            best_match = {
+                "account_id": account["account_id"],
+                "name": account["name"],
+                "score": round(score * 100)
+            }
+
+    return best_match if best_match and best_score >= THRESHOLD else None
+
+
+def _gpt_categorize_labor(description: str, labor_accounts: list,
+                          construction_stage: str = "General") -> dict:
+    """GPT fallback for matching a labor description to a Labor account."""
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
+
+    try:
+        ai_client = OpenAI(api_key=openai_api_key)
+
+        prompt = f"""You are a construction accountant. Match this labor description to the best account.
+
+CONSTRUCTION STAGE: {construction_stage}
+
+AVAILABLE LABOR ACCOUNTS:
+{json.dumps(labor_accounts, indent=2)}
+
+DESCRIPTION: "{description}"
+
+Return ONLY valid JSON:
+{{
+  "account_id": "exact-account-id-from-list",
+  "account_name": "exact-account-name-from-list",
+  "confidence": 85,
+  "reasoning": "Brief explanation"
+}}"""
+
+        response = ai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Construction accounting expert. Return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"[CheckFlow] GPT categorization error: {e}")
+        return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
+
+
+def _categorize_check_items(items: list, construction_stage: str = "General") -> list:
+    """
+    Categorize one or more labor descriptions.
+    Each item: {"amount": float, "description": str, "project_name": str (optional)}
+    Returns items with added "categorization" key.
+    """
+    labor_accounts = _get_labor_accounts()
+
+    for item in items:
+        desc = item.get("description", "")
+        # Try fuzzy match first
+        match = _fuzzy_match_labor_account(desc, labor_accounts)
+        if match and match["score"] >= 60:
+            item["categorization"] = {
+                "account_id": match["account_id"],
+                "account_name": match["name"],
+                "confidence": match["score"],
+                "method": "fuzzy_match"
+            }
+        else:
+            # GPT fallback
+            gpt_result = _gpt_categorize_labor(desc, labor_accounts, construction_stage)
+            item["categorization"] = {
+                "account_id": gpt_result.get("account_id"),
+                "account_name": gpt_result.get("account_name", "Uncategorized"),
+                "confidence": gpt_result.get("confidence", 0),
+                "method": "gpt_fallback",
+                "reasoning": gpt_result.get("reasoning")
+            }
+
+    return items
+
+
+def _update_check_flow(receipt_id: str, check_flow: dict, parsed_data: dict):
+    """Save updated check_flow state to the receipt's parsed_data."""
+    parsed_data["check_flow"] = check_flow
+    supabase.table("pending_receipts").update({
+        "parsed_data": parsed_data,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("id", receipt_id).execute()
+
+
+def _create_check_expenses(receipt_id: str, receipt_data: dict, check_flow: dict) -> list:
+    """Create expense entries from the completed check flow."""
+    project_id = receipt_data["project_id"]
+    created_expenses = []
+
+    if check_flow.get("is_split") and check_flow.get("splits"):
+        for split in check_flow["splits"]:
+            cat = split.get("categorization", {})
+            expense_data = {
+                "project": split.get("project_id", project_id),
+                "Amount": split["amount"],
+                "TxnDate": datetime.utcnow().date().isoformat(),
+                "LineDescription": f"Check: {split.get('description', '')}",
+                "account_id": cat.get("account_id"),
+                "payment_type": "Check",
+                "created_by": receipt_data.get("uploaded_by"),
+                "receipt_url": receipt_data.get("file_url"),
+                "auth_status": False
+            }
+            expense_data = {k: v for k, v in expense_data.items() if v is not None}
+            result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
+            if result.data:
+                created_expenses.append(result.data[0])
+    else:
+        cats = check_flow.get("categorizations", [{}])
+        cat = cats[0] if cats else {}
+        expense_data = {
+            "project": project_id,
+            "Amount": check_flow["amount"],
+            "TxnDate": datetime.utcnow().date().isoformat(),
+            "LineDescription": f"Check: {check_flow.get('description', '')}",
+            "account_id": cat.get("account_id"),
+            "payment_type": "Check",
+            "created_by": receipt_data.get("uploaded_by"),
+            "receipt_url": receipt_data.get("file_url"),
+            "auth_status": False
+        }
+        expense_data = {k: v for k, v in expense_data.items() if v is not None}
+        result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
+        if result.data:
+            created_expenses.append(result.data[0])
+
+    # Link receipt
+    if created_expenses:
+        supabase.table("pending_receipts").update({
+            "expense_id": created_expenses[0].get("expense_id"),
+            "status": "linked",
+            "linked_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", receipt_id).execute()
+
+    return created_expenses
+
+
+# ====== CHECK FLOW STATE HANDLERS ======
+
+def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, action):
+    """Handle actions when state is check_detected."""
+    if action == "confirm_check":
+        check_flow["state"] = "awaiting_amount"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        post_bot_message(
+            content="Got it. What is the check amount? (Type the dollar amount)",
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_amount",
+                "check_flow_active": True,
+                "awaiting_text_input": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_amount"}
+
+    elif action == "deny_check":
+        check_flow["state"] = "cancelled"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        # Reset status to pending so normal agent-process can run
+        supabase.table("pending_receipts").update({
+            "status": "pending",
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", receipt_id).execute()
+
+        post_bot_message(
+            content="Not a check. Processing as a regular receipt...",
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "pending",
+                "check_flow_active": False,
+            }
+        )
+        return {"success": True, "state": "cancelled", "reprocess": True}
+
+    raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state 'check_detected'")
+
+
+def _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, action, payload):
+    """Handle amount submission."""
+    if action != "submit_amount":
+        raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state 'awaiting_amount'")
+
+    text = (payload or {}).get("text", "")
+    amount = _parse_amount(text)
+
+    if amount is None:
+        post_bot_message(
+            content=f"Could not parse \"{text}\" as a valid amount. Please type a number (e.g. 1250 or $1,250.00).",
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_amount",
+                "check_flow_active": True,
+                "awaiting_text_input": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_amount", "error": "invalid_amount"}
+
+    check_flow["amount"] = amount
+    check_flow["state"] = "awaiting_split_decision"
+    _update_check_flow(receipt_id, check_flow, parsed_data)
+
+    # Also update the receipt amount field
+    supabase.table("pending_receipts").update({
+        "amount": amount,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("id", receipt_id).execute()
+
+    post_bot_message(
+        content=(
+            f"Check amount: **${amount:,.2f}**\n\n"
+            "Does this check need to be split across projects?"
+        ),
+        project_id=project_id,
+        metadata={
+            "agent_message": True,
+            "pending_receipt_id": receipt_id,
+            "receipt_status": "check_review",
+            "check_flow_state": "awaiting_split_decision",
+            "check_flow_active": True,
+        }
+    )
+    return {"success": True, "state": "awaiting_split_decision", "amount": amount}
+
+
+def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, action):
+    """Handle split yes/no decision."""
+    if action == "split_no":
+        check_flow["is_split"] = False
+        check_flow["state"] = "awaiting_description"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        post_bot_message(
+            content="Describe the labor for this check (e.g. \"Drywall labor\")",
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_description",
+                "check_flow_active": True,
+                "awaiting_text_input": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_description"}
+
+    elif action == "split_yes":
+        check_flow["is_split"] = True
+        check_flow["splits"] = []
+        check_flow["state"] = "awaiting_split_details"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        post_bot_message(
+            content=(
+                "Describe each split, one per message:\n"
+                "**[amount] [description] for [project name]**\n\n"
+                "Example: *500 drywall labor for Trasher Way*\n\n"
+                "If the split is for this project, you can skip the project name.\n"
+                "When done, type **done**."
+            ),
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_split_details",
+                "check_flow_active": True,
+                "awaiting_text_input": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_split_details"}
+
+    raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state 'awaiting_split_decision'")
+
+
+def _handle_description(receipt_id, project_id, check_flow, parsed_data, action, payload):
+    """Handle single labor description (no split)."""
+    if action != "submit_description":
+        raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state 'awaiting_description'")
+
+    text = (payload or {}).get("text", "").strip()
+    if not text:
+        return {"success": True, "state": "awaiting_description", "error": "empty_description"}
+
+    check_flow["description"] = text
+
+    # Categorize
+    items = [{"amount": check_flow["amount"], "description": text}]
+
+    # Get construction stage
+    construction_stage = "General Construction"
+    try:
+        proj = supabase.table("projects").select("project_stage").eq("project_id", project_id).single().execute()
+        if proj.data and proj.data.get("project_stage"):
+            construction_stage = proj.data["project_stage"]
+    except Exception:
+        pass
+
+    items = _categorize_check_items(items, construction_stage)
+    check_flow["categorizations"] = [items[0].get("categorization", {})]
+    check_flow["state"] = "awaiting_category_confirm"
+    _update_check_flow(receipt_id, check_flow, parsed_data)
+
+    cat = items[0].get("categorization", {})
+    cat_name = cat.get("account_name", "Uncategorized")
+    cat_conf = cat.get("confidence", 0)
+    method = cat.get("method", "")
+    method_label = "(fuzzy match)" if method == "fuzzy_match" else "(AI suggestion)"
+
+    post_bot_message(
+        content=(
+            f"**Categorization result** {method_label}\n\n"
+            f"${check_flow['amount']:,.2f} - {text}\n"
+            f"Category: **{cat_name}** ({cat_conf}% confidence)\n\n"
+            "Confirm this category?"
+        ),
+        project_id=project_id,
+        metadata={
+            "agent_message": True,
+            "pending_receipt_id": receipt_id,
+            "receipt_status": "check_review",
+            "check_flow_state": "awaiting_category_confirm",
+            "check_flow_active": True,
+        }
+    )
+    return {"success": True, "state": "awaiting_category_confirm"}
+
+
+def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, action, payload):
+    """Handle split line entries or done signal."""
+    if action == "split_done":
+        splits = check_flow.get("splits", [])
+        if not splits:
+            post_bot_message(
+                content="No splits entered yet. Please add at least one split, or type a description.",
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "check_review",
+                    "check_flow_state": "awaiting_split_details",
+                    "check_flow_active": True,
+                    "awaiting_text_input": True,
+                }
+            )
+            return {"success": True, "state": "awaiting_split_details", "error": "no_splits"}
+
+        # Categorize all splits
+        construction_stage = "General Construction"
+        try:
+            proj = supabase.table("projects").select("project_stage").eq("project_id", project_id).single().execute()
+            if proj.data and proj.data.get("project_stage"):
+                construction_stage = proj.data["project_stage"]
+        except Exception:
+            pass
+
+        splits = _categorize_check_items(splits, construction_stage)
+        check_flow["splits"] = splits
+        check_flow["state"] = "awaiting_category_confirm"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        # Build summary
+        total_split = sum(s.get("amount", 0) for s in splits)
+        check_amount = check_flow.get("amount", 0)
+        lines = []
+        for i, s in enumerate(splits, 1):
+            cat = s.get("categorization", {})
+            cat_name = cat.get("account_name", "Uncategorized")
+            cat_conf = cat.get("confidence", 0)
+            proj_name = s.get("project_name", "This project")
+            lines.append(f"{i}. ${s['amount']:,.2f} {s.get('description', '')} - **{cat_name}** ({cat_conf}%) - {proj_name}")
+
+        summary = "\n".join(lines)
+        diff_note = ""
+        if abs(total_split - check_amount) > 0.01:
+            diff_note = f"\n\nNote: Split total (${total_split:,.2f}) differs from check amount (${check_amount:,.2f}) by ${abs(total_split - check_amount):,.2f}"
+
+        post_bot_message(
+            content=(
+                f"**Categorization results**\n\n{summary}{diff_note}\n\n"
+                "Confirm these categories?"
+            ),
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_category_confirm",
+                "check_flow_active": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_category_confirm"}
+
+    elif action == "submit_split_line":
+        text = (payload or {}).get("text", "").strip()
+        if not text:
+            return {"success": True, "state": "awaiting_split_details", "error": "empty_line"}
+
+        # Parse: [amount] [description] for [project name]
+        # or: [amount] [description] (no project = current project)
+        match = re.match(r'^([\d,.]+)\s+(.+?)(?:\s+for\s+(.+))?$', text, re.IGNORECASE)
+
+        if match:
+            amount = _parse_amount(match.group(1))
+            description = match.group(2).strip()
+            project_name = match.group(3).strip() if match.group(3) else None
+        else:
+            # Fallback: try to extract amount from start
+            parts = text.split(None, 1)
+            amount = _parse_amount(parts[0]) if parts else None
+            description = parts[1] if len(parts) > 1 else text
+            project_name = None
+
+        if amount is None:
+            post_bot_message(
+                content=f"Could not parse amount from: \"{text}\"\nPlease use format: **[amount] [description]** (e.g. \"500 drywall labor\")",
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "check_review",
+                    "check_flow_state": "awaiting_split_details",
+                    "check_flow_active": True,
+                    "awaiting_text_input": True,
+                }
+            )
+            return {"success": True, "state": "awaiting_split_details", "error": "parse_error"}
+
+        # Resolve project if specified
+        split_project_id = project_id
+        if project_name:
+            try:
+                projects = supabase.table("projects").select("project_id, project_name").execute()
+                for p in (projects.data or []):
+                    if project_name.lower() in p["project_name"].lower():
+                        split_project_id = p["project_id"]
+                        project_name = p["project_name"]
+                        break
+            except Exception:
+                pass
+
+        split_entry = {
+            "amount": amount,
+            "description": description,
+            "project_id": split_project_id,
+            "project_name": project_name or "This project",
+        }
+        check_flow["splits"].append(split_entry)
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        total_so_far = sum(s.get("amount", 0) for s in check_flow["splits"])
+        check_amount = check_flow.get("amount", 0)
+        remaining = check_amount - total_so_far
+
+        remaining_note = ""
+        if remaining > 0.01:
+            remaining_note = f" (${remaining:,.2f} remaining)"
+        elif remaining < -0.01:
+            remaining_note = f" (${abs(remaining):,.2f} over check amount)"
+
+        post_bot_message(
+            content=(
+                f"Added: ${amount:,.2f} - {description} ({project_name or 'This project'})\n"
+                f"Split total: ${total_so_far:,.2f} of ${check_amount:,.2f}{remaining_note}\n\n"
+                "Add another split or type **done** to finish."
+            ),
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_split_details",
+                "check_flow_active": True,
+                "awaiting_text_input": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_split_details", "split_count": len(check_flow["splits"])}
+
+    raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state 'awaiting_split_details'")
+
+
+def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, action, receipt_data):
+    """Handle category confirmation or cancellation."""
+    if action == "confirm_categories":
+        expenses = _create_check_expenses(receipt_id, receipt_data, check_flow)
+        check_flow["state"] = "completed"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        count = len(expenses)
+        post_bot_message(
+            content=(
+                f"**Check processed**\n\n"
+                f"{count} expense{'s' if count != 1 else ''} created and ready for review in Expenses > From Pending."
+            ),
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "linked",
+                "check_flow_state": "completed",
+                "check_flow_active": False,
+            }
+        )
+        return {"success": True, "state": "completed", "expenses_created": count}
+
+    elif action == "cancel":
+        check_flow["state"] = "cancelled"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        supabase.table("pending_receipts").update({
+            "status": "pending",
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", receipt_id).execute()
+
+        post_bot_message(
+            content="Check processing cancelled.",
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "pending",
+                "check_flow_state": "cancelled",
+                "check_flow_active": False,
+            }
+        )
+        return {"success": True, "state": "cancelled"}
+
+    raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state 'awaiting_category_confirm'")
+
+
+# ====== CHECK-ACTION ENDPOINT ======
+
+@router.post("/{receipt_id}/check-action")
+async def check_action(receipt_id: str, payload: CheckActionRequest):
+    """
+    Handle a user action in the check processing conversation.
+    Routes to the appropriate handler based on current state + action.
+    """
+    try:
+        receipt = supabase.table("pending_receipts") \
+            .select("*") \
+            .eq("id", receipt_id) \
+            .single() \
+            .execute()
+
+        if not receipt.data:
+            raise HTTPException(status_code=404, detail="Receipt not found")
+
+        receipt_data = receipt.data
+        project_id = receipt_data["project_id"]
+        parsed_data = receipt_data.get("parsed_data") or {}
+        check_flow = parsed_data.get("check_flow")
+
+        if not check_flow:
+            raise HTTPException(status_code=400, detail="No active check flow for this receipt")
+
+        current_state = check_flow.get("state")
+        action = payload.action
+
+        print(f"[CheckFlow] receipt={receipt_id} | state={current_state} | action={action}")
+
+        if current_state == "check_detected":
+            result = _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, action)
+            # If user denied and wants reprocess, trigger normal agent-process
+            if result.get("reprocess"):
+                try:
+                    await agent_process_receipt(receipt_id, force=False)
+                except Exception as e:
+                    print(f"[CheckFlow] Reprocess after deny failed: {e}")
+            return result
+        elif current_state == "awaiting_amount":
+            return _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, action, payload.payload)
+        elif current_state == "awaiting_split_decision":
+            return _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, action)
+        elif current_state == "awaiting_description":
+            return _handle_description(receipt_id, project_id, check_flow, parsed_data, action, payload.payload)
+        elif current_state == "awaiting_split_details":
+            return _handle_split_details(receipt_id, project_id, check_flow, parsed_data, action, payload.payload)
+        elif current_state == "awaiting_category_confirm":
+            return _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, action, receipt_data)
+        elif current_state in ("completed", "cancelled"):
+            raise HTTPException(status_code=400, detail=f"Check flow already {current_state}")
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid check flow state: {current_state}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[CheckFlow] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Check action error: {str(e)}")
 
 
 @router.post("/{receipt_id}/create-expense")
