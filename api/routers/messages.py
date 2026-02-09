@@ -212,6 +212,29 @@ def get_channel_name(channel_type: str, project_id: str = None, channel_id: str 
     return "Messages"
 
 
+def _run_mention_notifications(content, sender_user_id, sender_name,
+                               sender_avatar_color, channel_type,
+                               project_id, channel_id):
+    """Sync wrapper to safely run async mention notifications from a background task."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(send_mention_notifications(
+                content=content,
+                sender_user_id=sender_user_id,
+                sender_name=sender_name,
+                sender_avatar_color=sender_avatar_color,
+                channel_type=channel_type,
+                project_id=project_id,
+                channel_id=channel_id
+            ))
+        finally:
+            loop.close()
+    except Exception as e:
+        print(f"[Messages] Mention notification error: {e}")
+
+
 async def send_mention_notifications(
     content: str,
     sender_user_id: str,
@@ -359,18 +382,19 @@ def create_message(
             sender_avatar_color = user_result.data.get("avatar_color")
 
         # Send push notifications for @mentions (in background)
-        background_tasks.add_task(
-            asyncio.get_event_loop().run_until_complete,
-            send_mention_notifications(
-                content=payload.content,
-                sender_user_id=user_id,
-                sender_name=sender_name,
-                sender_avatar_color=sender_avatar_color,
-                channel_type=payload.channel_type,
-                project_id=payload.project_id,
-                channel_id=payload.channel_id
+        try:
+            background_tasks.add_task(
+                _run_mention_notifications,
+                payload.content,
+                user_id,
+                sender_name,
+                sender_avatar_color,
+                payload.channel_type,
+                payload.project_id,
+                payload.channel_id
             )
-        )
+        except Exception as bg_err:
+            print(f"[Messages] Background task setup error (non-blocking): {bg_err}")
 
         return {"message": response}
 
@@ -464,18 +488,19 @@ def create_thread_reply(
             sender_avatar_color = user_result.data.get("avatar_color")
 
         # Send push notifications for @mentions (in background)
-        background_tasks.add_task(
-            asyncio.get_event_loop().run_until_complete,
-            send_mention_notifications(
-                content=payload.content,
-                sender_user_id=user_id,
-                sender_name=sender_name,
-                sender_avatar_color=sender_avatar_color,
-                channel_type=parent_data["channel_type"],
-                project_id=parent_data.get("project_id"),
-                channel_id=parent_data.get("channel_id")
+        try:
+            background_tasks.add_task(
+                _run_mention_notifications,
+                payload.content,
+                user_id,
+                sender_name,
+                sender_avatar_color,
+                parent_data["channel_type"],
+                parent_data.get("project_id"),
+                parent_data.get("channel_id")
             )
-        )
+        except Exception:
+            pass
 
         return {"reply": msg}
 
