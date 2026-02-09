@@ -353,13 +353,14 @@ async def list_templates():
 
         files = supabase.storage.from_(TEMPLATES_BUCKET).list()
 
-        # Filter for folders (templates)
+        # Filter for folders (templates) - folders have id=None in Supabase storage
         templates = []
         for item in files or []:
-            if item.get("id") and not "." in item.get("name", ""):
+            name = item.get("name", "")
+            if name and "." not in name:
                 templates.append({
-                    "id": item.get("name"),
-                    "name": item.get("name"),
+                    "id": name,
+                    "name": name,
                     "created_at": item.get("created_at"),
                     "updated_at": item.get("updated_at")
                 })
