@@ -1062,48 +1062,68 @@ Return ONLY valid JSON:
 
         print(f"[Agent] Step 6: Receipt updated in DB | status=ready")
 
-        # ===== STEP 6.5: Auto-create expense =====
+        # ===== STEP 6.5: Auto-create expense (if config allows) =====
         expense_id = None
+
+        # Read agent config
+        agent_cfg = {}
         try:
-            expense_data = {
-                "project": project_id,
-                "Amount": parsed_data.get("amount"),
-                "TxnDate": parsed_data.get("receipt_date"),
-                "LineDescription": parsed_data.get("description") or f"Receipt: {receipt_data.get('file_name')}",
-                "account_id": final_account_id,
-                "created_by": receipt_data.get("uploaded_by"),
-                "receipt_url": receipt_data.get("file_url"),
-                "auth_status": False,
-            }
+            cfg_result = supabase.table("agent_config").select("key, value").execute()
+            for row in (cfg_result.data or []):
+                agent_cfg[row["key"]] = row["value"]
+        except Exception:
+            pass  # Table may not exist yet -- use defaults
 
-            if vendor_id:
-                expense_data["vendor_id"] = vendor_id
+        auto_create = agent_cfg.get("auto_create_expense", True)
+        min_confidence = int(agent_cfg.get("min_confidence", 70))
+        should_create = auto_create and final_confidence >= min_confidence
 
-            # Remove None values
-            expense_data = {k: v for k, v in expense_data.items() if v is not None}
+        if not should_create:
+            print(f"[Agent] Step 6.5: Skipping expense creation | auto_create={auto_create} | confidence={final_confidence} < min={min_confidence}")
+        else:
+            print(f"[Agent] Step 6.5: Creating expense | confidence={final_confidence} >= min={min_confidence}")
 
-            expense_result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
+        if should_create:
+            try:
+                expense_data = {
+                    "project": project_id,
+                    "Amount": parsed_data.get("amount"),
+                    "TxnDate": parsed_data.get("receipt_date"),
+                    "LineDescription": parsed_data.get("description") or f"Receipt: {receipt_data.get('file_name')}",
+                    "account_id": final_account_id,
+                    "created_by": receipt_data.get("uploaded_by"),
+                    "receipt_url": receipt_data.get("file_url"),
+                    "auth_status": False,
+                }
 
-            if expense_result.data:
-                expense_id = expense_result.data[0].get("expense_id")
+                if vendor_id:
+                    expense_data["vendor_id"] = vendor_id
 
-                # Link receipt to expense
-                supabase.table("pending_receipts") \
-                    .update({
-                        "expense_id": expense_id,
-                        "status": "linked",
-                        "linked_at": datetime.utcnow().isoformat(),
-                        "updated_at": datetime.utcnow().isoformat()
-                    }) \
-                    .eq("id", receipt_id) \
-                    .execute()
+                # Remove None values
+                expense_data = {k: v for k, v in expense_data.items() if v is not None}
 
-                print(f"[Agent] Step 6.5: Expense created | expense_id={expense_id}")
-            else:
-                print("[Agent] Step 6.5: Expense insert returned no data")
+                expense_result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
 
-        except Exception as exp_err:
-            print(f"[Agent] Step 6.5: Expense creation failed (non-blocking): {exp_err}")
+                if expense_result.data:
+                    expense_id = expense_result.data[0].get("expense_id")
+
+                    # Link receipt to expense
+                    supabase.table("pending_receipts") \
+                        .update({
+                            "expense_id": expense_id,
+                            "status": "linked",
+                            "linked_at": datetime.utcnow().isoformat(),
+                            "updated_at": datetime.utcnow().isoformat()
+                        }) \
+                        .eq("id", receipt_id) \
+                        .execute()
+
+                    print(f"[Agent] Step 6.5: Expense created | expense_id={expense_id}")
+                else:
+                    print("[Agent] Step 6.5: Expense insert returned no data")
+
+            except Exception as exp_err:
+                print(f"[Agent] Step 6.5: Expense creation failed (non-blocking): {exp_err}")
 
         # ===== STEP 7: Post Arturito summary message =====
         text_sample = f"{parsed_data.get('vendor_name', '')} {description}"
@@ -2192,3 +2212,78 @@ def get_unprocessed_counts():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting counts: {str(e)}")
+
+
+# ====== AGENT MANAGER ENDPOINTS ======
+
+@router.get("/agent-stats")
+def get_agent_stats():
+    """Return aggregate stats for the receipt agent."""
+    try:
+        all_receipts = supabase.table("pending_receipts") \
+            .select("id, status, parsed_data") \
+            .in_("status", ["ready", "linked", "error", "duplicate", "check_review"]) \
+            .execute()
+
+        data = all_receipts.data or []
+        total = len(data)
+        linked = sum(1 for r in data if r["status"] == "linked")
+        errors = sum(1 for r in data if r["status"] == "error")
+        duplicates = sum(1 for r in data if r["status"] == "duplicate")
+        ready = sum(1 for r in data if r["status"] == "ready")
+
+        confidences = []
+        for r in data:
+            cat = (r.get("parsed_data") or {}).get("categorization") or {}
+            if cat.get("confidence"):
+                confidences.append(cat["confidence"])
+        avg_confidence = round(sum(confidences) / len(confidences)) if confidences else 0
+        success_rate = round((linked / total) * 100) if total > 0 else 0
+
+        return {
+            "total_processed": total,
+            "expenses_created": linked,
+            "pending_review": ready,
+            "errors": errors,
+            "duplicates_caught": duplicates,
+            "success_rate": success_rate,
+            "avg_confidence": avg_confidence,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting agent stats: {str(e)}")
+
+
+@router.get("/agent-config")
+def get_agent_config():
+    """Return current agent configuration."""
+    try:
+        result = supabase.table("agent_config").select("*").execute()
+        config = {}
+        for row in (result.data or []):
+            config[row["key"]] = row["value"]
+        return config
+    except Exception as e:
+        # Table might not exist yet -- return defaults
+        return {
+            "auto_create_expense": True,
+            "min_confidence": 70,
+            "auto_skip_duplicates": False,
+        }
+
+
+@router.patch("/agent-config")
+def update_agent_config(payload: dict):
+    """Update agent configuration (key-value pairs)."""
+    try:
+        for key, value in payload.items():
+            supabase.table("agent_config") \
+                .upsert({
+                    "key": key,
+                    "value": json.dumps(value) if not isinstance(value, str) else value,
+                    "updated_at": datetime.utcnow().isoformat()
+                }) \
+                .execute()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating agent config: {str(e)}")
