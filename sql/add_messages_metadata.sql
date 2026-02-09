@@ -28,11 +28,16 @@ CREATE POLICY "Service role full access" ON message_attachments
   USING (auth.role() = 'service_role')
   WITH CHECK (auth.role() = 'service_role');
 
--- 3. Arturito bot user (idempotent - same as create_receipt_agent.sql)
-INSERT INTO users (user_id, user_name, avatar_color)
+-- 3. Arturito bot user
+--    Uses DO UPDATE to ensure it exists even if password_hash is NOT NULL.
+--    The password is a dummy bcrypt hash -- bot can never login.
+INSERT INTO users (user_id, user_name, avatar_color, password_hash)
 VALUES (
   '00000000-0000-0000-0000-000000000001',
   'Arturito',
-  35
+  35,
+  '$2b$12$BotNoLoginBotNoLoginBotNO1.1.1.1.1.1.1.1.1.1.1.1.1.1'
 )
-ON CONFLICT (user_id) DO NOTHING;
+ON CONFLICT (user_id) DO UPDATE SET
+  user_name = EXCLUDED.user_name,
+  avatar_color = EXCLUDED.avatar_color;

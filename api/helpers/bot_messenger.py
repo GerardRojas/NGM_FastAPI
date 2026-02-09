@@ -29,17 +29,23 @@ def _ensure_bot_user_exists():
 
         if not result.data or len(result.data) == 0:
             print("[BotMessenger] Arturito user not found, creating...")
+            # Include password_hash in case users table has NOT NULL constraint
+            from utils.auth import hash_password
+            dummy_hash = hash_password("BOT_NO_LOGIN")
+
             supabase.table("users").insert({
                 "user_id": ARTURITO_BOT_USER_ID,
                 "user_name": "Arturito",
                 "avatar_color": 35,
+                "password_hash": dummy_hash,
             }).execute()
             print("[BotMessenger] Arturito user created successfully")
+        else:
+            print("[BotMessenger] Arturito user already exists")
 
         _bot_user_verified = True
     except Exception as e:
         print(f"[BotMessenger] Error ensuring bot user exists: {e}")
-        # Still mark as verified to avoid retrying every message
         _bot_user_verified = True
 
 
@@ -73,10 +79,12 @@ def post_bot_message(
             "created_at": datetime.utcnow().isoformat(),
         }
 
+        print(f"[BotMessenger] Inserting message | project={project_id} | type={channel_type}")
         result = supabase.table("messages").insert(message_data).execute()
 
         if result.data and len(result.data) > 0:
-            print(f"[BotMessenger] Message posted OK | project={project_id}")
+            msg_id = result.data[0].get("id", "?")
+            print(f"[BotMessenger] Message posted OK | id={msg_id} | project={project_id}")
             return result.data[0]
 
         print(f"[BotMessenger] Insert returned no data | project={project_id}")
@@ -84,5 +92,5 @@ def post_bot_message(
 
     except Exception as e:
         # Never let bot message failures break the main pipeline
-        print(f"[BotMessenger] Error posting message: {e}")
+        print(f"[BotMessenger] ERROR posting message: {e}")
         return None
