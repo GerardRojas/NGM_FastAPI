@@ -599,31 +599,23 @@ def _build_agent_message(parsed_data, categorize_data, warnings, lang="en"):
     confidence = int(categorize_data.get("confidence", 0))
 
     if lang == "es":
-        header = "**Gasto de material procesado**"
+        header = f"Escanee este recibo de **{vendor}** -- ${amount:,.2f}"
+        if date != "Unknown":
+            header += f" del {date}"
+        header += "."
+        body = f"Categoria: **{category}** ({confidence}% confianza)"
         if warnings:
-            header += " - Revision recomendada"
-        body = (
-            f"Proveedor: {vendor}\n"
-            f"Monto: ${amount:,.2f}\n"
-            f"Fecha: {date}\n"
-            f"Categoria: {category} ({confidence}% confianza)"
-        )
-        if warnings:
-            body += "\n\nAdvertencias:\n" + "\n".join(f"- {w}" for w in warnings)
-        body += "\n\nListo para revision en Expenses > From Pending"
+            body += "\n\nAtencion:\n" + "\n".join(f"- {w}" for w in warnings)
+        body += "\n\nListo para revision en Expenses > From Pending."
     else:
-        header = "**Material expense processed**"
+        header = f"I scanned this receipt from **{vendor}** -- ${amount:,.2f}"
+        if date != "Unknown":
+            header += f" on {date}"
+        header += "."
+        body = f"Category: **{category}** ({confidence}% confidence)"
         if warnings:
-            header += " - Review recommended"
-        body = (
-            f"Vendor: {vendor}\n"
-            f"Amount: ${amount:,.2f}\n"
-            f"Date: {date}\n"
-            f"Category: {category} ({confidence}% confidence)"
-        )
-        if warnings:
-            body += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in warnings)
-        body += "\n\nReady for review in Expenses > From Pending"
+            body += "\n\nHeads up:\n" + "\n".join(f"- {w}" for w in warnings)
+        body += "\n\nReady for review in Expenses > From Pending."
 
     return f"{header}\n{body}"
 
@@ -717,10 +709,10 @@ async def agent_process_receipt(
 
             post_bot_message(
                 content=(
-                    "**Duplicate receipt detected**\n"
-                    f"This file matches an existing receipt:\n"
-                    f"- {dup_vendor}, ${dup_amount:,.2f} ({dup_date}) - {hash_dup.get('status')}\n\n"
-                    "Would you like to process it anyway? Click **Process Anyway** below."
+                    f"Heads up -- this looks like a duplicate. "
+                    f"I found a matching receipt from {dup_vendor} for ${dup_amount:,.2f} "
+                    f"({dup_date}), currently {hash_dup.get('status')}.\n\n"
+                    "Want me to process it anyway?"
                 ),
                 project_id=project_id,
                 metadata={
@@ -767,9 +759,8 @@ async def agent_process_receipt(
 
             post_bot_message(
                 content=(
-                    "**Check detected**\n\n"
-                    f"The uploaded file \"{file_name}\" looks like it might be a check.\n"
-                    "Is this a check?"
+                    f"This file \"{file_name}\" looks like it might be a check "
+                    "rather than a receipt. Is that right?"
                 ),
                 project_id=project_id,
                 metadata={
@@ -1098,9 +1089,8 @@ Return ONLY valid JSON:
         if project_id:
             post_bot_message(
                 content=(
-                    "**Receipt processing failed**\n\n"
-                    f"Error: {str(e)}\n\n"
-                    "Please process this receipt manually via Expenses > From Pending."
+                    f"I ran into a problem processing this receipt: {str(e)}\n\n"
+                    "You can process it manually from Expenses > From Pending."
                 ),
                 project_id=project_id,
                 metadata={
@@ -1316,7 +1306,7 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
         post_bot_message(
-            content="Got it. What is the check amount? (Type the dollar amount)",
+            content="Got it, this is a check. What is the total amount?",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1340,7 +1330,7 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
         }).eq("id", receipt_id).execute()
 
         post_bot_message(
-            content="Not a check. Processing as a regular receipt...",
+            content="No problem, I will process it as a regular receipt.",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1364,7 +1354,7 @@ def _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, act
 
     if amount is None:
         post_bot_message(
-            content=f"Could not parse \"{text}\" as a valid amount. Please type a number (e.g. 1250 or $1,250.00).",
+            content=f"I could not read \"{text}\" as a dollar amount. Try something like 1250 or $1,250.00.",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1389,8 +1379,7 @@ def _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, act
 
     post_bot_message(
         content=(
-            f"Check amount: **${amount:,.2f}**\n\n"
-            "Does this check need to be split across projects?"
+            f"Got it, **${amount:,.2f}**. Does this check need to be split across multiple projects?"
         ),
         project_id=project_id,
         metadata={
@@ -1412,7 +1401,7 @@ def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, acti
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
         post_bot_message(
-            content="Describe the labor for this check (e.g. \"Drywall labor\")",
+            content="Alright, single project. What is the labor description? (e.g. \"Drywall labor\")",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1433,11 +1422,11 @@ def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, acti
 
         post_bot_message(
             content=(
-                "Describe each split, one per message:\n"
+                "Alright, let us split it. Send each split as a message:\n"
                 "**[amount] [description] for [project name]**\n\n"
                 "Example: *500 drywall labor for Trasher Way*\n\n"
-                "If the split is for this project, you can skip the project name.\n"
-                "When done, type **done**."
+                "You can skip the project name if it is for this project.\n"
+                "Type **done** when you are finished."
             ),
             project_id=project_id,
             metadata={
@@ -1490,10 +1479,9 @@ def _handle_description(receipt_id, project_id, check_flow, parsed_data, action,
 
     post_bot_message(
         content=(
-            f"**Categorization result** {method_label}\n\n"
-            f"${check_flow['amount']:,.2f} - {text}\n"
-            f"Category: **{cat_name}** ({cat_conf}% confidence)\n\n"
-            "Confirm this category?"
+            f"I categorized this as **{cat_name}** ({cat_conf}% confidence) {method_label}.\n\n"
+            f"${check_flow['amount']:,.2f} -- {text}\n\n"
+            "Does that look right?"
         ),
         project_id=project_id,
         metadata={
@@ -1513,7 +1501,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
         splits = check_flow.get("splits", [])
         if not splits:
             post_bot_message(
-                content="No splits entered yet. Please add at least one split, or type a description.",
+                content="I do not have any splits yet. Add at least one, or just type a description.",
                 project_id=project_id,
                 metadata={
                     "agent_message": True,
@@ -1558,8 +1546,8 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
 
         post_bot_message(
             content=(
-                f"**Categorization results**\n\n{summary}{diff_note}\n\n"
-                "Confirm these categories?"
+                f"Here is how I categorized the splits:\n\n{summary}{diff_note}\n\n"
+                "Does everything look right?"
             ),
             project_id=project_id,
             metadata={
@@ -1594,7 +1582,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
 
         if amount is None:
             post_bot_message(
-                content=f"Could not parse amount from: \"{text}\"\nPlease use format: **[amount] [description]** (e.g. \"500 drywall labor\")",
+                content=f"I could not read an amount from \"{text}\". Try the format: **[amount] [description]** (e.g. \"500 drywall labor\")",
                 project_id=project_id,
                 metadata={
                     "agent_message": True,
@@ -1641,9 +1629,9 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
 
         post_bot_message(
             content=(
-                f"Added: ${amount:,.2f} - {description} ({project_name or 'This project'})\n"
-                f"Split total: ${total_so_far:,.2f} of ${check_amount:,.2f}{remaining_note}\n\n"
-                "Add another split or type **done** to finish."
+                f"Added ${amount:,.2f} for {description} ({project_name or 'this project'}).\n"
+                f"Running total: ${total_so_far:,.2f} of ${check_amount:,.2f}{remaining_note}\n\n"
+                "Send another split or type **done** to wrap up."
             ),
             project_id=project_id,
             metadata={
@@ -1670,8 +1658,8 @@ def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, ac
         count = len(expenses)
         post_bot_message(
             content=(
-                f"**Check processed**\n\n"
-                f"{count} expense{'s' if count != 1 else ''} created and ready for review in Expenses > From Pending."
+                f"All done. {count} expense{'s' if count != 1 else ''} created from this check. "
+                "You can review them in Expenses > From Pending."
             ),
             project_id=project_id,
             metadata={
@@ -1694,7 +1682,7 @@ def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, ac
         }).eq("id", receipt_id).execute()
 
         post_bot_message(
-            content="Check processing cancelled.",
+            content="No worries, check processing cancelled. The receipt is back to pending.",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1829,6 +1817,18 @@ def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromRecei
             .eq("id", receipt_id) \
             .execute()
 
+        # Post confirmation to receipts channel
+        vendor_name = receipt_data.get("vendor_name") or "Unknown vendor"
+        post_bot_message(
+            content=f"Expense created -- ${payload.amount:,.2f} from {vendor_name}. Ready for authorization.",
+            project_id=receipt_data["project_id"],
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "linked",
+            }
+        )
+
         return {
             "success": True,
             "expense": expense_result.data[0],
@@ -1850,7 +1850,7 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest):
     try:
         # Verify receipt exists
         receipt = supabase.table("pending_receipts") \
-            .select("id, expense_id") \
+            .select("id, expense_id, project_id, vendor_name, amount") \
             .eq("id", receipt_id) \
             .single() \
             .execute()
@@ -1894,6 +1894,22 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest):
                 .update({"receipt_url": receipt_full.data.get("file_url")}) \
                 .eq("expense_id", payload.expense_id) \
                 .execute()
+
+        # Post linking confirmation to receipts channel
+        link_project_id = receipt.data.get("project_id")
+        if link_project_id:
+            link_vendor = receipt.data.get("vendor_name") or "receipt"
+            link_amount = receipt.data.get("amount")
+            amount_text = f" (${link_amount:,.2f})" if link_amount else ""
+            post_bot_message(
+                content=f"Receipt from {link_vendor}{amount_text} linked to an existing expense.",
+                project_id=link_project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "linked",
+                }
+            )
 
         return {
             "success": True,
