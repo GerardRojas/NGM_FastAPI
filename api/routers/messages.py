@@ -34,6 +34,7 @@ class MessageCreate(BaseModel):
     project_id: Optional[str] = None  # For project channels
     reply_to_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    attachments: Optional[List[Dict[str, Any]]] = None
 
 
 class MessageResponse(BaseModel):
@@ -95,6 +96,7 @@ def normalize_message(row: Dict[str, Any]) -> Dict[str, Any]:
         "created_at": row.get("created_at", ""),
         "reactions": row.get("reactions"),
         "attachments": row.get("attachments"),
+        "metadata": row.get("metadata"),
     }
 
 
@@ -348,6 +350,9 @@ def create_message(
         if payload.metadata:
             data["metadata"] = payload.metadata
 
+        if payload.attachments:
+            data["attachments"] = payload.attachments
+
         # Set channel reference
         if payload.channel_type in ["custom", "direct"]:
             if not payload.channel_id:
@@ -365,21 +370,24 @@ def create_message(
 
         # Get user info for response
         msg = result.data[0]
-        user_result = supabase.table("users") \
-            .select("user_name, avatar_color") \
-            .eq("user_id", user_id) \
-            .single() \
-            .execute()
-
         response = normalize_message(msg)
         sender_name = "Someone"
         sender_avatar_color = None
 
-        if user_result.data:
-            response["user_name"] = user_result.data.get("user_name")
-            response["avatar_color"] = user_result.data.get("avatar_color")
-            sender_name = user_result.data.get("user_name", "Someone")
-            sender_avatar_color = user_result.data.get("avatar_color")
+        try:
+            user_result = supabase.table("users") \
+                .select("user_name, avatar_color") \
+                .eq("user_id", user_id) \
+                .execute()
+
+            if user_result.data and len(user_result.data) > 0:
+                user_row = user_result.data[0]
+                response["user_name"] = user_row.get("user_name")
+                response["avatar_color"] = user_row.get("avatar_color")
+                sender_name = user_row.get("user_name", "Someone")
+                sender_avatar_color = user_row.get("avatar_color")
+        except Exception as user_err:
+            print(f"[Messages] User lookup error (non-blocking): {user_err}")
 
         # Send push notifications for @mentions (in background)
         try:
