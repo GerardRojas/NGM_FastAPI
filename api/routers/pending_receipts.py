@@ -122,6 +122,13 @@ class DuplicateActionRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+class ReceiptActionRequest(BaseModel):
+    """User action in the receipt split conversation"""
+    action: str  # single_project, split_projects, submit_split_line, split_done, cancel
+    payload: Optional[Dict[str, Any]] = None
+    user_id: Optional[str] = None
+
+
 # ====== HELPERS ======
 
 def ensure_bucket_exists():
@@ -581,6 +588,65 @@ def _check_expense_duplicate(project_id: str, vendor_id, amount, txn_date):
         return None
 
 
+def _check_file_hash_split_reuse(file_hash: str, project_id: str, receipt_id: str):
+    """Check if hash matches a 'split' receipt from ANOTHER project (cross-project reuse)."""
+    try:
+        result = supabase.table("pending_receipts") \
+            .select("*") \
+            .eq("file_hash", file_hash) \
+            .eq("status", "split") \
+            .neq("project_id", project_id) \
+            .neq("id", receipt_id) \
+            .execute()
+        if result.data:
+            return sorted(result.data, key=lambda x: x.get("created_at", ""), reverse=True)[0]
+        return None
+    except Exception as e:
+        print(f"[Agent] Split reuse check error: {e}")
+        return None
+
+
+def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, account_id, amount=None, description=None):
+    """Create a single expense from receipt data. Returns expense record or None."""
+    try:
+        expense_data = {
+            "project": project_id,
+            "Amount": amount or parsed_data.get("amount"),
+            "TxnDate": parsed_data.get("receipt_date"),
+            "LineDescription": description or parsed_data.get("description") or f"Receipt: {receipt_data.get('file_name')}",
+            "account_id": account_id,
+            "created_by": receipt_data.get("uploaded_by"),
+            "receipt_url": receipt_data.get("file_url"),
+            "auth_status": False,
+        }
+        if vendor_id:
+            expense_data["vendor_id"] = vendor_id
+        expense_data = {k: v for k, v in expense_data.items() if v is not None}
+
+        result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
+        if result.data:
+            return result.data[0]
+        return None
+    except Exception as e:
+        print(f"[Agent] Expense creation error: {e}")
+        return None
+
+
+def _parse_receipt_split_line(text: str):
+    """Parse '500 plumbing materials' or '500.50 electrical supplies' format."""
+    match = re.match(r'^\$?\s*([\d,]+\.?\d*)\s+(.+)$', text.strip())
+    if not match:
+        return None
+    amount_str = match.group(1).replace(',', '')
+    try:
+        amount = float(amount_str)
+        if amount <= 0:
+            return None
+        return {"amount": amount, "description": match.group(2).strip()}
+    except ValueError:
+        return None
+
+
 def _detect_language(text: str) -> str:
     """Simple heuristic: returns 'es' for Spanish, 'en' for English (default)."""
     spanish_words = [
@@ -644,12 +710,14 @@ async def agent_process_receipt(
 
     Pipeline:
     1. Fetch receipt, download file
-    2. Duplicate check (file hash)
+    2. Duplicate check (file hash) / split reuse detection
     3. OCR extraction (OpenAI Vision)
     4. Data duplicate check (vendor+amount+date)
     5. Auto-categorize (GPT with construction stage context)
-    6. Update receipt with enriched data
-    7. Post Arturito summary message to Receipts channel
+    6. Update receipt with enriched data + receipt_flow
+    7. Post Arturito summary + project question (awaiting user response)
+
+    Expense creation happens in the receipt-action endpoint after user responds.
     """
     receipt_data = None
     project_id = None
@@ -700,6 +768,73 @@ async def agent_process_receipt(
                 .update({"file_hash": file_hash}) \
                 .eq("id", receipt_id) \
                 .execute()
+
+        # Check if this file was already processed as a split in another project
+        split_reuse = _check_file_hash_split_reuse(file_hash, project_id, receipt_id)
+        if split_reuse:
+            print(f"[Agent] Step 2: Split reuse detected | original in project {split_reuse.get('project_id')}")
+            original_parsed = split_reuse.get("parsed_data") or {}
+            # Strip old flow states from copied data
+            original_parsed.pop("receipt_flow", None)
+            original_parsed.pop("check_flow", None)
+            original_parsed.pop("duplicate_flow", None)
+
+            receipt_flow = {
+                "state": "awaiting_project_decision",
+                "started_at": datetime.utcnow().isoformat(),
+                "split_items": [],
+                "total_for_project": 0.0,
+                "reused_from": split_reuse.get("id"),
+            }
+            original_parsed["receipt_flow"] = receipt_flow
+
+            supabase.table("pending_receipts").update({
+                "status": "ready",
+                "parsed_data": original_parsed,
+                "vendor_name": original_parsed.get("vendor_name"),
+                "amount": original_parsed.get("amount"),
+                "receipt_date": original_parsed.get("receipt_date"),
+                "suggested_category": (original_parsed.get("categorization") or {}).get("account_name"),
+                "suggested_account_id": (original_parsed.get("categorization") or {}).get("account_id"),
+                "processed_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", receipt_id).execute()
+
+            # Get project name
+            project_name = "this project"
+            try:
+                proj_resp = supabase.table("projects").select("project_name") \
+                    .eq("project_id", project_id).single().execute()
+                if proj_resp.data and proj_resp.data.get("project_name"):
+                    project_name = proj_resp.data["project_name"]
+            except Exception:
+                pass
+
+            vendor_name = original_parsed.get("vendor_name", "Unknown")
+            amount = original_parsed.get("amount", 0)
+            cat = original_parsed.get("categorization", {})
+
+            post_bot_message(
+                content=(
+                    f"This receipt from **{vendor_name}** for ${amount:,.2f} was already processed as a split in another project.\n"
+                    f"Category: **{cat.get('account_name', 'Uncategorized')}** ({cat.get('confidence', 0)}% confidence)\n\n"
+                    f"Is this entire bill for **{project_name}**?"
+                ),
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "ready",
+                    "receipt_flow_state": "awaiting_project_decision",
+                    "receipt_flow_active": True,
+                }
+            )
+
+            return {
+                "success": True,
+                "status": "ready",
+                "message": "Split receipt reuse - awaiting project decision",
+            }
 
         # Check exact file duplicate
         print(f"[Agent] Step 2: Checking file hash duplicate | hash={file_hash[:16]}... | force={force}")
@@ -788,8 +923,8 @@ async def agent_process_receipt(
 
             post_bot_message(
                 content=(
-                    f"This file \"{file_name}\" looks like it might be a check "
-                    "rather than a receipt. Is that right?"
+                    f"This file \"{file_name}\" looks like a check. "
+                    "Is it for materials or labor?"
                 ),
                 project_id=project_id,
                 metadata={
@@ -1029,6 +1164,15 @@ Return ONLY valid JSON:
         # ===== STEP 6: Update receipt with enriched data =====
         if warnings:
             print(f"[Agent] Step 5: Warnings: {warnings}")
+
+        # Initialize receipt flow for project decision
+        receipt_flow = {
+            "state": "awaiting_project_decision",
+            "started_at": datetime.utcnow().isoformat(),
+            "split_items": [],
+            "total_for_project": 0.0,
+        }
+
         enriched_parsed = {
             **parsed_data,
             "categorization": {
@@ -1041,6 +1185,7 @@ Return ONLY valid JSON:
             "agent_warnings": warnings,
             "data_duplicate": data_dup is not None,
             "expense_duplicate": expense_dup is not None,
+            "receipt_flow": receipt_flow,
         }
 
         update_data = {
@@ -1062,74 +1207,29 @@ Return ONLY valid JSON:
 
         print(f"[Agent] Step 6: Receipt updated in DB | status=ready")
 
-        # ===== STEP 6.5: Auto-create expense (if config allows) =====
-        expense_id = None
-
-        # Read agent config
-        agent_cfg = {}
-        try:
-            cfg_result = supabase.table("agent_config").select("key, value").execute()
-            for row in (cfg_result.data or []):
-                agent_cfg[row["key"]] = row["value"]
-        except Exception:
-            pass  # Table may not exist yet -- use defaults
-
-        auto_create = agent_cfg.get("auto_create_expense", True)
-        min_confidence = int(agent_cfg.get("min_confidence", 70))
-        should_create = auto_create and final_confidence >= min_confidence
-
-        if not should_create:
-            print(f"[Agent] Step 6.5: Skipping expense creation | auto_create={auto_create} | confidence={final_confidence} < min={min_confidence}")
-        else:
-            print(f"[Agent] Step 6.5: Creating expense | confidence={final_confidence} >= min={min_confidence}")
-
-        if should_create:
-            try:
-                expense_data = {
-                    "project": project_id,
-                    "Amount": parsed_data.get("amount"),
-                    "TxnDate": parsed_data.get("receipt_date"),
-                    "LineDescription": parsed_data.get("description") or f"Receipt: {receipt_data.get('file_name')}",
-                    "account_id": final_account_id,
-                    "created_by": receipt_data.get("uploaded_by"),
-                    "receipt_url": receipt_data.get("file_url"),
-                    "auth_status": False,
-                }
-
-                if vendor_id:
-                    expense_data["vendor_id"] = vendor_id
-
-                # Remove None values
-                expense_data = {k: v for k, v in expense_data.items() if v is not None}
-
-                expense_result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
-
-                if expense_result.data:
-                    expense_id = expense_result.data[0].get("expense_id")
-
-                    # Link receipt to expense
-                    supabase.table("pending_receipts") \
-                        .update({
-                            "expense_id": expense_id,
-                            "status": "linked",
-                            "linked_at": datetime.utcnow().isoformat(),
-                            "updated_at": datetime.utcnow().isoformat()
-                        }) \
-                        .eq("id", receipt_id) \
-                        .execute()
-
-                    print(f"[Agent] Step 6.5: Expense created | expense_id={expense_id}")
-                else:
-                    print("[Agent] Step 6.5: Expense insert returned no data")
-
-            except Exception as exp_err:
-                print(f"[Agent] Step 6.5: Expense creation failed (non-blocking): {exp_err}")
-
-        # ===== STEP 7: Post Arturito summary message =====
+        # ===== STEP 7: Post Arturito summary + project question =====
         text_sample = f"{parsed_data.get('vendor_name', '')} {description}"
         lang = _detect_language(text_sample)
 
-        msg_content = _build_agent_message(parsed_data, categorize_data, warnings, lang, expense_created=expense_id is not None)
+        msg_content = _build_agent_message(parsed_data, categorize_data, warnings, lang, expense_created=False)
+
+        # Get project name for the question
+        project_name = "this project"
+        try:
+            proj_name_resp = supabase.table("projects") \
+                .select("project_name") \
+                .eq("project_id", project_id) \
+                .single() \
+                .execute()
+            if proj_name_resp.data and proj_name_resp.data.get("project_name"):
+                project_name = proj_name_resp.data["project_name"]
+        except Exception:
+            pass
+
+        if lang == "es":
+            msg_content += f"\n\nEste bill es solo para **{project_name}**?"
+        else:
+            msg_content += f"\n\nIs this entire bill for **{project_name}**?"
 
         post_bot_message(
             content=msg_content,
@@ -1137,19 +1237,21 @@ Return ONLY valid JSON:
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
-                "receipt_status": "linked" if expense_id else "ready",
+                "receipt_status": "ready",
                 "has_warnings": len(warnings) > 0,
-                "confidence": final_confidence
+                "confidence": final_confidence,
+                "receipt_flow_state": "awaiting_project_decision",
+                "receipt_flow_active": True,
             }
         )
 
-        print(f"[Agent] Step 7: Arturito message posted | lang={lang}")
-        print(f"[Agent] === DONE receipt {receipt_id} | {parsed_data.get('vendor_name')} ${parsed_data.get('amount')} -> {final_category} ({final_confidence}%) | expense={'created' if expense_id else 'skipped'} ===")
+        print(f"[Agent] Step 7: Arturito message posted | lang={lang} | awaiting project decision")
+        print(f"[Agent] === DONE OCR receipt {receipt_id} | {parsed_data.get('vendor_name')} ${parsed_data.get('amount')} -> {final_category} ({final_confidence}%) | awaiting user response ===")
 
         return {
             "success": True,
-            "status": "linked" if expense_id else "ready",
-            "message": "Receipt processed and expense created" if expense_id else "Receipt processed successfully",
+            "status": "ready",
+            "message": "Receipt processed - awaiting project decision",
             "data": {
                 "vendor_name": parsed_data.get("vendor_name"),
                 "amount": parsed_data.get("amount"),
@@ -1158,7 +1260,6 @@ Return ONLY valid JSON:
                 "confidence": final_confidence,
             },
             "warnings": warnings,
-            "expense_id": expense_id,
         }
 
     except HTTPException:
@@ -1390,16 +1491,40 @@ def _create_check_expenses(receipt_id: str, receipt_data: dict, check_flow: dict
     return created_expenses
 
 
+def _get_payroll_channel_id() -> Optional[str]:
+    """Look up the Payroll group channel ID from the channels table."""
+    try:
+        result = supabase.table("channels") \
+            .select("id").eq("type", "group").eq("name", "Payroll") \
+            .limit(1).execute()
+        if result.data and len(result.data) > 0:
+            return str(result.data[0]["id"])
+    except Exception as e:
+        print(f"[CheckFlow] Error looking up Payroll channel: {e}")
+    return None
+
+
+def _check_flow_msg_kwargs(project_id: str, check_flow: dict) -> dict:
+    """Return post_bot_message routing kwargs based on check flow target channel."""
+    channel_id = check_flow.get("channel_id")
+    if channel_id:
+        return {"channel_id": channel_id, "channel_type": "group"}
+    return {"project_id": project_id}
+
+
 # ====== CHECK FLOW STATE HANDLERS ======
 
 def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, action):
-    """Handle actions when state is check_detected."""
-    if action == "confirm_check":
+    """Handle actions when state is check_detected (material / labor / not a check)."""
+
+    if action == "confirm_material":
+        # Material check: stay in receipts channel (same as old confirm_check)
         check_flow["state"] = "awaiting_amount"
+        check_flow["check_type"] = "material"
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
         post_bot_message(
-            content="Got it, this is a check. What is the total amount?",
+            content="Got it, material check. What is the total amount?",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1411,6 +1536,86 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
             }
         )
         return {"success": True, "state": "awaiting_amount"}
+
+    elif action == "confirm_labor":
+        # Labor check: route to Payroll group channel
+        payroll_channel_id = _get_payroll_channel_id()
+        if not payroll_channel_id:
+            post_bot_message(
+                content="I could not find the Payroll channel. Please make sure it exists, then try again.",
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "check_review",
+                    "check_flow_state": "check_detected",
+                    "check_flow_active": True,
+                }
+            )
+            return {"success": False, "error": "payroll_channel_not_found"}
+
+        check_flow["state"] = "awaiting_amount"
+        check_flow["check_type"] = "labor"
+        check_flow["channel_id"] = payroll_channel_id
+        check_flow["origin_project_id"] = project_id
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        # Post redirect message in the receipts channel
+        post_bot_message(
+            content=(
+                "Got it, this is a labor check. I will continue in the **Payroll** channel.\n\n"
+                "[Go to Payroll](/messages.html?channel=" + payroll_channel_id + "&type=group)"
+            ),
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "redirected_to_payroll",
+                "check_flow_active": False,
+                "payroll_channel_id": payroll_channel_id,
+            }
+        )
+
+        # Get receipt file info for context in Payroll
+        receipt = supabase.table("pending_receipts") \
+            .select("file_name, file_url") \
+            .eq("id", receipt_id).single().execute()
+        file_name = receipt.data.get("file_name", "check") if receipt.data else "check"
+        file_url = receipt.data.get("file_url", "") if receipt.data else ""
+
+        # Get project name
+        proj_name = "Unknown"
+        try:
+            proj = supabase.table("projects") \
+                .select("project_name") \
+                .eq("project_id", project_id).single().execute()
+            if proj.data:
+                proj_name = proj.data.get("project_name", "Unknown")
+        except Exception:
+            pass
+
+        file_link = f"[{file_name}]({file_url})" if file_url else file_name
+
+        # Post check info + amount question in Payroll channel
+        post_bot_message(
+            content=(
+                f"Labor check received from project **{proj_name}**: {file_link}\n\n"
+                "What is the total amount?"
+            ),
+            channel_id=payroll_channel_id,
+            channel_type="group",
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_amount",
+                "check_flow_active": True,
+                "awaiting_text_input": True,
+                "origin_project_id": project_id,
+            }
+        )
+        return {"success": True, "state": "awaiting_amount", "routed_to": "payroll"}
 
     elif action == "deny_check":
         check_flow["state"] = "cancelled"
@@ -1448,7 +1653,7 @@ def _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, act
     if amount is None:
         post_bot_message(
             content=f"I could not read \"{text}\" as a dollar amount. Try something like 1250 or $1,250.00.",
-            project_id=project_id,
+            **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
@@ -1474,7 +1679,7 @@ def _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, act
         content=(
             f"Got it, **${amount:,.2f}**. Does this check need to be split across multiple projects?"
         ),
-        project_id=project_id,
+        **_check_flow_msg_kwargs(project_id, check_flow),
         metadata={
             "agent_message": True,
             "pending_receipt_id": receipt_id,
@@ -1495,7 +1700,7 @@ def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, acti
 
         post_bot_message(
             content="Alright, single project. What is the labor description? (e.g. \"Drywall labor\")",
-            project_id=project_id,
+            **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
@@ -1521,7 +1726,7 @@ def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, acti
                 "You can skip the project name if it is for this project.\n"
                 "Type **done** when you are finished."
             ),
-            project_id=project_id,
+            **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
@@ -1550,10 +1755,11 @@ def _handle_description(receipt_id, project_id, check_flow, parsed_data, action,
     # Categorize
     items = [{"amount": check_flow["amount"], "description": text}]
 
-    # Get construction stage
+    # Get construction stage (use origin project for labor checks routed to Payroll)
+    stage_project_id = check_flow.get("origin_project_id", project_id)
     construction_stage = "General Construction"
     try:
-        proj = supabase.table("projects").select("project_stage").eq("project_id", project_id).single().execute()
+        proj = supabase.table("projects").select("project_stage").eq("project_id", stage_project_id).single().execute()
         if proj.data and proj.data.get("project_stage"):
             construction_stage = proj.data["project_stage"]
     except Exception:
@@ -1576,7 +1782,7 @@ def _handle_description(receipt_id, project_id, check_flow, parsed_data, action,
             f"${check_flow['amount']:,.2f} -- {text}\n\n"
             "Does that look right?"
         ),
-        project_id=project_id,
+        **_check_flow_msg_kwargs(project_id, check_flow),
         metadata={
             "agent_message": True,
             "pending_receipt_id": receipt_id,
@@ -1595,7 +1801,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
         if not splits:
             post_bot_message(
                 content="I do not have any splits yet. Add at least one, or just type a description.",
-                project_id=project_id,
+                **_check_flow_msg_kwargs(project_id, check_flow),
                 metadata={
                     "agent_message": True,
                     "pending_receipt_id": receipt_id,
@@ -1607,10 +1813,11 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
             )
             return {"success": True, "state": "awaiting_split_details", "error": "no_splits"}
 
-        # Categorize all splits
+        # Categorize all splits (use origin project for labor checks routed to Payroll)
+        stage_project_id = check_flow.get("origin_project_id", project_id)
         construction_stage = "General Construction"
         try:
-            proj = supabase.table("projects").select("project_stage").eq("project_id", project_id).single().execute()
+            proj = supabase.table("projects").select("project_stage").eq("project_id", stage_project_id).single().execute()
             if proj.data and proj.data.get("project_stage"):
                 construction_stage = proj.data["project_stage"]
         except Exception:
@@ -1642,7 +1849,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
                 f"Here is how I categorized the splits:\n\n{summary}{diff_note}\n\n"
                 "Does everything look right?"
             ),
-            project_id=project_id,
+            **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
@@ -1676,7 +1883,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
         if amount is None:
             post_bot_message(
                 content=f"I could not read an amount from \"{text}\". Try the format: **[amount] [description]** (e.g. \"500 drywall labor\")",
-                project_id=project_id,
+                **_check_flow_msg_kwargs(project_id, check_flow),
                 metadata={
                     "agent_message": True,
                     "pending_receipt_id": receipt_id,
@@ -1726,7 +1933,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
                 f"Running total: ${total_so_far:,.2f} of ${check_amount:,.2f}{remaining_note}\n\n"
                 "Send another split or type **done** to wrap up."
             ),
-            project_id=project_id,
+            **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
@@ -1754,7 +1961,7 @@ def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, ac
                 f"All done. {count} expense{'s' if count != 1 else ''} created from this check. "
                 "You can review them in Expenses > From Pending."
             ),
-            project_id=project_id,
+            **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
@@ -1776,7 +1983,7 @@ def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, ac
 
         post_bot_message(
             content="No worries, check processing cancelled. The receipt is back to pending.",
-            project_id=project_id,
+            **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
@@ -1944,6 +2151,313 @@ async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
     except Exception as e:
         print(f"[DuplicateFlow] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Duplicate action error: {str(e)}")
+
+
+@router.post("/{receipt_id}/receipt-action")
+async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
+    """
+    Handle user action in the receipt split conversation.
+    Routes to handler based on receipt_flow.state + action.
+    """
+    try:
+        receipt = supabase.table("pending_receipts") \
+            .select("*") \
+            .eq("id", receipt_id) \
+            .single() \
+            .execute()
+
+        if not receipt.data:
+            raise HTTPException(status_code=404, detail="Receipt not found")
+
+        receipt_data = receipt.data
+        project_id = receipt_data["project_id"]
+        parsed_data = receipt_data.get("parsed_data") or {}
+        receipt_flow = parsed_data.get("receipt_flow")
+
+        if not receipt_flow:
+            raise HTTPException(status_code=400, detail="No active receipt flow for this receipt")
+
+        current_state = receipt_flow.get("state")
+        action = payload.action
+
+        print(f"[ReceiptFlow] receipt={receipt_id} | state={current_state} | action={action}")
+
+        if action == "cancel":
+            receipt_flow["state"] = "cancelled"
+            parsed_data["receipt_flow"] = receipt_flow
+            supabase.table("pending_receipts").update({
+                "parsed_data": parsed_data,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", receipt_id).execute()
+
+            post_bot_message(
+                content="Split cancelled. The receipt is ready for manual processing.",
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "ready",
+                    "receipt_flow_state": "cancelled",
+                    "receipt_flow_active": False,
+                }
+            )
+            return {"success": True, "state": "cancelled"}
+
+        if current_state == "awaiting_project_decision":
+            # Get project name
+            project_name = "this project"
+            try:
+                proj_resp = supabase.table("projects").select("project_name") \
+                    .eq("project_id", project_id).single().execute()
+                if proj_resp.data and proj_resp.data.get("project_name"):
+                    project_name = proj_resp.data["project_name"]
+            except Exception:
+                pass
+
+            if action == "single_project":
+                # Read agent config for confidence check
+                agent_cfg = {}
+                try:
+                    cfg_result = supabase.table("agent_config").select("key, value").execute()
+                    for row in (cfg_result.data or []):
+                        agent_cfg[row["key"]] = row["value"]
+                except Exception:
+                    pass
+
+                auto_create = agent_cfg.get("auto_create_expense", True)
+                min_confidence = int(agent_cfg.get("min_confidence", 70))
+                cat = parsed_data.get("categorization", {})
+                final_confidence = cat.get("confidence", 0)
+                final_account_id = cat.get("account_id")
+                vendor_id = parsed_data.get("vendor_id")
+
+                should_create = auto_create and final_confidence >= min_confidence
+
+                expense_id = None
+                if should_create and final_account_id:
+                    expense = _create_receipt_expense(
+                        project_id, parsed_data, receipt_data,
+                        vendor_id, final_account_id
+                    )
+                    if expense:
+                        expense_id = expense.get("expense_id")
+
+                receipt_flow["state"] = "completed"
+                parsed_data["receipt_flow"] = receipt_flow
+
+                if expense_id:
+                    supabase.table("pending_receipts").update({
+                        "status": "linked",
+                        "expense_id": expense_id,
+                        "parsed_data": parsed_data,
+                        "linked_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", receipt_id).execute()
+
+                    post_bot_message(
+                        content="Expense saved -- ready for authorization.",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "linked",
+                            "receipt_flow_state": "completed",
+                            "receipt_flow_active": False,
+                        }
+                    )
+                    print(f"[ReceiptFlow] Single project -> expense created | id={expense_id}")
+                else:
+                    supabase.table("pending_receipts").update({
+                        "parsed_data": parsed_data,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", receipt_id).execute()
+
+                    post_bot_message(
+                        content="Receipt processed. Ready for review in Expenses > From Pending.",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "ready",
+                            "receipt_flow_state": "completed",
+                            "receipt_flow_active": False,
+                        }
+                    )
+                    print(f"[ReceiptFlow] Single project -> skipped expense (confidence={final_confidence})")
+
+                return {"success": True, "state": "completed", "expense_id": expense_id}
+
+            elif action == "split_projects":
+                receipt_flow["state"] = "awaiting_split_details"
+                parsed_data["receipt_flow"] = receipt_flow
+                supabase.table("pending_receipts").update({
+                    "parsed_data": parsed_data,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                post_bot_message(
+                    content=(
+                        f"Got it, this bill is split. Tell me which items belong to **{project_name}**.\n\n"
+                        "Send each item as: **[amount] [description]**\n"
+                        "Example: *500 plumbing materials*\n\n"
+                        "Type **done** when finished."
+                    ),
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "ready",
+                        "receipt_flow_state": "awaiting_split_details",
+                        "receipt_flow_active": True,
+                        "awaiting_text_input": True,
+                    }
+                )
+                print(f"[ReceiptFlow] Split selected -> awaiting_split_details")
+                return {"success": True, "state": "awaiting_split_details"}
+
+            else:
+                raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state '{current_state}'")
+
+        elif current_state == "awaiting_split_details":
+            receipt_amount = parsed_data.get("amount", 0)
+
+            if action == "submit_split_line":
+                text = (payload.payload or {}).get("text", "")
+                parsed_line = _parse_receipt_split_line(text)
+
+                if not parsed_line:
+                    post_bot_message(
+                        content="I could not parse that. Send each item as: **[amount] [description]**\nExample: *500 plumbing materials*",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "ready",
+                            "receipt_flow_state": "awaiting_split_details",
+                            "receipt_flow_active": True,
+                            "awaiting_text_input": True,
+                        }
+                    )
+                    return {"success": True, "state": "awaiting_split_details", "error": "invalid_format"}
+
+                receipt_flow["split_items"].append(parsed_line)
+                receipt_flow["total_for_project"] = round(
+                    sum(item["amount"] for item in receipt_flow["split_items"]), 2
+                )
+                parsed_data["receipt_flow"] = receipt_flow
+                supabase.table("pending_receipts").update({
+                    "parsed_data": parsed_data,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                total = receipt_flow["total_for_project"]
+                remaining = round(receipt_amount - total, 2)
+                remaining_note = f" (${remaining:,.2f} remaining)" if remaining > 0 else ""
+
+                post_bot_message(
+                    content=(
+                        f"Added: ${parsed_line['amount']:,.2f} -- {parsed_line['description']}\n"
+                        f"Running total: ${total:,.2f} of ${receipt_amount:,.2f}{remaining_note}\n\n"
+                        "Send another item or type **done**."
+                    ),
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "ready",
+                        "receipt_flow_state": "awaiting_split_details",
+                        "receipt_flow_active": True,
+                        "awaiting_text_input": True,
+                    }
+                )
+                print(f"[ReceiptFlow] Split item added | ${parsed_line['amount']:.2f} {parsed_line['description']} | total=${total:.2f}")
+                return {"success": True, "state": "awaiting_split_details", "items": receipt_flow["split_items"]}
+
+            elif action == "split_done":
+                items = receipt_flow.get("split_items", [])
+                if not items:
+                    post_bot_message(
+                        content="Please add at least one item before finishing.",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "ready",
+                            "receipt_flow_state": "awaiting_split_details",
+                            "receipt_flow_active": True,
+                            "awaiting_text_input": True,
+                        }
+                    )
+                    return {"success": True, "state": "awaiting_split_details", "error": "no_items"}
+
+                # Create expenses for each split item
+                cat = parsed_data.get("categorization", {})
+                account_id = cat.get("account_id")
+                vendor_id = parsed_data.get("vendor_id")
+                created_expenses = []
+
+                for item in items:
+                    expense = _create_receipt_expense(
+                        project_id, parsed_data, receipt_data,
+                        vendor_id, account_id,
+                        amount=item["amount"],
+                        description=item["description"]
+                    )
+                    if expense:
+                        created_expenses.append(expense)
+
+                receipt_flow["state"] = "completed"
+                parsed_data["receipt_flow"] = receipt_flow
+                expense_id = created_expenses[0].get("expense_id") if created_expenses else None
+
+                supabase.table("pending_receipts").update({
+                    "status": "split",
+                    "expense_id": expense_id,
+                    "parsed_data": parsed_data,
+                    "linked_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                # Get project name for message
+                project_name = "this project"
+                try:
+                    proj_resp = supabase.table("projects").select("project_name") \
+                        .eq("project_id", project_id).single().execute()
+                    if proj_resp.data and proj_resp.data.get("project_name"):
+                        project_name = proj_resp.data["project_name"]
+                except Exception:
+                    pass
+
+                total = receipt_flow["total_for_project"]
+                count = len(created_expenses)
+                post_bot_message(
+                    content=(
+                        f"Done! {count} expense(s) created for **{project_name}** totaling ${total:,.2f}.\n\n"
+                        "This receipt is marked as split -- upload it to other projects to register their portions."
+                    ),
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "split",
+                        "receipt_flow_state": "completed",
+                        "receipt_flow_active": False,
+                    }
+                )
+                print(f"[ReceiptFlow] Split done | {count} expenses created | total=${total:.2f}")
+                return {"success": True, "state": "completed", "expense_ids": [e.get("expense_id") for e in created_expenses]}
+
+            else:
+                raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state '{current_state}'")
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Receipt flow in terminal state '{current_state}'")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ReceiptFlow] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Receipt action error: {str(e)}")
 
 
 @router.post("/{receipt_id}/create-expense")

@@ -28,7 +28,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_receipts_dedup
   ON pending_receipts(project_id, vendor_name, amount, receipt_date)
   WHERE status IN ('ready', 'linked');
 
--- 4. Expand status CHECK constraint to include 'duplicate' and 'check_review'
+-- 4. Expand status CHECK constraint to include 'duplicate', 'check_review', 'split'
 ALTER TABLE pending_receipts DROP CONSTRAINT IF EXISTS pending_receipts_status_check;
 ALTER TABLE pending_receipts ADD CONSTRAINT pending_receipts_status_check
   CHECK (status IN (
@@ -39,5 +39,6 @@ ALTER TABLE pending_receipts ADD CONSTRAINT pending_receipts_status_check
     'rejected',
     'error',
     'duplicate',
-    'check_review'
+    'check_review',
+    'split'
   ));

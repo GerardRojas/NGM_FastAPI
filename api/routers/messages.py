@@ -29,8 +29,8 @@ router = APIRouter(prefix="/messages", tags=["messages"])
 
 class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1)
-    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct)$")
-    channel_id: Optional[str] = None  # For custom/direct channels
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct|group)$")
+    channel_id: Optional[str] = None  # For custom/direct/group channels
     project_id: Optional[str] = None  # For project channels
     reply_to_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -55,7 +55,7 @@ class MessageResponse(BaseModel):
 
 
 class ChannelCreate(BaseModel):
-    type: str = Field(..., pattern="^(custom|direct)$")
+    type: str = Field(..., pattern="^(custom|direct|group)$")
     name: Optional[str] = None
     description: Optional[str] = None
     member_ids: List[str] = []
@@ -296,9 +296,9 @@ def get_messages(
             .eq("channel_type", channel_type)
 
         # Filter by channel
-        if channel_type in ["custom", "direct"]:
+        if channel_type in ["custom", "direct", "group"]:
             if not channel_id:
-                raise HTTPException(status_code=400, detail="channel_id required for custom/direct channels")
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group channels")
             query = query.eq("channel_id", channel_id)
         else:
             # Project channels
@@ -351,9 +351,9 @@ def create_message(
             data["metadata"] = payload.metadata
 
         # Set channel reference
-        if payload.channel_type in ["custom", "direct"]:
+        if payload.channel_type in ["custom", "direct", "group"]:
             if not payload.channel_id:
-                raise HTTPException(status_code=400, detail="channel_id required for custom/direct channels")
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group channels")
             data["channel_id"] = payload.channel_id
         else:
             if not payload.project_id:
@@ -648,6 +648,53 @@ def create_channel(
 
         if payload.type == "direct" and len(payload.member_ids) == 0:
             raise HTTPException(status_code=400, detail="At least one member required for direct messages")
+
+        # For group channels, deduplicate by name (return existing if same name)
+        if payload.type == "group":
+            if not payload.name:
+                raise HTTPException(status_code=400, detail="Name required for group channels")
+
+            existing = supabase.table("channels") \
+                .select("id, type, name, description, created_by, created_at") \
+                .eq("type", "group") \
+                .eq("name", payload.name) \
+                .execute()
+
+            if existing.data:
+                channel = normalize_channel(existing.data[0])
+                channel_id = channel["id"]
+
+                # Ensure current user is a member
+                member_check = supabase.table("channel_members") \
+                    .select("id") \
+                    .eq("channel_id", channel_id) \
+                    .eq("user_id", user_id) \
+                    .execute()
+
+                if not member_check.data:
+                    supabase.table("channel_members").insert({
+                        "channel_id": channel_id,
+                        "user_id": user_id,
+                        "role": "member",
+                    }).execute()
+
+                # Return members
+                members_result = supabase.table("channel_members") \
+                    .select("user_id, users(user_id, user_name, avatar_color)") \
+                    .eq("channel_id", channel_id) \
+                    .execute()
+
+                channel["members"] = []
+                for m in (members_result.data or []):
+                    user_data = m.get("users")
+                    if user_data:
+                        channel["members"].append({
+                            "user_id": str(user_data.get("user_id", "")),
+                            "user_name": user_data.get("user_name"),
+                            "avatar_color": user_data.get("avatar_color"),
+                        })
+
+                return {"channel": channel, "existing": True}
 
         # For direct messages, check if a DM already exists with these exact members
         if payload.type == "direct":

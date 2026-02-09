@@ -2,7 +2,7 @@
 # ================================
 # Arturito Bot Message Helper
 # ================================
-# Posts messages to project channels as the Arturito bot user.
+# Posts messages to project channels or group channels as the Arturito bot user.
 # Messages are inserted directly into the messages table;
 # Supabase Realtime delivers them to connected frontends automatically.
 
@@ -51,17 +51,22 @@ def _ensure_bot_user_exists():
 
 def post_bot_message(
     content: str,
-    project_id: str,
+    project_id: str = None,
     channel_type: str = "project_receipts",
+    channel_id: str = None,
     metadata: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
-    Post a message to a project channel as the Arturito bot.
+    Post a message as the Arturito bot.
+
+    For project channels: pass project_id (+ channel_type like project_receipts).
+    For group channels: pass channel_id (+ channel_type="group").
 
     Args:
         content: Message text (markdown supported)
-        project_id: Project UUID
+        project_id: Project UUID (for project channels)
         channel_type: Channel type (default: project_receipts)
+        channel_id: Channel UUID (for group/custom channels)
         metadata: Optional metadata dict (e.g. receipt_id, status)
 
     Returns:
@@ -73,21 +78,29 @@ def post_bot_message(
         message_data = {
             "content": content,
             "channel_type": channel_type,
-            "project_id": project_id,
             "user_id": ARTURITO_BOT_USER_ID,
             "metadata": metadata or {},
             "created_at": datetime.utcnow().isoformat(),
         }
 
-        print(f"[BotMessenger] Inserting message | project={project_id} | type={channel_type}")
+        if channel_id:
+            message_data["channel_id"] = channel_id
+        elif project_id:
+            message_data["project_id"] = project_id
+        else:
+            print("[BotMessenger] WARNING: No project_id or channel_id provided")
+            return None
+
+        target = f"channel={channel_id}" if channel_id else f"project={project_id}"
+        print(f"[BotMessenger] Inserting message | {target} | type={channel_type}")
         result = supabase.table("messages").insert(message_data).execute()
 
         if result.data and len(result.data) > 0:
             msg_id = result.data[0].get("id", "?")
-            print(f"[BotMessenger] Message posted OK | id={msg_id} | project={project_id}")
+            print(f"[BotMessenger] Message posted OK | id={msg_id} | {target}")
             return result.data[0]
 
-        print(f"[BotMessenger] Insert returned no data | project={project_id}")
+        print(f"[BotMessenger] Insert returned no data | {target}")
         return None
 
     except Exception as e:

@@ -17,17 +17,17 @@ router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
 class TaskCreate(BaseModel):
     task_description: str
-    company: str  # UUID de la empresa
+    company: Optional[str] = None  # UUID de la empresa
     project: Optional[str] = None  # UUID del proyecto
-    owner: str  # UUID del owner
+    owner: Optional[str] = None  # UUID del owner
     collaborator: Optional[str] = None  # UUID del colaborador
-    type: str  # UUID del tipo de tarea
-    department: str  # UUID del departamento
+    type: Optional[str] = None  # UUID del tipo de tarea
+    department: Optional[str] = None  # UUID del departamento
     due_date: Optional[str] = None  # Fecha YYYY-MM-DD
     deadline: Optional[str] = None  # Fecha YYYY-MM-DD
     status: str = "not started"  # Nombre del status
 
-    @field_validator("task_description", "company", "owner", "type", "department")
+    @field_validator("task_description")
     @classmethod
     def not_empty(cls, v: str) -> str:
         if not v or not v.strip():
@@ -338,9 +338,9 @@ def create_task(payload: TaskCreate) -> Dict[str, Any]:
 
         status_id = status_response.data[0]["task_status_id"]
 
-        # Preparar datos para insertar
-        task_data = {
-            "task_description": payload.task_description,
+        # Preparar datos para insertar (solo campos con valor)
+        task_data = {"task_description": payload.task_description, "task_status": status_id}
+        optional_mappings = {
             "company_management": payload.company,
             "project_id": payload.project,
             "Owner_id": payload.owner,
@@ -349,8 +349,10 @@ def create_task(payload: TaskCreate) -> Dict[str, Any]:
             "task_department": payload.department,
             "due_date": payload.due_date,
             "deadline": payload.deadline,
-            "task_status": status_id,
         }
+        for col, val in optional_mappings.items():
+            if val is not None:
+                task_data[col] = val
 
         # Insertar tarea
         response = supabase.table("tasks").insert(task_data).execute()
@@ -424,16 +426,25 @@ def patch_task(task_id: str, payload: TaskUpdate) -> Dict[str, Any]:
             if field == "status" and value is not None:
                 # Intentar buscar por nombre si no parece UUID
                 try:
-                    # Si es UUID válido, usarlo directamente
                     import uuid
                     uuid.UUID(value)
                     update_data[column] = value
                 except ValueError:
-                    # Buscar por nombre
                     status_response = supabase.table("tasks_status").select("task_status_id").ilike("task_status", value).execute()
                     if not status_response.data:
                         raise HTTPException(status_code=400, detail=f"Invalid status: '{value}'")
                     update_data[column] = status_response.data[0]["task_status_id"]
+            # Manejar priority (puede ser nombre o UUID)
+            elif field == "priority" and value is not None:
+                try:
+                    import uuid
+                    uuid.UUID(value)
+                    update_data[column] = value
+                except ValueError:
+                    priority_response = supabase.table("tasks_priority").select("priority_id").ilike("priority", value).execute()
+                    if not priority_response.data:
+                        raise HTTPException(status_code=400, detail=f"Invalid priority: '{value}'")
+                    update_data[column] = priority_response.data[0]["priority_id"]
             else:
                 update_data[column] = value
 

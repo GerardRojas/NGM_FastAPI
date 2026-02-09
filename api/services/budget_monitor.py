@@ -18,6 +18,8 @@ import os
 
 from supabase import create_client, Client
 
+from api.helpers.daneel_messenger import post_daneel_message
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -444,6 +446,66 @@ async def notify_recipients(alert: Dict, recipients: List[Dict]):
 
 
 # ============================================================================
+# Daneel Channel Alerts
+# ============================================================================
+
+def format_channel_alert(alert: Dict) -> str:
+    """Format a budget alert as a channel message for Daneel to post."""
+    alert_type = alert["alert_type"]
+    account = alert["account_name"]
+    budget = alert["budget_amount"]
+    actual = alert["actual_amount"]
+    pct = alert["percentage"]
+
+    if alert_type == "overspend":
+        over = actual - budget
+        return (
+            f"Budget Exceeded: {account}\n"
+            f"Budget: ${budget:,.2f} | Actual: ${actual:,.2f} | Over by ${over:,.2f} ({pct:.1f}%)\n"
+            f"Action required - acknowledge in Budget Monitor."
+        )
+
+    if alert_type == "critical":
+        remaining = budget - actual
+        return (
+            f"Budget Critical: {account}\n"
+            f"{pct:.1f}% used | ${remaining:,.2f} remaining of ${budget:,.2f} budget."
+        )
+
+    if alert_type == "warning":
+        remaining = budget - actual
+        return (
+            f"Budget Warning: {account}\n"
+            f"{pct:.1f}% used | ${remaining:,.2f} remaining of ${budget:,.2f} budget."
+        )
+
+    if alert_type == "no_budget":
+        return (
+            f"Unbudgeted Expense: ${actual:,.2f} in {account}\n"
+            f"No budget assigned for this account. Review recommended."
+        )
+
+    return alert.get("message", "Budget alert")
+
+
+def post_alert_to_channel(alert: Dict):
+    """Post a budget alert to the project's accounting channel as Daneel."""
+    content = format_channel_alert(alert)
+    metadata = {
+        "alert_type": alert["alert_type"],
+        "account_name": alert["account_name"],
+        "percentage": alert.get("percentage", 0),
+        "budget_amount": alert["budget_amount"],
+        "actual_amount": alert["actual_amount"],
+    }
+    post_daneel_message(
+        content=content,
+        project_id=alert["project_id"],
+        metadata=metadata,
+    )
+
+
+# ============================================================================
 # Main Check Function
 # ============================================================================
 
@@ -488,6 +550,9 @@ async def check_project_budgets(
             await save_alert_log(alert, notified)
             alerts_sent += 1
             logger.info(f"[BudgetMonitor] Alert sent: {alert['title']} to {len(notified)} users")
+
+            # Post to project accounting channel as Daneel
+            post_alert_to_channel(alert)
 
     return alerts_sent
 

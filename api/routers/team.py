@@ -19,6 +19,7 @@ SELECT_CLAUSE = """
   user_name,
   user_photo,
   avatar_color,
+  is_external,
   user_phone_number,
   user_birthday,
   user_address,
@@ -41,6 +42,7 @@ def normalize_user_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "user_name": r.get("user_name"),
         "user_photo": r.get("user_photo"),
         "avatar_color": r.get("avatar_color"),
+        "is_external": r.get("is_external", False),
         "user_phone_number": r.get("user_phone_number"),
         "user_birthday": r.get("user_birthday"),
         "user_address": r.get("user_address"),
@@ -72,6 +74,7 @@ class UserCreate(BaseModel):
 
     user_photo: Optional[str] = None
     avatar_color: Optional[int] = Field(default=None, ge=0, le=360)
+    is_external: Optional[bool] = False
 
     user_phone_number: Optional[str] = None
     user_birthday: Optional[str] = None  # "YYYY-MM-DD"
@@ -90,6 +93,7 @@ class UserUpdate(BaseModel):
 
     user_photo: Optional[str] = None
     avatar_color: Optional[int] = Field(default=None, ge=0, le=360)
+    is_external: Optional[bool] = None
 
     user_phone_number: Optional[str] = None
     user_birthday: Optional[str] = None  # "YYYY-MM-DD"
@@ -231,6 +235,7 @@ def create_user(payload: UserCreate) -> Dict[str, Any]:
         "user_name": data.get("user_name"),
         "user_photo": data.get("user_photo"),
         "avatar_color": data.get("avatar_color"),
+        "is_external": data.get("is_external", False),
         "user_phone_number": data.get("user_phone_number"),
         "user_birthday": data.get("user_birthday"),
         "user_address": data.get("user_address"),
@@ -270,6 +275,7 @@ def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
         "user_name",
         "user_photo",
         "avatar_color",
+        "is_external",
         "user_phone_number",
         "user_birthday",
         "user_address",
