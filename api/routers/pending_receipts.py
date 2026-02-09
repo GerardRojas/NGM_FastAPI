@@ -116,6 +116,12 @@ class CheckActionRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+class DuplicateActionRequest(BaseModel):
+    """User action in the duplicate confirmation conversation"""
+    action: str  # confirm_process, skip
+    user_id: Optional[str] = None
+
+
 # ====== HELPERS ======
 
 def ensure_bucket_exists():
@@ -694,18 +700,33 @@ async def agent_process_receipt(
         hash_dup = _check_file_hash_duplicate(file_hash, project_id, receipt_id)
         if hash_dup and not force:
             print(f"[Agent] Step 2: DUPLICATE FOUND | matches receipt {hash_dup.get('id')}")
+
+            dup_vendor = hash_dup.get("vendor_name") or "Unknown"
+            dup_amount = hash_dup.get("amount") or 0
+            dup_date = hash_dup.get("receipt_date") or "Unknown"
+
+            # Store duplicate flow state in parsed_data (same pattern as check_flow)
+            duplicate_flow = {
+                "state": "awaiting_confirmation",
+                "detected_at": datetime.utcnow().isoformat(),
+                "duplicate_of": hash_dup.get("id"),
+                "dup_vendor": dup_vendor,
+                "dup_amount": float(dup_amount),
+                "dup_date": str(dup_date),
+            }
+
+            existing_parsed = receipt_data.get("parsed_data") or {}
+            existing_parsed["duplicate_flow"] = duplicate_flow
+
             supabase.table("pending_receipts") \
                 .update({
                     "status": "duplicate",
+                    "parsed_data": existing_parsed,
                     "processing_error": f"Duplicate of receipt {hash_dup.get('id')}",
                     "updated_at": datetime.utcnow().isoformat()
                 }) \
                 .eq("id", receipt_id) \
                 .execute()
-
-            dup_vendor = hash_dup.get("vendor_name") or "Unknown"
-            dup_amount = hash_dup.get("amount") or 0
-            dup_date = hash_dup.get("receipt_date") or "Unknown"
 
             post_bot_message(
                 content=(
@@ -720,7 +741,9 @@ async def agent_process_receipt(
                     "pending_receipt_id": receipt_id,
                     "receipt_status": "duplicate",
                     "duplicate_of": hash_dup.get("id"),
-                    "allow_force_process": True
+                    "allow_force_process": True,
+                    "duplicate_flow_active": True,
+                    "duplicate_flow_state": "awaiting_confirmation",
                 }
             )
 
@@ -1757,6 +1780,100 @@ async def check_action(receipt_id: str, payload: CheckActionRequest):
     except Exception as e:
         print(f"[CheckFlow] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Check action error: {str(e)}")
+
+
+# ====== DUPLICATE-ACTION ENDPOINT ======
+
+@router.post("/{receipt_id}/duplicate-action")
+async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
+    """
+    Handle a user response in the duplicate confirmation conversation.
+    Actions: confirm_process (yes), skip (no).
+    """
+    try:
+        receipt = supabase.table("pending_receipts") \
+            .select("*") \
+            .eq("id", receipt_id) \
+            .single() \
+            .execute()
+
+        if not receipt.data:
+            raise HTTPException(status_code=404, detail="Receipt not found")
+
+        receipt_data = receipt.data
+        project_id = receipt_data["project_id"]
+        parsed_data = receipt_data.get("parsed_data") or {}
+        duplicate_flow = parsed_data.get("duplicate_flow")
+
+        if not duplicate_flow:
+            raise HTTPException(status_code=400, detail="No active duplicate flow for this receipt")
+
+        current_state = duplicate_flow.get("state")
+        action = payload.action
+
+        print(f"[DuplicateFlow] receipt={receipt_id} | state={current_state} | action={action}")
+
+        if current_state != "awaiting_confirmation":
+            raise HTTPException(status_code=400, detail=f"Duplicate flow already resolved (state: {current_state})")
+
+        if action == "confirm_process":
+            # User confirmed: process anyway
+            duplicate_flow["state"] = "confirmed"
+            parsed_data["duplicate_flow"] = duplicate_flow
+            supabase.table("pending_receipts").update({
+                "status": "pending",
+                "parsed_data": parsed_data,
+                "processing_error": None,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", receipt_id).execute()
+
+            post_bot_message(
+                content="Got it, processing this receipt anyway.",
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "processing",
+                    "duplicate_flow_active": False,
+                    "duplicate_flow_state": "confirmed",
+                }
+            )
+
+            # Re-trigger processing with force=True
+            await agent_process_receipt(receipt_id, force=True)
+            return {"success": True, "state": "confirmed"}
+
+        elif action == "skip":
+            # User declined: keep as duplicate
+            duplicate_flow["state"] = "skipped"
+            parsed_data["duplicate_flow"] = duplicate_flow
+            supabase.table("pending_receipts").update({
+                "parsed_data": parsed_data,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", receipt_id).execute()
+
+            post_bot_message(
+                content="No problem, I will skip this one.",
+                project_id=project_id,
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "duplicate",
+                    "duplicate_flow_active": False,
+                    "duplicate_flow_state": "skipped",
+                }
+            )
+
+            return {"success": True, "state": "skipped"}
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for duplicate flow")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[DuplicateFlow] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Duplicate action error: {str(e)}")
 
 
 @router.post("/{receipt_id}/create-expense")
