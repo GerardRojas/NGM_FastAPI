@@ -189,14 +189,14 @@ async def list_estimates():
 
         files = supabase.storage.from_(ESTIMATES_BUCKET).list()
 
-        # Filter for folders (estimates)
+        # Filter for folders (estimates) - folders have no extension in name
         estimates = []
         for item in files or []:
-            if item.get("id") and not "." in item.get("name", ""):
-                # It's a folder
+            name = item.get("name", "")
+            if name and "." not in name:
                 estimates.append({
-                    "id": item.get("name"),
-                    "name": item.get("name"),
+                    "id": name,
+                    "name": name,
                     "created_at": item.get("created_at"),
                     "updated_at": item.get("updated_at")
                 })
