@@ -350,9 +350,6 @@ def create_message(
         if payload.metadata:
             data["metadata"] = payload.metadata
 
-        if payload.attachments:
-            data["attachments"] = payload.attachments
-
         # Set channel reference
         if payload.channel_type in ["custom", "direct"]:
             if not payload.channel_id:
@@ -363,14 +360,40 @@ def create_message(
                 raise HTTPException(status_code=400, detail="project_id required for project channels")
             data["project_id"] = payload.project_id
 
+        # Don't include reply_to_id if null (avoid FK issues)
+        if not payload.reply_to_id:
+            data.pop("reply_to_id", None)
+
         result = supabase.table("messages").insert(data).execute()
 
         if not result.data:
             raise HTTPException(status_code=500, detail="Failed to create message")
 
-        # Get user info for response
         msg = result.data[0]
+        message_id = msg["id"]
+
+        # Insert attachments into message_attachments table (separate from messages)
+        saved_attachments = []
+        if payload.attachments:
+            for att in payload.attachments:
+                try:
+                    att_data = {
+                        "message_id": message_id,
+                        "name": att.get("name", ""),
+                        "type": att.get("type", ""),
+                        "size": att.get("size", 0),
+                        "url": att.get("url", ""),
+                        "thumbnail_url": att.get("thumbnail_url"),
+                    }
+                    att_result = supabase.table("message_attachments").insert(att_data).execute()
+                    if att_result.data:
+                        saved_attachments.append(att_result.data[0])
+                except Exception as att_err:
+                    print(f"[Messages] Attachment insert error (non-blocking): {att_err}")
+
+        # Get user info for response
         response = normalize_message(msg)
+        response["attachments"] = saved_attachments or payload.attachments
         sender_name = "Someone"
         sender_avatar_color = None
 

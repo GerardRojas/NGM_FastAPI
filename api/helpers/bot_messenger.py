@@ -12,6 +12,36 @@ from datetime import datetime
 
 ARTURITO_BOT_USER_ID = "00000000-0000-0000-0000-000000000001"
 
+_bot_user_verified = False
+
+
+def _ensure_bot_user_exists():
+    """Create Arturito bot user if it doesn't exist (runs once per process)."""
+    global _bot_user_verified
+    if _bot_user_verified:
+        return
+
+    try:
+        result = supabase.table("users") \
+            .select("user_id") \
+            .eq("user_id", ARTURITO_BOT_USER_ID) \
+            .execute()
+
+        if not result.data or len(result.data) == 0:
+            print("[BotMessenger] Arturito user not found, creating...")
+            supabase.table("users").insert({
+                "user_id": ARTURITO_BOT_USER_ID,
+                "user_name": "Arturito",
+                "avatar_color": 35,
+            }).execute()
+            print("[BotMessenger] Arturito user created successfully")
+
+        _bot_user_verified = True
+    except Exception as e:
+        print(f"[BotMessenger] Error ensuring bot user exists: {e}")
+        # Still mark as verified to avoid retrying every message
+        _bot_user_verified = True
+
 
 def post_bot_message(
     content: str,
@@ -31,6 +61,8 @@ def post_bot_message(
     Returns:
         Created message record or None on failure
     """
+    _ensure_bot_user_exists()
+
     try:
         message_data = {
             "content": content,
@@ -44,7 +76,10 @@ def post_bot_message(
         result = supabase.table("messages").insert(message_data).execute()
 
         if result.data and len(result.data) > 0:
+            print(f"[BotMessenger] Message posted OK | project={project_id}")
             return result.data[0]
+
+        print(f"[BotMessenger] Insert returned no data | project={project_id}")
         return None
 
     except Exception as e:
