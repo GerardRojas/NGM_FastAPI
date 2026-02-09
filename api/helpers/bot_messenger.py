@@ -36,7 +36,7 @@ def _ensure_bot_user_exists():
             supabase.table("users").insert({
                 "user_id": ARTURITO_BOT_USER_ID,
                 "user_name": "Arturito",
-                "avatar_color": 35,
+                "avatar_color": 145,
                 "password_hash": dummy_hash,
             }).execute()
             print("[BotMessenger] Arturito user created successfully")

@@ -596,7 +596,7 @@ def _detect_language(text: str) -> str:
     return "en"
 
 
-def _build_agent_message(parsed_data, categorize_data, warnings, lang="en"):
+def _build_agent_message(parsed_data, categorize_data, warnings, lang="en", expense_created=False):
     """Build Arturito's summary message for the receipts channel."""
     vendor = parsed_data.get("vendor_name") or "Unknown"
     amount = parsed_data.get("amount") or 0
@@ -612,7 +612,10 @@ def _build_agent_message(parsed_data, categorize_data, warnings, lang="en"):
         body = f"Categoria: **{category}** ({confidence}% confianza)"
         if warnings:
             body += "\n\nAtencion:\n" + "\n".join(f"- {w}" for w in warnings)
-        body += "\n\nListo para revision en Expenses > From Pending."
+        if expense_created:
+            body += "\n\nGasto guardado -- listo para autorizacion."
+        else:
+            body += "\n\nListo para revision en Expenses > From Pending."
     else:
         header = f"I scanned this receipt from **{vendor}** -- ${amount:,.2f}"
         if date != "Unknown":
@@ -621,7 +624,10 @@ def _build_agent_message(parsed_data, categorize_data, warnings, lang="en"):
         body = f"Category: **{category}** ({confidence}% confidence)"
         if warnings:
             body += "\n\nHeads up:\n" + "\n".join(f"- {w}" for w in warnings)
-        body += "\n\nReady for review in Expenses > From Pending."
+        if expense_created:
+            body += "\n\nExpense saved -- ready for authorization."
+        else:
+            body += "\n\nReady for review in Expenses > From Pending."
 
     return f"{header}\n{body}"
 
@@ -1056,11 +1062,54 @@ Return ONLY valid JSON:
 
         print(f"[Agent] Step 6: Receipt updated in DB | status=ready")
 
+        # ===== STEP 6.5: Auto-create expense =====
+        expense_id = None
+        try:
+            expense_data = {
+                "project": project_id,
+                "Amount": parsed_data.get("amount"),
+                "TxnDate": parsed_data.get("receipt_date"),
+                "LineDescription": parsed_data.get("description") or f"Receipt: {receipt_data.get('file_name')}",
+                "account_id": final_account_id,
+                "created_by": receipt_data.get("uploaded_by"),
+                "receipt_url": receipt_data.get("file_url"),
+                "auth_status": False,
+            }
+
+            if vendor_id:
+                expense_data["vendor_id"] = vendor_id
+
+            # Remove None values
+            expense_data = {k: v for k, v in expense_data.items() if v is not None}
+
+            expense_result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
+
+            if expense_result.data:
+                expense_id = expense_result.data[0].get("expense_id")
+
+                # Link receipt to expense
+                supabase.table("pending_receipts") \
+                    .update({
+                        "expense_id": expense_id,
+                        "status": "linked",
+                        "linked_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat()
+                    }) \
+                    .eq("id", receipt_id) \
+                    .execute()
+
+                print(f"[Agent] Step 6.5: Expense created | expense_id={expense_id}")
+            else:
+                print("[Agent] Step 6.5: Expense insert returned no data")
+
+        except Exception as exp_err:
+            print(f"[Agent] Step 6.5: Expense creation failed (non-blocking): {exp_err}")
+
         # ===== STEP 7: Post Arturito summary message =====
         text_sample = f"{parsed_data.get('vendor_name', '')} {description}"
         lang = _detect_language(text_sample)
 
-        msg_content = _build_agent_message(parsed_data, categorize_data, warnings, lang)
+        msg_content = _build_agent_message(parsed_data, categorize_data, warnings, lang, expense_created=expense_id is not None)
 
         post_bot_message(
             content=msg_content,
@@ -1068,19 +1117,19 @@ Return ONLY valid JSON:
             metadata={
                 "agent_message": True,
                 "pending_receipt_id": receipt_id,
-                "receipt_status": "ready",
+                "receipt_status": "linked" if expense_id else "ready",
                 "has_warnings": len(warnings) > 0,
                 "confidence": final_confidence
             }
         )
 
         print(f"[Agent] Step 7: Arturito message posted | lang={lang}")
-        print(f"[Agent] === DONE receipt {receipt_id} | {parsed_data.get('vendor_name')} ${parsed_data.get('amount')} -> {final_category} ({final_confidence}%) ===")
+        print(f"[Agent] === DONE receipt {receipt_id} | {parsed_data.get('vendor_name')} ${parsed_data.get('amount')} -> {final_category} ({final_confidence}%) | expense={'created' if expense_id else 'skipped'} ===")
 
         return {
             "success": True,
-            "status": "ready",
-            "message": "Receipt processed successfully",
+            "status": "linked" if expense_id else "ready",
+            "message": "Receipt processed and expense created" if expense_id else "Receipt processed successfully",
             "data": {
                 "vendor_name": parsed_data.get("vendor_name"),
                 "amount": parsed_data.get("amount"),
@@ -1088,7 +1137,8 @@ Return ONLY valid JSON:
                 "category": final_category,
                 "confidence": final_confidence,
             },
-            "warnings": warnings
+            "warnings": warnings,
+            "expense_id": expense_id,
         }
 
     except HTTPException:

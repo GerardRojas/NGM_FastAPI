@@ -35,7 +35,7 @@ INSERT INTO users (user_id, user_name, avatar_color, password_hash)
 VALUES (
   '00000000-0000-0000-0000-000000000001',
   'Arturito',
-  35,
+  145,
   '$2b$12$BotNoLoginBotNoLoginBotNO1.1.1.1.1.1.1.1.1.1.1.1.1.1'
 )
 ON CONFLICT (user_id) DO UPDATE SET
