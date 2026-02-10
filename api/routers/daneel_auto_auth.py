@@ -169,12 +169,24 @@ async def update_auto_auth_config(payload: AutoAuthConfigUpdate):
     import json
     try:
         update_data = {k: v for k, v in payload.dict().items() if v is not None}
+        now = datetime.now(timezone.utc).isoformat()
         for key, value in update_data.items():
-            supabase.table("agent_config").upsert({
-                "key": key,
-                "value": json.dumps(value) if not isinstance(value, (str, int, float, bool)) else value,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
+            # Non-strings get json.dumps so JSONB stores them as parseable strings
+            json_val = value if isinstance(value, str) else json.dumps(value)
+            # Explicit SELECT + UPDATE/INSERT (upsert can silently no-op)
+            existing = supabase.table("agent_config") \
+                .select("key") \
+                .eq("key", key) \
+                .execute()
+            if existing.data:
+                supabase.table("agent_config") \
+                    .update({"value": json_val, "updated_at": now}) \
+                    .eq("key", key) \
+                    .execute()
+            else:
+                supabase.table("agent_config") \
+                    .insert({"key": key, "value": json_val, "updated_at": now}) \
+                    .execute()
         return {"ok": True, "updated_keys": list(update_data.keys())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating config: {str(e)}")

@@ -95,11 +95,22 @@ def _save_config_key(key: str, value):
     import json
     try:
         sb = _get_supabase()
-        sb.table("agent_config").upsert({
-            "key": key,
-            "value": json.dumps(value) if not isinstance(value, (str, int, float, bool)) else value,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        now = datetime.now(timezone.utc).isoformat()
+        json_val = value if isinstance(value, str) else json.dumps(value)
+        # Explicit SELECT + UPDATE/INSERT (upsert can silently no-op)
+        existing = sb.table("agent_config") \
+            .select("key") \
+            .eq("key", key) \
+            .execute()
+        if existing.data:
+            sb.table("agent_config") \
+                .update({"value": json_val, "updated_at": now}) \
+                .eq("key", key) \
+                .execute()
+        else:
+            sb.table("agent_config") \
+                .insert({"key": key, "value": json_val, "updated_at": now}) \
+                .execute()
     except Exception as e:
         logger.error(f"[DaneelAutoAuth] Config save error for {key}: {e}")
 
