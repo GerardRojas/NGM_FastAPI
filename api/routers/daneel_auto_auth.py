@@ -364,3 +364,17 @@ async def get_auth_report(report_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting report: {str(e)}")
+
+
+@router.delete("/auto-auth/reports")
+async def delete_auth_reports():
+    """Delete all auth reports."""
+    try:
+        # Supabase requires a filter for delete; use created_at > epoch to match all
+        supabase.table("daneel_auth_reports") \
+            .delete() \
+            .gt("created_at", "1970-01-01T00:00:00Z") \
+            .execute()
+        return {"ok": True, "message": "All reports deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting reports: {str(e)}")
