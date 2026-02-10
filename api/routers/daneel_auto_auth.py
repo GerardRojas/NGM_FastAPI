@@ -266,3 +266,89 @@ async def get_project_summary():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting project summary: {str(e)}")
+
+
+# ================================
+# AUTH REPORTS
+# ================================
+
+@router.get("/auto-auth/reports")
+async def list_auth_reports(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """List recent auth reports (newest first)."""
+    try:
+        import json
+        result = supabase.table("daneel_auth_reports") \
+            .select("report_id, report_type, project_id, project_name, created_at, summary") \
+            .order("created_at", desc=True) \
+            .range(offset, offset + limit - 1) \
+            .execute()
+
+        reports = []
+        for r in (result.data or []):
+            s = r.get("summary") or {}
+            if isinstance(s, str):
+                try:
+                    s = json.loads(s)
+                except Exception:
+                    s = {}
+            reports.append({
+                "report_id": r["report_id"],
+                "report_type": r["report_type"],
+                "project_id": r.get("project_id"),
+                "project_name": r.get("project_name"),
+                "created_at": r["created_at"],
+                "authorized": s.get("authorized", 0),
+                "missing_info": s.get("missing_info", 0),
+                "duplicates": s.get("duplicates", 0),
+                "escalated": s.get("escalated", 0),
+                "expenses_processed": s.get("expenses_processed", 0),
+            })
+        return {"data": reports}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing reports: {str(e)}")
+
+
+@router.get("/auto-auth/reports/{report_id}")
+async def get_auth_report(report_id: str):
+    """Get a single auth report with full decision detail."""
+    try:
+        import json
+        result = supabase.table("daneel_auth_reports") \
+            .select("*") \
+            .eq("report_id", report_id) \
+            .single() \
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        r = result.data
+        s = r.get("summary") or {}
+        d = r.get("decisions") or []
+        if isinstance(s, str):
+            try:
+                s = json.loads(s)
+            except Exception:
+                s = {}
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except Exception:
+                d = []
+
+        return {
+            "report_id": r["report_id"],
+            "report_type": r["report_type"],
+            "project_id": r.get("project_id"),
+            "project_name": r.get("project_name"),
+            "created_at": r["created_at"],
+            "summary": s,
+            "decisions": d,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting report: {str(e)}")

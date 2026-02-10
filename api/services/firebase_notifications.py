@@ -112,7 +112,8 @@ async def send_push_notification(
     body: str,
     data: Optional[dict] = None,
     sender_name: Optional[str] = None,
-    avatar_color: Optional[str] = None
+    avatar_color: Optional[str] = None,
+    tag: str = "ngm-mention"
 ) -> bool:
     """
     Send a push notification to all devices of a user.
@@ -124,6 +125,7 @@ async def send_push_notification(
         data: Optional custom data payload
         sender_name: Name of the sender (for avatar)
         avatar_color: Color for the avatar
+        tag: Webpush notification tag (notifications with same tag replace each other)
 
     Returns:
         True if at least one notification was sent successfully
@@ -166,7 +168,7 @@ async def send_push_notification(
                     notification=messaging.WebpushNotification(
                         icon="/assets/img/greenblack_icon.png",
                         badge="/assets/img/greenblack_icon.png",
-                        tag="ngm-mention",
+                        tag=tag,
                         require_interaction=True
                     ),
                     fcm_options=messaging.WebpushFCMOptions(
@@ -249,6 +251,73 @@ async def notify_mentioned_users(
             notified_count += 1
 
     logger.info(f"[Firebase] Notified {notified_count}/{len(mentioned_user_ids)} mentioned users")
+    return notified_count
+
+
+# ============================================================================
+# Notify Message Recipients (DM / Group)
+# ============================================================================
+
+async def notify_message_recipients(
+    recipient_user_ids: List[str],
+    sender_name: str,
+    message_preview: str,
+    channel_name: str,
+    channel_type: str,
+    message_url: Optional[str] = None,
+    avatar_color: Optional[str] = None
+) -> int:
+    """
+    Send push notifications to DM/group message recipients.
+
+    Args:
+        recipient_user_ids: List of user UUIDs to notify (sender already excluded)
+        sender_name: Name of the person who sent the message
+        message_preview: Preview of the message content
+        channel_name: Name of the channel (for group) or sender name (for DM)
+        channel_type: "direct" or "group"
+        message_url: URL to open when notification is clicked
+        avatar_color: Color for sender's avatar
+
+    Returns:
+        Number of users successfully notified
+    """
+    if not recipient_user_ids:
+        return 0
+
+    preview = message_preview[:100]
+    if len(message_preview) > 100:
+        preview += "..."
+
+    if channel_type == "direct":
+        title = sender_name
+        body = preview
+    else:
+        title = f"{sender_name} in {channel_name}"
+        body = preview
+
+    data = {
+        "type": "message",
+        "channel": channel_name,
+        "url": message_url or "/messages.html"
+    }
+
+    notified_count = 0
+
+    for user_id in recipient_user_ids:
+        success = await send_push_notification(
+            user_id=user_id,
+            title=title,
+            body=body,
+            data=data,
+            sender_name=sender_name,
+            avatar_color=avatar_color,
+            tag=f"ngm-msg-{channel_name[:20]}"
+        )
+        if success:
+            notified_count += 1
+
+    logger.info(f"[Firebase] Notified {notified_count}/{len(recipient_user_ids)} {channel_type} recipients")
     return notified_count
 
 

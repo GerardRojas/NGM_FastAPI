@@ -43,3 +43,25 @@ CREATE POLICY "Service role full access on daneel_pending_info" ON daneel_pendin
     FOR ALL
     USING (auth.role() = 'service_role')
     WITH CHECK (auth.role() = 'service_role');
+
+-- 3. Auth reports: decision log for each run session
+CREATE TABLE IF NOT EXISTS daneel_auth_reports (
+    report_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_type TEXT NOT NULL,          -- 'project_run', 'backlog', 'realtime_batch'
+    project_id  UUID,
+    project_name TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    summary     JSONB NOT NULL DEFAULT '{}',
+    decisions   JSONB NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_daneel_reports_created
+    ON daneel_auth_reports (created_at DESC);
+
+ALTER TABLE daneel_auth_reports ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Service role full access on daneel_auth_reports" ON daneel_auth_reports;
+CREATE POLICY "Service role full access on daneel_auth_reports" ON daneel_auth_reports
+    FOR ALL
+    USING (auth.role() = 'service_role')
+    WITH CHECK (auth.role() = 'service_role');

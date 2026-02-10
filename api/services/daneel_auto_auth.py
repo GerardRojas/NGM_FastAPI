@@ -651,6 +651,43 @@ def _resolve_pending_info(sb, expense_id: str):
 
 
 # ============================================================================
+# Auth report persistence
+# ============================================================================
+
+def _save_auth_report(sb, report_type: str, summary: dict, decisions: list,
+                      project_id: Optional[str] = None, project_name: Optional[str] = None):
+    """Save an auth report with per-expense decisions."""
+    import json as _json
+    try:
+        sb.table("daneel_auth_reports").insert({
+            "report_type": report_type,
+            "project_id": project_id,
+            "project_name": project_name,
+            "summary": _json.dumps(summary),
+            "decisions": _json.dumps(decisions),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] save_auth_report failed: {e}")
+
+
+def _make_decision_entry(expense: dict, lookups: dict, decision: str,
+                         rule: str = "", reason: str = "", missing_fields: list = None) -> dict:
+    """Build a compact decision object for the report."""
+    return {
+        "expense_id": expense.get("expense_id") or expense.get("id"),
+        "vendor": lookups["vendors"].get(expense.get("vendor_id"), "Unknown"),
+        "amount": float(expense.get("Amount") or 0),
+        "date": (expense.get("TxnDate") or "")[:10],
+        "bill_id": expense.get("bill_id") or "",
+        "decision": decision,
+        "rule": rule,
+        "reason": reason,
+        "missing_fields": missing_fields or [],
+    }
+
+
+# ============================================================================
 # Message builders
 # ============================================================================
 
@@ -781,10 +818,11 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
     query = sb.table("expenses_manual_COGS") \
         .select("*") \
         .eq("status", "pending")
-    if not process_all and last_run:
-        query = query.gt("created_at", last_run)
     if project_id:
+        # Per-project run: always process ALL pending for that project
         query = query.eq("project", project_id)
+    elif not process_all and last_run:
+        query = query.gt("created_at", last_run)
     result = query.order("created_at").execute()
 
     pending = result.data or []
@@ -813,17 +851,28 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
     total_missing = 0
     total_duplicates = 0
     total_escalated = 0
+    missing_detail = []   # [{expense_id, vendor, missing_fields}]
+    all_decisions = []    # decision entries for auth report
 
-    for project_id, expenses in projects.items():
+    # Resolve project names for reports
+    proj_names = {}
+    try:
+        pn_result = sb.table("projects").select("project_id, project_name").execute()
+        proj_names = {p["project_id"]: p["project_name"] for p in (pn_result.data or [])}
+    except Exception:
+        pass
+
+    for pid, expenses in projects.items():
         authorized_list = []
         missing_info_list = []
         duplicate_list = []
         escalation_list = []
+        decisions = []  # per-project decisions for report
 
         # Load all expenses for this project (for duplicate comparison)
         all_project = sb.table("expenses_manual_COGS") \
             .select("*") \
-            .eq("project", project_id) \
+            .eq("project", pid) \
             .execute()
         all_project_expenses = all_project.data or []
 
@@ -835,7 +884,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 by_vendor.setdefault(vid, []).append(e)
 
         # Phase 1: Rule engine -- classify each expense
-        auth_candidates = []  # (expense, rule) tuples ready for authorization
+        auth_candidates = []  # (expense, rule, reason) tuples ready for authorization
 
         for expense in expenses:
             exp_id = expense.get("expense_id") or expense.get("id")
@@ -844,7 +893,13 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             missing = run_health_check(expense, cfg, bills_map)
             if missing:
                 missing_info_list.append({"expense": expense, "missing": missing})
-                _track_pending_info(sb, exp_id, project_id, missing)
+                _track_pending_info(sb, exp_id, pid, missing)
+                decisions.append(_make_decision_entry(
+                    expense, lookups, "missing_info",
+                    rule="HEALTH", reason="Health check failed", missing_fields=missing))
+            else:
+                # Resolve any stale pending-info record from a previous run
+                _resolve_pending_info(sb, exp_id)
 
             # 1b. Bill hint cross-validation (soft armoring layer)
             from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
@@ -860,10 +915,10 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                         date_str=(expense.get("TxnDate") or ""),
                     )
                     if hint_val.get("amount_match") is False:
-                        escalation_list.append({
-                            "expense": expense,
-                            "reason": f"Bill hint amount mismatch: {hint_val['mismatches'][0]}"
-                        })
+                        reason_txt = f"Bill hint amount mismatch: {hint_val['mismatches'][0]}"
+                        escalation_list.append({"expense": expense, "reason": reason_txt})
+                        decisions.append(_make_decision_entry(
+                            expense, lookups, "escalated", rule="BILL_HINT", reason=reason_txt))
                         continue
 
             # 2. Duplicate check
@@ -873,6 +928,8 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
 
             if dup_result.verdict == "duplicate":
                 duplicate_list.append({"expense": expense, "result": dup_result})
+                decisions.append(_make_decision_entry(
+                    expense, lookups, "duplicate", rule=dup_result.rule, reason=dup_result.details))
                 continue  # do NOT authorize
 
             if dup_result.verdict == "need_info":
@@ -880,7 +937,10 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 if not missing:
                     need_fields = ["receipt"] if "receipt" in dup_result.rule.lower() else ["bill_id", "receipt"]
                     missing_info_list.append({"expense": expense, "missing": need_fields})
-                    _track_pending_info(sb, exp_id, project_id, need_fields)
+                    _track_pending_info(sb, exp_id, pid, need_fields)
+                    decisions.append(_make_decision_entry(
+                        expense, lookups, "missing_info",
+                        rule=dup_result.rule, reason=dup_result.details, missing_fields=need_fields))
                 continue
 
             if dup_result.verdict == "ambiguous":
@@ -895,13 +955,17 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                         )
                         if gpt_result.verdict == "duplicate":
                             duplicate_list.append({"expense": expense, "result": gpt_result})
+                            decisions.append(_make_decision_entry(
+                                expense, lookups, "duplicate", rule=gpt_result.rule, reason=gpt_result.details))
                             continue
                         if gpt_result.verdict == "not_duplicate":
                             if not missing:
-                                auth_candidates.append((expense, gpt_result.rule))
+                                auth_candidates.append((expense, gpt_result.rule, gpt_result.details))
                             continue
                 # Still ambiguous -- escalate to human
                 escalation_list.append({"expense": expense, "reason": dup_result.details})
+                decisions.append(_make_decision_entry(
+                    expense, lookups, "escalated", rule=dup_result.rule, reason=dup_result.details))
                 continue
 
             # 3. If missing critical info, don't authorize but continue
@@ -909,7 +973,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 continue
 
             # 4. Rule engine cleared -- add to candidates (NOT authorized yet)
-            auth_candidates.append((expense, dup_result.rule))
+            auth_candidates.append((expense, dup_result.rule, dup_result.details))
 
         # Phase 2: GPT batch review -- final sanity check before authorizing
         if auth_candidates and cfg.get("daneel_gpt_fallback_enabled"):
@@ -918,25 +982,29 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 flagged_set = set(review.get("flagged_indices", []))
                 reason = review.get("reason", "GPT batch review flagged suspicious pattern")
                 surviving = []
-                for i, (exp, rule) in enumerate(auth_candidates):
+                for i, (exp, rule, det) in enumerate(auth_candidates):
                     if i in flagged_set:
                         escalation_list.append({"expense": exp, "reason": f"[Batch review] {reason}"})
+                        decisions.append(_make_decision_entry(
+                            exp, lookups, "escalated", rule="GPT_BATCH", reason=reason))
                     else:
-                        surviving.append((exp, rule))
+                        surviving.append((exp, rule, det))
                 auth_candidates = surviving
 
         # Phase 3: Authorize all approved candidates
-        for expense, rule in auth_candidates:
+        for expense, rule, det in auth_candidates:
             exp_id = expense.get("expense_id") or expense.get("id")
-            if authorize_expense(sb, exp_id, project_id, rule):
+            if authorize_expense(sb, exp_id, pid, rule):
                 authorized_list.append(expense)
+                decisions.append(_make_decision_entry(
+                    expense, lookups, "authorized", rule=rule, reason=det))
 
         # Phase 4: Post batch messages for this project
         if authorized_list:
             msg = _build_batch_auth_message(authorized_list, lookups)
             post_daneel_message(
                 content=msg,
-                project_id=project_id,
+                project_id=pid,
                 channel_type="project_general",
                 metadata={"type": "auto_auth_batch", "count": len(authorized_list),
                           "total": sum(float(e.get("Amount") or 0) for e in authorized_list)},
@@ -946,7 +1014,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             msg = _build_missing_info_message(missing_info_list, lookups, bookkeeping_mentions)
             post_daneel_message(
                 content=msg,
-                project_id=project_id,
+                project_id=pid,
                 channel_type="project_general",
                 metadata={"type": "auto_auth_missing_info", "count": len(missing_info_list)},
             )
@@ -955,7 +1023,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             msg = _build_escalation_message(escalation_list, lookups, escalation_mentions)
             post_daneel_message(
                 content=msg,
-                project_id=project_id,
+                project_id=pid,
                 channel_type="project_general",
                 metadata={"type": "auto_auth_escalation", "count": len(escalation_list)},
             )
@@ -964,9 +1032,21 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         total_missing += len(missing_info_list)
         total_duplicates += len(duplicate_list)
         total_escalated += len(escalation_list)
+        all_decisions.extend(decisions)
 
-    # Update last run timestamp
-    _save_config_key("daneel_auto_auth_last_run", now)
+        # Collect detail for debugging
+        for item in missing_info_list:
+            e = item["expense"]
+            missing_detail.append({
+                "expense_id": e.get("expense_id") or e.get("id"),
+                "vendor": lookups["vendors"].get(e.get("vendor_id"), "Unknown"),
+                "amount": float(e.get("Amount") or 0),
+                "missing_fields": item["missing"],
+            })
+
+    # Update last run timestamp (skip for per-project runs to not affect global runs)
+    if not project_id:
+        _save_config_key("daneel_auto_auth_last_run", now)
 
     summary = {
         "status": "ok",
@@ -975,8 +1055,17 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         "duplicates": total_duplicates,
         "escalated": total_escalated,
         "expenses_processed": len(pending),
+        "missing_detail": missing_detail[:20],  # cap for response size
     }
     logger.info(f"[DaneelAutoAuth] Run complete: {summary}")
+
+    # Save auth report
+    if all_decisions:
+        rtype = "project_run" if project_id else ("backlog" if process_all else "scheduled")
+        rname = proj_names.get(project_id, "") if project_id else None
+        _save_auth_report(sb, rtype, summary, all_decisions,
+                          project_id=project_id, project_name=rname)
+
     return summary
 
 
@@ -1209,10 +1298,18 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                 return
 
         # Authorize
+        decision = None
         if authorize_expense(sb, expense_id, project_id, dup_result.rule):
             vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
             amt = f"${float(expense.get('Amount') or 0):,.2f}"
             logger.info(f"[DaneelAutoAuth] Auto-authorized: {expense_id} ({vname} {amt})")
+            decision = _make_decision_entry(expense, lookups, "authorized",
+                                            rule=dup_result.rule, reason=dup_result.details)
+
+        # Save realtime decision to report log
+        if decision:
+            _save_auth_report(sb, "realtime", {"authorized": 1}, [decision],
+                              project_id=project_id)
 
     except Exception as e:
         logger.error(f"[DaneelAutoAuth] trigger_auto_auth_check error: {e}")

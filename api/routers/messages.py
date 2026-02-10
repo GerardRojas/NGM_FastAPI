@@ -18,7 +18,7 @@ from typing import Optional, List, Dict, Any
 from uuid import UUID
 from api.supabase_client import supabase
 from api.auth import get_current_user
-from api.services.firebase_notifications import notify_mentioned_users
+from api.services.firebase_notifications import notify_mentioned_users, notify_message_recipients
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
@@ -49,9 +49,16 @@ class MessageResponse(BaseModel):
     reply_to_id: Optional[str]
     thread_count: int
     is_edited: bool
+    is_deleted: bool = False
     created_at: str
     reactions: Optional[Dict[str, List[str]]]
     attachments: Optional[List[Dict[str, Any]]]
+
+
+class ChannelClearRequest(BaseModel):
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct|group)$")
+    channel_id: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 class ChannelCreate(BaseModel):
@@ -81,9 +88,11 @@ def normalize_message(row: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(user_data, list) and user_data:
         user_data = user_data[0]
 
+    is_deleted = row.get("is_deleted", False)
+
     return {
         "id": str(row.get("id", "")),
-        "content": row.get("content", ""),
+        "content": "" if is_deleted else row.get("content", ""),
         "channel_type": row.get("channel_type", ""),
         "channel_id": str(row["channel_id"]) if row.get("channel_id") else None,
         "project_id": str(row["project_id"]) if row.get("project_id") else None,
@@ -93,9 +102,10 @@ def normalize_message(row: Dict[str, Any]) -> Dict[str, Any]:
         "reply_to_id": str(row["reply_to_id"]) if row.get("reply_to_id") else None,
         "thread_count": row.get("thread_count", 0),
         "is_edited": row.get("is_edited", False),
+        "is_deleted": is_deleted,
         "created_at": row.get("created_at", ""),
-        "reactions": row.get("reactions"),
-        "attachments": row.get("attachments"),
+        "reactions": None if is_deleted else row.get("reactions"),
+        "attachments": None if is_deleted else row.get("attachments"),
         "metadata": row.get("metadata"),
     }
 
@@ -214,15 +224,35 @@ def get_channel_name(channel_type: str, project_id: str = None, channel_id: str 
     return "Messages"
 
 
-def _run_mention_notifications(content, sender_user_id, sender_name,
+def get_channel_member_ids(channel_id: str, exclude_user_id: str = None) -> List[str]:
+    """Get all member user_ids from a channel, optionally excluding one user."""
+    try:
+        result = supabase.table("channel_members") \
+            .select("user_id") \
+            .eq("channel_id", channel_id) \
+            .execute()
+
+        member_ids = []
+        for row in (result.data or []):
+            uid = str(row.get("user_id", ""))
+            if uid and uid != exclude_user_id:
+                member_ids.append(uid)
+
+        return member_ids
+    except Exception as e:
+        print(f"[Messages] Error getting channel members: {e}")
+        return []
+
+
+def _run_message_notifications(content, sender_user_id, sender_name,
                                sender_avatar_color, channel_type,
                                project_id, channel_id):
-    """Sync wrapper to safely run async mention notifications from a background task."""
+    """Sync wrapper to safely run async message notifications from a background task."""
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(send_mention_notifications(
+            loop.run_until_complete(send_message_notifications(
                 content=content,
                 sender_user_id=sender_user_id,
                 sender_name=sender_name,
@@ -234,10 +264,10 @@ def _run_mention_notifications(content, sender_user_id, sender_name,
         finally:
             loop.close()
     except Exception as e:
-        print(f"[Messages] Mention notification error: {e}")
+        print(f"[Messages] Message notification error: {e}")
 
 
-async def send_mention_notifications(
+async def send_message_notifications(
     content: str,
     sender_user_id: str,
     sender_name: str,
@@ -246,13 +276,7 @@ async def send_mention_notifications(
     project_id: str = None,
     channel_id: str = None
 ):
-    """Background task to send push notifications for mentions."""
-    mentioned_user_ids = extract_mentioned_user_ids(content, sender_user_id)
-
-    if not mentioned_user_ids:
-        return
-
-    channel_name = get_channel_name(channel_type, project_id, channel_id)
+    """Background task to send push notifications for mentions and DM/group messages."""
 
     # Build URL for notification click
     if channel_type.startswith("project_") and project_id:
@@ -262,14 +286,39 @@ async def send_mention_notifications(
     else:
         message_url = "/messages.html"
 
-    await notify_mentioned_users(
-        mentioned_user_ids=mentioned_user_ids,
-        sender_name=sender_name,
-        message_preview=content,
-        channel_name=channel_name,
-        message_url=message_url,
-        avatar_color=sender_avatar_color
-    )
+    channel_name = get_channel_name(channel_type, project_id, channel_id)
+
+    # --- Phase 1: @mention notifications ---
+    mentioned_user_ids = extract_mentioned_user_ids(content, sender_user_id)
+
+    if mentioned_user_ids:
+        await notify_mentioned_users(
+            mentioned_user_ids=mentioned_user_ids,
+            sender_name=sender_name,
+            message_preview=content,
+            channel_name=channel_name,
+            message_url=message_url,
+            avatar_color=sender_avatar_color
+        )
+
+    # --- Phase 2: DM / Group notifications ---
+    if channel_type in ("direct", "group") and channel_id:
+        recipient_ids = get_channel_member_ids(channel_id, exclude_user_id=sender_user_id)
+
+        # Exclude users already notified via @mention to avoid double notifications
+        already_notified = set(mentioned_user_ids)
+        recipient_ids = [uid for uid in recipient_ids if uid not in already_notified]
+
+        if recipient_ids:
+            await notify_message_recipients(
+                recipient_user_ids=recipient_ids,
+                sender_name=sender_name,
+                message_preview=content,
+                channel_name=channel_name,
+                channel_type=channel_type,
+                message_url=message_url,
+                avatar_color=sender_avatar_color
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -412,10 +461,10 @@ def create_message(
         except Exception as user_err:
             print(f"[Messages] User lookup error (non-blocking): {user_err}")
 
-        # Send push notifications for @mentions (in background)
+        # Send push notifications for @mentions + DM/group (in background)
         try:
             background_tasks.add_task(
-                _run_mention_notifications,
+                _run_message_notifications,
                 payload.content,
                 user_id,
                 sender_name,
@@ -518,10 +567,10 @@ def create_thread_reply(
             sender_name = user_result.data.get("user_name", "Someone")
             sender_avatar_color = user_result.data.get("avatar_color")
 
-        # Send push notifications for @mentions (in background)
+        # Send push notifications for @mentions + DM/group (in background)
         try:
             background_tasks.add_task(
-                _run_mention_notifications,
+                _run_message_notifications,
                 payload.content,
                 user_id,
                 sender_name,
@@ -923,6 +972,93 @@ def mark_mention_read(
             raise HTTPException(status_code=404, detail="Mention not found")
 
         return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MESSAGE DELETE / CLEAR ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.patch("/{message_id}/delete")
+def soft_delete_message(
+    message_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Soft-delete a message. Users can only delete their own messages."""
+    try:
+        user_id = current_user["user_id"]
+
+        # Verify message exists and belongs to user
+        msg_result = supabase.table("messages") \
+            .select("id, user_id") \
+            .eq("id", message_id) \
+            .single() \
+            .execute()
+
+        if not msg_result.data:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        if str(msg_result.data["user_id"]) != user_id:
+            raise HTTPException(status_code=403, detail="You can only delete your own messages")
+
+        # Soft delete
+        supabase.table("messages") \
+            .update({
+                "is_deleted": True,
+                "deleted_at": "now()",
+                "deleted_by": user_id,
+            }) \
+            .eq("id", message_id) \
+            .execute()
+
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.post("/channel/clear")
+def clear_channel_messages(
+    payload: ChannelClearRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Clear all messages in a channel. CEO and COO only."""
+    try:
+        user_id = current_user["user_id"]
+        role = current_user.get("role", "")
+
+        if role not in ["CEO", "COO"]:
+            raise HTTPException(status_code=403, detail="Only CEO and COO can clear conversations")
+
+        # Build channel filter
+        query = supabase.table("messages") \
+            .update({
+                "is_deleted": True,
+                "deleted_at": "now()",
+                "deleted_by": user_id,
+            }) \
+            .eq("channel_type", payload.channel_type) \
+            .eq("is_deleted", False)
+
+        if payload.channel_type in ["custom", "direct", "group"]:
+            if not payload.channel_id:
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group channels")
+            query = query.eq("channel_id", payload.channel_id)
+        else:
+            if not payload.project_id:
+                raise HTTPException(status_code=400, detail="project_id required for project channels")
+            query = query.eq("project_id", payload.project_id)
+
+        result = query.execute()
+        count = len(result.data) if result.data else 0
+
+        return {"ok": True, "count": count}
 
     except HTTPException:
         raise
