@@ -4,10 +4,10 @@ Endpoints for triggering, monitoring, and configuring Daneel's
 automatic expense authorization engine.
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime, timezone
+from typing import Optional, List
+from datetime import datetime, timezone, timedelta
 
 from api.supabase_client import supabase
 
@@ -27,6 +27,8 @@ class AutoAuthConfigUpdate(BaseModel):
     daneel_labor_keywords: Optional[str] = None
     daneel_bookkeeping_role: Optional[str] = None
     daneel_accounting_mgr_role: Optional[str] = None
+    daneel_bookkeeping_users: Optional[str] = None
+    daneel_accounting_mgr_users: Optional[str] = None
     daneel_gpt_fallback_enabled: Optional[bool] = None
     daneel_gpt_fallback_confidence: Optional[int] = None
 
@@ -36,14 +38,18 @@ class AutoAuthConfigUpdate(BaseModel):
 # ================================
 
 @router.post("/auto-auth/run")
-async def run_auto_auth(background_tasks: BackgroundTasks):
+async def run_auto_auth(
+    background_tasks: BackgroundTasks,
+    project_id: Optional[str] = Query(None, description="Filter to a specific project")
+):
     """
     Manually trigger a full auto-authorization run.
     Processes all new pending expenses since last run.
+    Optionally filter by project_id.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
     try:
-        result = await _run()
+        result = await _run(project_id=project_id)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Auto-auth run failed: {str(e)}")
@@ -172,3 +178,91 @@ async def update_auto_auth_config(payload: AutoAuthConfigUpdate):
         return {"ok": True, "updated_keys": list(update_data.keys())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating config: {str(e)}")
+
+
+# ================================
+# PROJECT SUMMARY
+# ================================
+
+@router.get("/auto-auth/project-summary")
+async def get_project_summary():
+    """
+    Per-project expense summary for Daneel dashboard.
+    Returns pending, authorized-by-Daneel, and missing-info counts per project.
+    """
+    try:
+        from api.services.daneel_auto_auth import DANEEL_BOT_USER_ID
+
+        # Get all pending expenses grouped by project
+        pending_result = supabase.table("expenses_manual_COGS") \
+            .select("expense_id, project, status") \
+            .eq("status", "pending") \
+            .execute()
+
+        # Get all projects for name resolution
+        projects_result = supabase.table("projects") \
+            .select("project_id, project_name") \
+            .execute()
+        project_names = {p["project_id"]: p["project_name"] for p in (projects_result.data or [])}
+
+        # Get Daneel authorizations (last 30 days)
+        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        auth_result = supabase.table("expense_status_log") \
+            .select("expense_id, metadata") \
+            .eq("changed_by", DANEEL_BOT_USER_ID) \
+            .eq("new_status", "auth") \
+            .gt("changed_at", thirty_days_ago) \
+            .execute()
+
+        # Get expense->project mapping for authorized expenses
+        auth_expense_ids = [r["expense_id"] for r in (auth_result.data or []) if r.get("expense_id")]
+        auth_by_project = {}
+        if auth_expense_ids:
+            # Batch lookup in chunks of 50
+            for i in range(0, len(auth_expense_ids), 50):
+                chunk = auth_expense_ids[i:i+50]
+                exp_result = supabase.table("expenses_manual_COGS") \
+                    .select("expense_id, project") \
+                    .in_("expense_id", chunk) \
+                    .execute()
+                for e in (exp_result.data or []):
+                    pid = e.get("project")
+                    if pid:
+                        auth_by_project[pid] = auth_by_project.get(pid, 0) + 1
+
+        # Get unresolved pending info grouped by project
+        pending_info_result = supabase.table("daneel_pending_info") \
+            .select("expense_id, project_id") \
+            .is_("resolved_at", "null") \
+            .execute()
+        missing_by_project = {}
+        for pi in (pending_info_result.data or []):
+            pid = pi.get("project_id")
+            if pid:
+                missing_by_project[pid] = missing_by_project.get(pid, 0) + 1
+
+        # Aggregate pending by project
+        pending_by_project = {}
+        for e in (pending_result.data or []):
+            pid = e.get("project")
+            if pid:
+                pending_by_project[pid] = pending_by_project.get(pid, 0) + 1
+
+        # Build summary - only include projects that have activity
+        all_project_ids = set(pending_by_project.keys()) | set(auth_by_project.keys()) | set(missing_by_project.keys())
+        summary = []
+        for pid in all_project_ids:
+            summary.append({
+                "project_id": pid,
+                "project_name": project_names.get(pid, "Unknown Project"),
+                "pending": pending_by_project.get(pid, 0),
+                "authorized_by_daneel": auth_by_project.get(pid, 0),
+                "missing_info": missing_by_project.get(pid, 0),
+            })
+
+        # Sort by pending count descending
+        summary.sort(key=lambda x: x["pending"], reverse=True)
+        return {"data": summary}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting project summary: {str(e)}")

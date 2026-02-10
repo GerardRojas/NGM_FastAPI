@@ -17,7 +17,9 @@ INSERT INTO agent_config (key, value) VALUES
     ('daneel_accounting_mgr_role',      'null'::jsonb),
     ('daneel_auto_auth_last_run',       'null'::jsonb),
     ('daneel_gpt_fallback_enabled',    'false'::jsonb),
-    ('daneel_gpt_fallback_confidence', '75'::jsonb)
+    ('daneel_gpt_fallback_confidence', '75'::jsonb),
+    ('daneel_bookkeeping_users',       '[]'::jsonb),
+    ('daneel_accounting_mgr_users',    '[]'::jsonb)
 ON CONFLICT (key) DO NOTHING;
 
 -- 2. Tracking table for expenses awaiting missing info

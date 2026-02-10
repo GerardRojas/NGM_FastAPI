@@ -814,21 +814,17 @@ def _build_agent_message(parsed_data, categorize_data, warnings, lang="en", expe
 # ====== AGENT ENDPOINT ======
 
 @router.post("/{receipt_id}/agent-process")
-async def agent_process_receipt(
-    receipt_id: str,
-    force: bool = Query(False, description="Force processing even if duplicate detected")
-):
+async def agent_process_receipt(receipt_id: str):
     """
     Full automated processing pipeline for material receipts.
 
     Pipeline:
     1. Fetch receipt, download file
-    2. Duplicate check (file hash) / split reuse detection
+    2. Split reuse detection / check detection
     3. OCR extraction (OpenAI Vision)
-    4. Data duplicate check (vendor+amount+date)
-    5. Auto-categorize (GPT with construction stage context)
-    6. Update receipt with enriched data + receipt_flow
-    7. Post Arturito summary + project question (awaiting user response)
+    4. Auto-categorize (GPT with construction stage context)
+    5. Update receipt with enriched data + receipt_flow
+    6. Post Andrew summary + project question (awaiting user response)
 
     Expense creation happens in the receipt-action endpoint after user responds.
     """
@@ -949,66 +945,7 @@ async def agent_process_receipt(
                 "message": "Split receipt reuse - awaiting item selection",
             }
 
-        # Check exact file duplicate
-        print(f"[Agent] Step 2: Checking file hash duplicate | hash={file_hash[:16]}... | force={force}")
-        hash_dup = _check_file_hash_duplicate(file_hash, project_id, receipt_id)
-        if hash_dup and not force:
-            print(f"[Agent] Step 2: DUPLICATE FOUND | matches receipt {hash_dup.get('id')}")
-
-            dup_vendor = hash_dup.get("vendor_name") or "Unknown"
-            dup_amount = hash_dup.get("amount") or 0
-            dup_date = hash_dup.get("receipt_date") or "Unknown"
-
-            # Store duplicate flow state in parsed_data (same pattern as check_flow)
-            duplicate_flow = {
-                "state": "awaiting_confirmation",
-                "detected_at": datetime.utcnow().isoformat(),
-                "duplicate_of": hash_dup.get("id"),
-                "dup_vendor": dup_vendor,
-                "dup_amount": float(dup_amount),
-                "dup_date": str(dup_date),
-            }
-
-            existing_parsed = receipt_data.get("parsed_data") or {}
-            existing_parsed["duplicate_flow"] = duplicate_flow
-
-            supabase.table("pending_receipts") \
-                .update({
-                    "status": "duplicate",
-                    "parsed_data": existing_parsed,
-                    "processing_error": f"Duplicate of receipt {hash_dup.get('id')}",
-                    "updated_at": datetime.utcnow().isoformat()
-                }) \
-                .eq("id", receipt_id) \
-                .execute()
-
-            post_andrew_message(
-                content=(
-                    f"Heads up -- this looks like a duplicate. "
-                    f"I found a matching receipt from {dup_vendor} for ${dup_amount:,.2f} "
-                    f"({dup_date}), currently {hash_dup.get('status')}.\n\n"
-                    "Want me to process it anyway?"
-                ),
-                project_id=project_id,
-                metadata={
-                    "agent_message": True,
-                    "pending_receipt_id": receipt_id,
-                    "receipt_status": "duplicate",
-                    "duplicate_of": hash_dup.get("id"),
-                    "allow_force_process": True,
-                    "duplicate_flow_active": True,
-                    "duplicate_flow_state": "awaiting_confirmation",
-                }
-            )
-
-            return {
-                "success": False,
-                "status": "duplicate",
-                "message": "Duplicate receipt detected",
-                "duplicate_of": hash_dup
-            }
-        elif hash_dup and force:
-            print(f"[Agent] Step 2: DUPLICATE FOUND but force=True, continuing...")
+        # (Duplicate detection removed -- was matching error/incomplete receipts)
 
         # ===== STEP 2.5: Check Detection (Heuristic) =====
         file_name = receipt_data.get("file_name", "")
@@ -1220,30 +1157,32 @@ async def agent_process_receipt(
         }
         print(f"[Agent] Step 3: OCR complete | vendor={vendor_name} | amount={amount} | date={receipt_date} | {len(line_items)} line item(s)")
 
-        # ===== STEP 4: Data duplicate check (after OCR) =====
-        print(f"[Agent] Step 4: Checking data duplicates | vendor_matched={'yes' if vendor_id else 'no'}")
+        # ===== STEP 3.7: Filename hint cross-validation =====
+        from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
+        hint_file_name = receipt_data.get("file_name", "")
+        bill_hint = parse_bill_hint(hint_file_name)
+        hint_validation = {}
+        if bill_hint:
+            hint_validation = cross_validate_bill_hint(
+                bill_hint,
+                vendor_name=vendor_name if vendor_name != "Unknown" else None,
+                amount=amount,
+                date_str=receipt_date,
+            )
+            parsed_data["bill_hint"] = bill_hint
+            parsed_data["bill_hint_validation"] = hint_validation
+            print(f"[Agent] Step 3.7: Filename hint | hints={bill_hint} | mismatches={hint_validation.get('mismatches', [])}")
+
+        # ===== STEP 4: Warnings =====
         warnings = []
         if validation_unresolved:
             warnings.append("Invoice total mismatch - could not auto-correct, escalating to bookkeeping")
         elif validation.get("corrections_made"):
             warnings.append("Amounts corrected by verification pass")
 
-        data_dup = _check_data_duplicate(
-            project_id,
-            parsed_data.get("vendor_name"),
-            parsed_data.get("amount"),
-            parsed_data.get("receipt_date")
-        )
-        if data_dup:
-            warnings.append("Similar receipt already exists in this project")
-
-        expense_dup = _check_expense_duplicate(
-            project_id, vendor_id,
-            parsed_data.get("amount"),
-            parsed_data.get("receipt_date")
-        )
-        if expense_dup:
-            warnings.append("Matching expense already registered for this project")
+        # Filename cross-check mismatches
+        for mismatch in hint_validation.get("mismatches", []):
+            warnings.append(f"Filename cross-check: {mismatch}")
 
         if not vendor_id:
             warnings.append("Vendor not found in database")
@@ -1369,8 +1308,6 @@ async def agent_process_receipt(
                 "warning": categorize_data.get("warning"),
             },
             "agent_warnings": warnings,
-            "data_duplicate": data_dup is not None,
-            "expense_duplicate": expense_dup is not None,
             "receipt_flow": receipt_flow,
         }
 
@@ -2585,8 +2522,8 @@ async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
                 }
             )
 
-            # Re-trigger processing with force=True
-            await agent_process_receipt(receipt_id, force=True)
+            # Re-trigger processing
+            await agent_process_receipt(receipt_id)
             return {"success": True, "state": "confirmed"}
 
         elif action == "skip":

@@ -60,6 +60,8 @@ _DEFAULT_CONFIG = {
     "daneel_labor_keywords": "labor",
     "daneel_bookkeeping_role": None,
     "daneel_accounting_mgr_role": None,
+    "daneel_bookkeeping_users": "[]",
+    "daneel_accounting_mgr_users": "[]",
     "daneel_auto_auth_last_run": None,
     "daneel_gpt_fallback_enabled": False,
     "daneel_gpt_fallback_confidence": 75,
@@ -674,8 +676,8 @@ def _build_batch_auth_message(authorized: List[dict], lookups: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_missing_info_message(missing_list: List[dict], lookups: dict, role_name: str) -> str:
-    mention = f"@{role_name}" if role_name else ""
+def _build_missing_info_message(missing_list: List[dict], lookups: dict, mention_str: str) -> str:
+    mention = mention_str if mention_str else ""
     lines = [
         f"{mention} The following expenses need additional information before authorization:".strip(),
         "",
@@ -696,8 +698,8 @@ def _build_missing_info_message(missing_list: List[dict], lookups: dict, role_na
     return "\n".join(lines)
 
 
-def _build_escalation_message(escalated: List[dict], lookups: dict, role_name: str) -> str:
-    mention = f"@{role_name}" if role_name else ""
+def _build_escalation_message(escalated: List[dict], lookups: dict, mention_str: str) -> str:
+    mention = mention_str if mention_str else ""
     lines = [
         f"{mention} The following expenses require manual review:".strip(),
         "",
@@ -717,7 +719,7 @@ def _build_escalation_message(escalated: List[dict], lookups: dict, role_name: s
 
 
 def _resolve_role_name(sb, role_id: Optional[str]) -> str:
-    """Resolve a role UUID to its name for @mentions."""
+    """Resolve a role UUID to its name for @mentions (legacy, kept for fallback)."""
     if not role_id:
         return ""
     try:
@@ -729,15 +731,40 @@ def _resolve_role_name(sb, role_id: Optional[str]) -> str:
         return ""
 
 
+def _resolve_user_mentions(sb, user_ids_json) -> str:
+    """Convert a JSON array of user_ids to '@User1 @User2' mention string."""
+    import json as _json
+    if not user_ids_json:
+        return ""
+    try:
+        ids = _json.loads(user_ids_json) if isinstance(user_ids_json, str) else user_ids_json
+        if not ids or not isinstance(ids, list):
+            return ""
+        result = sb.table("users").select("user_name").in_("user_id", ids).execute()
+        names = [u["user_name"] for u in (result.data or []) if u.get("user_name")]
+        return " ".join(f"@{name}" for name in names)
+    except Exception:
+        return ""
+
+
+def _resolve_mentions(sb, cfg: dict, key_users: str, key_role: str) -> str:
+    """Resolve mentions: try new user-based keys first, fall back to legacy role key."""
+    mentions = _resolve_user_mentions(sb, cfg.get(key_users))
+    if not mentions:
+        mentions = _resolve_role_name(sb, cfg.get(key_role))
+    return mentions
+
+
 # ============================================================================
 # Main orchestrator
 # ============================================================================
 
-async def run_auto_auth(process_all: bool = False) -> dict:
+async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -> dict:
     """
     Process pending expenses.
     process_all=False (default): only new since last run.
     process_all=True: process ALL pending expenses (backlog).
+    project_id: if provided, only process expenses for this project.
     """
     cfg = load_auto_auth_config()
 
@@ -756,6 +783,8 @@ async def run_auto_auth(process_all: bool = False) -> dict:
         .eq("status", "pending")
     if not process_all and last_run:
         query = query.gt("created_at", last_run)
+    if project_id:
+        query = query.eq("project", project_id)
     result = query.order("created_at").execute()
 
     pending = result.data or []
@@ -776,9 +805,9 @@ async def run_auto_auth(process_all: bool = False) -> dict:
         if pid:
             projects.setdefault(pid, []).append(exp)
 
-    # Resolve role names for mentions
-    bookkeeping_role = _resolve_role_name(sb, cfg.get("daneel_bookkeeping_role"))
-    accounting_mgr_role = _resolve_role_name(sb, cfg.get("daneel_accounting_mgr_role"))
+    # Resolve mention targets (user-based with legacy role fallback)
+    bookkeeping_mentions = _resolve_mentions(sb, cfg, "daneel_bookkeeping_users", "daneel_bookkeeping_role")
+    escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
 
     total_authorized = 0
     total_missing = 0
@@ -816,6 +845,26 @@ async def run_auto_auth(process_all: bool = False) -> dict:
             if missing:
                 missing_info_list.append({"expense": expense, "missing": missing})
                 _track_pending_info(sb, exp_id, project_id, missing)
+
+            # 1b. Bill hint cross-validation (soft armoring layer)
+            from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
+            bill_id_str = (expense.get("bill_id") or "").strip()
+            if bill_id_str:
+                hint = parse_bill_hint(bill_id_str)
+                if hint and hint.get("amount_hint") is not None:
+                    exp_vendor_name = lookups["vendors"].get(expense.get("vendor_id"), "")
+                    hint_val = cross_validate_bill_hint(
+                        hint,
+                        vendor_name=exp_vendor_name,
+                        amount=float(expense.get("Amount") or 0),
+                        date_str=(expense.get("TxnDate") or ""),
+                    )
+                    if hint_val.get("amount_match") is False:
+                        escalation_list.append({
+                            "expense": expense,
+                            "reason": f"Bill hint amount mismatch: {hint_val['mismatches'][0]}"
+                        })
+                        continue
 
             # 2. Duplicate check
             vendor_id = expense.get("vendor_id")
@@ -894,7 +943,7 @@ async def run_auto_auth(process_all: bool = False) -> dict:
             )
 
         if missing_info_list:
-            msg = _build_missing_info_message(missing_info_list, lookups, bookkeeping_role)
+            msg = _build_missing_info_message(missing_info_list, lookups, bookkeeping_mentions)
             post_daneel_message(
                 content=msg,
                 project_id=project_id,
@@ -903,7 +952,7 @@ async def run_auto_auth(process_all: bool = False) -> dict:
             )
 
         if escalation_list:
-            msg = _build_escalation_message(escalation_list, lookups, accounting_mgr_role)
+            msg = _build_escalation_message(escalation_list, lookups, escalation_mentions)
             post_daneel_message(
                 content=msg,
                 project_id=project_id,
@@ -1069,11 +1118,11 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
         if missing:
             _track_pending_info(sb, expense_id, project_id, missing)
             # Post individual missing info message
-            bookkeeping_role = _resolve_role_name(sb, cfg.get("daneel_bookkeeping_role"))
+            bookkeeping_mentions = _resolve_mentions(sb, cfg, "daneel_bookkeeping_users", "daneel_bookkeeping_role")
             vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
             amt = f"${float(expense.get('Amount') or 0):,.2f}"
             fields_str = ", ".join(missing)
-            msg = (f"@{bookkeeping_role} " if bookkeeping_role else "") + \
+            msg = (f"{bookkeeping_mentions} " if bookkeeping_mentions else "") + \
                   f"Expense from **{vname}** ({amt}) is missing: **{fields_str}**. " \
                   f"Please provide to proceed with authorization."
             post_daneel_message(
@@ -1128,10 +1177,10 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                         return
 
             # Still ambiguous -- escalate to human
-            accounting_mgr_role = _resolve_role_name(sb, cfg.get("daneel_accounting_mgr_role"))
+            escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
             vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
             amt = f"${float(expense.get('Amount') or 0):,.2f}"
-            msg = (f"@{accounting_mgr_role} " if accounting_mgr_role else "") + \
+            msg = (f"{escalation_mentions} " if escalation_mentions else "") + \
                   f"Expense from **{vname}** ({amt}) requires manual review: {dup_result.details}"
             post_daneel_message(
                 content=msg,
@@ -1146,10 +1195,10 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
             review = gpt_batch_review([expense], lookups)
             if not review.get("approve_all"):
                 reason = review.get("reason", "GPT flagged suspicious pattern")
-                accounting_mgr_role = _resolve_role_name(sb, cfg.get("daneel_accounting_mgr_role"))
+                escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
                 vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
                 amt = f"${float(expense.get('Amount') or 0):,.2f}"
-                msg = (f"@{accounting_mgr_role} " if accounting_mgr_role else "") + \
+                msg = (f"{escalation_mentions} " if escalation_mentions else "") + \
                       f"Expense from **{vname}** ({amt}) flagged by batch review: {reason}"
                 post_daneel_message(
                     content=msg,
