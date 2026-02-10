@@ -32,9 +32,8 @@ STALE_STATUSES = ("ready", "check_review", "duplicate")
 
 def get_supabase() -> Client:
     """Get Supabase client."""
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
-    return create_client(url, key)
+    from api.supabase_client import supabase
+    return supabase
 
 
 def _get_agent_config(supabase: Client) -> Dict[str, Any]:

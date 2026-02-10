@@ -29,9 +29,8 @@ logger = logging.getLogger(__name__)
 
 def get_supabase() -> Client:
     """Get Supabase client."""
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
-    return create_client(url, key)
+    from api.supabase_client import supabase
+    return supabase
 
 
 # ============================================================================

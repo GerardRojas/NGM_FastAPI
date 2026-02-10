@@ -30,9 +30,8 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def _get_supabase() -> Client:
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
-    return create_client(url, key)
+    from api.supabase_client import supabase
+    return supabase
 
 
 # ============================================================================
@@ -816,7 +815,8 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
     """
     cfg = load_auto_auth_config()
 
-    if not cfg.get("daneel_auto_auth_enabled"):
+    # Per-project manual runs bypass the global auto-auth toggle
+    if not project_id and not cfg.get("daneel_auto_auth_enabled"):
         return {"status": "disabled", "message": "Auto-auth is disabled"}
 
     sb = _get_supabase()
