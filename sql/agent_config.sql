@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS agent_config (
 INSERT INTO agent_config (key, value) VALUES
     ('auto_create_expense', 'true'::jsonb),
     ('min_confidence', '70'::jsonb),
-    ('auto_skip_duplicates', 'false'::jsonb)
+    ('auto_skip_duplicates', 'false'::jsonb),
+    ('receipt_reminder_hours', '4'::jsonb),
+    ('receipt_max_reminders', '3'::jsonb)
 ON CONFLICT (key) DO NOTHING;
 
 -- RLS: service role only (backend manages this table)

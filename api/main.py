@@ -65,6 +65,9 @@ from api.routers.process_manager import router as process_manager_router
 # ========= ADU CALCULATOR: Allowance ADU Calculator ==========
 from api.routers.adu_calculator import router as adu_calculator_router
 
+# ========= DANEEL AUTO-AUTH: Automated Expense Authorization ==========
+from api.routers.daneel_auto_auth import router as daneel_auto_auth_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -171,6 +174,9 @@ app.include_router(process_manager_router)
 
 # ADU Calculator (allowance calculator with GPT screenshot analysis)
 app.include_router(adu_calculator_router)
+
+# Daneel Auto-Auth (automated expense authorization)
+app.include_router(daneel_auto_auth_router)
 
 # ========================================
 # Root & Healthcheck

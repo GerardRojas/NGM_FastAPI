@@ -1,0 +1,1169 @@
+# ============================================================================
+# NGM Hub - Daneel Auto-Authorization Service
+# ============================================================================
+# Rule-based engine that auto-authorizes new pending expenses that pass
+# health check and duplicate verification.  Zero LLM tokens for routine
+# operations -- only file-hash comparison (HTTP HEAD) is used for the rare
+# case of same-date / different-bill duplicates.
+#
+# Run modes:
+# 1. Event-driven: BackgroundTask after expense create / update
+# 2. Manual trigger: POST /daneel/auto-auth/run
+# ============================================================================
+
+import logging
+import re
+import os
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import httpx
+from supabase import create_client, Client
+
+from api.helpers.daneel_messenger import post_daneel_message, DANEEL_BOT_USER_ID
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Supabase client
+# ============================================================================
+
+def _get_supabase() -> Client:
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+    return create_client(url, key)
+
+
+# ============================================================================
+# Data classes
+# ============================================================================
+
+@dataclass
+class DuplicateResult:
+    verdict: str   # 'duplicate', 'not_duplicate', 'ambiguous', 'need_info'
+    rule: str      # e.g. 'R3', 'R5'
+    details: str   # human-readable explanation
+    paired_expense_id: Optional[str] = None
+
+
+# ============================================================================
+# Config
+# ============================================================================
+
+_DEFAULT_CONFIG = {
+    "daneel_auto_auth_enabled": False,
+    "daneel_auto_auth_require_bill": True,
+    "daneel_auto_auth_require_receipt": True,
+    "daneel_fuzzy_threshold": 85,
+    "daneel_amount_tolerance": 0.05,
+    "daneel_labor_keywords": "labor",
+    "daneel_bookkeeping_role": None,
+    "daneel_accounting_mgr_role": None,
+    "daneel_auto_auth_last_run": None,
+    "daneel_gpt_fallback_enabled": False,
+    "daneel_gpt_fallback_confidence": 75,
+}
+
+
+def load_auto_auth_config() -> dict:
+    """Read daneel_* keys from agent_config table."""
+    try:
+        sb = _get_supabase()
+        result = sb.table("agent_config").select("key, value").like("key", "daneel_%").execute()
+        cfg = dict(_DEFAULT_CONFIG)
+        for row in (result.data or []):
+            val = row["value"]
+            # JSONB values come back as native Python types
+            if isinstance(val, str):
+                try:
+                    import json
+                    val = json.loads(val)
+                except Exception:
+                    pass
+            cfg[row["key"]] = val
+        return cfg
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] Config load error: {e}")
+        return dict(_DEFAULT_CONFIG)
+
+
+def _save_config_key(key: str, value):
+    """Persist a single config key."""
+    import json
+    try:
+        sb = _get_supabase()
+        sb.table("agent_config").upsert({
+            "key": key,
+            "value": json.dumps(value) if not isinstance(value, (str, int, float, bool)) else value,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] Config save error for {key}: {e}")
+
+
+# ============================================================================
+# Lookup helpers  (resolve UUIDs to names, cached per run)
+# ============================================================================
+
+def _load_lookups(sb) -> dict:
+    """Load accounts, payment_methods, vendors into dicts keyed by UUID."""
+    lookups = {"accounts": {}, "payment_methods": {}, "vendors": {}}
+    try:
+        accts = sb.table("accounts").select("account_id, Name").execute()
+        for a in (accts.data or []):
+            lookups["accounts"][a["account_id"]] = a["Name"]
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] accounts lookup error: {e}")
+
+    try:
+        pms = sb.table("paymet_methods").select("id, payment_method_name").execute()
+        for p in (pms.data or []):
+            lookups["payment_methods"][p["id"]] = p["payment_method_name"]
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] payment_methods lookup error: {e}")
+
+    try:
+        vends = sb.table("Vendors").select("vendor_id, vendor_name").execute()
+        for v in (vends.data or []):
+            lookups["vendors"][v["vendor_id"]] = v["vendor_name"]
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] vendors lookup error: {e}")
+
+    return lookups
+
+
+# ============================================================================
+# String helpers (ported from expenses.js)
+# ============================================================================
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    if not s1:
+        return len(s2) if s2 else 0
+    if not s2:
+        return len(s1)
+    m, n = len(s1), len(s2)
+    prev = list(range(n + 1))
+    curr = [0] * (n + 1)
+    for i in range(1, m + 1):
+        curr[0] = i
+        for j in range(1, n + 1):
+            cost = 0 if s1[i - 1] == s2[j - 1] else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev, curr = curr, prev
+    return prev[n]
+
+
+def string_similarity(s1: str, s2: str) -> float:
+    """Returns 0-100 similarity percentage."""
+    a = (s1 or "").strip().lower()
+    b = (s2 or "").strip().lower()
+    if not a and not b:
+        return 100.0
+    if not a or not b:
+        return 0.0
+    max_len = max(len(a), len(b))
+    dist = levenshtein_distance(a, b)
+    return round((1 - dist / max_len) * 100, 1)
+
+
+def normalize_bill_id(bill_id: str) -> str:
+    if not bill_id:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", bill_id.upper())
+
+
+# ============================================================================
+# Receipt hash (lightweight -- HTTP HEAD only, no file download)
+# ============================================================================
+
+def get_receipt_hash(receipt_url: Optional[str]) -> Optional[str]:
+    """
+    Get a lightweight fingerprint for a receipt file via HTTP HEAD.
+    Uses ETag or Content-Length as proxy.  Returns None if unavailable.
+    """
+    if not receipt_url:
+        return None
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.head(receipt_url, follow_redirects=True)
+            etag = resp.headers.get("etag")
+            if etag:
+                return f"etag:{etag}"
+            cl = resp.headers.get("content-length")
+            ct = resp.headers.get("content-type", "")
+            if cl:
+                return f"cl:{cl}:{ct}"
+    except Exception as e:
+        logger.warning(f"[DaneelAutoAuth] HEAD failed for {receipt_url}: {e}")
+    return None
+
+
+# ============================================================================
+# Health Check
+# ============================================================================
+
+def run_health_check(expense: dict, config: dict, bills_map: dict) -> List[str]:
+    """
+    Returns list of missing field names.  Empty = healthy.
+    Does NOT block processing -- caller collects and continues.
+    """
+    missing = []
+
+    if not expense.get("vendor_id"):
+        missing.append("vendor")
+    if not expense.get("Amount") and expense.get("Amount") != 0:
+        missing.append("amount")
+    if not expense.get("TxnDate"):
+        missing.append("date")
+    if not expense.get("account_id"):
+        missing.append("account")
+
+    if config.get("daneel_auto_auth_require_bill", True):
+        bill = (expense.get("bill_id") or "").strip()
+        if not bill:
+            missing.append("bill_id")
+
+    if config.get("daneel_auto_auth_require_receipt", True):
+        receipt = _get_expense_receipt(expense, bills_map)
+        if not receipt:
+            missing.append("receipt")
+
+    return missing
+
+
+def _get_expense_receipt(expense: dict, bills_map: dict) -> Optional[str]:
+    """Resolve receipt URL: check bills table first, then legacy field."""
+    bill_id = (expense.get("bill_id") or "").strip()
+    if bill_id and bill_id in bills_map:
+        url = bills_map[bill_id].get("receipt_url")
+        if url:
+            return url
+    return expense.get("receipt_url") or None
+
+
+# ============================================================================
+# Duplicate Rules Engine
+# ============================================================================
+
+def check_duplicate(
+    expense: dict,
+    same_vendor_expenses: List[dict],
+    bills_map: dict,
+    config: dict,
+    lookups: dict,
+) -> DuplicateResult:
+    """
+    Check if expense is a duplicate of any same-vendor expense.
+    Returns the first matching rule result.
+    """
+    tolerance = float(config.get("daneel_amount_tolerance", 0.05))
+    fuzzy_thresh = float(config.get("daneel_fuzzy_threshold", 85))
+    labor_kw = str(config.get("daneel_labor_keywords", "labor")).lower()
+
+    exp_amount = float(expense.get("Amount") or 0)
+    exp_date = (expense.get("TxnDate") or "")[:10]
+    exp_bill = normalize_bill_id(expense.get("bill_id") or "")
+    exp_desc = (expense.get("LineDescription") or "").strip().lower()
+    exp_account_name = lookups["accounts"].get(expense.get("account_id"), "").lower()
+    exp_payment_name = lookups["payment_methods"].get(expense.get("payment_type"), "").lower()
+    exp_receipt = _get_expense_receipt(expense, bills_map)
+    exp_id = expense.get("expense_id") or expense.get("id")
+
+    is_labor = labor_kw in exp_account_name
+    is_check = "check" in exp_payment_name
+
+    worst_dup = None  # track the most concerning duplicate found
+
+    for other in same_vendor_expenses:
+        other_id = other.get("expense_id") or other.get("id")
+        if other_id == exp_id:
+            continue
+
+        oth_amount = float(other.get("Amount") or 0)
+        oth_date = (other.get("TxnDate") or "")[:10]
+        oth_bill = normalize_bill_id(other.get("bill_id") or "")
+        oth_desc = (other.get("LineDescription") or "").strip().lower()
+        oth_account_name = lookups["accounts"].get(other.get("account_id"), "").lower()
+        oth_payment_name = lookups["payment_methods"].get(other.get("payment_type"), "").lower()
+        oth_receipt = _get_expense_receipt(other, bills_map)
+
+        oth_is_labor = labor_kw in oth_account_name
+        oth_is_check = "check" in oth_payment_name
+
+        amount_diff = abs(exp_amount - oth_amount)
+        same_amount = amount_diff <= tolerance
+        same_date = exp_date == oth_date and exp_date != ""
+        diff_date = not same_date
+
+        # ------ R1: Amount mismatch -- quick discard ------
+        if not same_amount:
+            continue
+
+        # ------ R5: Recurring labor payment ------
+        if (same_amount and diff_date
+                and (is_labor or oth_is_labor)
+                and (is_check or oth_is_check)):
+            # Not a duplicate -- labor payments recur
+            continue
+
+        # ------ R8: Labor + same check number ------
+        if is_labor and oth_is_labor and same_amount and exp_bill and oth_bill:
+            if exp_bill == oth_bill and diff_date:
+                # Same check number, different date = separate check payments
+                continue
+
+        # ------ R6: Same bill, diff date, check ------
+        if (exp_bill and oth_bill
+                and string_similarity(exp_bill, oth_bill) >= 90
+                and same_amount and diff_date
+                and (is_check or oth_is_check)):
+            continue
+
+        # ------ R3: Identical purchase (same date + same bill) ------
+        if (same_amount and same_date
+                and exp_bill and oth_bill
+                and string_similarity(exp_bill, oth_bill) >= 90):
+            return DuplicateResult(
+                verdict="duplicate",
+                rule="R3",
+                details=f"Identical: same vendor, amount, date, bill #{exp_bill}",
+                paired_expense_id=other_id,
+            )
+
+        # ------ R4: Same date + same description, no bill ------
+        if (same_amount and same_date
+                and (not exp_bill or not oth_bill)
+                and string_similarity(exp_desc, oth_desc) >= fuzzy_thresh):
+            return DuplicateResult(
+                verdict="duplicate",
+                rule="R4",
+                details=f"Same vendor, amount, date, description (no bill to distinguish)",
+                paired_expense_id=other_id,
+            )
+
+        # ------ R7: Same date, DIFFERENT bill ------
+        if same_amount and same_date and exp_bill and oth_bill and exp_bill != oth_bill:
+            # Check receipt hashes
+            exp_hash = get_receipt_hash(exp_receipt)
+            oth_hash = get_receipt_hash(oth_receipt)
+
+            if exp_hash and oth_hash:
+                bill_info = bills_map.get((expense.get("bill_id") or "").strip(), {})
+                oth_bill_info = bills_map.get((other.get("bill_id") or "").strip(), {})
+                is_split = (bill_info.get("status") == "split"
+                            or oth_bill_info.get("status") == "split")
+
+                if exp_hash == oth_hash and not is_split:
+                    # R7b: Same file, not a split = duplicate
+                    return DuplicateResult(
+                        verdict="duplicate",
+                        rule="R7b",
+                        details="Same vendor, amount, date; different bills but same receipt file",
+                        paired_expense_id=other_id,
+                    )
+                # R7a: Different files = separate invoices, not dup
+                continue
+            elif not exp_hash or not oth_hash:
+                # R7c: Can't verify without receipts
+                worst_dup = worst_dup or DuplicateResult(
+                    verdict="need_info",
+                    rule="R7c",
+                    details="Same vendor, amount, date, different bills -- need receipt files to verify",
+                    paired_expense_id=other_id,
+                )
+                continue
+
+        # ------ R9: Labor, no check number, receipt comparison ------
+        if is_labor and oth_is_labor and same_amount and not exp_bill and not oth_bill:
+            exp_hash = get_receipt_hash(exp_receipt)
+            oth_hash = get_receipt_hash(oth_receipt)
+            if exp_hash and oth_hash:
+                if exp_hash != oth_hash:
+                    continue  # R9: different checks visually
+                else:
+                    return DuplicateResult(
+                        verdict="duplicate",
+                        rule="R9_same_hash",
+                        details="Labor expenses with same receipt file and no bill number",
+                        paired_expense_id=other_id,
+                    )
+            else:
+                # R9b: need receipt
+                worst_dup = worst_dup or DuplicateResult(
+                    verdict="need_info",
+                    rule="R9b",
+                    details="Labor expenses with same amount, no bill -- need check image to verify",
+                    paired_expense_id=other_id,
+                )
+                continue
+
+        # ------ Catch-all for same amount + same date with no clear rule ------
+        if same_amount and same_date:
+            worst_dup = worst_dup or DuplicateResult(
+                verdict="ambiguous",
+                rule="DEFAULT",
+                details=f"Same vendor, amount (${exp_amount:.2f}), date ({exp_date}) -- needs human review",
+                paired_expense_id=other_id,
+            )
+
+    # Return worst finding, or clean pass
+    return worst_dup or DuplicateResult(
+        verdict="not_duplicate",
+        rule="CLEAR",
+        details="No duplicate patterns found",
+    )
+
+
+# ============================================================================
+# GPT Fallback for ambiguous cases
+# ============================================================================
+
+_GPT_SYSTEM_PROMPT = (
+    "You are Daneel, a financial duplicate-detection agent for a construction company. "
+    "You receive two expenses that the rule engine flagged as ambiguous. "
+    "Determine if they are duplicates or distinct transactions.\n\n"
+    "RULES:\n"
+    "- Respond with ONLY a JSON object: {\"verdict\": \"duplicate\" | \"not_duplicate\", \"confidence\": 0-100, \"reason\": \"brief explanation\"}\n"
+    "- Consider: same vendor + similar amount + same date is suspicious\n"
+    "- Recurring labor/payroll payments on different dates are NOT duplicates\n"
+    "- Same bill on a split invoice across projects is NOT a duplicate\n"
+    "- Slightly different descriptions for identical items ARE duplicates\n"
+    "- If truly uncertain, use confidence < 50\n"
+    "- No preamble, no markdown, just the JSON object"
+)
+
+
+def _format_expense_for_gpt(exp: dict, lookups: dict) -> str:
+    """Format a single expense as a concise string for GPT context."""
+    vendor = lookups["vendors"].get(exp.get("vendor_id"), "Unknown")
+    account = lookups["accounts"].get(exp.get("account_id"), "Unknown")
+    payment = lookups["payment_methods"].get(exp.get("payment_type"), "Unknown")
+    return (
+        f"Vendor: {vendor} | Amount: ${float(exp.get('Amount') or 0):,.2f} | "
+        f"Date: {(exp.get('TxnDate') or '')[:10]} | Bill#: {exp.get('bill_id') or '-'} | "
+        f"Account: {account} | Payment: {payment} | "
+        f"Description: {exp.get('LineDescription') or '-'}"
+    )
+
+
+def gpt_resolve_ambiguous(
+    expense: dict,
+    other: dict,
+    lookups: dict,
+    min_confidence: int = 75,
+) -> DuplicateResult:
+    """
+    Ask GPT-4o-mini to resolve an ambiguous duplicate pair.
+    Returns a DuplicateResult. Falls back to 'ambiguous' on any error.
+    """
+    import json as _json
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return DuplicateResult("ambiguous", "GPT_NO_KEY", "OpenAI API key not configured")
+
+    exp_a = _format_expense_for_gpt(expense, lookups)
+    exp_b = _format_expense_for_gpt(other, lookups)
+    user_msg = f"Expense A:\n{exp_a}\n\nExpense B:\n{exp_b}\n\nAre these duplicates?"
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": _GPT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.1,
+            max_tokens=150,
+        )
+        raw = response.choices[0].message.content.strip()
+        data = _json.loads(raw)
+
+        verdict = data.get("verdict", "").lower()
+        confidence = int(data.get("confidence", 0))
+        reason = data.get("reason", "GPT analysis")
+
+        if confidence < min_confidence:
+            return DuplicateResult("ambiguous", "GPT_LOW_CONF",
+                                   f"GPT confidence {confidence}% < threshold {min_confidence}%: {reason}")
+
+        if verdict == "duplicate":
+            return DuplicateResult("duplicate", "GPT_DUP",
+                                   f"GPT ({confidence}%): {reason}",
+                                   paired_expense_id=other.get("expense_id") or other.get("id"))
+        else:
+            return DuplicateResult("not_duplicate", "GPT_CLEAR",
+                                   f"GPT ({confidence}%): {reason}")
+
+    except Exception as e:
+        logger.warning(f"[DaneelAutoAuth] GPT fallback failed: {e}")
+        return DuplicateResult("ambiguous", "GPT_ERROR", f"GPT fallback error: {e}")
+
+
+# ============================================================================
+# GPT Batch Review (final sanity check before authorizing)
+# ============================================================================
+
+_GPT_BATCH_REVIEW_PROMPT = (
+    "You are Daneel, a financial supervisor for a construction company. "
+    "A rule engine has cleared the following expenses for auto-authorization. "
+    "Review the batch and flag anything suspicious BEFORE they are authorized.\n\n"
+    "FLAG these patterns:\n"
+    "- Unusually high amounts compared to other expenses in the batch\n"
+    "- Multiple expenses from the same vendor on the same day with similar amounts\n"
+    "- Round-number amounts that look like estimates rather than real invoices (e.g. $10,000.00 exactly)\n"
+    "- Anything that feels off based on common construction expense patterns\n\n"
+    "RESPOND with ONLY a JSON object:\n"
+    "- If all clear: {\"approve\": true, \"note\": \"brief summary\"}\n"
+    "- If flagged: {\"approve\": false, \"flagged\": [list of 0-based indices], \"reason\": \"explanation\"}\n"
+    "- Be conservative: when in doubt, approve. Only flag truly suspicious patterns.\n"
+    "- No preamble, no markdown, just the JSON object"
+)
+
+
+def gpt_batch_review(candidates: List[dict], lookups: dict) -> dict:
+    """
+    GPT reviews a batch of expenses before authorization.
+    Returns {"approve_all": True} or {"approve_all": False, "flagged_indices": [...], "reason": "..."}.
+    Fails open (approves all) on any error.
+    """
+    if not candidates:
+        return {"approve_all": True}
+
+    import json as _json
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"approve_all": True}
+
+    # Build summary table
+    lines = []
+    for i, exp in enumerate(candidates):
+        vendor = lookups["vendors"].get(exp.get("vendor_id"), "Unknown")
+        account = lookups["accounts"].get(exp.get("account_id"), "Unknown")
+        amt = f"${float(exp.get('Amount') or 0):,.2f}"
+        date = (exp.get("TxnDate") or "")[:10]
+        desc = (exp.get("LineDescription") or "-")[:60]
+        bill = exp.get("bill_id") or "-"
+        lines.append(f"[{i}] {vendor} | {amt} | {date} | {account} | Bill#{bill} | {desc}")
+
+    user_msg = f"Batch of {len(candidates)} expenses to authorize:\n\n" + "\n".join(lines)
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": _GPT_BATCH_REVIEW_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=300,
+        )
+        raw = response.choices[0].message.content.strip()
+        data = _json.loads(raw)
+
+        if data.get("approve", True):
+            logger.info(f"[DaneelAutoAuth] Batch review APPROVED {len(candidates)} expenses: {data.get('note', '')}")
+            return {"approve_all": True}
+
+        flagged = data.get("flagged", [])
+        reason = data.get("reason", "GPT flagged suspicious pattern")
+        logger.info(f"[DaneelAutoAuth] Batch review FLAGGED indices {flagged}: {reason}")
+        return {"approve_all": False, "flagged_indices": flagged, "reason": reason}
+
+    except Exception as e:
+        logger.warning(f"[DaneelAutoAuth] Batch review failed (approving all): {e}")
+        return {"approve_all": True}
+
+
+# ============================================================================
+# Authorize a single expense (mirrors update_expense_status logic)
+# ============================================================================
+
+def authorize_expense(sb, expense_id: str, project_id: str, rule: str = "passed_all_checks") -> bool:
+    """Set expense status to 'auth' as Daneel."""
+    try:
+        sb.table("expenses_manual_COGS").update({
+            "status": "auth",
+            "auth_status": True,
+            "auth_by": DANEEL_BOT_USER_ID,
+        }).eq("expense_id", expense_id).execute()
+
+        sb.table("expense_status_log").insert({
+            "expense_id": expense_id,
+            "old_status": "pending",
+            "new_status": "auth",
+            "changed_by": DANEEL_BOT_USER_ID,
+            "reason": "Auto-authorized by Daneel",
+            "metadata": {"agent": "daneel", "rule": rule},
+        }).execute()
+
+        # Trigger budget monitor (same as human auth)
+        try:
+            from api.services.budget_monitor import trigger_project_budget_check
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(trigger_project_budget_check(project_id))
+            else:
+                asyncio.run(trigger_project_budget_check(project_id))
+        except Exception as e:
+            logger.warning(f"[DaneelAutoAuth] Budget check trigger failed: {e}")
+
+        return True
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] authorize_expense failed for {expense_id}: {e}")
+        return False
+
+
+# ============================================================================
+# Pending info tracking
+# ============================================================================
+
+def _track_pending_info(sb, expense_id: str, project_id: str, missing: List[str], message_id: Optional[str] = None):
+    try:
+        sb.table("daneel_pending_info").upsert({
+            "expense_id": expense_id,
+            "project_id": project_id,
+            "missing_fields": missing,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "resolved_at": None,
+            "message_id": message_id,
+        }).execute()
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] track_pending_info failed: {e}")
+
+
+def _resolve_pending_info(sb, expense_id: str):
+    try:
+        sb.table("daneel_pending_info").update({
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("expense_id", expense_id).execute()
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] resolve_pending_info failed: {e}")
+
+
+# ============================================================================
+# Message builders
+# ============================================================================
+
+def _build_batch_auth_message(authorized: List[dict], lookups: dict) -> str:
+    total = sum(float(e.get("Amount") or 0) for e in authorized)
+    lines = [
+        f"**Expense Authorization Report**",
+        f"Authorized **{len(authorized)}** expenses totaling **${total:,.2f}**",
+        "",
+        "| Vendor | Amount | Date | Bill # |",
+        "|--------|--------|------|--------|",
+    ]
+    for e in authorized[:20]:  # cap table rows
+        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
+        amt = f"${float(e.get('Amount') or 0):,.2f}"
+        date = (e.get("TxnDate") or "")[:10]
+        bill = e.get("bill_id") or "-"
+        lines.append(f"| {vname} | {amt} | {date} | {bill} |")
+    if len(authorized) > 20:
+        lines.append(f"| ... and {len(authorized) - 20} more | | | |")
+    lines.append("")
+    lines.append("All expenses passed health check and duplicate verification.")
+    return "\n".join(lines)
+
+
+def _build_missing_info_message(missing_list: List[dict], lookups: dict, role_name: str) -> str:
+    mention = f"@{role_name}" if role_name else ""
+    lines = [
+        f"{mention} The following expenses need additional information before authorization:".strip(),
+        "",
+        "| Vendor | Amount | Date | Missing |",
+        "|--------|--------|------|---------|",
+    ]
+    for item in missing_list[:20]:
+        e = item["expense"]
+        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
+        amt = f"${float(e.get('Amount') or 0):,.2f}"
+        date = (e.get("TxnDate") or "")[:10]
+        fields = ", ".join(item["missing"])
+        lines.append(f"| {vname} | {amt} | {date} | {fields} |")
+    if len(missing_list) > 20:
+        lines.append(f"| ... and {len(missing_list) - 20} more | | | |")
+    lines.append("")
+    lines.append("Please update these expenses with the missing information.")
+    return "\n".join(lines)
+
+
+def _build_escalation_message(escalated: List[dict], lookups: dict, role_name: str) -> str:
+    mention = f"@{role_name}" if role_name else ""
+    lines = [
+        f"{mention} The following expenses require manual review:".strip(),
+        "",
+        "| Vendor | Amount | Date | Reason |",
+        "|--------|--------|------|--------|",
+    ]
+    for item in escalated[:20]:
+        e = item["expense"]
+        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
+        amt = f"${float(e.get('Amount') or 0):,.2f}"
+        date = (e.get("TxnDate") or "")[:10]
+        reason = item["reason"]
+        lines.append(f"| {vname} | {amt} | {date} | {reason} |")
+    if len(escalated) > 20:
+        lines.append(f"| ... and {len(escalated) - 20} more | | | |")
+    return "\n".join(lines)
+
+
+def _resolve_role_name(sb, role_id: Optional[str]) -> str:
+    """Resolve a role UUID to its name for @mentions."""
+    if not role_id:
+        return ""
+    try:
+        result = sb.table("rols").select("rol_name").eq("rol_id", role_id).single().execute()
+        if result.data:
+            return result.data["rol_name"].replace(" ", "")
+        return ""
+    except Exception:
+        return ""
+
+
+# ============================================================================
+# Main orchestrator
+# ============================================================================
+
+async def run_auto_auth(process_all: bool = False) -> dict:
+    """
+    Process pending expenses.
+    process_all=False (default): only new since last run.
+    process_all=True: process ALL pending expenses (backlog).
+    """
+    cfg = load_auto_auth_config()
+
+    if not cfg.get("daneel_auto_auth_enabled"):
+        return {"status": "disabled", "message": "Auto-auth is disabled"}
+
+    sb = _get_supabase()
+    lookups = _load_lookups(sb)
+
+    last_run = cfg.get("daneel_auto_auth_last_run")
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Fetch pending expenses
+    query = sb.table("expenses_manual_COGS") \
+        .select("*") \
+        .eq("status", "pending")
+    if not process_all and last_run:
+        query = query.gt("created_at", last_run)
+    result = query.order("created_at").execute()
+
+    pending = result.data or []
+    if not pending:
+        _save_config_key("daneel_auto_auth_last_run", now)
+        return {"status": "ok", "message": "No new pending expenses", "authorized": 0}
+
+    # Load all bills metadata
+    bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
+    bills_map = {}
+    for b in (bills_result.data or []):
+        bills_map[b["bill_id"]] = b
+
+    # Group by project
+    projects = {}
+    for exp in pending:
+        pid = exp.get("project")
+        if pid:
+            projects.setdefault(pid, []).append(exp)
+
+    # Resolve role names for mentions
+    bookkeeping_role = _resolve_role_name(sb, cfg.get("daneel_bookkeeping_role"))
+    accounting_mgr_role = _resolve_role_name(sb, cfg.get("daneel_accounting_mgr_role"))
+
+    total_authorized = 0
+    total_missing = 0
+    total_duplicates = 0
+    total_escalated = 0
+
+    for project_id, expenses in projects.items():
+        authorized_list = []
+        missing_info_list = []
+        duplicate_list = []
+        escalation_list = []
+
+        # Load all expenses for this project (for duplicate comparison)
+        all_project = sb.table("expenses_manual_COGS") \
+            .select("*") \
+            .eq("project", project_id) \
+            .execute()
+        all_project_expenses = all_project.data or []
+
+        # Group all project expenses by vendor for O(n) duplicate comparison
+        by_vendor = {}
+        for e in all_project_expenses:
+            vid = e.get("vendor_id")
+            if vid:
+                by_vendor.setdefault(vid, []).append(e)
+
+        # Phase 1: Rule engine -- classify each expense
+        auth_candidates = []  # (expense, rule) tuples ready for authorization
+
+        for expense in expenses:
+            exp_id = expense.get("expense_id") or expense.get("id")
+
+            # 1. Health check (non-blocking)
+            missing = run_health_check(expense, cfg, bills_map)
+            if missing:
+                missing_info_list.append({"expense": expense, "missing": missing})
+                _track_pending_info(sb, exp_id, project_id, missing)
+
+            # 2. Duplicate check
+            vendor_id = expense.get("vendor_id")
+            same_vendor = by_vendor.get(vendor_id, []) if vendor_id else []
+            dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups)
+
+            if dup_result.verdict == "duplicate":
+                duplicate_list.append({"expense": expense, "result": dup_result})
+                continue  # do NOT authorize
+
+            if dup_result.verdict == "need_info":
+                # Add to missing info if not already there
+                if not missing:
+                    need_fields = ["receipt"] if "receipt" in dup_result.rule.lower() else ["bill_id", "receipt"]
+                    missing_info_list.append({"expense": expense, "missing": need_fields})
+                    _track_pending_info(sb, exp_id, project_id, need_fields)
+                continue
+
+            if dup_result.verdict == "ambiguous":
+                # Try GPT fallback if enabled
+                if cfg.get("daneel_gpt_fallback_enabled") and dup_result.paired_expense_id:
+                    paired = next((e for e in all_project_expenses
+                                   if (e.get("expense_id") or e.get("id")) == dup_result.paired_expense_id), None)
+                    if paired:
+                        gpt_result = gpt_resolve_ambiguous(
+                            expense, paired, lookups,
+                            min_confidence=int(cfg.get("daneel_gpt_fallback_confidence", 75)),
+                        )
+                        if gpt_result.verdict == "duplicate":
+                            duplicate_list.append({"expense": expense, "result": gpt_result})
+                            continue
+                        if gpt_result.verdict == "not_duplicate":
+                            if not missing:
+                                auth_candidates.append((expense, gpt_result.rule))
+                            continue
+                # Still ambiguous -- escalate to human
+                escalation_list.append({"expense": expense, "reason": dup_result.details})
+                continue
+
+            # 3. If missing critical info, don't authorize but continue
+            if missing:
+                continue
+
+            # 4. Rule engine cleared -- add to candidates (NOT authorized yet)
+            auth_candidates.append((expense, dup_result.rule))
+
+        # Phase 2: GPT batch review -- final sanity check before authorizing
+        if auth_candidates and cfg.get("daneel_gpt_fallback_enabled"):
+            review = gpt_batch_review([c[0] for c in auth_candidates], lookups)
+            if not review.get("approve_all"):
+                flagged_set = set(review.get("flagged_indices", []))
+                reason = review.get("reason", "GPT batch review flagged suspicious pattern")
+                surviving = []
+                for i, (exp, rule) in enumerate(auth_candidates):
+                    if i in flagged_set:
+                        escalation_list.append({"expense": exp, "reason": f"[Batch review] {reason}"})
+                    else:
+                        surviving.append((exp, rule))
+                auth_candidates = surviving
+
+        # Phase 3: Authorize all approved candidates
+        for expense, rule in auth_candidates:
+            exp_id = expense.get("expense_id") or expense.get("id")
+            if authorize_expense(sb, exp_id, project_id, rule):
+                authorized_list.append(expense)
+
+        # Phase 4: Post batch messages for this project
+        if authorized_list:
+            msg = _build_batch_auth_message(authorized_list, lookups)
+            post_daneel_message(
+                content=msg,
+                project_id=project_id,
+                channel_type="project_general",
+                metadata={"type": "auto_auth_batch", "count": len(authorized_list),
+                          "total": sum(float(e.get("Amount") or 0) for e in authorized_list)},
+            )
+
+        if missing_info_list:
+            msg = _build_missing_info_message(missing_info_list, lookups, bookkeeping_role)
+            post_daneel_message(
+                content=msg,
+                project_id=project_id,
+                channel_type="project_general",
+                metadata={"type": "auto_auth_missing_info", "count": len(missing_info_list)},
+            )
+
+        if escalation_list:
+            msg = _build_escalation_message(escalation_list, lookups, accounting_mgr_role)
+            post_daneel_message(
+                content=msg,
+                project_id=project_id,
+                channel_type="project_general",
+                metadata={"type": "auto_auth_escalation", "count": len(escalation_list)},
+            )
+
+        total_authorized += len(authorized_list)
+        total_missing += len(missing_info_list)
+        total_duplicates += len(duplicate_list)
+        total_escalated += len(escalation_list)
+
+    # Update last run timestamp
+    _save_config_key("daneel_auto_auth_last_run", now)
+
+    summary = {
+        "status": "ok",
+        "authorized": total_authorized,
+        "missing_info": total_missing,
+        "duplicates": total_duplicates,
+        "escalated": total_escalated,
+        "expenses_processed": len(pending),
+    }
+    logger.info(f"[DaneelAutoAuth] Run complete: {summary}")
+    return summary
+
+
+# ============================================================================
+# Re-process pending info
+# ============================================================================
+
+async def reprocess_pending_info() -> dict:
+    """Re-check expenses that were waiting for missing info."""
+    cfg = load_auto_auth_config()
+    if not cfg.get("daneel_auto_auth_enabled"):
+        return {"status": "disabled"}
+
+    sb = _get_supabase()
+    lookups = _load_lookups(sb)
+
+    # Fetch unresolved pending info
+    result = sb.table("daneel_pending_info") \
+        .select("*") \
+        .is_("resolved_at", "null") \
+        .execute()
+    pending = result.data or []
+
+    if not pending:
+        return {"status": "ok", "reprocessed": 0, "authorized": 0}
+
+    # Load bills
+    bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
+    bills_map = {b["bill_id"]: b for b in (bills_result.data or [])}
+
+    reprocessed = 0
+    authorized = 0
+
+    for item in pending:
+        exp_id = item["expense_id"]
+        project_id = item.get("project_id")
+
+        # Re-fetch expense
+        exp_result = sb.table("expenses_manual_COGS") \
+            .select("*") \
+            .eq("expense_id", exp_id) \
+            .single() \
+            .execute()
+        if not exp_result.data:
+            _resolve_pending_info(sb, exp_id)
+            continue
+
+        expense = exp_result.data
+
+        # Skip if already authorized
+        if expense.get("status") != "pending":
+            _resolve_pending_info(sb, exp_id)
+            continue
+
+        # Re-run health check
+        missing = run_health_check(expense, cfg, bills_map)
+        if missing:
+            # Still missing -- update fields
+            try:
+                sb.table("daneel_pending_info").update({
+                    "missing_fields": missing,
+                }).eq("expense_id", exp_id).execute()
+            except Exception:
+                pass
+            continue
+
+        # Info is now complete -- run duplicate check
+        vendor_id = expense.get("vendor_id")
+        same_vendor_result = sb.table("expenses_manual_COGS") \
+            .select("*") \
+            .eq("project", project_id) \
+            .eq("vendor_id", vendor_id) \
+            .execute()
+        same_vendor = same_vendor_result.data or []
+
+        dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups)
+
+        if dup_result.verdict == "ambiguous" and cfg.get("daneel_gpt_fallback_enabled") and dup_result.paired_expense_id:
+            paired = next((e for e in same_vendor
+                           if (e.get("expense_id") or e.get("id")) == dup_result.paired_expense_id), None)
+            if paired:
+                dup_result = gpt_resolve_ambiguous(
+                    expense, paired, lookups,
+                    min_confidence=int(cfg.get("daneel_gpt_fallback_confidence", 75)),
+                )
+
+        if dup_result.verdict in ("duplicate", "ambiguous", "need_info"):
+            # Still problematic -- keep pending
+            continue
+
+        # All clear -- authorize
+        if authorize_expense(sb, exp_id, project_id, "reprocessed_" + dup_result.rule):
+            authorized += 1
+
+        _resolve_pending_info(sb, exp_id)
+        reprocessed += 1
+
+    return {"status": "ok", "reprocessed": reprocessed, "authorized": authorized}
+
+
+# ============================================================================
+# Event trigger (single expense, called as BackgroundTask)
+# ============================================================================
+
+async def trigger_auto_auth_check(expense_id: str, project_id: str):
+    """
+    Lightweight check for a single expense.
+    Called as BackgroundTask after expense creation or update.
+    """
+    try:
+        cfg = load_auto_auth_config()
+        if not cfg.get("daneel_auto_auth_enabled"):
+            return
+
+        sb = _get_supabase()
+
+        # Fetch the expense
+        exp_result = sb.table("expenses_manual_COGS") \
+            .select("*") \
+            .eq("expense_id", expense_id) \
+            .single() \
+            .execute()
+
+        if not exp_result.data:
+            return
+        expense = exp_result.data
+
+        if expense.get("status") != "pending":
+            return
+
+        lookups = _load_lookups(sb)
+
+        # Load bills
+        bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
+        bills_map = {b["bill_id"]: b for b in (bills_result.data or [])}
+
+        # Health check
+        missing = run_health_check(expense, cfg, bills_map)
+        if missing:
+            _track_pending_info(sb, expense_id, project_id, missing)
+            # Post individual missing info message
+            bookkeeping_role = _resolve_role_name(sb, cfg.get("daneel_bookkeeping_role"))
+            vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
+            amt = f"${float(expense.get('Amount') or 0):,.2f}"
+            fields_str = ", ".join(missing)
+            msg = (f"@{bookkeeping_role} " if bookkeeping_role else "") + \
+                  f"Expense from **{vname}** ({amt}) is missing: **{fields_str}**. " \
+                  f"Please provide to proceed with authorization."
+            post_daneel_message(
+                content=msg,
+                project_id=project_id,
+                channel_type="project_general",
+                metadata={"type": "auto_auth_missing_info", "count": 1},
+            )
+            return  # don't authorize yet
+
+        # Duplicate check
+        vendor_id = expense.get("vendor_id")
+        if vendor_id:
+            same_vendor_result = sb.table("expenses_manual_COGS") \
+                .select("*") \
+                .eq("project", project_id) \
+                .eq("vendor_id", vendor_id) \
+                .execute()
+            same_vendor = same_vendor_result.data or []
+        else:
+            same_vendor = []
+
+        dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups)
+
+        if dup_result.verdict == "duplicate":
+            logger.info(f"[DaneelAutoAuth] Duplicate detected: {expense_id} ({dup_result.rule})")
+            return
+
+        if dup_result.verdict == "need_info":
+            need_fields = ["receipt"] if "receipt" in dup_result.rule.lower() else ["bill_id", "receipt"]
+            _track_pending_info(sb, expense_id, project_id, need_fields)
+            return
+
+        if dup_result.verdict == "ambiguous":
+            # Try GPT fallback if enabled
+            if cfg.get("daneel_gpt_fallback_enabled") and dup_result.paired_expense_id:
+                paired = next((e for e in same_vendor
+                               if (e.get("expense_id") or e.get("id")) == dup_result.paired_expense_id), None)
+                if paired:
+                    gpt_result = gpt_resolve_ambiguous(
+                        expense, paired, lookups,
+                        min_confidence=int(cfg.get("daneel_gpt_fallback_confidence", 75)),
+                    )
+                    if gpt_result.verdict == "duplicate":
+                        logger.info(f"[DaneelAutoAuth] GPT flagged duplicate: {expense_id} ({gpt_result.rule})")
+                        return
+                    if gpt_result.verdict == "not_duplicate":
+                        if authorize_expense(sb, expense_id, project_id, gpt_result.rule):
+                            vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
+                            amt = f"${float(expense.get('Amount') or 0):,.2f}"
+                            logger.info(f"[DaneelAutoAuth] GPT cleared + auto-authorized: {expense_id} ({vname} {amt})")
+                        return
+
+            # Still ambiguous -- escalate to human
+            accounting_mgr_role = _resolve_role_name(sb, cfg.get("daneel_accounting_mgr_role"))
+            vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
+            amt = f"${float(expense.get('Amount') or 0):,.2f}"
+            msg = (f"@{accounting_mgr_role} " if accounting_mgr_role else "") + \
+                  f"Expense from **{vname}** ({amt}) requires manual review: {dup_result.details}"
+            post_daneel_message(
+                content=msg,
+                project_id=project_id,
+                channel_type="project_general",
+                metadata={"type": "auto_auth_escalation", "count": 1},
+            )
+            return
+
+        # All clear by rules -- GPT batch review as final check
+        if cfg.get("daneel_gpt_fallback_enabled"):
+            review = gpt_batch_review([expense], lookups)
+            if not review.get("approve_all"):
+                reason = review.get("reason", "GPT flagged suspicious pattern")
+                accounting_mgr_role = _resolve_role_name(sb, cfg.get("daneel_accounting_mgr_role"))
+                vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
+                amt = f"${float(expense.get('Amount') or 0):,.2f}"
+                msg = (f"@{accounting_mgr_role} " if accounting_mgr_role else "") + \
+                      f"Expense from **{vname}** ({amt}) flagged by batch review: {reason}"
+                post_daneel_message(
+                    content=msg,
+                    project_id=project_id,
+                    channel_type="project_general",
+                    metadata={"type": "auto_auth_escalation", "count": 1},
+                )
+                return
+
+        # Authorize
+        if authorize_expense(sb, expense_id, project_id, dup_result.rule):
+            vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
+            amt = f"${float(expense.get('Amount') or 0):,.2f}"
+            logger.info(f"[DaneelAutoAuth] Auto-authorized: {expense_id} ({vname} {amt})")
+
+    except Exception as e:
+        logger.error(f"[DaneelAutoAuth] trigger_auto_auth_check error: {e}")

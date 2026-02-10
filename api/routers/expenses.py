@@ -100,7 +100,7 @@ def extract_rel_value(row: dict, rel_name: str, field: str):
 # ====== ENDPOINTS ======
 
 @router.post("", status_code=201)
-def create_expense(payload: ExpenseCreate):
+def create_expense(payload: ExpenseCreate, background_tasks: BackgroundTasks):
     """
     Crea un nuevo gasto
     """
@@ -122,9 +122,17 @@ def create_expense(payload: ExpenseCreate):
         # Insertar gasto
         res = supabase.table("expenses_manual_COGS").insert(data).execute()
 
+        # Trigger Daneel auto-auth check for new pending expense
+        created = res.data[0] if res.data else {}
+        expense_id = created.get("expense_id")
+        project_id = created.get("project")
+        if expense_id and project_id and created.get("status", "pending") == "pending":
+            from api.services.daneel_auto_auth import trigger_auto_auth_check
+            background_tasks.add_task(trigger_auto_auth_check, expense_id, project_id)
+
         return {
             "message": "Expense created",
-            "expense": res.data[0],
+            "expense": created,
         }
 
     except HTTPException:
@@ -134,7 +142,7 @@ def create_expense(payload: ExpenseCreate):
 
 
 @router.post("/batch", status_code=201)
-def create_expenses_batch(payload: ExpenseBatchCreate):
+def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: BackgroundTasks):
     """
     Crea múltiples gastos en una sola operación (bulk insert).
     Mucho más eficiente que crear uno por uno.
@@ -179,6 +187,14 @@ def create_expenses_batch(payload: ExpenseBatchCreate):
         res = supabase.table("expenses_manual_COGS").insert(expenses_data).execute()
 
         created_expenses = res.data or []
+
+        # Trigger Daneel auto-auth for each created pending expense
+        from api.services.daneel_auto_auth import trigger_auto_auth_check
+        for exp in created_expenses:
+            exp_id = exp.get("expense_id")
+            proj_id = exp.get("project")
+            if exp_id and proj_id and exp.get("status", "pending") == "pending":
+                background_tasks.add_task(trigger_auto_auth_check, exp_id, proj_id)
 
         return {
             "message": f"Batch insert completed: {len(created_expenses)} created",
@@ -630,7 +646,7 @@ def update_expense(expense_id: str, payload: ExpenseUpdate):
 
 
 @router.patch("/{expense_id}")
-def patch_expense(expense_id: str, payload: ExpenseUpdate, user_id: Optional[str] = None, change_reason: Optional[str] = None):
+def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: BackgroundTasks, user_id: Optional[str] = None, change_reason: Optional[str] = None):
     """
     Actualiza parcialmente un gasto existente con logging de cambios.
     Solo se actualizan los campos proporcionados en el body.
@@ -750,9 +766,18 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, user_id: Optional[str
         # Actualizar
         res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
 
+        # Trigger Daneel re-check when bill_id or receipt_url is updated on a pending expense
+        updated_exp = res.data[0] if res.data else {}
+        if (updated_exp.get("status", current_status) == "pending"
+                and ("bill_id" in data or "receipt_url" in data)):
+            project_id = updated_exp.get("project") or existing.get("project")
+            if project_id:
+                from api.services.daneel_auto_auth import trigger_auto_auth_check
+                background_tasks.add_task(trigger_auto_auth_check, expense_id, project_id)
+
         return {
             "message": "Expense updated successfully",
-            "expense": res.data[0] if res.data else None,
+            "expense": updated_exp,
             "changes_logged": len(change_logs),
             "status_changed": status_changed
         }
