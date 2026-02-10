@@ -685,9 +685,12 @@ def _make_decision_entry(expense: dict, lookups: dict, decision: str,
                          rule: str = "", reason: str = "", missing_fields: list = None,
                          checks: list = None) -> dict:
     """Build a compact decision object for the report."""
+    vendor_name = lookups["vendors"].get(expense.get("vendor_id"), "")
+    if not vendor_name:
+        vendor_name = expense.get("bill_id") or "Unknown"
     entry = {
         "expense_id": expense.get("expense_id") or expense.get("id"),
-        "vendor": lookups["vendors"].get(expense.get("vendor_id"), "Unknown"),
+        "vendor": vendor_name,
         "amount": float(expense.get("Amount") or 0),
         "date": (expense.get("TxnDate") or "")[:10],
         "bill_id": expense.get("bill_id") or "",
