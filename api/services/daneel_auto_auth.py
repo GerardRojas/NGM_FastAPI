@@ -136,9 +136,9 @@ def _load_lookups(sb) -> dict:
         logger.error(f"[DaneelAutoAuth] payment_methods lookup error: {e}")
 
     try:
-        vends = sb.table("Vendors").select("vendor_id, vendor_name").execute()
+        vends = sb.table("Vendors").select("id, vendor_name").execute()
         for v in (vends.data or []):
-            lookups["vendors"][v["vendor_id"]] = v["vendor_name"]
+            lookups["vendors"][v["id"]] = v["vendor_name"]
     except Exception as e:
         logger.error(f"[DaneelAutoAuth] vendors lookup error: {e}")
 
