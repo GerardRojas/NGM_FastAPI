@@ -19,6 +19,7 @@ import os
 from supabase import create_client, Client
 
 from api.helpers.daneel_messenger import post_daneel_message
+from services.agent_persona import personalize as _personalize_msg
 
 logger = logging.getLogger(__name__)
 
@@ -457,37 +458,39 @@ def format_channel_alert(alert: Dict) -> str:
     if alert_type == "overspend":
         over = actual - budget
         return (
-            f"Budget Exceeded: {account}\n"
+            f"I've been watching **{account}** closely -- it has exceeded its budget.\n"
             f"Budget: ${budget:,.2f} | Actual: ${actual:,.2f} | Over by ${over:,.2f} ({pct:.1f}%)\n"
-            f"Action required - acknowledge in Budget Monitor."
+            f"This requires acknowledgment in Budget Monitor."
         )
 
     if alert_type == "critical":
         remaining = budget - actual
         return (
-            f"Budget Critical: {account}\n"
+            f"**{account}** is approaching its limit. I'm keeping a close eye on this.\n"
             f"{pct:.1f}% used | ${remaining:,.2f} remaining of ${budget:,.2f} budget."
         )
 
     if alert_type == "warning":
         remaining = budget - actual
         return (
-            f"Budget Warning: {account}\n"
+            f"A note on **{account}** -- spending is getting close to the threshold.\n"
             f"{pct:.1f}% used | ${remaining:,.2f} remaining of ${budget:,.2f} budget."
         )
 
     if alert_type == "no_budget":
         return (
-            f"Unbudgeted Expense: ${actual:,.2f} in {account}\n"
-            f"No budget assigned for this account. Review recommended."
+            f"I've noticed spending in **{account}** with no budget assigned.\n"
+            f"${actual:,.2f} recorded so far. Worth looking into."
         )
 
     return alert.get("message", "Budget alert")
 
 
 def post_alert_to_channel(alert: Dict):
-    """Post a budget alert to the project's accounting channel as Daneel."""
+    """Post a budget alert to the project's general channel as Daneel."""
     content = format_channel_alert(alert)
+    # GPT adds natural variation so stacked alerts don't read identically
+    content = _personalize_msg("daneel", content)
     metadata = {
         "alert_type": alert["alert_type"],
         "account_name": alert["account_name"],

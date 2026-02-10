@@ -67,7 +67,7 @@ from openai import OpenAI
 import json
 import io
 from pdf2image import convert_from_bytes
-from api.helpers.bot_messenger import post_bot_message, ARTURITO_BOT_USER_ID
+from api.helpers.andrew_messenger import post_andrew_message, ANDREW_BOT_USER_ID
 from services.receipt_scanner import (
     scan_receipt as _scan_receipt_core,
     auto_categorize as _auto_categorize_core,
@@ -904,7 +904,7 @@ async def agent_process_receipt(
             amount = original_parsed.get("amount", 0)
             cat = original_parsed.get("categorization", {})
 
-            post_bot_message(
+            post_andrew_message(
                 content=(
                     f"This receipt from **{vendor_name}** for ${amount:,.2f} was already processed as a split in another project.\n"
                     f"Category: **{cat.get('account_name', 'Uncategorized')}** ({cat.get('confidence', 0)}% confidence)\n\n"
@@ -959,7 +959,7 @@ async def agent_process_receipt(
                 .eq("id", receipt_id) \
                 .execute()
 
-            post_bot_message(
+            post_andrew_message(
                 content=(
                     f"Heads up -- this looks like a duplicate. "
                     f"I found a matching receipt from {dup_vendor} for ${dup_amount:,.2f} "
@@ -1011,10 +1011,10 @@ async def agent_process_receipt(
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", receipt_id).execute()
 
-            post_bot_message(
+            post_andrew_message(
                 content=(
                     f"This file \"{file_name}\" looks like a check. "
-                    "Is it for materials or labor?"
+                    "Materials or labor?"
                 ),
                 project_id=project_id,
                 metadata={
@@ -1231,7 +1231,7 @@ async def agent_process_receipt(
         else:
             msg_content += f"\n\nIs this entire bill for **{project_name}**?"
 
-        post_bot_message(
+        post_andrew_message(
             content=msg_content,
             project_id=project_id,
             metadata={
@@ -1281,7 +1281,7 @@ async def agent_process_receipt(
 
         # Post error message if we know the project
         if project_id:
-            post_bot_message(
+            post_andrew_message(
                 content=(
                     f"I ran into a problem processing this receipt: {str(e)}\n\n"
                     "You can process it manually from Expenses > From Pending."
@@ -1505,7 +1505,7 @@ def _get_payroll_channel_id() -> Optional[str]:
 
 
 def _check_flow_msg_kwargs(project_id: str, check_flow: dict) -> dict:
-    """Return post_bot_message routing kwargs based on check flow target channel."""
+    """Return post_andrew_message routing kwargs based on check flow target channel."""
     channel_id = check_flow.get("channel_id")
     if channel_id:
         return {"channel_id": channel_id, "channel_type": "group"}
@@ -1523,8 +1523,8 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
         check_flow["check_type"] = "material"
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
-        post_bot_message(
-            content="Got it, material check. What is the total amount?",
+        post_andrew_message(
+            content="Material check. What is the total amount?",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1541,8 +1541,8 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
         # Labor check: route to Payroll group channel
         payroll_channel_id = _get_payroll_channel_id()
         if not payroll_channel_id:
-            post_bot_message(
-                content="I could not find the Payroll channel. Please make sure it exists, then try again.",
+            post_andrew_message(
+                content="Can't find the Payroll channel. Make sure it exists and try again.",
                 project_id=project_id,
                 metadata={
                     "agent_message": True,
@@ -1561,7 +1561,7 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
         # Post redirect message in the receipts channel
-        post_bot_message(
+        post_andrew_message(
             content=(
                 "Got it, this is a labor check. I will continue in the **Payroll** channel.\n\n"
                 "[Go to Payroll](/messages.html?channel=" + payroll_channel_id + "&type=group)"
@@ -1598,7 +1598,7 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
         file_link = f"[{file_name}]({file_url})" if file_url else file_name
 
         # Post check info + amount question in Payroll channel
-        post_bot_message(
+        post_andrew_message(
             content=(
                 f"Labor check received from project **{proj_name}**: {file_link}\n\n"
                 "What is the total amount?"
@@ -1627,8 +1627,8 @@ def _handle_check_detected(receipt_id, project_id, check_flow, parsed_data, acti
             "updated_at": datetime.utcnow().isoformat()
         }).eq("id", receipt_id).execute()
 
-        post_bot_message(
-            content="No problem, I will process it as a regular receipt.",
+        post_andrew_message(
+            content="Not a check then. Processing it as a regular receipt.",
             project_id=project_id,
             metadata={
                 "agent_message": True,
@@ -1651,8 +1651,8 @@ def _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, act
     amount = _parse_amount(text)
 
     if amount is None:
-        post_bot_message(
-            content=f"I could not read \"{text}\" as a dollar amount. Try something like 1250 or $1,250.00.",
+        post_andrew_message(
+            content=f"\"{text}\" doesn't look like a dollar amount. Try something like 1250 or $1,250.00.",
             **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
@@ -1675,10 +1675,8 @@ def _handle_awaiting_amount(receipt_id, project_id, check_flow, parsed_data, act
         "updated_at": datetime.utcnow().isoformat()
     }).eq("id", receipt_id).execute()
 
-    post_bot_message(
-        content=(
-            f"Got it, **${amount:,.2f}**. Does this check need to be split across multiple projects?"
-        ),
+    post_andrew_message(
+        content=f"**${amount:,.2f}**. Does this check need to be split across multiple projects?",
         **_check_flow_msg_kwargs(project_id, check_flow),
         metadata={
             "agent_message": True,
@@ -1698,8 +1696,8 @@ def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, acti
         check_flow["state"] = "awaiting_description"
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
-        post_bot_message(
-            content="Alright, single project. What is the labor description? (e.g. \"Drywall labor\")",
+        post_andrew_message(
+            content="Single project. What is the labor description? (e.g. \"Drywall labor\")",
             **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
@@ -1718,7 +1716,7 @@ def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, acti
         check_flow["state"] = "awaiting_split_details"
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
-        post_bot_message(
+        post_andrew_message(
             content=(
                 "Alright, let us split it. Send each split as a message:\n"
                 "**[amount] [description] for [project name]**\n\n"
@@ -1776,7 +1774,7 @@ def _handle_description(receipt_id, project_id, check_flow, parsed_data, action,
     method = cat.get("method", "")
     method_label = "(fuzzy match)" if method == "fuzzy_match" else "(AI suggestion)"
 
-    post_bot_message(
+    post_andrew_message(
         content=(
             f"I categorized this as **{cat_name}** ({cat_conf}% confidence) {method_label}.\n\n"
             f"${check_flow['amount']:,.2f} -- {text}\n\n"
@@ -1799,8 +1797,8 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
     if action == "split_done":
         splits = check_flow.get("splits", [])
         if not splits:
-            post_bot_message(
-                content="I do not have any splits yet. Add at least one, or just type a description.",
+            post_andrew_message(
+                content="Nothing to split yet. Add at least one item, or just type a description.",
                 **_check_flow_msg_kwargs(project_id, check_flow),
                 metadata={
                     "agent_message": True,
@@ -1844,7 +1842,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
         if abs(total_split - check_amount) > 0.01:
             diff_note = f"\n\nNote: Split total (${total_split:,.2f}) differs from check amount (${check_amount:,.2f}) by ${abs(total_split - check_amount):,.2f}"
 
-        post_bot_message(
+        post_andrew_message(
             content=(
                 f"Here is how I categorized the splits:\n\n{summary}{diff_note}\n\n"
                 "Does everything look right?"
@@ -1881,8 +1879,8 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
             project_name = None
 
         if amount is None:
-            post_bot_message(
-                content=f"I could not read an amount from \"{text}\". Try the format: **[amount] [description]** (e.g. \"500 drywall labor\")",
+            post_andrew_message(
+                content=f"Can't read an amount from \"{text}\". Try: **[amount] [description]** (e.g. \"500 drywall labor\")",
                 **_check_flow_msg_kwargs(project_id, check_flow),
                 metadata={
                     "agent_message": True,
@@ -1927,7 +1925,7 @@ def _handle_split_details(receipt_id, project_id, check_flow, parsed_data, actio
         elif remaining < -0.01:
             remaining_note = f" (${abs(remaining):,.2f} over check amount)"
 
-        post_bot_message(
+        post_andrew_message(
             content=(
                 f"Added ${amount:,.2f} for {description} ({project_name or 'this project'}).\n"
                 f"Running total: ${total_so_far:,.2f} of ${check_amount:,.2f}{remaining_note}\n\n"
@@ -1956,10 +1954,10 @@ def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, ac
         _update_check_flow(receipt_id, check_flow, parsed_data)
 
         count = len(expenses)
-        post_bot_message(
+        post_andrew_message(
             content=(
-                f"All done. {count} expense{'s' if count != 1 else ''} created from this check. "
-                "You can review them in Expenses > From Pending."
+                f"{count} expense{'s' if count != 1 else ''} created from this check. "
+                "Review them in Expenses > From Pending."
             ),
             **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
@@ -1981,8 +1979,8 @@ def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, ac
             "updated_at": datetime.utcnow().isoformat()
         }).eq("id", receipt_id).execute()
 
-        post_bot_message(
-            content="No worries, check processing cancelled. The receipt is back to pending.",
+        post_andrew_message(
+            content="Check processing cancelled. Receipt is back to pending.",
             **_check_flow_msg_kwargs(project_id, check_flow),
             metadata={
                 "agent_message": True,
@@ -2104,8 +2102,8 @@ async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", receipt_id).execute()
 
-            post_bot_message(
-                content="Got it, processing this receipt anyway.",
+            post_andrew_message(
+                content="Processing it anyway.",
                 project_id=project_id,
                 metadata={
                     "agent_message": True,
@@ -2129,8 +2127,8 @@ async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", receipt_id).execute()
 
-            post_bot_message(
-                content="No problem, I will skip this one.",
+            post_andrew_message(
+                content="Skipping this one.",
                 project_id=project_id,
                 metadata={
                     "agent_message": True,
@@ -2190,8 +2188,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", receipt_id).execute()
 
-            post_bot_message(
-                content="Split cancelled. The receipt is ready for manual processing.",
+            post_andrew_message(
+                content="Split cancelled. Receipt is ready for manual processing.",
                 project_id=project_id,
                 metadata={
                     "agent_message": True,
@@ -2271,7 +2269,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
                     count = len(created_expenses)
                     msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
-                    post_bot_message(
+                    post_andrew_message(
                         content=msg,
                         project_id=project_id,
                         metadata={
@@ -2289,8 +2287,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "updated_at": datetime.utcnow().isoformat()
                     }).eq("id", receipt_id).execute()
 
-                    post_bot_message(
-                        content="Receipt processed. Ready for review.",
+                    post_andrew_message(
+                        content="Processed. Ready for review.",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -2324,7 +2322,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "Type your assignments, e.g.: **3, 4 to Sunset Heights, 7 to Oak Park**"
                     )
 
-                post_bot_message(
+                post_andrew_message(
                     content=prompt_msg,
                     project_id=project_id,
                     metadata={
@@ -2349,8 +2347,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 # Parse item-to-project assignments
                 assignments = _parse_item_assignments(text, num_items)
                 if not assignments:
-                    post_bot_message(
-                        content="I could not parse that. Use this format:\n**3, 4 to Sunset Heights, 7 to Oak Park**",
+                    post_andrew_message(
+                        content="Didn't catch that. Use this format:\n**3, 4 to Sunset Heights, 7 to Oak Park**",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -2370,8 +2368,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 for assignment in assignments:
                     project = _resolve_project_by_name(assignment["project_query"])
                     if not project:
-                        post_bot_message(
-                            content=f'Could not find a project matching "{assignment["project_query"]}". Please try again.',
+                        post_andrew_message(
+                            content=f'No project matching "{assignment["project_query"]}". Try again.',
                             project_id=project_id,
                             metadata={
                                 "agent_message": True,
@@ -2464,7 +2462,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     if created_other:
                         split_msg += f"\n\n{len(created_other)} expense(s) auto-created."
 
-                    post_bot_message(
+                    post_andrew_message(
                         content=split_msg,
                         project_id=pa["project_id"],
                         metadata={
@@ -2496,7 +2494,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
                 # Post summary to this project
                 num_projects = len(project_assignments) + (1 if this_project_indices else 0)
-                post_bot_message(
+                post_andrew_message(
                     content=(
                         f"Done! Items split across {num_projects} project(s):\n"
                         + "\n".join(f"- {s}" for s in summary_parts)
@@ -2592,7 +2590,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
                     count = len(created_expenses)
                     msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
-                    post_bot_message(
+                    post_andrew_message(
                         content=msg,
                         project_id=project_id,
                         metadata={
@@ -2610,8 +2608,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "updated_at": datetime.utcnow().isoformat()
                     }).eq("id", receipt_id).execute()
 
-                    post_bot_message(
-                        content="Receipt processed. Ready for review.",
+                    post_andrew_message(
+                        content="Processed. Ready for review.",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -2633,7 +2631,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     "updated_at": datetime.utcnow().isoformat()
                 }).eq("id", receipt_id).execute()
 
-                post_bot_message(
+                post_andrew_message(
                     content=(
                         f"Got it, this bill is split. Tell me which items belong to **{project_name}**.\n\n"
                         "Send each item as: **[amount] [description]**\n"
@@ -2664,8 +2662,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 parsed_line = _parse_receipt_split_line(text)
 
                 if not parsed_line:
-                    post_bot_message(
-                        content="I could not parse that. Send each item as: **[amount] [description]**\nExample: *500 plumbing materials*",
+                    post_andrew_message(
+                        content="Didn't catch that. Send each item as: **[amount] [description]**\nExample: *500 plumbing materials*",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -2692,7 +2690,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 remaining = round(receipt_amount - total, 2)
                 remaining_note = f" (${remaining:,.2f} remaining)" if remaining > 0 else ""
 
-                post_bot_message(
+                post_andrew_message(
                     content=(
                         f"Added: ${parsed_line['amount']:,.2f} -- {parsed_line['description']}\n"
                         f"Running total: ${total:,.2f} of ${receipt_amount:,.2f}{remaining_note}\n\n"
@@ -2714,8 +2712,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
             elif action == "split_done":
                 items = receipt_flow.get("split_items", [])
                 if not items:
-                    post_bot_message(
-                        content="Please add at least one item before finishing.",
+                    post_andrew_message(
+                        content="Add at least one item before finishing.",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -2768,7 +2766,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
                 total = receipt_flow["total_for_project"]
                 count = len(created_expenses)
-                post_bot_message(
+                post_andrew_message(
                     content=(
                         f"Done! {count} expense(s) created for **{project_name}** totaling ${total:,.2f}.\n\n"
                         "This receipt is marked as split -- upload it to other projects to register their portions."
@@ -2858,7 +2856,7 @@ def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromRecei
 
         # Post confirmation to receipts channel
         vendor_name = receipt_data.get("vendor_name") or "Unknown vendor"
-        post_bot_message(
+        post_andrew_message(
             content=f"Expense created -- ${payload.amount:,.2f} from {vendor_name}. Ready for authorization.",
             project_id=receipt_data["project_id"],
             metadata={
@@ -2940,7 +2938,7 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest):
             link_vendor = receipt.data.get("vendor_name") or "receipt"
             link_amount = receipt.data.get("amount")
             amount_text = f" (${link_amount:,.2f})" if link_amount else ""
-            post_bot_message(
+            post_andrew_message(
                 content=f"Receipt from {link_vendor}{amount_text} linked to an existing expense.",
                 project_id=link_project_id,
                 metadata={

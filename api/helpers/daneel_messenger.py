@@ -50,7 +50,7 @@ def _ensure_bot_user_exists():
 def post_daneel_message(
     content: str,
     project_id: str,
-    channel_type: str = "project_accounting",
+    channel_type: str = "project_general",
     metadata: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
