@@ -925,16 +925,28 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 _resolve_pending_info(sb, exp_id)
 
             # 1b. Bill hint cross-validation (soft armoring layer)
+            # Parse the receipt FILENAME (not bill_id) for embedded amount hints,
+            # then compare against the SUM of all expenses on the same bill.
             from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
+            from urllib.parse import unquote
             bill_id_str = (expense.get("bill_id") or "").strip()
-            if bill_id_str:
-                hint = parse_bill_hint(bill_id_str)
+            if bill_id_str and bill_id_str in bills_map:
+                receipt_url = bills_map[bill_id_str].get("receipt_url") or ""
+                # Extract filename from URL path and decode URL encoding
+                hint_source = unquote(receipt_url.rsplit("/", 1)[-1]) if "/" in receipt_url else unquote(receipt_url)
+                hint = parse_bill_hint(hint_source) if hint_source else {}
                 if hint and hint.get("amount_hint") is not None:
+                    # Sum ALL expenses with the same bill_id (bill total, not single line)
+                    bill_total = sum(
+                        float(e.get("Amount") or 0)
+                        for e in all_project_expenses
+                        if (e.get("bill_id") or "").strip() == bill_id_str
+                    )
                     exp_vendor_name = lookups["vendors"].get(expense.get("vendor_id"), "")
                     hint_val = cross_validate_bill_hint(
                         hint,
                         vendor_name=exp_vendor_name,
-                        amount=float(expense.get("Amount") or 0),
+                        amount=bill_total,
                         date_str=(expense.get("TxnDate") or ""),
                     )
                     if hint_val.get("amount_match") is False:
@@ -946,11 +958,13 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                             checks=exp_checks))
                         continue
                     else:
-                        exp_checks.append({"check": "bill_hint", "passed": True, "detail": "Bill hint validated"})
+                        exp_checks.append({"check": "bill_hint", "passed": True,
+                                           "detail": f"Bill total ${bill_total:,.2f} matches hint ${hint['amount_hint']:,.2f}"})
                 else:
-                    exp_checks.append({"check": "bill_hint", "passed": True, "detail": "No amount hint to validate"})
+                    exp_checks.append({"check": "bill_hint", "passed": True, "detail": "No amount hint in receipt filename"})
             else:
-                exp_checks.append({"check": "bill_hint", "passed": True, "detail": "No bill ID"})
+                exp_checks.append({"check": "bill_hint", "passed": True,
+                                   "detail": "No bill" if not bill_id_str else "Bill not in bills table"})
 
             # 2. Duplicate check
             vendor_id = expense.get("vendor_id")
