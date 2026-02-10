@@ -25,9 +25,6 @@ class AlertSettingsUpdate(BaseModel):
     overspend_alert: Optional[bool] = None
     no_budget_alert: Optional[bool] = None
     is_enabled: Optional[bool] = None
-    check_frequency_minutes: Optional[int] = None
-    quiet_start_hour: Optional[int] = None       # 0-23
-    quiet_end_hour: Optional[int] = None         # 0-23
 
 
 class AlertRecipientCreate(BaseModel):
@@ -100,9 +97,6 @@ async def get_alert_settings(
                 "overspend_alert": True,
                 "no_budget_alert": True,
                 "is_enabled": True,
-                "check_frequency_minutes": 60,
-                "quiet_start_hour": 22,
-                "quiet_end_hour": 7,
             },
             "scope": "default"
         }
@@ -453,17 +447,25 @@ async def trigger_budget_check(
 ):
     """
     Manually trigger a budget check.
+    If project_id is provided, checks only that project.
+    Otherwise checks all projects.
     Runs in background and returns immediately.
     """
     try:
-        from api.services.budget_monitor import run_budget_check
-
-        # Run check in background
-        background_tasks.add_task(run_budget_check)
+        if project_id:
+            from api.services.budget_monitor import trigger_project_budget_check
+            background_tasks.add_task(trigger_project_budget_check, project_id)
+            scope = "project"
+        else:
+            from api.services.budget_monitor import run_budget_check
+            background_tasks.add_task(run_budget_check)
+            scope = "all"
 
         return {
             "message": "Budget check started",
             "status": "running",
+            "scope": scope,
+            "project_id": project_id,
             "triggered_by": current_user.get("user_name")
         }
 

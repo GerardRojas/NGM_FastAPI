@@ -68,6 +68,10 @@ import json
 import io
 from pdf2image import convert_from_bytes
 from api.helpers.bot_messenger import post_bot_message, ARTURITO_BOT_USER_ID
+from services.receipt_scanner import (
+    scan_receipt as _scan_receipt_core,
+    auto_categorize as _auto_categorize_core,
+)
 
 router = APIRouter(prefix="/pending-receipts", tags=["Pending Receipts"])
 
@@ -606,13 +610,15 @@ def _check_file_hash_split_reuse(file_hash: str, project_id: str, receipt_id: st
         return None
 
 
-def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, account_id, amount=None, description=None):
+def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, account_id,
+                            amount=None, description=None, bill_id=None, txn_date=None,
+                            txn_type_id=None, payment_method_id=None):
     """Create a single expense from receipt data. Returns expense record or None."""
     try:
         expense_data = {
             "project": project_id,
             "Amount": amount or parsed_data.get("amount"),
-            "TxnDate": parsed_data.get("receipt_date"),
+            "TxnDate": txn_date or parsed_data.get("receipt_date"),
             "LineDescription": description or parsed_data.get("description") or f"Receipt: {receipt_data.get('file_name')}",
             "account_id": account_id,
             "created_by": receipt_data.get("uploaded_by"),
@@ -621,6 +627,12 @@ def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, ac
         }
         if vendor_id:
             expense_data["vendor_id"] = vendor_id
+        if bill_id:
+            expense_data["bill_id"] = bill_id
+        if txn_type_id:
+            expense_data["txn_type_id"] = txn_type_id
+        if payment_method_id:
+            expense_data["payment_type"] = payment_method_id
         expense_data = {k: v for k, v in expense_data.items() if v is not None}
 
         result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
@@ -647,6 +659,65 @@ def _parse_receipt_split_line(text: str):
         return None
 
 
+def _parse_item_assignments(text: str, num_items: int):
+    """Parse '3, 4 to Sunset Heights, 7 to Oak Park' into project assignments.
+
+    Supports bilingual input (English/Spanish):
+      - Separators: to, a, van a, go to, para
+      - Number connectors: , (comma), y, and, spaces
+
+    Returns list of {"item_indices": [int, ...], "project_query": str} or None on failure.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    # Split on common delimiters between assignments: period, semicolon, newline,
+    # or comma followed by a digit (indicating a new assignment group)
+    # We process the full text with findall instead of splitting
+    separators = r'(?:to|a|van\s+a|go\s+to|para)\s+'
+    number_group = r'((?:\d+)(?:\s*[,\s]\s*(?:y|and)?\s*\d+)*)'
+    pattern = rf'{number_group}\s+{separators}(.+?)(?=\s*[,;.]\s*\d|\s*\n\s*\d|$)'
+
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    if not matches:
+        return None
+
+    assignments = []
+    seen_indices = set()
+    for nums_str, proj_name in matches:
+        indices = [int(n) for n in re.findall(r'\d+', nums_str)]
+        # Validate range
+        if not indices or any(i < 1 or i > num_items for i in indices):
+            return None
+        # Check for duplicate assignments
+        for i in indices:
+            if i in seen_indices:
+                return None
+            seen_indices.add(i)
+        assignments.append({
+            "item_indices": indices,
+            "project_query": proj_name.strip().rstrip(",;."),
+        })
+
+    return assignments if assignments else None
+
+
+def _resolve_project_by_name(query: str):
+    """Fetch projects from DB and find first case-insensitive substring match.
+    Returns {"project_id": ..., "project_name": ...} or None.
+    """
+    try:
+        projects = supabase.table("projects").select("project_id, project_name").execute()
+        query_lower = query.lower().strip()
+        for p in (projects.data or []):
+            if query_lower in p["project_name"].lower():
+                return {"project_id": p["project_id"], "project_name": p["project_name"]}
+    except Exception as e:
+        print(f"[ReceiptFlow] Project lookup error: {e}")
+    return None
+
+
 def _detect_language(text: str) -> str:
     """Simple heuristic: returns 'es' for Spanish, 'en' for English (default)."""
     spanish_words = [
@@ -662,6 +733,18 @@ def _detect_language(text: str) -> str:
     return "en"
 
 
+def _build_numbered_list(line_items: list, lang: str = "en") -> str:
+    """Build a numbered list of line items with categories for the bot message."""
+    lines = []
+    for i, item in enumerate(line_items, 1):
+        desc = item.get("description") or "Item"
+        amt = item.get("amount", 0)
+        cat = item.get("account_name") or "Uncategorized"
+        conf = item.get("confidence", 0)
+        lines.append(f"{i}. {desc} -- ${amt:,.2f} -> {cat} ({conf}%)")
+    return "\n".join(lines)
+
+
 def _build_agent_message(parsed_data, categorize_data, warnings, lang="en", expense_created=False):
     """Build Arturito's summary message for the receipts channel."""
     vendor = parsed_data.get("vendor_name") or "Unknown"
@@ -669,31 +752,38 @@ def _build_agent_message(parsed_data, categorize_data, warnings, lang="en", expe
     date = parsed_data.get("receipt_date") or "Unknown"
     category = categorize_data.get("account_name") or parsed_data.get("suggested_category") or "Uncategorized"
     confidence = int(categorize_data.get("confidence", 0))
+    line_items = parsed_data.get("line_items", [])
+    item_count = len(line_items)
+    show_list = item_count > 1 and not expense_created
 
     if lang == "es":
         header = f"Escanee este recibo de **{vendor}** -- ${amount:,.2f}"
         if date != "Unknown":
             header += f" del {date}"
         header += "."
-        body = f"Categoria: **{category}** ({confidence}% confianza)"
+        if show_list:
+            numbered = _build_numbered_list(line_items, lang)
+            body = f"\n{numbered}"
+        else:
+            body = f"Categoria: **{category}** ({confidence}% confianza)"
         if warnings:
             body += "\n\nAtencion:\n" + "\n".join(f"- {w}" for w in warnings)
         if expense_created:
             body += "\n\nGasto guardado -- listo para autorizacion."
-        else:
-            body += "\n\nListo para revision en Expenses > From Pending."
     else:
         header = f"I scanned this receipt from **{vendor}** -- ${amount:,.2f}"
         if date != "Unknown":
             header += f" on {date}"
         header += "."
-        body = f"Category: **{category}** ({confidence}% confidence)"
+        if show_list:
+            numbered = _build_numbered_list(line_items, lang)
+            body = f"\n{numbered}"
+        else:
+            body = f"Category: **{category}** ({confidence}% confidence)"
         if warnings:
             body += "\n\nHeads up:\n" + "\n".join(f"- {w}" for w in warnings)
         if expense_created:
             body += "\n\nExpense saved -- ready for authorization."
-        else:
-            body += "\n\nReady for review in Expenses > From Pending."
 
     return f"{header}\n{body}"
 
@@ -780,7 +870,7 @@ async def agent_process_receipt(
             original_parsed.pop("duplicate_flow", None)
 
             receipt_flow = {
-                "state": "awaiting_project_decision",
+                "state": "awaiting_item_selection",
                 "started_at": datetime.utcnow().isoformat(),
                 "split_items": [],
                 "total_for_project": 0.0,
@@ -825,7 +915,7 @@ async def agent_process_receipt(
                     "agent_message": True,
                     "pending_receipt_id": receipt_id,
                     "receipt_status": "ready",
-                    "receipt_flow_state": "awaiting_project_decision",
+                    "receipt_flow_state": "awaiting_item_selection",
                     "receipt_flow_active": True,
                 }
             )
@@ -833,7 +923,7 @@ async def agent_process_receipt(
             return {
                 "success": True,
                 "status": "ready",
-                "message": "Split receipt reuse - awaiting project decision",
+                "message": "Split receipt reuse - awaiting item selection",
             }
 
         # Check exact file duplicate
@@ -942,110 +1032,51 @@ async def agent_process_receipt(
                 "message": "Check detected - awaiting user confirmation",
             }
 
-        # ===== STEP 3: OCR Extraction =====
+        # ===== STEP 3: OCR Extraction (Shared Service) =====
         print(f"[Agent] Step 2: No duplicate found, proceeding to OCR")
-        print(f"[Agent] Step 3: Starting OCR extraction (GPT-4o Vision)...")
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise Exception("OpenAI API key not configured")
+        print(f"[Agent] Step 3: Starting OCR extraction (shared service)...")
+        try:
+            scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            raise Exception(f"OCR extraction failed: {str(e)}")
 
-        ai_client = OpenAI(api_key=openai_api_key)
+        line_items = scan_result.get("expenses", [])
+        validation = scan_result.get("validation", {})
 
-        # Get vendor and account lists for matching
+        # Derive summary fields from line items (backwards compat)
+        first_item = line_items[0] if line_items else {}
+        vendor_name = first_item.get("vendor") or "Unknown"
+        amount = validation.get("invoice_total") or sum(item.get("amount", 0) for item in line_items)
+        receipt_date = first_item.get("date")
+        bill_id = first_item.get("bill_id")
+        description = first_item.get("description") or "Material purchase"
+
+        # Resolve vendor_id from vendor name
         vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
         vendors_list = [
             {"id": v.get("id"), "name": v.get("vendor_name")}
             for v in (vendors_resp.data or []) if v.get("vendor_name")
         ]
-
-        accounts_resp = supabase.table("accounts").select("account_id, Name").execute()
-        accounts_list = [
-            {"id": a.get("account_id"), "name": a.get("Name")}
-            for a in (accounts_resp.data or []) if a.get("Name")
-        ]
-
-        # Convert file to base64 images
-        base64_images = []
-        media_type = file_type
-
-        if file_type == "application/pdf":
-            import platform
-            poppler_path = None
-            if platform.system() == "Windows":
-                poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin'
-            images = convert_from_bytes(file_content, dpi=200, poppler_path=poppler_path)
-            for img in images:
-                buffer = io.BytesIO()
-                img.save(buffer, format='PNG')
-                buffer.seek(0)
-                base64_images.append(base64.b64encode(buffer.getvalue()).decode('utf-8'))
-            media_type = "image/png"
-        else:
-            base64_images = [base64.b64encode(file_content).decode('utf-8')]
-
-        ocr_prompt = f"""Analyze this receipt/invoice and extract the key information.
-
-AVAILABLE VENDORS (match to one if possible):
-{json.dumps([v["name"] for v in vendors_list], indent=2)}
-
-AVAILABLE EXPENSE CATEGORIES (match to one if possible):
-{json.dumps([a["name"] for a in accounts_list], indent=2)}
-
-Extract and return JSON with:
-{{
-    "vendor_name": "Matched vendor name or extracted name",
-    "vendor_id": "UUID if matched to list, null otherwise",
-    "amount": 123.45,
-    "receipt_date": "YYYY-MM-DD",
-    "description": "Brief description of purchase",
-    "suggested_category": "Matched category name",
-    "suggested_account_id": "UUID if matched to list, null otherwise",
-    "confidence": 0.95
-}}
-
-RULES:
-- Use the TOTAL amount, not subtotals or individual items
-- For vendor, try to match exactly to the list first
-- For category, match based on what was purchased
-- Date format must be YYYY-MM-DD
-- confidence is 0-1 indicating how sure you are of the extraction
-"""
-
-        content = [{"type": "text", "text": ocr_prompt}]
-        for img_b64 in base64_images[:3]:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{media_type};base64,{img_b64}",
-                    "detail": "high"
-                }
-            })
-
-        ocr_response = ai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": content}],
-            max_tokens=1000,
-            response_format={"type": "json_object"}
-        )
-
-        parsed_data = json.loads(ocr_response.choices[0].message.content)
-        print(f"[Agent] Step 3: OCR complete | vendor={parsed_data.get('vendor_name')} | amount={parsed_data.get('amount')} | date={parsed_data.get('receipt_date')} | confidence={parsed_data.get('confidence')}")
-
-        # Resolve vendor_id by name if not matched
-        vendor_id = parsed_data.get("vendor_id")
-        if not vendor_id and parsed_data.get("vendor_name"):
+        vendor_id = None
+        if vendor_name and vendor_name != "Unknown":
             for v in vendors_list:
-                if v["name"].lower() == parsed_data["vendor_name"].lower():
+                if v["name"].lower() == vendor_name.lower():
                     vendor_id = v["id"]
                     break
 
-        # Resolve account_id by name if not matched
-        ocr_account_id = parsed_data.get("suggested_account_id")
-        if not ocr_account_id and parsed_data.get("suggested_category"):
-            for a in accounts_list:
-                if a["name"].lower() == parsed_data["suggested_category"].lower():
-                    ocr_account_id = a["id"]
-                    break
+        parsed_data = {
+            "vendor_name": vendor_name,
+            "vendor_id": vendor_id,
+            "amount": amount,
+            "receipt_date": receipt_date,
+            "bill_id": bill_id,
+            "description": description,
+            "line_items": line_items,
+            "validation": validation,
+        }
+        print(f"[Agent] Step 3: OCR complete | vendor={vendor_name} | amount={amount} | date={receipt_date} | {len(line_items)} line item(s)")
 
         # ===== STEP 4: Data duplicate check (after OCR) =====
         print(f"[Agent] Step 4: Checking data duplicates | vendor_matched={'yes' if vendor_id else 'no'}")
@@ -1071,9 +1102,8 @@ RULES:
         if not vendor_id:
             warnings.append("Vendor not found in database")
 
-        # ===== STEP 5: Auto-categorize =====
-        print(f"[Agent] Step 5: Starting auto-categorization...")
-        # Get project stage if available
+        # ===== STEP 5: Auto-categorize (Shared Service) =====
+        print(f"[Agent] Step 5: Starting auto-categorization (shared service)...")
         construction_stage = "General Construction"
         try:
             proj_resp = supabase.table("projects") \
@@ -1086,73 +1116,43 @@ RULES:
         except Exception:
             pass
 
-        description = parsed_data.get("description", "Material purchase")
-
-        # Filter out Labor accounts for material categorization
-        material_accounts = [
-            {"account_id": a["id"], "name": a["name"]}
-            for a in accounts_list if "labor" not in a["name"].lower()
+        # Categorize each line item via shared service
+        cat_expenses = [
+            {"rowIndex": i, "description": item.get("description", "")}
+            for i, item in enumerate(line_items)
         ]
 
-        categorize_prompt = f"""You are an expert construction accountant specializing in categorizing expenses.
-
-CONSTRUCTION STAGE: {construction_stage}
-
-AVAILABLE ACCOUNTS:
-{json.dumps(material_accounts, indent=2)}
-
-EXPENSE TO CATEGORIZE:
-Description: "{description}"
-Vendor: "{parsed_data.get('vendor_name', 'Unknown')}"
-
-INSTRUCTIONS:
-1. Determine the MOST APPROPRIATE account from the available accounts list.
-2. Consider the construction stage when categorizing.
-3. Calculate confidence (0-100) based on description clarity and stage match.
-4. ONLY use account_id values from the provided accounts list.
-
-SPECIAL RULES:
-- POWER TOOLS (drills, saws, grinders, nail guns, etc.) are CAPITAL ASSETS, set confidence to 0 with warning.
-- Consumables FOR power tools (drill bits, saw blades, nails) ARE valid COGS.
-- BEVERAGES (water, energy drinks, coffee) go under "Base Materials".
-
-Return ONLY valid JSON:
-{{
-  "account_id": "exact-account-id-from-list",
-  "account_name": "exact-account-name-from-list",
-  "confidence": 85,
-  "reasoning": "Brief explanation",
-  "warning": null
-}}"""
-
-        categorize_data = {}
+        categorizations = []
         try:
-            cat_response = ai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are a construction accounting expert. Return only valid JSON."},
-                    {"role": "user", "content": categorize_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=500,
-                response_format={"type": "json_object"}
-            )
-            categorize_data = json.loads(cat_response.choices[0].message.content)
+            if cat_expenses:
+                categorizations = _auto_categorize_core(stage=construction_stage, expenses=cat_expenses)
         except Exception as cat_err:
-            print(f"[Agent] Categorization failed, using OCR suggestion: {cat_err}")
-            categorize_data = {
-                "account_id": ocr_account_id,
-                "account_name": parsed_data.get("suggested_category"),
-                "confidence": int((parsed_data.get("confidence", 0.5)) * 100),
-                "reasoning": "OCR suggestion (auto-categorize unavailable)",
-                "warning": None
-            }
+            print(f"[Agent] Auto-categorization failed: {cat_err}")
 
-        # Pick the best account_id
-        final_account_id = categorize_data.get("account_id") or ocr_account_id
-        final_category = categorize_data.get("account_name") or parsed_data.get("suggested_category")
+        # Attach categorization to each line item
+        cat_map = {c["rowIndex"]: c for c in categorizations}
+        for i, item in enumerate(line_items):
+            cat = cat_map.get(i, {})
+            item["account_id"] = cat.get("account_id")
+            item["account_name"] = cat.get("account_name")
+            item["confidence"] = cat.get("confidence", 0)
+            item["reasoning"] = cat.get("reasoning")
+            item["warning"] = cat.get("warning")
+
+        # Primary categorization = highest confidence item
+        primary_cat = max(categorizations, key=lambda c: c.get("confidence", 0)) if categorizations else {}
+        categorize_data = {
+            "account_id": primary_cat.get("account_id"),
+            "account_name": primary_cat.get("account_name"),
+            "confidence": primary_cat.get("confidence", 0),
+            "reasoning": primary_cat.get("reasoning"),
+            "warning": primary_cat.get("warning"),
+        }
+
+        final_account_id = categorize_data.get("account_id")
+        final_category = categorize_data.get("account_name")
         final_confidence = categorize_data.get("confidence", 0)
-        print(f"[Agent] Step 5: Categorization complete | category={final_category} | confidence={final_confidence}% | reasoning={categorize_data.get('reasoning', 'N/A')}")
+        print(f"[Agent] Step 5: Categorization complete | category={final_category} | confidence={final_confidence}% | {len(categorizations)} item(s) categorized")
 
         # Add categorizer warnings
         if categorize_data.get("warning"):
@@ -1167,7 +1167,7 @@ Return ONLY valid JSON:
 
         # Initialize receipt flow for project decision
         receipt_flow = {
-            "state": "awaiting_project_decision",
+            "state": "awaiting_item_selection",
             "started_at": datetime.utcnow().isoformat(),
             "split_items": [],
             "total_for_project": 0.0,
@@ -1240,12 +1240,12 @@ Return ONLY valid JSON:
                 "receipt_status": "ready",
                 "has_warnings": len(warnings) > 0,
                 "confidence": final_confidence,
-                "receipt_flow_state": "awaiting_project_decision",
+                "receipt_flow_state": "awaiting_item_selection",
                 "receipt_flow_active": True,
             }
         )
 
-        print(f"[Agent] Step 7: Arturito message posted | lang={lang} | awaiting project decision")
+        print(f"[Agent] Step 7: Arturito message posted | lang={lang} | awaiting item selection")
         print(f"[Agent] === DONE OCR receipt {receipt_id} | {parsed_data.get('vendor_name')} ${parsed_data.get('amount')} -> {final_category} ({final_confidence}%) | awaiting user response ===")
 
         return {
@@ -2203,6 +2203,321 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
             )
             return {"success": True, "state": "cancelled"}
 
+        if current_state == "awaiting_item_selection":
+            # Get project name
+            project_name = "this project"
+            try:
+                proj_resp = supabase.table("projects").select("project_name") \
+                    .eq("project_id", project_id).single().execute()
+                if proj_resp.data and proj_resp.data.get("project_name"):
+                    project_name = proj_resp.data["project_name"]
+            except Exception:
+                pass
+
+            if action == "all_this_project":
+                # Create expenses for ALL line items in this project
+                agent_cfg = {}
+                try:
+                    cfg_result = supabase.table("agent_config").select("key, value").execute()
+                    for row in (cfg_result.data or []):
+                        agent_cfg[row["key"]] = row["value"]
+                except Exception:
+                    pass
+
+                auto_create = agent_cfg.get("auto_create_expense", True)
+                min_confidence = int(agent_cfg.get("min_confidence", 70))
+                cat = parsed_data.get("categorization", {})
+                vendor_id = parsed_data.get("vendor_id")
+
+                created_expenses = []
+                line_items = parsed_data.get("line_items", [])
+
+                if auto_create and line_items:
+                    for item in line_items:
+                        item_account_id = item.get("account_id") or cat.get("account_id")
+                        item_confidence = item.get("confidence", 0)
+                        if not item_account_id or item_confidence < min_confidence:
+                            continue
+                        expense = _create_receipt_expense(
+                            project_id, parsed_data, receipt_data,
+                            vendor_id, item_account_id,
+                            amount=item.get("amount"),
+                            description=item.get("description"),
+                            bill_id=item.get("bill_id"),
+                            txn_date=item.get("date"),
+                        )
+                        if expense:
+                            created_expenses.append(expense)
+                elif auto_create and cat.get("account_id"):
+                    expense = _create_receipt_expense(
+                        project_id, parsed_data, receipt_data,
+                        vendor_id, cat["account_id"]
+                    )
+                    if expense:
+                        created_expenses.append(expense)
+
+                expense_id = created_expenses[0].get("expense_id") if created_expenses else None
+                receipt_flow["state"] = "completed"
+                parsed_data["receipt_flow"] = receipt_flow
+
+                if created_expenses:
+                    supabase.table("pending_receipts").update({
+                        "status": "linked",
+                        "expense_id": expense_id,
+                        "parsed_data": parsed_data,
+                        "linked_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", receipt_id).execute()
+
+                    count = len(created_expenses)
+                    msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
+                    post_bot_message(
+                        content=msg,
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "linked",
+                            "receipt_flow_state": "completed",
+                            "receipt_flow_active": False,
+                        }
+                    )
+                    print(f"[ReceiptFlow] All items -> {count} expense(s) created | first_id={expense_id}")
+                else:
+                    supabase.table("pending_receipts").update({
+                        "parsed_data": parsed_data,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", receipt_id).execute()
+
+                    post_bot_message(
+                        content="Receipt processed. Ready for review.",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "ready",
+                            "receipt_flow_state": "completed",
+                            "receipt_flow_active": False,
+                        }
+                    )
+                    print(f"[ReceiptFlow] All items -> skipped expense creation (low confidence)")
+
+                return {"success": True, "state": "completed", "expense_id": expense_id}
+
+            elif action == "start_assign":
+                # User wants to assign items to other projects -- show prompt
+                line_items = parsed_data.get("line_items", [])
+                text_sample = f"{parsed_data.get('vendor_name', '')} {parsed_data.get('description', '')}"
+                lang = _detect_language(text_sample)
+                numbered = _build_numbered_list(line_items, lang)
+
+                if lang == "es":
+                    prompt_msg = (
+                        f"Cuales items van a otros proyectos? Los no mencionados se quedan en **{project_name}**.\n\n"
+                        f"{numbered}\n\n"
+                        "Escribe tus asignaciones, ej: **3, 4 a Sunset Heights, 7 a Oak Park**"
+                    )
+                else:
+                    prompt_msg = (
+                        f"Which items go to other projects? Unmentioned items stay with **{project_name}**.\n\n"
+                        f"{numbered}\n\n"
+                        "Type your assignments, e.g.: **3, 4 to Sunset Heights, 7 to Oak Park**"
+                    )
+
+                post_bot_message(
+                    content=prompt_msg,
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "ready",
+                        "receipt_flow_state": "awaiting_item_selection",
+                        "receipt_flow_active": True,
+                        "awaiting_text_input": True,
+                    }
+                )
+                return {"success": True, "state": "awaiting_item_selection"}
+
+            elif action == "assign_items":
+                text = (payload.payload or {}).get("text", "")
+                line_items = parsed_data.get("line_items", [])
+                num_items = len(line_items)
+
+                if not line_items:
+                    raise HTTPException(status_code=400, detail="No line items available for assignment")
+
+                # Parse item-to-project assignments
+                assignments = _parse_item_assignments(text, num_items)
+                if not assignments:
+                    post_bot_message(
+                        content="I could not parse that. Use this format:\n**3, 4 to Sunset Heights, 7 to Oak Park**",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "ready",
+                            "receipt_flow_state": "awaiting_item_selection",
+                            "receipt_flow_active": True,
+                            "awaiting_text_input": True,
+                        }
+                    )
+                    return {"success": True, "state": "awaiting_item_selection", "error": "parse_error"}
+
+                # Resolve project names
+                assigned_indices = set()
+                project_assignments = []
+
+                for assignment in assignments:
+                    project = _resolve_project_by_name(assignment["project_query"])
+                    if not project:
+                        post_bot_message(
+                            content=f'Could not find a project matching "{assignment["project_query"]}". Please try again.',
+                            project_id=project_id,
+                            metadata={
+                                "agent_message": True,
+                                "pending_receipt_id": receipt_id,
+                                "receipt_status": "ready",
+                                "receipt_flow_state": "awaiting_item_selection",
+                                "receipt_flow_active": True,
+                                "awaiting_text_input": True,
+                            }
+                        )
+                        return {"success": True, "state": "awaiting_item_selection", "error": "project_not_found"}
+
+                    project_assignments.append({
+                        "project_id": project["project_id"],
+                        "project_name": project["project_name"],
+                        "item_indices": assignment["item_indices"],
+                    })
+                    assigned_indices.update(assignment["item_indices"])
+
+                # Remaining items (not assigned) stay with this project
+                this_project_indices = [i for i in range(1, num_items + 1) if i not in assigned_indices]
+
+                # Read agent config for expense creation
+                agent_cfg = {}
+                try:
+                    cfg_result = supabase.table("agent_config").select("key, value").execute()
+                    for row in (cfg_result.data or []):
+                        agent_cfg[row["key"]] = row["value"]
+                except Exception:
+                    pass
+
+                auto_create = agent_cfg.get("auto_create_expense", True)
+                min_confidence = int(agent_cfg.get("min_confidence", 70))
+                cat = parsed_data.get("categorization", {})
+                vendor_id = parsed_data.get("vendor_id")
+
+                all_created = []
+                summary_parts = []
+
+                # Create expenses for THIS project (unassigned items)
+                if this_project_indices:
+                    created_here = []
+                    for idx in this_project_indices:
+                        item = line_items[idx - 1]
+                        item_account = item.get("account_id") or cat.get("account_id")
+                        if auto_create and item_account and item.get("confidence", 0) >= min_confidence:
+                            expense = _create_receipt_expense(
+                                project_id, parsed_data, receipt_data,
+                                vendor_id, item_account,
+                                amount=item.get("amount"),
+                                description=item.get("description"),
+                                bill_id=item.get("bill_id"),
+                                txn_date=item.get("date"),
+                            )
+                            if expense:
+                                created_here.append(expense)
+                                all_created.append(expense)
+                    this_total = sum(line_items[i - 1].get("amount", 0) for i in this_project_indices)
+                    summary_parts.append(f"**{project_name}**: {len(created_here)} item(s), ${this_total:,.2f}")
+
+                # Create expenses for OTHER projects
+                for pa in project_assignments:
+                    created_other = []
+                    for idx in pa["item_indices"]:
+                        item = line_items[idx - 1]
+                        item_account = item.get("account_id") or cat.get("account_id")
+                        if auto_create and item_account and item.get("confidence", 0) >= min_confidence:
+                            expense = _create_receipt_expense(
+                                pa["project_id"], parsed_data, receipt_data,
+                                vendor_id, item_account,
+                                amount=item.get("amount"),
+                                description=item.get("description"),
+                                bill_id=item.get("bill_id"),
+                                txn_date=item.get("date"),
+                            )
+                            if expense:
+                                created_other.append(expense)
+                                all_created.append(expense)
+
+                    other_total = sum(line_items[i - 1].get("amount", 0) for i in pa["item_indices"])
+                    summary_parts.append(f"**{pa['project_name']}**: {len(created_other)} item(s), ${other_total:,.2f}")
+
+                    # Post split notification to other project's receipt channel
+                    item_descriptions = [line_items[i - 1].get("description", "Item") for i in pa["item_indices"]]
+                    split_msg = (
+                        f"Split from **{project_name}** receipt ({parsed_data.get('vendor_name', 'Unknown')}):\n"
+                        + "\n".join(f"- {desc}" for desc in item_descriptions)
+                        + f"\nTotal: ${other_total:,.2f}"
+                    )
+                    if created_other:
+                        split_msg += f"\n\n{len(created_other)} expense(s) auto-created."
+
+                    post_bot_message(
+                        content=split_msg,
+                        project_id=pa["project_id"],
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "split",
+                            "split_repost": True,
+                            "source_project": project_name,
+                        }
+                    )
+
+                # Update receipt flow
+                receipt_flow["state"] = "completed"
+                receipt_flow["assignments"] = [
+                    {"project_id": pa["project_id"], "project_name": pa["project_name"], "items": pa["item_indices"]}
+                    for pa in project_assignments
+                ]
+                receipt_flow["this_project_items"] = this_project_indices
+                parsed_data["receipt_flow"] = receipt_flow
+
+                expense_id = all_created[0].get("expense_id") if all_created else None
+                supabase.table("pending_receipts").update({
+                    "status": "split",
+                    "expense_id": expense_id,
+                    "parsed_data": parsed_data,
+                    "linked_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                # Post summary to this project
+                num_projects = len(project_assignments) + (1 if this_project_indices else 0)
+                post_bot_message(
+                    content=(
+                        f"Done! Items split across {num_projects} project(s):\n"
+                        + "\n".join(f"- {s}" for s in summary_parts)
+                    ),
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "split",
+                        "receipt_flow_state": "completed",
+                        "receipt_flow_active": False,
+                    }
+                )
+
+                print(f"[ReceiptFlow] Split -> {len(all_created)} expenses across {num_projects} projects")
+                return {"success": True, "state": "completed", "expense_ids": [e.get("expense_id") for e in all_created]}
+
+            else:
+                raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state '{current_state}'")
+
+        # ── Backward compat: old states ──
         if current_state == "awaiting_project_decision":
             # Get project name
             project_name = "this project"
@@ -2228,24 +2543,45 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 min_confidence = int(agent_cfg.get("min_confidence", 70))
                 cat = parsed_data.get("categorization", {})
                 final_confidence = cat.get("confidence", 0)
-                final_account_id = cat.get("account_id")
                 vendor_id = parsed_data.get("vendor_id")
 
                 should_create = auto_create and final_confidence >= min_confidence
 
-                expense_id = None
-                if should_create and final_account_id:
+                created_expenses = []
+                line_items = parsed_data.get("line_items", [])
+
+                if should_create and line_items:
+                    # Create one expense per line item
+                    for item in line_items:
+                        item_account_id = item.get("account_id") or cat.get("account_id")
+                        item_confidence = item.get("confidence", 0)
+                        if not item_account_id or item_confidence < min_confidence:
+                            continue
+                        expense = _create_receipt_expense(
+                            project_id, parsed_data, receipt_data,
+                            vendor_id, item_account_id,
+                            amount=item.get("amount"),
+                            description=item.get("description"),
+                            bill_id=item.get("bill_id"),
+                            txn_date=item.get("date"),
+                        )
+                        if expense:
+                            created_expenses.append(expense)
+
+                elif should_create and cat.get("account_id"):
+                    # Fallback: no line items (old data), single expense from summary
                     expense = _create_receipt_expense(
                         project_id, parsed_data, receipt_data,
-                        vendor_id, final_account_id
+                        vendor_id, cat["account_id"]
                     )
                     if expense:
-                        expense_id = expense.get("expense_id")
+                        created_expenses.append(expense)
 
+                expense_id = created_expenses[0].get("expense_id") if created_expenses else None
                 receipt_flow["state"] = "completed"
                 parsed_data["receipt_flow"] = receipt_flow
 
-                if expense_id:
+                if created_expenses:
                     supabase.table("pending_receipts").update({
                         "status": "linked",
                         "expense_id": expense_id,
@@ -2254,8 +2590,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "updated_at": datetime.utcnow().isoformat()
                     }).eq("id", receipt_id).execute()
 
+                    count = len(created_expenses)
+                    msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
                     post_bot_message(
-                        content="Expense saved -- ready for authorization.",
+                        content=msg,
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -2265,7 +2603,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             "receipt_flow_active": False,
                         }
                     )
-                    print(f"[ReceiptFlow] Single project -> expense created | id={expense_id}")
+                    print(f"[ReceiptFlow] Single project -> {count} expense(s) created | first_id={expense_id}")
                 else:
                     supabase.table("pending_receipts").update({
                         "parsed_data": parsed_data,
@@ -2273,7 +2611,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     post_bot_message(
-                        content="Receipt processed. Ready for review in Expenses > From Pending.",
+                        content="Receipt processed. Ready for review.",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,

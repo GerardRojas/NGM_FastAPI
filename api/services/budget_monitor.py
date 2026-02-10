@@ -72,9 +72,6 @@ async def get_alert_settings(project_id: Optional[str] = None) -> Dict[str, Any]
             "overspend_alert": True,
             "no_budget_alert": True,
             "is_enabled": True,
-            "check_frequency_minutes": 60,
-            "quiet_start_hour": 22,
-            "quiet_end_hour": 7,
         }
 
     except Exception as e:
@@ -557,20 +554,6 @@ async def check_project_budgets(
     return alerts_sent
 
 
-def is_quiet_hours(settings: Dict[str, Any]) -> bool:
-    """Check if current time is within quiet hours."""
-    current_hour = datetime.now().hour
-    quiet_start = settings.get("quiet_start_hour", 22)
-    quiet_end = settings.get("quiet_end_hour", 7)
-
-    if quiet_start > quiet_end:
-        # Overnight quiet hours (e.g., 22:00 - 07:00)
-        return current_hour >= quiet_start or current_hour < quiet_end
-    else:
-        # Same-day quiet hours
-        return quiet_start <= current_hour < quiet_end
-
-
 async def run_budget_check() -> Dict[str, Any]:
     """
     Main function to run budget monitoring check.
@@ -588,11 +571,6 @@ async def run_budget_check() -> Dict[str, Any]:
     if not settings.get("is_enabled", True):
         logger.info("[BudgetMonitor] Alerts are disabled globally")
         return {"status": "disabled", "alerts_sent": 0}
-
-    # Check quiet hours
-    if is_quiet_hours(settings):
-        logger.info("[BudgetMonitor] Currently in quiet hours, skipping notifications")
-        return {"status": "quiet_hours", "alerts_sent": 0}
 
     # Get recipients
     recipients = await get_alert_recipients(settings.get("id"))
@@ -640,6 +618,61 @@ async def run_budget_check() -> Dict[str, Any]:
         "elapsed_seconds": elapsed,
         "timestamp": start_time.isoformat(),
     }
+
+
+# ============================================================================
+# Event-Driven Trigger (called from expense endpoints)
+# ============================================================================
+
+async def trigger_project_budget_check(project_id: str):
+    """
+    Lightweight trigger for a single project's budget check.
+    Called automatically when expenses are created or authorized.
+    Safe to call from BackgroundTasks - never raises exceptions.
+    """
+    try:
+        # Get project name
+        supabase = get_supabase()
+        proj = supabase.table("projects") \
+            .select("project_name") \
+            .eq("project_id", project_id) \
+            .single() \
+            .execute()
+
+        if not proj.data:
+            logger.warning(f"[BudgetMonitor] Project not found: {project_id}")
+            return
+
+        project_name = proj.data.get("project_name", "Unknown")
+
+        # Get settings (project-specific or global fallback)
+        settings = await get_alert_settings(project_id)
+
+        if not settings.get("is_enabled", True):
+            return
+
+        # Get recipients (project-specific or global fallback)
+        recipients = await get_alert_recipients(settings.get("id"))
+        if not recipients:
+            global_settings = await get_alert_settings()
+            recipients = await get_alert_recipients(global_settings.get("id"))
+
+        if not recipients:
+            return
+
+        alerts = await check_project_budgets(
+            project_id=project_id,
+            project_name=project_name,
+            settings=settings,
+            recipients=recipients
+        )
+
+        if alerts > 0:
+            logger.info(f"[BudgetMonitor] Event trigger: {alerts} alerts for {project_name}")
+
+    except Exception as e:
+        # Never let budget monitoring break expense operations
+        logger.error(f"[BudgetMonitor] Event trigger error for {project_id}: {e}")
 
 
 # ============================================================================
