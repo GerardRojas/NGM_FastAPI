@@ -79,26 +79,77 @@ _VISION_LINE_ITEMS_PROMPT = (
     '  "invoice_number": "INV-123 or null",\n'
     '  "invoice_date": "YYYY-MM-DD or null",\n'
     '  "line_items": [\n'
-    '    {"description": "Item description", "quantity": 1, "unit_price": 100.00, "amount": 100.00},\n'
-    '    ...\n'
+    '    {"description": "Item description", "quantity": 1, "unit_price": 100.00, "amount": 100.00}\n'
     '  ],\n'
     '  "subtotal": 200.00,\n'
     '  "tax": 16.00,\n'
     '  "total": 216.00,\n'
     '  "confidence": 90\n'
     "}\n\n"
-    "Rules:\n"
-    "- Extract ALL line items, not just a summary\n"
-    "- 'amount' per line = quantity * unit_price (or the line total shown)\n"
-    "- 'total' is the GRAND TOTAL / AMOUNT DUE at the bottom\n"
-    "- If quantity or unit_price is unclear, set them to null but always provide 'amount'\n"
-    "- 'confidence' is 0-100 for overall extraction quality\n"
+    "CRITICAL RULES:\n"
+    "1. ALWAYS use the LINE TOTAL (extended amount), NOT the unit price. "
+    "The line total is typically the RIGHTMOST dollar amount on each row.\n"
+    "   Examples:\n"
+    "   - 'QTY: 80, PRICE EACH: $1.84, EXTENSION: $147.20' -> amount = 147.20\n"
+    "   - '2 x $5.00 = $10.00' -> amount = 10.00\n"
+    "   - 'Widget (3 @ $25.00) ... $75.00' -> amount = 75.00\n"
+    "   - 'Artisan Frost 512 pieces $1,479.68 ... $2.89/piece' -> amount = 1479.68\n"
+    "2. Extract ALL line items from ALL sections/pages, not just a summary\n"
+    "3. For multi-section invoices, use the AMOUNT column (rightmost), not Rate or Price\n"
+    "4. 'subtotal' = sum of all line item amounts BEFORE tax\n"
+    "5. 'tax' = the tax amount (Sales Tax, Tax, IVA, VAT, HST, GST). 0 if none\n"
+    "6. 'total' = GRAND TOTAL / AMOUNT DUE / BALANCE DUE (final amount at the bottom)\n"
+    "7. Fees (delivery, shipping, service, environmental) are separate line items\n"
+    "8. DO NOT confuse store numbers, phone numbers, PO numbers, or SKUs with amounts\n"
+    "9. SELF-CHECK: sum of line item amounts should equal subtotal (pre-tax). "
+    "If it equals the grand total instead, your line items already include tax.\n"
+    "10. If quantity or unit_price is unclear, set them to null but always provide 'amount'\n"
+    "11. 'confidence' is 0-100 for overall extraction quality\n"
     "- No preamble, no markdown, just the JSON object"
 )
 
+_TEXT_LINE_ITEMS_PROMPT = (
+    "You are a financial document reader specialized in construction invoices. "
+    "Analyze this invoice/receipt text and extract EVERY line item.\n\n"
+    "RESPOND with ONLY a JSON object:\n"
+    "{\n"
+    '  "vendor": "Vendor Name",\n'
+    '  "invoice_number": "INV-123 or null",\n'
+    '  "invoice_date": "YYYY-MM-DD or null",\n'
+    '  "line_items": [\n'
+    '    {"description": "Item description", "quantity": 1, "unit_price": 100.00, "amount": 100.00}\n'
+    '  ],\n'
+    '  "subtotal": 200.00,\n'
+    '  "tax": 16.00,\n'
+    '  "total": 216.00,\n'
+    '  "confidence": 90\n'
+    "}\n\n"
+    "CRITICAL RULES:\n"
+    "1. ALWAYS use the LINE TOTAL (extended amount), NOT the unit price. "
+    "The line total is typically the RIGHTMOST dollar amount on each row.\n"
+    "   Examples:\n"
+    "   - 'QTY: 80, PRICE EACH: $1.84, EXTENSION: $147.20' -> amount = 147.20\n"
+    "   - '2 x $5.00 = $10.00' -> amount = 10.00\n"
+    "   - 'Widget (3 @ $25.00) ... $75.00' -> amount = 75.00\n"
+    "   - 'Artisan Frost 512 pieces $1,479.68 ... $2.89/piece' -> amount = 1479.68\n"
+    "2. Extract ALL line items from ALL sections, not just a summary\n"
+    "3. For multi-section invoices, use the AMOUNT column (rightmost), not Rate or Price\n"
+    "4. 'subtotal' = sum of all line item amounts BEFORE tax\n"
+    "5. 'tax' = the tax amount (Sales Tax, Tax, IVA, VAT, HST, GST). 0 if none\n"
+    "6. 'total' = GRAND TOTAL / AMOUNT DUE / BALANCE DUE (final amount)\n"
+    "7. Fees (delivery, shipping, service, environmental) are separate line items\n"
+    "8. DO NOT confuse store numbers, phone numbers, PO numbers, or SKUs with amounts\n"
+    "9. SELF-CHECK: sum of line item amounts should equal subtotal (pre-tax). "
+    "If it equals the grand total instead, your line items already include tax.\n"
+    "10. If quantity or unit_price is unclear, set them to null but always provide 'amount'\n"
+    "11. 'confidence' is 0-100 for overall extraction quality\n"
+    "- No preamble, no markdown, just the JSON object\n\n"
+    "--- RECEIPT TEXT ---\n{text}\n--- END ---"
+)
 
-def _download_and_encode_receipt(receipt_url: str) -> Optional[tuple]:
-    """Download receipt, return (b64_image, media_type) or None."""
+
+def _download_receipt(receipt_url: str) -> Optional[tuple]:
+    """Download receipt, return (file_content, content_type) or None."""
     if not receipt_url:
         return None
     try:
@@ -107,75 +158,112 @@ def _download_and_encode_receipt(receipt_url: str) -> Optional[tuple]:
             if resp.status_code != 200:
                 logger.warning(f"[AndrewMismatch] Download failed {resp.status_code}")
                 return None
-            file_content = resp.content
-            content_type = resp.headers.get("content-type", "")
-
-        import base64
-        if "pdf" in content_type.lower() or receipt_url.lower().endswith(".pdf"):
-            try:
-                from pdf2image import convert_from_bytes
-                import io
-                import platform
-                poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin' if platform.system() == "Windows" else None
-                images = convert_from_bytes(file_content, dpi=200, first_page=1, last_page=1,
-                                            poppler_path=poppler_path)
-                if not images:
-                    return None
-                buf = io.BytesIO()
-                images[0].save(buf, format='PNG')
-                buf.seek(0)
-                return base64.b64encode(buf.getvalue()).decode('utf-8'), "image/png"
-            except Exception as e:
-                logger.warning(f"[AndrewMismatch] PDF convert error: {e}")
-                return None
-        else:
-            return base64.b64encode(file_content).decode('utf-8'), content_type or "image/jpeg"
+            return resp.content, resp.headers.get("content-type", "")
     except Exception as e:
         logger.warning(f"[AndrewMismatch] Download error: {e}")
         return None
 
 
+def _encode_to_vision_image(file_content: bytes, content_type: str, receipt_url: str) -> Optional[tuple]:
+    """Convert file bytes to (b64_image, media_type) for Vision API, or None."""
+    import base64
+    is_pdf = "pdf" in content_type.lower() or receipt_url.lower().endswith(".pdf")
+
+    if is_pdf:
+        try:
+            from pdf2image import convert_from_bytes
+            import io
+            import platform
+            poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin' if platform.system() == "Windows" else None
+            images = convert_from_bytes(file_content, dpi=300, first_page=1, last_page=1,
+                                        poppler_path=poppler_path)
+            if not images:
+                return None
+            buf = io.BytesIO()
+            images[0].save(buf, format='PNG')
+            buf.seek(0)
+            return base64.b64encode(buf.getvalue()).decode('utf-8'), "image/png"
+        except Exception as e:
+            logger.warning(f"[AndrewMismatch] PDF convert error: {e}")
+            return None
+    else:
+        return base64.b64encode(file_content).decode('utf-8'), content_type or "image/jpeg"
+
+
 def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
     """
-    Use GPT Vision to extract detailed line items from an invoice image.
+    Extract detailed line items from an invoice.
+    Tries pdfplumber text extraction first for PDFs, falls back to GPT-4o Vision.
     Returns parsed dict or None on failure.
     """
-    encoded = _download_and_encode_receipt(receipt_url)
-    if not encoded:
+    downloaded = _download_receipt(receipt_url)
+    if not downloaded:
         return None
 
-    b64_image, media_type = encoded
+    file_content, content_type = downloaded
+    is_pdf = "pdf" in content_type.lower() or receipt_url.lower().endswith(".pdf")
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         logger.warning("[AndrewMismatch] No OPENAI_API_KEY")
         return None
 
+    # Try pdfplumber text extraction first for PDFs
+    extracted_text = None
+    if is_pdf:
+        try:
+            from services.receipt_scanner import extract_text_from_pdf
+            success, text = extract_text_from_pdf(file_content)
+            if success:
+                extracted_text = text
+                logger.info(f"[AndrewMismatch] pdfplumber: extracted {len(text)} chars")
+        except Exception as e:
+            logger.info(f"[AndrewMismatch] pdfplumber unavailable: {e}")
+
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _VISION_LINE_ITEMS_PROMPT},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:{media_type};base64,{b64_image}",
-                        "detail": "high"
-                    }}
-                ]
-            }],
-            temperature=0.1,
-            max_tokens=1500,
-        )
+
+        if extracted_text:
+            # Text mode (pdfplumber succeeded) -- gpt-4o for max accuracy
+            prompt = _TEXT_LINE_ITEMS_PROMPT.format(text=extracted_text)
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2000,
+            )
+        else:
+            # Vision mode (fallback)
+            encoded = _encode_to_vision_image(file_content, content_type, receipt_url)
+            if not encoded:
+                return None
+            b64_image, media_type = encoded
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _VISION_LINE_ITEMS_PROMPT},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{media_type};base64,{b64_image}",
+                            "detail": "high"
+                        }}
+                    ]
+                }],
+                temperature=0.1,
+                max_tokens=2000,
+            )
+
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         data = json.loads(raw)
+        data["_extraction_method"] = "pdfplumber" if extracted_text else "vision"
 
         confidence = int(data.get("confidence", 0))
         if confidence < 30:
-            logger.info(f"[AndrewMismatch] Vision confidence too low ({confidence}%)")
+            logger.info(f"[AndrewMismatch] Confidence too low ({confidence}%)")
             return None
 
         # Cross-validate: line items sum vs total/subtotal
@@ -202,13 +290,14 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
                 )
 
         logger.info(
-            f"[AndrewMismatch] Extracted {len(line_items)} line items, "
+            f"[AndrewMismatch] Extracted {len(line_items)} line items via "
+            f"{'pdfplumber+gpt' if extracted_text else 'vision'}, "
             f"subtotal=${ocr_subtotal:,.2f} tax=${ocr_tax:,.2f} total=${ocr_total:,.2f} "
             f"(confidence={data.get('confidence', confidence)}%)"
         )
         return data
     except Exception as e:
-        logger.warning(f"[AndrewMismatch] Vision extract failed: {e}")
+        logger.warning(f"[AndrewMismatch] Extract failed: {e}")
         return None
 
 

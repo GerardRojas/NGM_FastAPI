@@ -230,15 +230,38 @@ _VISION_BILL_TOTAL_PROMPT = (
     'set "subtotal" equal to "total" and "tax" to 0\n'
     "- All values must be numbers (no dollar signs, no commas)\n"
     '- If you see multiple totals, use the GRAND TOTAL / AMOUNT DUE / BALANCE DUE\n'
+    "- Look for totals in the BOTTOM section of the document\n"
+    "- DO NOT confuse store numbers, phone numbers, PO numbers, SKUs, "
+    "or product codes with monetary amounts\n"
     '- "confidence" is 0-100 how sure you are about the extracted values\n'
     "- If you cannot read the amounts clearly, set confidence below 50\n"
     "- No preamble, no markdown, just the JSON object"
 )
 
+_TEXT_BILL_TOTAL_PROMPT = (
+    "You are a financial document reader. Extract the billing totals from this "
+    "invoice/receipt text.\n\n"
+    "RESPOND with ONLY a JSON object:\n"
+    '{"subtotal": 990.50, "tax": 57.55, "total": 1048.05, "currency": "USD", "confidence": 95}\n\n'
+    "Rules:\n"
+    '- "total" is the GRAND TOTAL / AMOUNT DUE / BALANCE DUE (final amount including everything)\n'
+    '- "subtotal" is the sum of line items BEFORE tax (Subtotal, Merchandise Total, etc.)\n'
+    '- "tax" is the tax amount (Sales Tax, Tax, IVA, VAT, HST, GST). Set to 0 if none visible\n'
+    '- If only a single total with no breakdown, set "subtotal" equal to "total" and "tax" to 0\n'
+    "- All values must be numbers (no dollar signs, no commas)\n"
+    "- Look for totals in the BOTTOM section of the document\n"
+    "- DO NOT confuse store numbers, phone numbers, PO numbers, SKUs, "
+    "or product codes with monetary amounts\n"
+    '- "confidence" is 0-100\n'
+    "- No preamble, no markdown, just the JSON object\n\n"
+    "--- RECEIPT TEXT ---\n{text}\n--- END ---"
+)
+
 
 def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.05) -> Optional[dict]:
     """
-    Download a receipt image and ask GPT-4o Vision for the invoice totals.
+    Download a receipt and extract invoice totals.
+    Tries pdfplumber text extraction first for PDFs, falls back to GPT Vision.
     Returns dict with {total, subtotal, tax, currency, confidence} or None on failure.
     """
     if not receipt_url:
@@ -262,50 +285,73 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             file_content = resp.content
             content_type = resp.headers.get("content-type", "")
 
-        # 2. Determine media type and convert to base64 image(s)
-        if "pdf" in content_type.lower() or receipt_url.lower().endswith(".pdf"):
-            # PDF: convert first page to image
-            try:
-                from pdf2image import convert_from_bytes
-                import io
-                import platform
-                poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin' if platform.system() == "Windows" else None
-                images = convert_from_bytes(file_content, dpi=150, first_page=1, last_page=1,
-                                            poppler_path=poppler_path)
-                if not images:
-                    logger.warning("[DaneelAutoAuth] Vision: PDF conversion produced no images")
-                    return None
-                buf = io.BytesIO()
-                images[0].save(buf, format='PNG')
-                buf.seek(0)
-                b64_image = base64.b64encode(buf.getvalue()).decode('utf-8')
-                media_type = "image/png"
-            except Exception as e:
-                logger.warning(f"[DaneelAutoAuth] Vision: PDF convert error: {e}")
-                return None
-        else:
-            # Image: direct base64
-            b64_image = base64.b64encode(file_content).decode('utf-8')
-            media_type = content_type if content_type else "image/jpeg"
+        is_pdf = "pdf" in content_type.lower() or receipt_url.lower().endswith(".pdf")
 
-        # 3. Call GPT-4o-mini Vision
+        # 2. Try pdfplumber text extraction first for PDFs
+        extracted_text = None
+        if is_pdf:
+            try:
+                from services.receipt_scanner import extract_text_from_pdf
+                success, text = extract_text_from_pdf(file_content)
+                if success:
+                    extracted_text = text
+                    logger.info(f"[DaneelAutoAuth] pdfplumber: extracted {len(text)} chars")
+            except Exception as e:
+                logger.info(f"[DaneelAutoAuth] pdfplumber unavailable: {e}")
+
         from openai import OpenAI
         ai_client = OpenAI(api_key=api_key)
-        response = ai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _VISION_BILL_TOTAL_PROMPT},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:{media_type};base64,{b64_image}",
-                        "detail": "high"
-                    }}
-                ]
-            }],
-            temperature=0.1,
-            max_tokens=200,
-        )
+
+        if extracted_text:
+            # 3a. Text mode (pdfplumber succeeded) -- use gpt-4o-mini, no image needed
+            prompt = _TEXT_BILL_TOTAL_PROMPT.format(text=extracted_text)
+            response = ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=200,
+            )
+        else:
+            # 3b. Vision mode (fallback) -- convert to image
+            if is_pdf:
+                try:
+                    from pdf2image import convert_from_bytes
+                    import io
+                    import platform
+                    poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin' if platform.system() == "Windows" else None
+                    images = convert_from_bytes(file_content, dpi=300, first_page=1, last_page=1,
+                                                poppler_path=poppler_path)
+                    if not images:
+                        logger.warning("[DaneelAutoAuth] Vision: PDF conversion produced no images")
+                        return None
+                    buf = io.BytesIO()
+                    images[0].save(buf, format='PNG')
+                    buf.seek(0)
+                    b64_image = base64.b64encode(buf.getvalue()).decode('utf-8')
+                    media_type = "image/png"
+                except Exception as e:
+                    logger.warning(f"[DaneelAutoAuth] Vision: PDF convert error: {e}")
+                    return None
+            else:
+                b64_image = base64.b64encode(file_content).decode('utf-8')
+                media_type = content_type if content_type else "image/jpeg"
+
+            response = ai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _VISION_BILL_TOTAL_PROMPT},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{media_type};base64,{b64_image}",
+                            "detail": "high"
+                        }}
+                    ]
+                }],
+                temperature=0.1,
+                max_tokens=200,
+            )
+
         raw = response.choices[0].message.content.strip()
 
         # 4. Parse response

@@ -93,7 +93,7 @@ def _get_poppler_path():
 def _convert_pdf_to_images(file_content: bytes):
     """Convert PDF bytes to list of base64-encoded PNG strings."""
     poppler_path = _get_poppler_path()
-    images = convert_from_bytes(file_content, dpi=200, poppler_path=poppler_path)
+    images = convert_from_bytes(file_content, dpi=300, poppler_path=poppler_path)
     if not images:
         raise ValueError("Could not convert PDF to image")
 
