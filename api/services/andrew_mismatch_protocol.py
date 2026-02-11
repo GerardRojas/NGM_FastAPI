@@ -700,7 +700,7 @@ def _build_reconciliation_message(
 # Main orchestrator
 # ============================================================================
 
-async def run_mismatch_reconciliation(
+def run_mismatch_reconciliation(
     bill_id: str,
     project_id: str,
     source: str = "daneel",
@@ -826,17 +826,23 @@ async def run_mismatch_reconciliation(
         "confidence": result["confidence"],
     }
 
-    # Update the OCR metric row with bill/project context (if one was logged during extraction)
+    # Update the most recent OCR metric row with bill/project context
     try:
         from api.supabase_client import supabase as _sb
-        _sb.table("ocr_metrics").update({
-            "bill_id": bill_id,
-            "project_id": project_id,
-            "total_match_type": result.get("total_match_type", "none"),
-            "items_count": result.get("n_items", len(db_expenses)),
-        }).eq("agent", "andrew").eq("receipt_url", receipt_url).order(
+        # SELECT the latest row's id first, then UPDATE by id
+        # (Supabase ignores .order/.limit on UPDATE operations)
+        latest = _sb.table("ocr_metrics").select("id").eq(
+            "agent", "andrew"
+        ).eq("receipt_url", receipt_url).order(
             "created_at", desc=True
         ).limit(1).execute()
+        if latest.data:
+            _sb.table("ocr_metrics").update({
+                "bill_id": bill_id,
+                "project_id": project_id,
+                "total_match_type": result.get("total_match_type", "none"),
+                "items_count": result.get("n_items", len(db_expenses)),
+            }).eq("id", latest.data[0]["id"]).execute()
     except Exception:
         pass
 

@@ -43,8 +43,10 @@ async def reconcile_bill(
     DB expenses, identifying mismatches and optionally auto-correcting.
     """
     from api.services.andrew_mismatch_protocol import run_mismatch_reconciliation
+    import asyncio
     try:
-        result = await run_mismatch_reconciliation(
+        result = await asyncio.to_thread(
+            run_mismatch_reconciliation,
             bill_id=bill_id,
             project_id=project_id,
             source=source,

@@ -492,11 +492,14 @@ def check_duplicate(
     bills_map: dict,
     config: dict,
     lookups: dict,
+    hash_cache: Optional[dict] = None,
 ) -> DuplicateResult:
     """
     Check if expense is a duplicate of any same-vendor expense.
     Returns the first matching rule result.
     """
+    if hash_cache is None:
+        hash_cache = {}
     tolerance = float(config.get("daneel_amount_tolerance", 0.05))
     fuzzy_thresh = float(config.get("daneel_fuzzy_threshold", 85))
     labor_kw = str(config.get("daneel_labor_keywords", "labor")).lower()
@@ -584,9 +587,13 @@ def check_duplicate(
 
         # ------ R7: Same date, DIFFERENT bill ------
         if same_amount and same_date and exp_bill and oth_bill and exp_bill != oth_bill:
-            # Check receipt hashes
-            exp_hash = get_receipt_hash(exp_receipt)
-            oth_hash = get_receipt_hash(oth_receipt)
+            # Check receipt hashes (cached)
+            if exp_receipt and exp_receipt not in hash_cache:
+                hash_cache[exp_receipt] = get_receipt_hash(exp_receipt)
+            exp_hash = hash_cache.get(exp_receipt) if exp_receipt else None
+            if oth_receipt and oth_receipt not in hash_cache:
+                hash_cache[oth_receipt] = get_receipt_hash(oth_receipt)
+            oth_hash = hash_cache.get(oth_receipt) if oth_receipt else None
 
             if exp_hash and oth_hash:
                 bill_info = bills_map.get(normalize_bill_id((expense.get("bill_id") or "")), {})
@@ -616,8 +623,12 @@ def check_duplicate(
 
         # ------ R9: Labor, no check number, receipt comparison ------
         if is_labor and oth_is_labor and same_amount and not exp_bill and not oth_bill:
-            exp_hash = get_receipt_hash(exp_receipt)
-            oth_hash = get_receipt_hash(oth_receipt)
+            if exp_receipt and exp_receipt not in hash_cache:
+                hash_cache[exp_receipt] = get_receipt_hash(exp_receipt)
+            exp_hash = hash_cache.get(exp_receipt) if exp_receipt else None
+            if oth_receipt and oth_receipt not in hash_cache:
+                hash_cache[oth_receipt] = get_receipt_hash(oth_receipt)
+            oth_hash = hash_cache.get(oth_receipt) if oth_receipt else None
             if exp_hash and oth_hash:
                 if exp_hash != oth_hash:
                     continue  # R9: different checks visually
@@ -847,11 +858,8 @@ def authorize_expense(sb, expense_id: str, project_id: str, rule: str = "passed_
         try:
             from api.services.budget_monitor import trigger_project_budget_check
             import asyncio
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(trigger_project_budget_check(project_id))
-            else:
-                asyncio.run(trigger_project_budget_check(project_id))
+            loop = asyncio.get_running_loop()
+            loop.create_task(trigger_project_budget_check(project_id))
         except Exception as e:
             logger.warning(f"[DaneelAutoAuth] Budget check trigger failed: {e}")
 
@@ -936,69 +944,6 @@ def _make_decision_entry(expense: dict, lookups: dict, decision: str,
 # Message builders
 # ============================================================================
 
-def _build_batch_auth_message(authorized: List[dict], lookups: dict) -> str:
-    total = sum(float(e.get("Amount") or 0) for e in authorized)
-    lines = [
-        f"**Expense Authorization Report**",
-        f"Authorized **{len(authorized)}** expenses totaling **${total:,.2f}**",
-        "",
-        "| Vendor | Amount | Date | Bill # |",
-        "|--------|--------|------|--------|",
-    ]
-    for e in authorized[:20]:  # cap table rows
-        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
-        amt = f"${float(e.get('Amount') or 0):,.2f}"
-        date = (e.get("TxnDate") or "")[:10]
-        bill = e.get("bill_id") or "-"
-        lines.append(f"| {vname} | {amt} | {date} | {bill} |")
-    if len(authorized) > 20:
-        lines.append(f"| ... and {len(authorized) - 20} more | | | |")
-    lines.append("")
-    lines.append("All expenses passed health check and duplicate verification.")
-    return "\n".join(lines)
-
-
-def _build_missing_info_message(missing_list: List[dict], lookups: dict, mention_str: str) -> str:
-    mention = mention_str if mention_str else ""
-    lines = [
-        f"{mention} The following expenses need additional information before authorization:".strip(),
-        "",
-        "| Vendor | Amount | Date | Missing |",
-        "|--------|--------|------|---------|",
-    ]
-    for item in missing_list[:20]:
-        e = item["expense"]
-        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
-        amt = f"${float(e.get('Amount') or 0):,.2f}"
-        date = (e.get("TxnDate") or "")[:10]
-        fields = ", ".join(item["missing"])
-        lines.append(f"| {vname} | {amt} | {date} | {fields} |")
-    if len(missing_list) > 20:
-        lines.append(f"| ... and {len(missing_list) - 20} more | | | |")
-    lines.append("")
-    lines.append("Please update these expenses with the missing information.")
-    return "\n".join(lines)
-
-
-def _build_escalation_message(escalated: List[dict], lookups: dict, mention_str: str) -> str:
-    mention = mention_str if mention_str else ""
-    lines = [
-        f"{mention} The following expenses require manual review:".strip(),
-        "",
-        "| Vendor | Amount | Date | Reason |",
-        "|--------|--------|------|--------|",
-    ]
-    for item in escalated[:20]:
-        e = item["expense"]
-        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
-        amt = f"${float(e.get('Amount') or 0):,.2f}"
-        date = (e.get("TxnDate") or "")[:10]
-        reason = item["reason"]
-        lines.append(f"| {vname} | {amt} | {date} | {reason} |")
-    if len(escalated) > 20:
-        lines.append(f"| ... and {len(escalated) - 20} more | | | |")
-    return "\n".join(lines)
-
 
 _ANDREW_MISMATCH_CALLOUTS = [
     "@Andrew Heads up -- the numbers on this bill don't add up. Can you take a look and sort it out?",
@@ -1075,18 +1020,15 @@ def _build_mismatch_message(
         lines.append("")
 
     if expenses:
-        lines.append("**Expenses on this bill:**")
+        lines.append(f"**Expenses on this bill** ({len(expenses)}):")
         lines.append("")
-        lines.append("| Vendor | Amount | Date | Description |")
-        lines.append("|--------|--------|------|-------------|")
-        for e in expenses[:15]:
+        for e in expenses[:10]:
             vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
             amt = f"${float(e.get('Amount') or 0):,.2f}"
-            date = (e.get("TxnDate") or "")[:10]
             desc = (e.get("LineDescription") or "-")[:40]
-            lines.append(f"| {vname} | {amt} | {date} | {desc} |")
-        if len(expenses) > 15:
-            lines.append(f"| ... and {len(expenses) - 15} more | | | |")
+            lines.append(f"- {vname}: {amt} - {desc}")
+        if len(expenses) > 10:
+            lines.append(f"- ...and {len(expenses) - 10} more")
         lines.append("")
 
     if notify_andrew:
@@ -1139,15 +1081,14 @@ def _resolve_mentions(sb, cfg: dict, key_users: str, key_role: str) -> str:
 # ============================================================================
 
 def _trigger_andrew_reconciliation(bill_id: str, project_id: str, source: str):
-    """Fire Andrew's mismatch reconciliation as a background coroutine."""
+    """Fire Andrew's mismatch reconciliation in a background thread (non-blocking)."""
     try:
         from api.services.andrew_mismatch_protocol import run_mismatch_reconciliation
         import asyncio
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(run_mismatch_reconciliation(bill_id, project_id, source=source))
-        else:
-            asyncio.run(run_mismatch_reconciliation(bill_id, project_id, source=source))
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(
+            None, run_mismatch_reconciliation, bill_id, project_id, source
+        )
     except Exception as e:
         logger.warning(f"[DaneelAutoAuth] Andrew reconciliation trigger failed: {e}")
 
@@ -1290,6 +1231,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                         expense, lookups, "missing_info",
                         rule="HEALTH", reason="Health check failed (after smart resolve)",
                         missing_fields=still_missing, checks=exp_checks))
+                    continue  # Do not proceed to hint/dup checks with incomplete data
                 else:
                     # Fully resolved! Continue to duplicate check
                     exp_checks.append({"check": "health", "passed": True,
@@ -1377,7 +1319,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                 1 for e in all_project_expenses
                                 if normalize_bill_id(e.get("bill_id") or "") in _siblings
                             )
-                            tolerance_pct = float(cfg.get("daneel_amount_tolerance", 0.05))
+                            tolerance_pct = float(cfg.get("daneel_bill_validation_tolerance_pct", 0.01))
                             vision_total = vision_result["total"]
                             vision_subtotal = vision_result.get("subtotal", vision_total)
                             vision_tax = vision_result.get("tax", 0)
@@ -1434,9 +1376,8 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                         })
                             else:
                                 reason_txt = (
-                                    f"Vision OCR amount mismatch: invoice total "
-                                    f"${vision_total:,.2f} / subtotal ${vision_subtotal:,.2f} "
-                                    f"vs expenses sum ${bill_total:,.2f}"
+                                    f"OCR mismatch: invoice ${vision_total:,.2f} "
+                                    f"vs logged ${bill_total:,.2f}"
                                 )
                                 exp_checks.append({
                                     "check": "bill_hint_vision", "passed": False,
@@ -1506,15 +1447,20 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                 _hash_cache[other_receipt_url] = get_receipt_hash(other_receipt_url)
                             other_hash = _hash_cache[other_receipt_url]
                             if other_hash and other_hash == exp_hash:
-                                # Same receipt file on different bills -- check for split
+                                # Same receipt file on different bills
                                 exp_bill_info = bills_map.get(bill_id_str, {})
                                 oth_bill_info = bills_map.get(other_bill, {})
-                                is_split = (exp_bill_info.get("status") == "split"
-                                            or oth_bill_info.get("status") == "split")
-                                if not is_split:
+                                exp_status = (exp_bill_info.get("status") or "").lower()
+                                oth_status = (oth_bill_info.get("status") or "").lower()
+                                # Split bills can share receipts across projects - skip
+                                if exp_status == "split" or oth_status == "split":
+                                    continue
+                                # Only flag as duplicate when BOTH bills are closed
+                                # (open bills may have system glitches with hashes)
+                                if exp_status == "closed" and oth_status == "closed":
                                     reason_txt = (
                                         f"Receipt hash match: same file used on bill #{bill_id_raw} "
-                                        f"and bill #{(other_exp.get('bill_id') or '').strip()} (not a split)"
+                                        f"and bill #{(other_exp.get('bill_id') or '').strip()} (both closed)"
                                     )
                                     exp_checks.append({"check": "receipt_hash", "passed": False, "detail": reason_txt})
                                     escalation_list.append({"expense": expense, "reason": reason_txt})
@@ -1537,7 +1483,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             # 2. Duplicate check
             vendor_id = expense.get("vendor_id")
             same_vendor = by_vendor.get(vendor_id, []) if vendor_id else []
-            dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups)
+            dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_hash_cache)
 
             if dup_result.verdict == "duplicate":
                 exp_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})
@@ -1790,7 +1736,7 @@ async def reprocess_pending_info() -> dict:
             .execute()
         same_vendor = same_vendor_result.data or []
 
-        dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups)
+        dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache={})
 
         if dup_result.verdict == "ambiguous" and cfg.get("daneel_gpt_fallback_enabled") and dup_result.paired_expense_id:
             paired = next((e for e in same_vendor
@@ -1905,12 +1851,15 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                         if other_hash and other_hash == exp_hash:
                             exp_bill_info = bills_map.get(exp_bill_str, {})
                             oth_bill_info = bills_map.get(other_bill, {})
-                            is_split = (exp_bill_info.get("status") == "split"
-                                        or oth_bill_info.get("status") == "split")
-                            if not is_split:
+                            exp_status = (exp_bill_info.get("status") or "").lower()
+                            oth_status = (oth_bill_info.get("status") or "").lower()
+                            # Split bills can share receipts across projects
+                            if exp_status == "split" or oth_status == "split":
+                                pass  # skip, not a duplicate
+                            elif exp_status == "closed" and oth_status == "closed":
                                 reason_txt = (
                                     f"Receipt hash match: same file on bill #{exp_bill_raw} "
-                                    f"and bill #{(other_exp.get('bill_id') or '').strip()} (not a split)"
+                                    f"and bill #{(other_exp.get('bill_id') or '').strip()} (both closed)"
                                 )
                                 rt_checks.append({"check": "receipt_hash", "passed": False, "detail": reason_txt})
                                 escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
@@ -1943,7 +1892,8 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
         else:
             same_vendor = []
 
-        dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups)
+        _rt_hash_cache = {}
+        dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_rt_hash_cache)
 
         if dup_result.verdict == "duplicate":
             rt_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})

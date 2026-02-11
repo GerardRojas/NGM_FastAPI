@@ -408,22 +408,26 @@ def apply_auto_updates(sb, expense_id: str, updates: dict):
 def craft_batch_auth_message(authorized: list, lookups: dict) -> str:
     """Craft batch authorization message with Daneel personality."""
     total = sum(float(e.get("Amount") or 0) for e in authorized)
-    # Build raw table
+    # Group by vendor
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for e in authorized:
+        vid = e.get("vendor_id") or "unknown"
+        vname = lookups["vendors"].get(vid, "Unknown")
+        if vname not in groups:
+            groups[vname] = {"count": 0, "total": 0.0}
+        groups[vname]["count"] += 1
+        groups[vname]["total"] += float(e.get("Amount") or 0)
+
     lines = [
         f"**Expense Authorization Report**",
         f"Authorized **{len(authorized)}** expenses totaling **${total:,.2f}**",
         "",
-        "| Vendor | Amount | Date | Bill # |",
-        "|--------|--------|------|--------|",
     ]
-    for e in authorized[:20]:
-        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
-        amt = f"${float(e.get('Amount') or 0):,.2f}"
-        date = (e.get("TxnDate") or "")[:10]
-        bill = e.get("bill_id") or "-"
-        lines.append(f"| {vname} | {amt} | {date} | {bill} |")
-    if len(authorized) > 20:
-        lines.append(f"| ... and {len(authorized) - 20} more | | | |")
+    for vname, g in list(groups.items())[:20]:
+        lines.append(f"**{vname}** - {g['count']} item{'s' if g['count'] != 1 else ''} (${g['total']:,.2f})")
+    if len(groups) > 20:
+        lines.append(f"...and {len(groups) - 20} more vendors")
     lines.append("")
     lines.append("All expenses passed health check and duplicate verification.")
     raw = "\n".join(lines)
@@ -431,8 +435,9 @@ def craft_batch_auth_message(authorized: list, lookups: dict) -> str:
     personalized = _call_gpt(
         _DANEEL_CONVERSATION_PROMPT,
         f"Add subtle personality to this authorization report. "
-        f"Keep the table and all data EXACTLY as-is. "
-        f"You can adjust the header line and footer line only:\n\n{raw}",
+        f"Keep ALL bold vendor lines and the total summary EXACTLY as-is. "
+        f"You can only adjust the opening header and closing footer text. "
+        f"Do NOT add tables:\n\n{raw}",
         max_tokens=600,
         temperature=0.4,
     )
@@ -453,9 +458,8 @@ def craft_missing_info_message(missing_list: list, lookups: dict,
     """
     mention = mention_str if mention_str else ""
 
-    # Build raw table
     lines = [
-        f"{mention} The following expenses need additional information:".strip(),
+        f"{mention} {len(missing_list)} expense{'s' if len(missing_list) != 1 else ''} need additional info:".strip(),
         "",
     ]
 
@@ -476,58 +480,93 @@ def craft_missing_info_message(missing_list: list, lookups: dict,
             lines.append(f"- {a}")
         lines.append("")
 
-    lines.append("| Vendor | Amount | Date | Missing |")
-    lines.append("|--------|--------|------|---------|")
-    for item in missing_list[:20]:
+    # Group by vendor, merge missing fields
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for item in missing_list:
         e = item["expense"]
-        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
-        amt = f"${float(e.get('Amount') or 0):,.2f}"
-        date = (e.get("TxnDate") or "")[:10]
-        fields = ", ".join(item["missing"])
-        lines.append(f"| {vname} | {amt} | {date} | {fields} |")
-    if len(missing_list) > 20:
-        lines.append(f"| ... and {len(missing_list) - 20} more | | | |")
-    lines.append("")
-    lines.append("Please update these expenses with the missing information.")
+        vid = e.get("vendor_id") or "unknown"
+        vname = lookups["vendors"].get(vid, "Unknown")
+        if vname not in groups:
+            groups[vname] = {"count": 0, "total": 0.0, "missing": set()}
+        groups[vname]["count"] += 1
+        groups[vname]["total"] += float(e.get("Amount") or 0)
+        groups[vname]["missing"].update(item.get("missing", []))
 
+    for vname, g in list(groups.items())[:20]:
+        fields = ", ".join(sorted(g["missing"]))
+        lines.append(f"**{vname}** - {g['count']} item{'s' if g['count'] != 1 else ''} (${g['total']:,.2f})")
+        lines.append(f"Missing: {fields}")
+        lines.append("")
+    if len(groups) > 20:
+        lines.append(f"...and {len(groups) - 20} more vendors")
+        lines.append("")
+
+    lines.append("Please update these expenses with the missing information.")
     raw = "\n".join(lines)
 
     personalized = _call_gpt(
         _DANEEL_CONVERSATION_PROMPT,
         f"Rewrite this missing info request with personality. "
-        f"Keep the table, @mentions, and all data EXACTLY as-is. "
-        f"Adjust the conversational framing:\n\n{raw}",
+        f"Keep ALL bold vendor lines, missing field lists, @mentions, "
+        f"and auto-resolution context EXACTLY as-is. "
+        f"Only adjust the conversational framing text. Do NOT add tables:\n\n{raw}",
         max_tokens=700,
         temperature=0.4,
     )
     return personalized if personalized else raw
 
 
+def _normalize_reason_key(reason: str) -> str:
+    """Extract a grouping key from a reason string, stripping specific amounts."""
+    import re
+    r = reason.lower().strip()
+    # Strip dollar amounts for grouping (same mismatch type, different amounts)
+    r = re.sub(r'\$[\d,]+\.?\d*', '$X', r)
+    # Strip bill IDs
+    r = re.sub(r'#[\w\-]+', '#ID', r)
+    return r
+
+
 def craft_escalation_message(escalated: list, lookups: dict,
                              mention_str: str) -> str:
-    """Craft escalation message with personality."""
+    """Craft escalation message with personality, grouped by vendor+reason."""
     mention = mention_str if mention_str else ""
     lines = [
-        f"{mention} The following expenses require manual review:".strip(),
+        f"{mention} {len(escalated)} expense{'s' if len(escalated) != 1 else ''} require manual review:".strip(),
         "",
-        "| Vendor | Amount | Date | Reason |",
-        "|--------|--------|------|--------|",
     ]
-    for item in escalated[:20]:
+
+    # Group by (vendor, normalized_reason) — keep first raw reason for display
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for item in escalated:
         e = item["expense"]
-        vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
-        amt = f"${float(e.get('Amount') or 0):,.2f}"
-        date = (e.get("TxnDate") or "")[:10]
+        vid = e.get("vendor_id") or "unknown"
+        vname = lookups["vendors"].get(vid, "Unknown")
         reason = item["reason"]
-        lines.append(f"| {vname} | {amt} | {date} | {reason} |")
-    if len(escalated) > 20:
-        lines.append(f"| ... and {len(escalated) - 20} more | | | |")
+        key = (vname, _normalize_reason_key(reason))
+        if key not in groups:
+            groups[key] = {"count": 0, "total": 0.0, "reason": reason}
+        groups[key]["count"] += 1
+        groups[key]["total"] += float(e.get("Amount") or 0)
+
+    for (vname, _), g in list(groups.items())[:20]:
+        lines.append(f"**{vname}** - {g['count']} item{'s' if g['count'] != 1 else ''} (${g['total']:,.2f})")
+        lines.append(g["reason"])
+        lines.append("")
+    if len(groups) > 20:
+        lines.append(f"...and {len(groups) - 20} more groups")
+        lines.append("")
+
     raw = "\n".join(lines)
 
     personalized = _call_gpt(
         _DANEEL_CONVERSATION_PROMPT,
-        f"Rewrite this escalation alert with personality. Keep the table "
-        f"and @mentions EXACTLY as-is. Be firm but not alarming:\n\n{raw}",
+        f"Rewrite this escalation alert with personality. Keep ALL bold "
+        f"vendor lines (with item counts and amounts), reason lines below them, "
+        f"and @mentions EXACTLY as-is. Only adjust the opening and closing "
+        f"framing text. Be firm but not alarming. Do NOT add tables:\n\n{raw}",
         max_tokens=600,
         temperature=0.4,
     )
