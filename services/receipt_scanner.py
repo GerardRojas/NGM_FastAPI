@@ -108,22 +108,54 @@ def _convert_pdf_to_images(file_content: bytes):
     return base64_images
 
 
+def _sanitize_json(text: str) -> str:
+    """Fix common LLM JSON issues: trailing commas, single quotes, comments."""
+    # Remove single-line comments (// ...)
+    text = re.sub(r'//[^\n]*', '', text)
+    # Remove trailing commas before } or ]
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+    return text
+
+
 def _parse_json_response(result_text: str) -> dict:
-    """Parse JSON from OpenAI response, handling markdown code blocks."""
+    """Parse JSON from OpenAI response, handling markdown code blocks and LLM quirks."""
+    # 1. Direct parse
     try:
         return json.loads(result_text)
     except json.JSONDecodeError:
         pass
 
-    # Try markdown code block
+    # 2. Try markdown code block
     json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
     if json_match:
-        return json.loads(json_match.group(1))
+        raw = json_match.group(1)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Try sanitized
+            try:
+                return json.loads(_sanitize_json(raw))
+            except json.JSONDecodeError:
+                pass
 
-    # Try any JSON object
+    # 3. Try any JSON object
     json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
     if json_match:
-        return json.loads(json_match.group(0))
+        raw = json_match.group(0)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Try sanitized
+            try:
+                return json.loads(_sanitize_json(raw))
+            except json.JSONDecodeError:
+                pass
+
+    # 4. Last resort: sanitize entire text
+    try:
+        return json.loads(_sanitize_json(result_text))
+    except json.JSONDecodeError:
+        pass
 
     raise RuntimeError(f"OpenAI returned invalid JSON: {result_text[:500]}")
 

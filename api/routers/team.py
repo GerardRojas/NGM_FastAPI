@@ -25,8 +25,9 @@ SELECT_CLAUSE = """
   user_address,
   user_contract_url,
   user_description,
-  user_position,
+  department_id,
 
+  task_departments(department_id, department_name),
   rols!users_user_rol_fkey(rol_id, rol_name),
   users_seniority!users_user_seniority_fkey(id, user_seniority_name),
   users_status!users_user_status_fkey(id, user_status_name)
@@ -37,6 +38,7 @@ def normalize_user_row(r: Dict[str, Any]) -> Dict[str, Any]:
     role = r.get("rols")
     sen = r.get("users_seniority")
     st = r.get("users_status")
+    dept = r.get("task_departments")
 
     return {
         "user_id": r.get("user_id"),
@@ -50,7 +52,7 @@ def normalize_user_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "user_address": r.get("user_address"),
         "user_contract_url": r.get("user_contract_url"),
         "user_description": r.get("user_description"),
-        "user_position": r.get("user_position"),
+        "department": None if not dept else {"id": dept.get("department_id"), "name": dept.get("department_name")},
         "role": None if not role else {"id": role.get("rol_id"), "name": role.get("rol_name")},
         "seniority": None if not sen else {"id": sen.get("id"), "name": sen.get("user_seniority_name")},
         "status": None if not st else {"id": st.get("id"), "name": st.get("user_status_name")},
@@ -85,7 +87,7 @@ class UserCreate(BaseModel):
     user_address: Optional[str] = None
     user_contract_url: Optional[str] = None
     user_description: Optional[str] = None
-    user_position: Optional[str] = None
+    department_id: Optional[str] = None
 
     password: Optional[str] = None  # plaintext opcional (se hashea)
 
@@ -106,7 +108,7 @@ class UserUpdate(BaseModel):
     user_address: Optional[str] = None
     user_contract_url: Optional[str] = None
     user_description: Optional[str] = None
-    user_position: Optional[str] = None
+    department_id: Optional[str] = None
 
     password: Optional[str] = None  # plaintext opcional (se hashea)
 
@@ -134,6 +136,10 @@ def team_meta() -> Dict[str, Any]:
             supabase.table("users_status").select("id, user_status_name").order("user_status_name").execute().data
             or []
         )
+        departments = (
+            supabase.table("task_departments").select("department_id, department_name").order("department_name").execute().data
+            or []
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Supabase meta query failed: {e}")
 
@@ -141,6 +147,7 @@ def team_meta() -> Dict[str, Any]:
         "roles": [{"id": r["rol_id"], "name": r["rol_name"]} for r in roles],
         "seniorities": [{"id": s["id"], "name": s["user_seniority_name"]} for s in seniorities],
         "statuses": [{"id": s["id"], "name": s["user_status_name"]} for s in statuses],
+        "departments": [{"id": d["department_id"], "name": d["department_name"]} for d in departments],
     }
 
 
@@ -249,7 +256,7 @@ def create_user(payload: UserCreate) -> Dict[str, Any]:
         "user_address": data.get("user_address"),
         "user_contract_url": data.get("user_contract_url"),
         "user_description": data.get("user_description"),
-        "user_position": data.get("user_position"),
+        "department_id": data.get("department_id"),
         "user_rol": data.get("role_id"),
         "user_seniority": data.get("seniority_id"),
         "user_status": data.get("status_id"),
@@ -291,7 +298,7 @@ def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
         "user_address",
         "user_contract_url",
         "user_description",
-        "user_position",
+        "department_id",
     ]:
         if f in data:
             update_obj[f] = data[f]
