@@ -1302,15 +1302,17 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 _resolve_pending_info(sb, exp_id)
 
             # 1b. Bill hint cross-validation (soft armoring layer)
-            # Parse the receipt FILENAME (not bill_id) for embedded amount hints,
-            # then compare against the SUM of all expenses on the same bill.
+            # Only validate CLOSED bills — open bills are still accumulating items
+            # so comparing partial sums against the invoice total is meaningless.
             from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
             from urllib.parse import unquote
             bill_id_raw = (expense.get("bill_id") or "").strip()
             bill_id_str = normalize_bill_id(bill_id_raw)
             _siblings = _get_bill_siblings(bill_id_str, bills_map, receipt_groups)
-            if bill_id_str and bill_id_str in bills_map:
-                receipt_url = bills_map[bill_id_str].get("receipt_url") or ""
+            bill_data = bills_map.get(bill_id_str)
+            bill_status = (bill_data.get("status") or "").lower() if bill_data else ""
+            if bill_id_str and bill_data and bill_status == "closed":
+                receipt_url = bill_data.get("receipt_url") or ""
                 # Extract filename from URL path and decode URL encoding
                 hint_source = unquote(receipt_url.rsplit("/", 1)[-1]) if "/" in receipt_url else unquote(receipt_url)
                 hint = parse_bill_hint(hint_source) if hint_source else {}
@@ -1473,8 +1475,13 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                         exp_checks.append({"check": "bill_hint", "passed": True,
                                            "detail": "No amount hint in receipt filename (no receipt URL)"})
             else:
-                exp_checks.append({"check": "bill_hint", "passed": True,
-                                   "detail": "No bill" if not bill_id_str else "Bill not in bills table"})
+                if not bill_id_str:
+                    skip_reason = "No bill"
+                elif not bill_data:
+                    skip_reason = "Bill not in bills table"
+                else:
+                    skip_reason = f"Bill status is '{bill_status}' (only closed bills are validated)"
+                exp_checks.append({"check": "bill_hint", "passed": True, "detail": skip_reason})
 
             # 1c. Per-project receipt hash check (detect same receipt on different bills)
             if cfg.get("daneel_receipt_hash_check_enabled", True):
