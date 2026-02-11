@@ -33,6 +33,9 @@ class AutoAuthConfigUpdate(BaseModel):
     daneel_gpt_fallback_confidence: Optional[int] = None
     daneel_mismatch_notify_andrew: Optional[bool] = None
     daneel_receipt_hash_check_enabled: Optional[bool] = None
+    daneel_smart_layer_enabled: Optional[bool] = None
+    daneel_followup_hours: Optional[int] = None
+    daneel_escalation_hours: Optional[int] = None
 
 
 # ================================
@@ -380,3 +383,76 @@ async def delete_auth_reports():
         return {"ok": True, "message": "All reports deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting reports: {str(e)}")
+
+
+# ================================
+# SMART LAYER: FOLLOW-UPS
+# ================================
+
+@router.post("/auto-auth/follow-up-check")
+async def run_follow_up_check():
+    """
+    Check for pending info items awaiting human response and send follow-ups.
+    Should be called periodically (e.g., every 6 hours via cron/scheduler).
+    """
+    from api.services.daneel_smart_layer import check_pending_followups, execute_followups
+    try:
+        from api.services.daneel_auto_auth import load_auto_auth_config
+        cfg = load_auto_auth_config()
+        followup_h = int(cfg.get("daneel_followup_hours", 24))
+        escalation_h = int(cfg.get("daneel_escalation_hours", 48))
+
+        pending = check_pending_followups(followup_h, escalation_h)
+        if not pending:
+            return {"ok": True, "message": "No follow-ups needed", "stats": {}}
+        stats = execute_followups(pending)
+        return {
+            "ok": True,
+            "items_checked": len(pending),
+            "stats": stats,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Follow-up check failed: {str(e)}")
+
+
+@router.get("/auto-auth/pending-info-status")
+async def get_pending_info_status():
+    """
+    Get summary of expenses currently awaiting missing info.
+    Shows how long each has been waiting and what's needed.
+    """
+    try:
+        result = supabase.table("daneel_pending_info") \
+            .select("expense_id, project_id, missing_fields, requested_at") \
+            .is_("resolved_at", "null") \
+            .order("requested_at", desc=False) \
+            .execute()
+
+        now = datetime.now(timezone.utc)
+        items = []
+        for r in (result.data or []):
+            hours = 0
+            if r.get("requested_at"):
+                try:
+                    req = datetime.fromisoformat(r["requested_at"].replace("Z", "+00:00"))
+                    if req.tzinfo is None:
+                        req = req.replace(tzinfo=timezone.utc)
+                    hours = round((now - req).total_seconds() / 3600, 1)
+                except Exception:
+                    pass
+            items.append({
+                "expense_id": r["expense_id"],
+                "project_id": r.get("project_id"),
+                "missing_fields": r.get("missing_fields", []),
+                "hours_pending": hours,
+                "status": "stale" if hours >= 72 else "overdue" if hours >= 24 else "recent",
+            })
+
+        return {
+            "total": len(items),
+            "stale": sum(1 for i in items if i["status"] == "stale"),
+            "overdue": sum(1 for i in items if i["status"] == "overdue"),
+            "items": items,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting pending info status: {str(e)}")

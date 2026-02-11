@@ -69,6 +69,9 @@ from api.routers.adu_calculator import router as adu_calculator_router
 from api.routers.daneel_auto_auth import router as daneel_auto_auth_router
 from api.routers.andrew_mismatch import router as andrew_mismatch_router
 
+# ========= OCR METRICS: Extraction method tracking ==========
+from api.routers.ocr_metrics import router as ocr_metrics_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -185,6 +188,9 @@ app.include_router(daneel_auto_auth_router)
 
 # Andrew Mismatch Reconciliation (bill mismatch detection & correction)
 app.include_router(andrew_mismatch_router)
+
+# OCR Metrics (extraction method tracking across all agents)
+app.include_router(ocr_metrics_router)
 
 # ========================================
 # Root & Healthcheck

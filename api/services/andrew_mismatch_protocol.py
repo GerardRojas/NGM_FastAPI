@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 import httpx
 
 from api.helpers.andrew_messenger import post_andrew_message, ANDREW_BOT_USER_ID
+from api.services.ocr_metrics import log_ocr_metric
 
 logger = logging.getLogger(__name__)
 
@@ -295,9 +296,30 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
             f"subtotal=${ocr_subtotal:,.2f} tax=${ocr_tax:,.2f} total=${ocr_total:,.2f} "
             f"(confidence={data.get('confidence', confidence)}%)"
         )
+        log_ocr_metric(
+            agent="andrew",
+            source="mismatch_reconciliation",
+            extraction_method=data["_extraction_method"],
+            model_used="gpt-4o",
+            file_type="application/pdf" if is_pdf else (content_type or "unknown"),
+            char_count=len(extracted_text) if extracted_text else None,
+            success=True,
+            confidence=data.get("confidence", confidence),
+            items_count=len(line_items),
+            tax_detected=ocr_tax > 0,
+            total_match_type=data.get("_line_items_match"),
+            receipt_url=receipt_url,
+        )
         return data
     except Exception as e:
         logger.warning(f"[AndrewMismatch] Extract failed: {e}")
+        log_ocr_metric(
+            agent="andrew",
+            source="mismatch_reconciliation",
+            extraction_method="error",
+            success=False,
+            receipt_url=receipt_url,
+        )
         return None
 
 
@@ -803,5 +825,20 @@ async def run_mismatch_reconciliation(
         "corrections_applied": len(corrections),
         "confidence": result["confidence"],
     }
+
+    # Update the OCR metric row with bill/project context (if one was logged during extraction)
+    try:
+        from api.supabase_client import supabase as _sb
+        _sb.table("ocr_metrics").update({
+            "bill_id": bill_id,
+            "project_id": project_id,
+            "total_match_type": result.get("total_match_type", "none"),
+            "items_count": result.get("n_items", len(db_expenses)),
+        }).eq("agent", "andrew").eq("receipt_url", receipt_url).order(
+            "created_at", desc=True
+        ).limit(1).execute()
+    except Exception:
+        pass
+
     logger.info(f"[AndrewMismatch] Reconciliation complete: {summary}")
     return summary

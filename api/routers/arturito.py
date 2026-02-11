@@ -578,8 +578,7 @@ async def get_failed_commands_endpoint(
         if current_user.get("role") not in allowed_roles:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-        from api.db import get_supabase_client
-        supabase = get_supabase_client()
+        from api.supabase_client import supabase
 
         # Limit page size
         page_size = min(page_size, 100)
@@ -1159,8 +1158,7 @@ async def get_failed_commands_stats_endpoint(
         if current_user.get("role") not in allowed_roles:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-        from api.db import get_supabase_client
-        supabase = get_supabase_client()
+        from api.supabase_client import supabase
 
         stats = await get_failed_commands_stats(
             supabase=supabase,

@@ -11,6 +11,7 @@
 #   auto_categorize(stage, expenses) -> list[dict]
 
 from api.supabase_client import supabase
+from api.services.ocr_metrics import log_ocr_metric, ocr_timer
 from openai import OpenAI
 from typing import Optional
 import base64
@@ -663,6 +664,23 @@ def scan_receipt(
             raise RuntimeError("Some expenses are missing required fields (date, description, amount)")
 
     print(f"[SCAN-RECEIPT] COMPLETADO - metodo: {extraction_method}, items: {len(parsed_data['expenses'])}")
+
+    # Log OCR metric
+    tax_summary = parsed_data.get("tax_summary")
+    validation = parsed_data.get("validation")
+    log_ocr_metric(
+        agent="receipt_scanner",
+        source="correction" if correction_context else ("human_parse" if model == "fast" else "agent_process"),
+        extraction_method=extraction_method,
+        model_used=openai_model,
+        scan_mode=model,
+        file_type=file_type,
+        char_count=len(extracted_text) if extracted_text else None,
+        success=True,
+        confidence=int(validation.get("validation_passed", False)) * 100 if validation else None,
+        items_count=len(parsed_data["expenses"]),
+        tax_detected=bool(tax_summary and tax_summary.get("total_tax_detected", 0) > 0),
+    )
 
     return {
         "expenses": parsed_data["expenses"],

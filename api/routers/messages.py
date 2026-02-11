@@ -935,7 +935,8 @@ def get_my_mentions(
 
             mention = {
                 "message_id": str(row.get("id", "")),
-                "channel_id": str(row.get("channel_id", "")) if row.get("channel_id") else str(row.get("project_id", "")),
+                "channel_id": str(row.get("channel_id", "")) if row.get("channel_id") else None,
+                "project_id": str(row.get("project_id", "")) if row.get("project_id") else None,
                 "channel_type": row.get("channel_type", ""),
                 "channel_name": channel_name,
                 "content": row.get("content", ""),

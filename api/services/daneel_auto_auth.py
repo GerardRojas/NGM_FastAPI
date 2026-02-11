@@ -22,6 +22,7 @@ import httpx
 from supabase import create_client, Client
 
 from api.helpers.daneel_messenger import post_daneel_message, DANEEL_BOT_USER_ID
+from api.services.ocr_metrics import log_ocr_metric
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +386,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
         if subtotal <= 0:
             subtotal = total
 
+        _extraction_method = "pdfplumber" if extracted_text else "vision"
         result = {
             "total": total,
             "subtotal": subtotal,
@@ -396,10 +398,29 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             f"[DaneelAutoAuth] Vision: subtotal=${subtotal:,.2f} tax=${tax:,.2f} "
             f"total=${total:,.2f} (confidence={confidence}%)"
         )
+        log_ocr_metric(
+            agent="daneel",
+            source="hint_review",
+            extraction_method=_extraction_method,
+            model_used="gpt-4o",
+            file_type="application/pdf" if is_pdf else content_type,
+            char_count=len(extracted_text) if extracted_text else None,
+            success=True,
+            confidence=confidence,
+            tax_detected=tax > 0,
+            receipt_url=receipt_url,
+        )
         return result
 
     except Exception as e:
         logger.warning(f"[DaneelAutoAuth] Vision extract failed: {e}")
+        log_ocr_metric(
+            agent="daneel",
+            source="hint_review",
+            extraction_method="error",
+            success=False,
+            receipt_url=receipt_url,
+        )
         return None
 
 
