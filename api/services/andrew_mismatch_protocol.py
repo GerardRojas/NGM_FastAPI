@@ -178,9 +178,33 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
             logger.info(f"[AndrewMismatch] Vision confidence too low ({confidence}%)")
             return None
 
+        # Cross-validate: line items sum vs total/subtotal
+        line_items = data.get("line_items", [])
+        ocr_total = float(data.get("total", 0))
+        ocr_subtotal = float(data.get("subtotal", 0)) or ocr_total
+        ocr_tax = float(data.get("tax", 0))
+        items_sum = sum(float(item.get("amount") or 0) for item in line_items)
+
+        if items_sum > 0 and ocr_total > 0:
+            gap_total = abs(items_sum - ocr_total)
+            gap_subtotal = abs(items_sum - ocr_subtotal)
+
+            if gap_total / ocr_total <= 0.02:
+                data["_line_items_match"] = "total"
+            elif ocr_subtotal != ocr_total and ocr_subtotal > 0 and gap_subtotal / ocr_subtotal <= 0.02:
+                data["_line_items_match"] = "subtotal"
+            else:
+                data["_line_items_match"] = "inconsistent"
+                data["confidence"] = max(0, confidence - 10)
+                logger.info(
+                    f"[AndrewMismatch] Cross-validation: items_sum=${items_sum:,.2f} "
+                    f"vs total=${ocr_total:,.2f} / subtotal=${ocr_subtotal:,.2f} -- inconsistent"
+                )
+
         logger.info(
-            f"[AndrewMismatch] Extracted {len(data.get('line_items', []))} line items, "
-            f"total=${data.get('total', 0):,.2f} (confidence={confidence}%)"
+            f"[AndrewMismatch] Extracted {len(line_items)} line items, "
+            f"subtotal=${ocr_subtotal:,.2f} tax=${ocr_tax:,.2f} total=${ocr_total:,.2f} "
+            f"(confidence={data.get('confidence', confidence)}%)"
         )
         return data
     except Exception as e:
@@ -226,9 +250,31 @@ def reconcile_bill(
     """
     ocr_items = ocr_data.get("line_items", [])
     ocr_total = float(ocr_data.get("total", 0))
+    ocr_subtotal = float(ocr_data.get("subtotal", 0)) or ocr_total
+    ocr_tax = float(ocr_data.get("tax", 0))
     confidence = int(ocr_data.get("confidence", 0))
 
     db_total = sum(float(e.get("Amount") or 0) for e in db_expenses)
+    n_items = len(db_expenses)
+
+    # Cross-validate OCR line items sum
+    ocr_line_items_sum = sum(float(item.get("amount") or 0) for item in ocr_items)
+    line_items_consistency = ocr_data.get("_line_items_match", "unknown")
+
+    # Two-tier total comparison
+    rounding_tolerance = n_items * 0.01
+    larger = max(abs(ocr_total), abs(db_total)) if (ocr_total or db_total) else 1
+    pct_tolerance = larger * amount_tolerance
+    abs_tolerance = max(pct_tolerance, rounding_tolerance)
+
+    total_diff = abs(ocr_total - db_total)
+    subtotal_diff = abs(ocr_subtotal - db_total) if ocr_subtotal != ocr_total else float('inf')
+
+    total_match_type = "none"
+    if total_diff <= abs_tolerance:
+        total_match_type = "total"
+    elif subtotal_diff < float('inf') and subtotal_diff <= abs_tolerance:
+        total_match_type = "subtotal"
 
     matched = []
     amount_mismatches = []
@@ -304,7 +350,13 @@ def reconcile_bill(
         "missing_in_db": missing_in_db,
         "extra_in_db": extra_in_db,
         "ocr_total": ocr_total,
+        "ocr_subtotal": ocr_subtotal,
+        "ocr_tax": ocr_tax,
+        "ocr_line_items_sum": round(ocr_line_items_sum, 2),
+        "line_items_consistency": line_items_consistency,
         "db_total": round(db_total, 2),
+        "n_items": n_items,
+        "total_match_type": total_match_type,
         "confidence": confidence,
     }
 
@@ -393,17 +445,61 @@ def _build_reconciliation_message(
 ) -> str:
     """Build the reconciliation report message."""
     import random
+
+    ocr_total = result["ocr_total"]
+    ocr_subtotal = result.get("ocr_subtotal", ocr_total)
+    ocr_tax = result.get("ocr_tax", 0)
+    db_total = result["db_total"]
+    total_match_type = result.get("total_match_type", "none")
+    line_items_consistency = result.get("line_items_consistency", "unknown")
+
     lines = [
         random.choice(_RECONCILIATION_OPENERS),
         "",
         f"**Bill #{bill_id} -- Reconciliation Report**",
         "",
-        f"| | Invoice (OCR) | Database | Difference |",
-        f"|--|--------------|----------|------------|",
-        f"| **Total** | ${result['ocr_total']:,.2f} | ${result['db_total']:,.2f} | "
-        f"${abs(result['ocr_total'] - result['db_total']):,.2f} |",
-        "",
     ]
+
+    # Enhanced comparison table with subtotal/tax/total
+    if ocr_tax > 0 and ocr_subtotal != ocr_total:
+        lines.extend([
+            f"| | Invoice (OCR) | Database | Difference |",
+            f"|--|--------------|----------|------------|",
+            f"| **Subtotal** | ${ocr_subtotal:,.2f} | -- | -- |",
+            f"| **Tax** | ${ocr_tax:,.2f} | -- | -- |",
+            f"| **Total** | ${ocr_total:,.2f} | ${db_total:,.2f} | "
+            f"${abs(ocr_total - db_total):,.2f} |",
+            "",
+        ])
+    else:
+        lines.extend([
+            f"| | Invoice (OCR) | Database | Difference |",
+            f"|--|--------------|----------|------------|",
+            f"| **Total** | ${ocr_total:,.2f} | ${db_total:,.2f} | "
+            f"${abs(ocr_total - db_total):,.2f} |",
+            "",
+        ])
+
+    # Line items cross-validation note
+    ocr_line_items_sum = result.get("ocr_line_items_sum", 0)
+    if ocr_line_items_sum > 0:
+        lines.append(
+            f"OCR line items sum: ${ocr_line_items_sum:,.2f} "
+            f"({line_items_consistency.replace('_', ' ')})"
+        )
+        lines.append("")
+
+    # Tax-related diagnostic
+    if total_match_type == "subtotal":
+        lines.append(
+            f"*Expenses sum (${db_total:,.2f}) matches the invoice subtotal "
+            f"(${ocr_subtotal:,.2f}). Tax of ${ocr_tax:,.2f} may not be included "
+            f"in the expense line items.*"
+        )
+        lines.append("")
+    elif total_match_type == "total":
+        lines.append("Totals match within tolerance.")
+        lines.append("")
 
     # Matched items
     if result["matched"]:
@@ -465,10 +561,24 @@ def _build_reconciliation_message(
         lines.append("Auto-correct is disabled. Please review and fix the amounts manually.")
         lines.append("")
 
-    # Summary
-    total_issues = len(result["amount_mismatches"]) + len(result["missing_in_db"]) + len(result["extra_in_db"])
-    if total_issues == 0:
-        lines.append("All line items match. The totals discrepancy may be from tax or rounding.")
+    # Smart summary
+    total_issues = (len(result["amount_mismatches"])
+                    + len(result["missing_in_db"])
+                    + len(result["extra_in_db"]))
+    if total_issues == 0 and total_match_type != "none":
+        if total_match_type == "subtotal":
+            lines.append(
+                "All line items match. The totals discrepancy is due to tax "
+                "not being distributed into the expense amounts."
+            )
+        else:
+            lines.append("All line items and totals match. No issues found.")
+    elif total_issues == 0:
+        lines.append(
+            "All line items match individually, but the overall totals "
+            "don't reconcile. This may be from tax, rounding, or a "
+            "fee not captured as a line item."
+        )
     else:
         lines.append(f"Found **{total_issues}** issue(s) that need attention.")
 
@@ -592,7 +702,11 @@ async def run_mismatch_reconciliation(
         "status": "ok",
         "bill_id": bill_id,
         "ocr_total": result["ocr_total"],
+        "ocr_subtotal": result.get("ocr_subtotal", result["ocr_total"]),
+        "ocr_tax": result.get("ocr_tax", 0),
         "db_total": result["db_total"],
+        "total_match_type": result.get("total_match_type", "none"),
+        "line_items_consistency": result.get("line_items_consistency", "unknown"),
         "matched": len(result["matched"]),
         "amount_mismatches": len(result["amount_mismatches"]),
         "missing_in_db": len(result["missing_in_db"]),

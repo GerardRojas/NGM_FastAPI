@@ -219,23 +219,27 @@ def get_receipt_hash(receipt_url: Optional[str]) -> Optional[str]:
 
 _VISION_BILL_TOTAL_PROMPT = (
     "You are a financial document reader. Look at this invoice/receipt image "
-    "and extract the GRAND TOTAL amount (the final amount due, including taxes "
-    "and any additional charges).\n\n"
+    "and extract the billing amounts.\n\n"
     "RESPOND with ONLY a JSON object:\n"
-    "{\"total\": 1234.56, \"currency\": \"USD\", \"confidence\": 95}\n\n"
+    '{"subtotal": 990.50, "tax": 57.55, "total": 1048.05, "currency": "USD", "confidence": 95}\n\n'
     "Rules:\n"
-    "- \"total\" must be a number (no dollar signs, no commas)\n"
-    "- If you see multiple totals, use the GRAND TOTAL / AMOUNT DUE / BALANCE DUE\n"
-    "- \"confidence\" is 0-100 how sure you are this is the correct total\n"
-    "- If you cannot read the total clearly, set confidence below 50\n"
+    '- "total" is the GRAND TOTAL / AMOUNT DUE / BALANCE DUE (final amount including everything)\n'
+    '- "subtotal" is the sum of line items BEFORE tax (often labeled Subtotal, Merchandise Total, etc.)\n'
+    '- "tax" is the tax amount (Sales Tax, Tax, IVA, VAT, HST, GST). Set to 0 if no tax line visible\n'
+    '- If the document only shows a single total with no subtotal/tax breakdown, '
+    'set "subtotal" equal to "total" and "tax" to 0\n'
+    "- All values must be numbers (no dollar signs, no commas)\n"
+    '- If you see multiple totals, use the GRAND TOTAL / AMOUNT DUE / BALANCE DUE\n'
+    '- "confidence" is 0-100 how sure you are about the extracted values\n'
+    "- If you cannot read the amounts clearly, set confidence below 50\n"
     "- No preamble, no markdown, just the JSON object"
 )
 
 
-def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.05) -> Optional[float]:
+def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.05) -> Optional[dict]:
     """
-    Download a receipt image and ask GPT-4o-mini Vision for the invoice total.
-    Returns the extracted amount or None on any failure (fail-open).
+    Download a receipt image and ask GPT-4o Vision for the invoice totals.
+    Returns dict with {total, subtotal, tax, currency, confidence} or None on failure.
     """
     if not receipt_url:
         return None
@@ -300,7 +304,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
                 ]
             }],
             temperature=0.1,
-            max_tokens=100,
+            max_tokens=200,
         )
         raw = response.choices[0].message.content.strip()
 
@@ -310,14 +314,43 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         data = _json.loads(raw)
         total = float(data.get("total", 0))
+        subtotal = float(data.get("subtotal", 0))
+        tax = float(data.get("tax", 0))
         confidence = int(data.get("confidence", 0))
 
         if total <= 0 or confidence < 50:
             logger.info(f"[DaneelAutoAuth] Vision: low confidence ({confidence}%) or zero total")
             return None
 
-        logger.info(f"[DaneelAutoAuth] Vision: extracted total=${total:,.2f} (confidence={confidence}%)")
-        return total
+        # Self-validation: subtotal + tax should approximate total
+        if subtotal > 0 and tax >= 0:
+            computed = subtotal + tax
+            gap = abs(computed - total)
+            if total > 0 and gap / total <= 0.01:
+                confidence = min(100, confidence + 5)
+            elif total > 0 and gap / total > 0.05:
+                confidence = max(0, confidence - 15)
+                logger.info(
+                    f"[DaneelAutoAuth] Vision: self-validation gap "
+                    f"(subtotal={subtotal} + tax={tax} = {computed} vs total={total}), "
+                    f"confidence lowered to {confidence}%"
+                )
+
+        if subtotal <= 0:
+            subtotal = total
+
+        result = {
+            "total": total,
+            "subtotal": subtotal,
+            "tax": tax,
+            "currency": data.get("currency", "USD"),
+            "confidence": confidence,
+        }
+        logger.info(
+            f"[DaneelAutoAuth] Vision: subtotal=${subtotal:,.2f} tax=${tax:,.2f} "
+            f"total=${total:,.2f} (confidence={confidence}%)"
+        )
+        return result
 
     except Exception as e:
         logger.warning(f"[DaneelAutoAuth] Vision extract failed: {e}")
@@ -896,27 +929,69 @@ _ANDREW_MISMATCH_CALLOUTS = [
 
 def _build_mismatch_message(
     bill_id: str,
-    bill_total_expected: float,
+    ocr_result,
     expenses_sum: float,
     source: str,
     expenses: List[dict],
     lookups: dict,
+    n_items: int = 0,
     notify_andrew: bool = False,
 ) -> str:
     """
     Build a bill total mismatch notification.
+    ocr_result: float (hint path) or dict (vision path with subtotal/tax/total).
     source: 'hint' (filename) or 'vision' (GPT Vision OCR).
     """
     import random
-    diff = abs(bill_total_expected - expenses_sum)
+
+    if isinstance(ocr_result, dict):
+        ocr_total = ocr_result.get("total", 0)
+        ocr_subtotal = ocr_result.get("subtotal", ocr_total)
+        ocr_tax = ocr_result.get("tax", 0)
+    else:
+        ocr_total = float(ocr_result)
+        ocr_subtotal = ocr_total
+        ocr_tax = 0
+
+    diff_total = abs(ocr_total - expenses_sum)
+    diff_subtotal = abs(ocr_subtotal - expenses_sum)
+
     lines = [
         f"**Bill Amount Mismatch Detected** - Bill #{bill_id}",
         "",
-        f"| Source | Invoice Total | Expenses Sum | Difference |",
-        f"|--------|--------------|--------------|------------|",
-        f"| {source.capitalize()} | ${bill_total_expected:,.2f} | ${expenses_sum:,.2f} | ${diff:,.2f} |",
-        "",
     ]
+
+    if ocr_tax > 0 and ocr_subtotal != ocr_total:
+        lines.extend([
+            f"| | Invoice (OCR) | Expenses Sum | Difference |",
+            f"|--|--------------|--------------|------------|",
+            f"| **Subtotal** | ${ocr_subtotal:,.2f} | ${expenses_sum:,.2f} | ${diff_subtotal:,.2f} |",
+            f"| **Tax** | ${ocr_tax:,.2f} | -- | -- |",
+            f"| **Total** | ${ocr_total:,.2f} | ${expenses_sum:,.2f} | ${diff_total:,.2f} |",
+            "",
+        ])
+    else:
+        lines.extend([
+            f"| Source | Invoice Total | Expenses Sum | Difference |",
+            f"|--------|--------------|--------------|------------|",
+            f"| {source.capitalize()} | ${ocr_total:,.2f} | ${expenses_sum:,.2f} | ${diff_total:,.2f} |",
+            "",
+        ])
+
+    if ocr_tax > 0 and diff_subtotal < diff_total and diff_subtotal < 1.0:
+        lines.append(
+            f"*Note: Expenses sum closely matches the subtotal. "
+            f"The ${ocr_tax:,.2f} tax may not have been distributed into the line items.*"
+        )
+        lines.append("")
+
+    if n_items > 0:
+        rounding_max = n_items * 0.01
+        lines.append(
+            f"*Rounding tolerance: {n_items} items x $0.01 = ${rounding_max:,.2f}*"
+        )
+        lines.append("")
+
     if expenses:
         lines.append("**Expenses on this bill:**")
         lines.append("")
@@ -1072,6 +1147,8 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         duplicate_list = []
         escalation_list = []
         decisions = []  # per-project decisions for report
+        all_resolve_attempts = []  # smart layer resolution attempts
+        all_auto_resolved = []    # fields that were auto-resolved
 
         # Load all expenses for this project (for duplicate comparison)
         all_project = sb.table("expenses_manual_COGS") \
@@ -1101,14 +1178,38 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             # 1. Health check (non-blocking)
             missing = run_health_check(expense, cfg, bills_map)
             if missing:
-                exp_checks.append({"check": "health", "passed": False, "detail": "Missing: " + ", ".join(missing)})
-                missing_info_list.append({"expense": expense, "missing": missing})
-                _track_pending_info(sb, exp_id, pid, missing)
-                decisions.append(_make_decision_entry(
-                    expense, lookups, "missing_info",
-                    rule="HEALTH", reason="Health check failed", missing_fields=missing,
-                    checks=exp_checks))
-            else:
+                # 1a. Smart resolution: try to auto-fill missing fields
+                from api.services.daneel_smart_layer import (
+                    try_resolve_missing, apply_auto_updates,
+                )
+                auto_updates, still_missing, resolve_attempts = try_resolve_missing(
+                    expense, missing, pid, bills_map, lookups)
+                if auto_updates:
+                    apply_auto_updates(sb, exp_id, auto_updates)
+                    # Merge updates into in-memory expense for subsequent checks
+                    expense.update(auto_updates)
+                    all_resolve_attempts.extend(resolve_attempts)
+                    all_auto_resolved.extend([f for f in missing if f not in still_missing])
+                    exp_checks.append({
+                        "check": "smart_resolve", "passed": True,
+                        "detail": f"Auto-resolved: {list(auto_updates.keys())}"
+                    })
+                if still_missing:
+                    exp_checks.append({"check": "health", "passed": False,
+                                       "detail": "Still missing: " + ", ".join(still_missing)})
+                    missing_info_list.append({"expense": expense, "missing": still_missing})
+                    _track_pending_info(sb, exp_id, pid, still_missing)
+                    decisions.append(_make_decision_entry(
+                        expense, lookups, "missing_info",
+                        rule="HEALTH", reason="Health check failed (after smart resolve)",
+                        missing_fields=still_missing, checks=exp_checks))
+                else:
+                    # Fully resolved! Continue to duplicate check
+                    exp_checks.append({"check": "health", "passed": True,
+                                       "detail": "Resolved by smart layer: " + ", ".join(missing)})
+                    _resolve_pending_info(sb, exp_id)
+                    missing = []  # Clear so it proceeds to duplicate check
+            if not missing:
                 exp_checks.append({"check": "health", "passed": True, "detail": "All required fields present"})
                 # Resolve any stale pending-info record from a previous run
                 _resolve_pending_info(sb, exp_id)
@@ -1150,9 +1251,10 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                             _mismatch_notified.add(bill_id_str)
                             bill_expenses = [e for e in all_project_expenses
                                              if (e.get("bill_id") or "").strip() == bill_id_str]
+                            n_items_hint = len(bill_expenses)
                             mismatch_msg = _build_mismatch_message(
                                 bill_id_str, hint["amount_hint"], bill_total, "hint",
-                                bill_expenses, lookups,
+                                bill_expenses, lookups, n_items=n_items_hint,
                                 notify_andrew=cfg.get("daneel_mismatch_notify_andrew", True))
                             post_daneel_message(
                                 content=mismatch_msg, project_id=pid,
@@ -1170,50 +1272,111 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                     # No amount in filename -- fall back to GPT Vision OCR
                     if receipt_url:
                         if bill_id_str in _vision_cache:
-                            vision_total = _vision_cache[bill_id_str]
+                            vision_result = _vision_cache[bill_id_str]
                         else:
-                            vision_total = gpt_vision_extract_bill_total(receipt_url)
-                            _vision_cache[bill_id_str] = vision_total
-                        if vision_total is not None:
+                            vision_result = gpt_vision_extract_bill_total(receipt_url)
+                            _vision_cache[bill_id_str] = vision_result
+                        if vision_result is not None:
                             bill_total = sum(
                                 float(e.get("Amount") or 0)
                                 for e in all_project_expenses
                                 if (e.get("bill_id") or "").strip() == bill_id_str
                             )
-                            tolerance = float(cfg.get("daneel_amount_tolerance", 0.05))
+                            n_items = sum(
+                                1 for e in all_project_expenses
+                                if (e.get("bill_id") or "").strip() == bill_id_str
+                            )
+                            tolerance_pct = float(cfg.get("daneel_amount_tolerance", 0.05))
+                            vision_total = vision_result["total"]
+                            vision_subtotal = vision_result.get("subtotal", vision_total)
+                            vision_tax = vision_result.get("tax", 0)
+
+                            # Smart tolerance: max(percentage-based, rounding-based)
+                            rounding_tolerance = n_items * 0.01
                             larger = max(vision_total, bill_total) if bill_total else vision_total
-                            diff = abs(vision_total - bill_total)
-                            if larger > 0 and diff > larger * tolerance:
-                                reason_txt = (
-                                    f"Vision OCR amount mismatch: invoice total ${vision_total:,.2f} "
-                                    f"vs expenses sum ${bill_total:,.2f}"
-                                )
-                                exp_checks.append({"check": "bill_hint_vision", "passed": False, "detail": reason_txt})
-                                escalation_list.append({"expense": expense, "reason": reason_txt})
-                                decisions.append(_make_decision_entry(
-                                    expense, lookups, "escalated", rule="BILL_HINT_VISION", reason=reason_txt,
-                                    checks=exp_checks))
-                                # Mismatch notification (once per bill)
+                            pct_tolerance = larger * tolerance_pct if larger > 0 else 0
+                            abs_tolerance = max(pct_tolerance, rounding_tolerance)
+
+                            diff_vs_total = abs(vision_total - bill_total)
+                            diff_vs_subtotal = abs(vision_subtotal - bill_total)
+
+                            match_type = None
+                            if diff_vs_total <= abs_tolerance:
+                                match_type = "total"
+                            elif vision_subtotal != vision_total and diff_vs_subtotal <= abs_tolerance:
+                                match_type = "subtotal"
+
+                            if match_type == "total":
+                                exp_checks.append({
+                                    "check": "bill_hint_vision", "passed": True,
+                                    "detail": (
+                                        f"Vision OCR total ${vision_total:,.2f} matches "
+                                        f"expenses sum ${bill_total:,.2f}"
+                                    )
+                                })
+                            elif match_type == "subtotal":
+                                exp_checks.append({
+                                    "check": "bill_hint_vision", "passed": True,
+                                    "detail": (
+                                        f"Vision OCR subtotal ${vision_subtotal:,.2f} matches "
+                                        f"expenses sum ${bill_total:,.2f} "
+                                        f"(tax ${vision_tax:,.2f} may not be included in expenses)"
+                                    )
+                                })
                                 if bill_id_str not in _mismatch_notified:
                                     _mismatch_notified.add(bill_id_str)
-                                    bill_expenses = [e for e in all_project_expenses
-                                                     if (e.get("bill_id") or "").strip() == bill_id_str]
+                                    info_msg = (
+                                        f"**Bill #{bill_id_str} -- Tax Note**\n\n"
+                                        f"Expenses sum (${bill_total:,.2f}) matches the invoice "
+                                        f"subtotal (${vision_subtotal:,.2f}) but not the grand total "
+                                        f"(${vision_total:,.2f}). The difference of "
+                                        f"${vision_tax:,.2f} appears to be tax that was not "
+                                        f"distributed into the expense line items.\n\n"
+                                        f"No action needed if tax is tracked separately."
+                                    )
+                                    post_daneel_message(
+                                        content=info_msg, project_id=pid,
+                                        channel_type="project_general",
+                                        metadata={
+                                            "type": "bill_tax_note", "bill_id": bill_id_str,
+                                            "source": "vision"
+                                        })
+                            else:
+                                reason_txt = (
+                                    f"Vision OCR amount mismatch: invoice total "
+                                    f"${vision_total:,.2f} / subtotal ${vision_subtotal:,.2f} "
+                                    f"vs expenses sum ${bill_total:,.2f}"
+                                )
+                                exp_checks.append({
+                                    "check": "bill_hint_vision", "passed": False,
+                                    "detail": reason_txt
+                                })
+                                escalation_list.append({"expense": expense, "reason": reason_txt})
+                                decisions.append(_make_decision_entry(
+                                    expense, lookups, "escalated",
+                                    rule="BILL_HINT_VISION", reason=reason_txt,
+                                    checks=exp_checks))
+                                if bill_id_str not in _mismatch_notified:
+                                    _mismatch_notified.add(bill_id_str)
+                                    bill_expenses = [
+                                        e for e in all_project_expenses
+                                        if (e.get("bill_id") or "").strip() == bill_id_str
+                                    ]
                                     mismatch_msg = _build_mismatch_message(
-                                        bill_id_str, vision_total, bill_total, "vision",
-                                        bill_expenses, lookups,
+                                        bill_id_str, vision_result, bill_total, "vision",
+                                        bill_expenses, lookups, n_items=n_items,
                                         notify_andrew=cfg.get("daneel_mismatch_notify_andrew", True))
                                     post_daneel_message(
                                         content=mismatch_msg, project_id=pid,
                                         channel_type="project_general",
-                                        metadata={"type": "bill_mismatch", "bill_id": bill_id_str,
-                                                  "source": "vision"})
-                                    # Trigger Andrew's reconciliation protocol
+                                        metadata={
+                                            "type": "bill_mismatch", "bill_id": bill_id_str,
+                                            "source": "vision"
+                                        })
                                     if cfg.get("daneel_mismatch_notify_andrew", True):
-                                        _trigger_andrew_reconciliation(bill_id_str, pid, "daneel_vision")
+                                        _trigger_andrew_reconciliation(
+                                            bill_id_str, pid, "daneel_vision")
                                 continue
-                            else:
-                                exp_checks.append({"check": "bill_hint_vision", "passed": True,
-                                                   "detail": f"Vision OCR total ${vision_total:,.2f} matches expenses sum ${bill_total:,.2f}"})
                         else:
                             exp_checks.append({"check": "bill_hint", "passed": True,
                                                "detail": "No filename hint; Vision OCR could not extract total"})
@@ -1375,9 +1538,15 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                     expense, lookups, "authorized", rule=rule, reason=det,
                     checks=chks))
 
-        # Phase 4: Post batch messages for this project
+        # Phase 4: Post batch messages for this project (smart layer)
+        from api.services.daneel_smart_layer import (
+            craft_batch_auth_message as _smart_batch,
+            craft_missing_info_message as _smart_missing,
+            craft_escalation_message as _smart_escalation,
+        )
+
         if authorized_list:
-            msg = _build_batch_auth_message(authorized_list, lookups)
+            msg = _smart_batch(authorized_list, lookups)
             post_daneel_message(
                 content=msg,
                 project_id=pid,
@@ -1387,16 +1556,24 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             )
 
         if missing_info_list:
-            msg = _build_missing_info_message(missing_info_list, lookups, bookkeeping_mentions)
+            resolution_summary = {
+                "auto_resolved_count": len(all_auto_resolved),
+                "auto_resolved_fields": list(set(all_auto_resolved)),
+                "still_missing_count": len(missing_info_list),
+                "attempts": all_resolve_attempts[:10],
+            }
+            msg = _smart_missing(missing_info_list, lookups,
+                                 bookkeeping_mentions, resolution_summary)
             post_daneel_message(
                 content=msg,
                 project_id=pid,
                 channel_type="project_general",
-                metadata={"type": "auto_auth_missing_info", "count": len(missing_info_list)},
+                metadata={"type": "auto_auth_missing_info", "count": len(missing_info_list),
+                          "auto_resolved": len(all_auto_resolved)},
             )
 
         if escalation_list:
-            msg = _build_escalation_message(escalation_list, lookups, escalation_mentions)
+            msg = _smart_escalation(escalation_list, lookups, escalation_mentions)
             post_daneel_message(
                 content=msg,
                 project_id=pid,
