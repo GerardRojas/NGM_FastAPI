@@ -64,6 +64,7 @@ _DEFAULT_CONFIG = {
     "daneel_auto_auth_last_run": None,
     "daneel_gpt_fallback_enabled": False,
     "daneel_gpt_fallback_confidence": 75,
+    "daneel_mismatch_notify_andrew": True,
 }
 
 
@@ -883,6 +884,51 @@ def _build_escalation_message(escalated: List[dict], lookups: dict, mention_str:
     return "\n".join(lines)
 
 
+def _build_mismatch_message(
+    bill_id: str,
+    bill_total_expected: float,
+    expenses_sum: float,
+    source: str,
+    expenses: List[dict],
+    lookups: dict,
+    notify_andrew: bool = False,
+) -> str:
+    """
+    Build a bill total mismatch notification.
+    source: 'hint' (filename) or 'vision' (GPT Vision OCR).
+    """
+    diff = abs(bill_total_expected - expenses_sum)
+    lines = [
+        f"**Bill Amount Mismatch Detected** - Bill #{bill_id}",
+        "",
+        f"| Source | Invoice Total | Expenses Sum | Difference |",
+        f"|--------|--------------|--------------|------------|",
+        f"| {source.capitalize()} | ${bill_total_expected:,.2f} | ${expenses_sum:,.2f} | ${diff:,.2f} |",
+        "",
+    ]
+    if expenses:
+        lines.append("**Expenses on this bill:**")
+        lines.append("")
+        lines.append("| Vendor | Amount | Date | Description |")
+        lines.append("|--------|--------|------|-------------|")
+        for e in expenses[:15]:
+            vname = lookups["vendors"].get(e.get("vendor_id"), "Unknown")
+            amt = f"${float(e.get('Amount') or 0):,.2f}"
+            date = (e.get("TxnDate") or "")[:10]
+            desc = (e.get("LineDescription") or "-")[:40]
+            lines.append(f"| {vname} | {amt} | {date} | {desc} |")
+        if len(expenses) > 15:
+            lines.append(f"| ... and {len(expenses) - 15} more | | | |")
+        lines.append("")
+
+    if notify_andrew:
+        lines.append("@Andrew Please review this bill mismatch and reconcile the expense amounts.")
+    else:
+        lines.append("Please review this bill and reconcile the expense amounts.")
+
+    return "\n".join(lines)
+
+
 def _resolve_role_name(sb, role_id: Optional[str]) -> str:
     """Resolve a role UUID to its name for @mentions (legacy, kept for fallback)."""
     if not role_id:
@@ -1016,6 +1062,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         # Each candidate tracks a checks trail: [{check, passed, detail}]
         auth_candidates = []  # (expense, rule, reason, checks) tuples
         _vision_cache = {}  # bill_id -> vision_total (avoid repeated GPT calls for same bill)
+        _mismatch_notified = set()  # bill_ids already notified (one message per bill)
 
         for expense in expenses:
             exp_id = expense.get("expense_id") or expense.get("id")
@@ -1068,6 +1115,20 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                         decisions.append(_make_decision_entry(
                             expense, lookups, "escalated", rule="BILL_HINT", reason=reason_txt,
                             checks=exp_checks))
+                        # Mismatch notification (once per bill)
+                        if bill_id_str not in _mismatch_notified:
+                            _mismatch_notified.add(bill_id_str)
+                            bill_expenses = [e for e in all_project_expenses
+                                             if (e.get("bill_id") or "").strip() == bill_id_str]
+                            mismatch_msg = _build_mismatch_message(
+                                bill_id_str, hint["amount_hint"], bill_total, "hint",
+                                bill_expenses, lookups,
+                                notify_andrew=cfg.get("daneel_mismatch_notify_andrew", True))
+                            post_daneel_message(
+                                content=mismatch_msg, project_id=pid,
+                                channel_type="project_general",
+                                metadata={"type": "bill_mismatch", "bill_id": bill_id_str,
+                                          "source": "hint"})
                         continue
                     else:
                         exp_checks.append({"check": "bill_hint", "passed": True,
@@ -1099,6 +1160,20 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                 decisions.append(_make_decision_entry(
                                     expense, lookups, "escalated", rule="BILL_HINT_VISION", reason=reason_txt,
                                     checks=exp_checks))
+                                # Mismatch notification (once per bill)
+                                if bill_id_str not in _mismatch_notified:
+                                    _mismatch_notified.add(bill_id_str)
+                                    bill_expenses = [e for e in all_project_expenses
+                                                     if (e.get("bill_id") or "").strip() == bill_id_str]
+                                    mismatch_msg = _build_mismatch_message(
+                                        bill_id_str, vision_total, bill_total, "vision",
+                                        bill_expenses, lookups,
+                                        notify_andrew=cfg.get("daneel_mismatch_notify_andrew", True))
+                                    post_daneel_message(
+                                        content=mismatch_msg, project_id=pid,
+                                        channel_type="project_general",
+                                        metadata={"type": "bill_mismatch", "bill_id": bill_id_str,
+                                                  "source": "vision"})
                                 continue
                             else:
                                 exp_checks.append({"check": "bill_hint_vision", "passed": True,

@@ -31,6 +31,7 @@ class AutoAuthConfigUpdate(BaseModel):
     daneel_accounting_mgr_users: Optional[str] = None
     daneel_gpt_fallback_enabled: Optional[bool] = None
     daneel_gpt_fallback_confidence: Optional[int] = None
+    daneel_mismatch_notify_andrew: Optional[bool] = None
 
 
 # ================================
