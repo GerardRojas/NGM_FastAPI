@@ -569,61 +569,43 @@ def scan_receipt(
     base64_images = []
     media_type = file_type
 
-    # HEAVY MODE: pdfplumber -> Vision with gpt-4o
-    if model == "heavy":
-        print(f"[SCAN-RECEIPT] MODO HEAVY (gpt-4o)")
+    # Both modes try pdfplumber first for PDFs
+    if file_type == "application/pdf":
+        print(f"[SCAN-RECEIPT] PDF detectado, intentando pdfplumber...")
+        text_success, text_result = extract_text_from_pdf(file_content)
 
-        if file_type == "application/pdf":
-            # Try pdfplumber first even in heavy mode
-            print(f"[SCAN-RECEIPT] Intentando pdfplumber...")
-            text_success, text_result = extract_text_from_pdf(file_content)
-
-            if text_success:
-                use_text_mode = True
-                extraction_method = "pdfplumber"
-                extracted_text = text_result
-                print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
-            else:
-                print(f"[SCAN-RECEIPT] pdfplumber fallo ({text_result}), usando Vision...")
-                extraction_method = "vision_direct"
-                try:
-                    base64_images = _convert_pdf_to_images(file_content)
-                    media_type = "image/png"
-                    print(f"[SCAN-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
-                except Exception as pdf_error:
-                    raise ValueError(f"Error processing PDF: {str(pdf_error)}")
-        else:
+        if text_success:
+            use_text_mode = True
+            extraction_method = "pdfplumber"
+            extracted_text = text_result
+            print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
+        elif model == "heavy":
+            # HEAVY: fall back to Vision
+            print(f"[SCAN-RECEIPT] pdfplumber fallo ({text_result}), falling back to Vision...")
             extraction_method = "vision_direct"
-            base64_images = [base64.b64encode(file_content).decode('utf-8')]
-            print(f"[SCAN-RECEIPT] Imagen lista para Vision")
-
-    # FAST MODE: pdfplumber -> Vision fallback
-    else:
-        print(f"[SCAN-RECEIPT] MODO FAST: pdfplumber -> Vision")
-
-        if file_type == "application/pdf":
-            print(f"[SCAN-RECEIPT] Archivo PDF detectado")
-            print(f"[SCAN-RECEIPT] Intentando pdfplumber...")
-            text_success, text_result = extract_text_from_pdf(file_content)
-
-            if text_success:
-                use_text_mode = True
-                extraction_method = "pdfplumber"
-                extracted_text = text_result
-                print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
-            else:
-                print(f"[SCAN-RECEIPT] pdfplumber fallo ({text_result}), usando Vision...")
-                extraction_method = "vision"
-                try:
-                    base64_images = _convert_pdf_to_images(file_content)
-                    media_type = "image/png"
-                    print(f"[SCAN-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
-                except Exception as pdf_error:
-                    raise ValueError(f"Error processing PDF: {str(pdf_error)}")
+            try:
+                base64_images = _convert_pdf_to_images(file_content)
+                media_type = "image/png"
+                print(f"[SCAN-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
+            except Exception as pdf_error:
+                raise ValueError(f"Error processing PDF: {str(pdf_error)}")
         else:
-            print(f"[SCAN-RECEIPT] Imagen detectada ({file_type}) - usando Vision")
-            extraction_method = "vision"
-            base64_images = [base64.b64encode(file_content).decode('utf-8')]
+            # FAST: no Vision fallback, return error
+            raise ValueError(
+                f"Fast mode: PDF has no extractable text ({text_result}). "
+                f"Use heavy mode for scanned documents."
+            )
+    elif model == "heavy":
+        # Images always need Vision
+        extraction_method = "vision_direct"
+        base64_images = [base64.b64encode(file_content).decode('utf-8')]
+        print(f"[SCAN-RECEIPT] Imagen lista para Vision")
+    else:
+        # FAST + image: no Vision, return error
+        raise ValueError(
+            "Fast mode only supports PDFs with extractable text. "
+            "Use heavy mode for images and scanned documents."
+        )
 
     # Build prompt
     if correction_context:

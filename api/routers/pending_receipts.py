@@ -1049,11 +1049,24 @@ async def agent_process_receipt(receipt_id: str):
 
         # ===== STEP 3: OCR Extraction (Shared Service) =====
         print(f"[Agent] Step 2: No duplicate found, proceeding to OCR")
-        print(f"[Agent] Step 3: Starting OCR extraction (shared service)...")
+        # Read scan mode from agent_config (default: heavy)
+        _scan_mode = "heavy"
         try:
-            scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
+            _mode_row = supabase.table("agent_config").select("value").eq("key", "andrew_scan_mode").execute()
+            if _mode_row.data and _mode_row.data[0].get("value") in ("fast", "heavy"):
+                _scan_mode = _mode_row.data[0]["value"]
+        except Exception:
+            pass
+        print(f"[Agent] Step 3: Starting OCR extraction (mode={_scan_mode})...")
+        try:
+            scan_result = _scan_receipt_core(file_content, file_type, model=_scan_mode)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            if _scan_mode == "fast":
+                # Fast mode failed (no extractable text) -- auto-fallback to heavy
+                print(f"[Agent] Step 3: Fast mode failed ({e}), falling back to heavy...")
+                scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
+            else:
+                raise HTTPException(status_code=400, detail=str(e))
         except RuntimeError as e:
             raise Exception(f"OCR extraction failed: {str(e)}")
 
