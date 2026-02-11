@@ -543,6 +543,12 @@ def check_duplicate(
         if not same_amount:
             continue
 
+        # ------ R2: Different account = NOT a duplicate ------
+        exp_account_id = expense.get("account_id") or ""
+        oth_account_id = other.get("account_id") or ""
+        if exp_account_id and oth_account_id and exp_account_id != oth_account_id:
+            continue
+
         # ------ R5: Recurring labor payment ------
         if (same_amount and diff_date
                 and (is_labor or oth_is_labor)

@@ -59,6 +59,7 @@ from api.supabase_client import supabase
 from typing import Optional, List, Dict, Any
 import base64
 import hashlib
+import logging
 import os
 import re
 import uuid
@@ -66,6 +67,8 @@ from datetime import datetime, timedelta
 from openai import OpenAI
 import json
 import io
+
+logger = logging.getLogger(__name__)
 from pdf2image import convert_from_bytes
 from api.helpers.andrew_messenger import post_andrew_message, ANDREW_BOT_USER_ID
 from services.receipt_scanner import (
@@ -3812,6 +3815,7 @@ def get_agent_stats():
         }
 
     except Exception as e:
+        logger.error(f"[agent-stats] Error getting agent stats: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting agent stats: {str(e)}")
 
 
@@ -3825,6 +3829,7 @@ def get_agent_config():
             config[row["key"]] = row["value"]
         return config
     except Exception as e:
+        logger.error(f"[agent-config] Error loading agent config: {e}", exc_info=True)
         # Table might not exist yet -- return defaults
         return {
             "auto_create_expense": True,
@@ -3847,6 +3852,7 @@ def update_agent_config(payload: dict):
                 .execute()
         return {"ok": True}
     except Exception as e:
+        logger.error(f"[agent-config] Error updating agent config: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error updating agent config: {str(e)}")
 
 

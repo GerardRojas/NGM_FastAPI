@@ -4,11 +4,14 @@ Endpoints for retrieving aggregated OCR extraction metrics
 across receipt_scanner, Daneel, and Andrew agents.
 """
 
+import logging
 from fastapi import APIRouter, Query
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 
 from api.supabase_client import supabase
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ocr-metrics", tags=["ocr-metrics"])
 
@@ -22,21 +25,45 @@ async def get_ocr_summary(
     Aggregated OCR metrics summary for the dashboard widget.
     Returns breakdown by agent and extraction method.
     """
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    empty_response = {
+        "period_days": days,
+        "total_scans": 0,
+        "success_rate": 0,
+        "pdfplumber_count": 0,
+        "vision_count": 0,
+        "error_count": 0,
+        "pdfplumber_pct": 0,
+        "vision_pct": 0,
+        "avg_confidence": None,
+        "tax_detected_count": 0,
+        "match_types": {"total": 0, "subtotal": 0, "mismatch": 0, "none": 0},
+        "by_agent": {},
+        "by_method": {},
+        "by_agent_method": {},
+    }
 
-    query = supabase.table("ocr_metrics") \
-        .select("*") \
-        .gte("created_at", since) \
-        .order("created_at", desc=True)
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
-    if project_id:
-        query = query.eq("project_id", project_id)
+        query = supabase.table("ocr_metrics") \
+            .select("*") \
+            .gte("created_at", since) \
+            .order("created_at", desc=True)
 
-    result = query.execute()
-    rows = result.data or []
+        if project_id:
+            query = query.eq("project_id", project_id)
+
+        result = query.execute()
+        rows = result.data or []
+    except Exception as e:
+        logger.error(f"[ocr-metrics] Failed to query ocr_metrics table: {e}")
+        return empty_response
 
     # Aggregate
     total = len(rows)
+    if total == 0:
+        return empty_response
+
     by_agent = {}
     by_method = {}
     by_agent_method = {}
@@ -108,15 +135,19 @@ async def get_recent_metrics(
     """
     Recent OCR metric entries for detailed inspection.
     """
-    query = supabase.table("ocr_metrics") \
-        .select("*") \
-        .order("created_at", desc=True) \
-        .limit(limit)
+    try:
+        query = supabase.table("ocr_metrics") \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .limit(limit)
 
-    if agent:
-        query = query.eq("agent", agent)
-    if method:
-        query = query.eq("extraction_method", method)
+        if agent:
+            query = query.eq("agent", agent)
+        if method:
+            query = query.eq("extraction_method", method)
 
-    result = query.execute()
-    return {"items": result.data or [], "count": len(result.data or [])}
+        result = query.execute()
+        return {"items": result.data or [], "count": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"[ocr-metrics] Failed to query recent metrics: {e}")
+        return {"items": [], "count": 0}

@@ -894,11 +894,32 @@ def get_my_mentions(
 
         result = query.order("created_at", desc=True).limit(limit).execute()
 
+        # Get read status from message_mentions table
+        message_ids = [str(row.get("id", "")) for row in (result.data or []) if row.get("id")]
+        read_message_ids = set()
+        if message_ids:
+            try:
+                read_result = supabase.table("message_mentions") \
+                    .select("message_id") \
+                    .eq("user_id", user_id) \
+                    .not_.is_("read_at", "null") \
+                    .in_("message_id", message_ids) \
+                    .execute()
+                read_message_ids = {str(r["message_id"]) for r in (read_result.data or [])}
+            except:
+                pass
+
         mentions = []
         for row in (result.data or []):
             user_data = row.get("users") or {}
             if isinstance(user_data, list) and user_data:
                 user_data = user_data[0]
+
+            msg_id = str(row.get("id", ""))
+            is_read = msg_id in read_message_ids
+
+            if unread_only and is_read:
+                continue
 
             # Get channel name
             channel_name = ""
@@ -934,7 +955,7 @@ def get_my_mentions(
                     pass
 
             mention = {
-                "message_id": str(row.get("id", "")),
+                "message_id": msg_id,
                 "channel_id": str(row.get("channel_id", "")) if row.get("channel_id") else None,
                 "project_id": str(row.get("project_id", "")) if row.get("project_id") else None,
                 "channel_type": row.get("channel_type", ""),
@@ -945,6 +966,7 @@ def get_my_mentions(
                 "sender_name": user_data.get("user_name") if isinstance(user_data, dict) else None,
                 "sender_photo": user_data.get("user_photo") if isinstance(user_data, dict) else None,
                 "sender_avatar_color": user_data.get("avatar_color") if isinstance(user_data, dict) else None,
+                "is_read": is_read,
             }
             mentions.append(mention)
 
@@ -954,28 +976,41 @@ def get_my_mentions(
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
-@router.patch("/mentions/{mention_id}/read")
+@router.patch("/mentions/{message_id}/read")
 def mark_mention_read(
-    mention_id: str,
+    message_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Mark a mention as read"""
+    """Mark a mention as read by message_id"""
     try:
         user_id = current_user["user_id"]
 
-        result = supabase.table("message_mentions") \
-            .update({"read_at": "now()"}) \
-            .eq("id", mention_id) \
+        # Check if record exists
+        existing = supabase.table("message_mentions") \
+            .select("id") \
+            .eq("message_id", message_id) \
             .eq("user_id", user_id) \
             .execute()
 
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Mention not found")
+        if existing.data:
+            # Update existing record
+            supabase.table("message_mentions") \
+                .update({"read_at": "now()"}) \
+                .eq("message_id", message_id) \
+                .eq("user_id", user_id) \
+                .execute()
+        else:
+            # Insert new record
+            supabase.table("message_mentions") \
+                .insert({
+                    "message_id": message_id,
+                    "user_id": user_id,
+                    "read_at": "now()"
+                }) \
+                .execute()
 
         return {"ok": True}
 
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
