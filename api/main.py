@@ -84,6 +84,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://ngm-hub-frontend.onrender.com",
+        "https://ngm-hub.onrender.com",
+        "https://ngm-hub-staging.onrender.com",
+        "https://www.ngmanagements.com",
+        "https://ngmanagements.com",
         "http://localhost:5500",
         "http://127.0.0.1:5500",
         "http://localhost:3000",

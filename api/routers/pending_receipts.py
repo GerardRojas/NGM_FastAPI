@@ -1173,6 +1173,27 @@ async def agent_process_receipt(receipt_id: str):
             parsed_data["bill_hint_validation"] = hint_validation
             print(f"[Agent] Step 3.7: Filename hint | hints={bill_hint} | mismatches={hint_validation.get('mismatches', [])}")
 
+        # ===== STEP 3.8: Smart missing info analysis + auto-resolve =====
+        from api.services.andrew_smart_layer import (
+            analyze_missing_info, apply_resolutions, craft_receipt_message,
+            craft_escalation_message,
+        )
+        smart_analysis = analyze_missing_info(parsed_data, receipt_data, project_id)
+        if smart_analysis.get("resolutions"):
+            parsed_data = apply_resolutions(parsed_data, smart_analysis["resolutions"])
+            # Re-derive summary fields after resolution
+            vendor_name = parsed_data.get("vendor_name", vendor_name)
+            vendor_id = parsed_data.get("vendor_id", vendor_id)
+            amount = parsed_data.get("amount", amount)
+            receipt_date = parsed_data.get("receipt_date", receipt_date)
+            bill_id = parsed_data.get("bill_id", bill_id)
+            print(f"[Agent] Step 3.8: Smart resolved: {list(smart_analysis['resolutions'].keys())}")
+        if smart_analysis.get("unresolved"):
+            print(f"[Agent] Step 3.8: Still missing: {smart_analysis['unresolved']}")
+        if smart_analysis.get("attempts"):
+            for attempt in smart_analysis["attempts"]:
+                print(f"[Agent] Step 3.8:   {attempt}")
+
         # ===== STEP 4: Warnings =====
         warnings = []
         if validation_unresolved:
@@ -1330,11 +1351,14 @@ async def agent_process_receipt(receipt_id: str):
 
         print(f"[Agent] Step 6: Receipt updated in DB | status=ready")
 
-        # ===== STEP 7: Post Arturito summary + project question =====
-        text_sample = f"{parsed_data.get('vendor_name', '')} {description}"
-        lang = _detect_language(text_sample)
-
-        msg_content = _build_agent_message(parsed_data, categorize_data, warnings, lang, expense_created=False)
+        # ===== STEP 7: Post Andrew smart message =====
+        # Determine flow state
+        if low_confidence_items:
+            flow_state = "awaiting_category_confirmation"
+        elif smart_analysis.get("unresolved"):
+            flow_state = "awaiting_missing_info"
+        else:
+            flow_state = "awaiting_item_selection"
 
         # Get project name for the question
         project_name = "this project"
@@ -1349,12 +1373,21 @@ async def agent_process_receipt(receipt_id: str):
         except Exception:
             pass
 
-        # Build different question depending on flow state
+        # Build intelligent message with personality + context
+        msg_content = craft_receipt_message(
+            parsed_data=parsed_data,
+            categorize_data=categorize_data,
+            warnings=warnings,
+            analysis=smart_analysis,
+            project_name=project_name,
+            flow_state=flow_state,
+        )
+
+        # Append category confirmation prompt if needed
         if low_confidence_items:
-            # Ask about uncertain categories first
             cat_lines = []
             for lci in low_confidence_items:
-                idx = lci["index"] + 1  # 1-based for user
+                idx = lci["index"] + 1
                 desc = lci["description"][:60]
                 if lci["suggested"]:
                     cat_lines.append(f"{idx}. '{desc}' -- suggested: {lci['suggested']} ({lci['confidence']}%)")
@@ -1366,14 +1399,26 @@ async def agent_process_receipt(receipt_id: str):
                 "Type the correct account for each, e.g.: `1 Materials, 2 Delivery`\n"
                 "Or reply **all correct** to accept the suggestions."
             )
-            flow_state = "awaiting_category_confirmation"
-        else:
-            if lang == "es":
-                msg_content += f"\n\nEste bill es solo para **{project_name}**?"
-            else:
-                msg_content += f"\n\nIs this entire bill for **{project_name}**?"
-            flow_state = "awaiting_item_selection"
 
+        # Store smart analysis in parsed_data for later use
+        enriched_parsed["smart_analysis"] = {
+            "missing_fields": smart_analysis.get("missing_fields", []),
+            "resolutions": smart_analysis.get("resolutions", {}),
+            "unresolved": smart_analysis.get("unresolved", []),
+            "attempts": smart_analysis.get("attempts", []),
+        }
+        # Update enriched receipt flow with missing info state
+        if flow_state == "awaiting_missing_info":
+            enriched_parsed["receipt_flow"]["state"] = "awaiting_missing_info"
+            enriched_parsed["receipt_flow"]["missing_fields"] = smart_analysis.get("unresolved", [])
+
+        # Re-save with smart analysis data
+        supabase.table("pending_receipts") \
+            .update({"parsed_data": enriched_parsed}) \
+            .eq("id", receipt_id) \
+            .execute()
+
+        awaiting_text = bool(low_confidence_items) or bool(smart_analysis.get("unresolved"))
         post_andrew_message(
             content=msg_content,
             project_id=project_id,
@@ -1385,11 +1430,11 @@ async def agent_process_receipt(receipt_id: str):
                 "confidence": final_confidence,
                 "receipt_flow_state": flow_state,
                 "receipt_flow_active": True,
-                "awaiting_text_input": bool(low_confidence_items),
+                "awaiting_text_input": awaiting_text,
             }
         )
 
-        print(f"[Agent] Step 7: Arturito message posted | lang={lang} | state={flow_state}")
+        print(f"[Agent] Step 7: Andrew smart message posted | state={flow_state} | unresolved={smart_analysis.get('unresolved', [])}")
 
         # ===== STEP 7.5: Bookkeeping escalation for unresolved validation =====
         if validation_unresolved:
@@ -1397,11 +1442,14 @@ async def agent_process_receipt(receipt_id: str):
             inv_total = validation.get("invoice_total", 0)
             calc_sum = validation.get("calculated_sum", 0)
             difference = round(abs(inv_total - calc_sum), 2)
-            escalation_msg = (
-                f"{mentions} -- I couldn't reconcile the totals for this receipt from "
-                f"**{parsed_data.get('vendor_name', 'Unknown')}**. Invoice says "
-                f"${inv_total:,.2f} but items sum to ${calc_sum:,.2f} "
-                f"(${difference:,.2f} off). Manual review needed."
+            escalation_msg = craft_escalation_message(
+                receipt_data={"parsed_data": parsed_data},
+                mentions=mentions,
+                issue=(
+                    f"Invoice says ${inv_total:,.2f} but items sum to "
+                    f"${calc_sum:,.2f} (${difference:,.2f} off)"
+                ),
+                attempts=smart_analysis.get("attempts", []),
             )
             post_andrew_message(
                 content=escalation_msg,
@@ -2715,6 +2763,141 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 }
             )
             return {"success": True, "state": "awaiting_item_selection"}
+
+        # ── Missing info flow (smart layer) ──
+        if current_state == "awaiting_missing_info":
+            text = (payload.payload or {}).get("text", "").strip() if payload.payload else ""
+            if not text:
+                raise HTTPException(status_code=400, detail="Text input required for missing info")
+
+            from api.services.andrew_smart_layer import (
+                interpret_reply, craft_reply_response,
+            )
+
+            # Build context for reply interpretation
+            smart = parsed_data.get("smart_analysis") or {}
+            reply_context = {
+                "flow_state": "awaiting_missing_info",
+                "original_question": "Missing info about receipt",
+                "vendor_name": parsed_data.get("vendor_name"),
+                "amount": parsed_data.get("amount"),
+                "missing_fields": smart.get("unresolved", []),
+            }
+            interpretation = interpret_reply(text, reply_context)
+            print(f"[ReceiptFlow] Missing info reply interpreted: {interpretation}")
+
+            # Apply extracted fields
+            updated_fields = []
+            if interpretation.get("vendor_name"):
+                parsed_data["vendor_name"] = interpretation["vendor_name"]
+                if parsed_data.get("line_items") and len(parsed_data["line_items"]) > 0:
+                    parsed_data["line_items"][0]["vendor"] = interpretation["vendor_name"]
+                # Try to resolve vendor_id
+                try:
+                    v_resp = supabase.table("Vendors").select("id, vendor_name").execute()
+                    for v in (v_resp.data or []):
+                        if (v.get("vendor_name") or "").lower() == interpretation["vendor_name"].lower():
+                            parsed_data["vendor_id"] = v["id"]
+                            break
+                except Exception:
+                    pass
+                updated_fields.append("vendor")
+
+            if interpretation.get("receipt_date"):
+                parsed_data["receipt_date"] = interpretation["receipt_date"]
+                if parsed_data.get("line_items") and len(parsed_data["line_items"]) > 0:
+                    parsed_data["line_items"][0]["date"] = interpretation["receipt_date"]
+                updated_fields.append("date")
+
+            if interpretation.get("check_number"):
+                parsed_data["check_number"] = interpretation["check_number"]
+                updated_fields.append("check_number")
+
+            # Remove resolved fields from unresolved list
+            remaining = [f for f in smart.get("unresolved", [])
+                         if f not in updated_fields and f != "vendor_not_in_db"]
+
+            if interpretation.get("unclear"):
+                # Ask again with clarification
+                response_msg = craft_reply_response(interpretation, reply_context)
+                if response_msg:
+                    post_andrew_message(
+                        content=response_msg,
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_flow_state": "awaiting_missing_info",
+                            "receipt_flow_active": True,
+                            "awaiting_text_input": True,
+                        }
+                    )
+                return {"success": True, "state": "awaiting_missing_info", "clarification_needed": True}
+
+            # Update parsed data and transition if all resolved
+            smart["unresolved"] = remaining
+            parsed_data["smart_analysis"] = smart
+
+            if remaining:
+                # Still missing fields -- stay in this state
+                receipt_flow["missing_fields"] = remaining
+                parsed_data["receipt_flow"] = receipt_flow
+                supabase.table("pending_receipts").update({
+                    "parsed_data": parsed_data,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                response_msg = craft_reply_response(interpretation, reply_context)
+                if response_msg:
+                    post_andrew_message(
+                        content=response_msg,
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_flow_state": "awaiting_missing_info",
+                            "receipt_flow_active": True,
+                            "awaiting_text_input": True,
+                        }
+                    )
+                return {"success": True, "state": "awaiting_missing_info",
+                        "updated_fields": updated_fields, "still_missing": remaining}
+            else:
+                # All resolved -- transition to item selection
+                receipt_flow["state"] = "awaiting_item_selection"
+                receipt_flow.pop("missing_fields", None)
+                parsed_data["receipt_flow"] = receipt_flow
+                supabase.table("pending_receipts").update({
+                    "parsed_data": parsed_data,
+                    "vendor_name": parsed_data.get("vendor_name"),
+                    "amount": parsed_data.get("amount"),
+                    "receipt_date": parsed_data.get("receipt_date"),
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                # Get project name
+                project_name = "this project"
+                try:
+                    proj_resp = supabase.table("projects").select("project_name") \
+                        .eq("project_id", project_id).single().execute()
+                    if proj_resp.data:
+                        project_name = proj_resp.data.get("project_name", project_name)
+                except Exception:
+                    pass
+
+                ack_msg = f"Got it -- updated {', '.join(updated_fields)}. Is this entire bill for **{project_name}**?"
+                post_andrew_message(
+                    content=ack_msg,
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_flow_state": "awaiting_item_selection",
+                        "receipt_flow_active": True,
+                    }
+                )
+                return {"success": True, "state": "awaiting_item_selection",
+                        "updated_fields": updated_fields}
 
         if current_state == "awaiting_item_selection":
             # Get project name

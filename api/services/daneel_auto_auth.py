@@ -288,7 +288,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
         from openai import OpenAI
         ai_client = OpenAI(api_key=api_key)
         response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{
                 "role": "user",
                 "content": [
@@ -596,7 +596,7 @@ def gpt_resolve_ambiguous(
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": _GPT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -681,7 +681,7 @@ def gpt_batch_review(candidates: List[dict], lookups: dict) -> dict:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": _GPT_BATCH_REVIEW_PROMPT},
                 {"role": "user", "content": user_msg},

@@ -154,7 +154,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{
                 "role": "user",
                 "content": [

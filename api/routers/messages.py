@@ -1036,15 +1036,10 @@ def clear_channel_messages(
         if role not in ["CEO", "COO"]:
             raise HTTPException(status_code=403, detail="Only CEO and COO can clear conversations")
 
-        # Build channel filter
+        # Hard-delete: remove messages entirely (no "this message was deleted" placeholders)
         query = supabase.table("messages") \
-            .update({
-                "is_deleted": True,
-                "deleted_at": "now()",
-                "deleted_by": user_id,
-            }) \
-            .eq("channel_type", payload.channel_type) \
-            .eq("is_deleted", False)
+            .delete() \
+            .eq("channel_type", payload.channel_type)
 
         if payload.channel_type in ["custom", "direct", "group"]:
             if not payload.channel_id:
