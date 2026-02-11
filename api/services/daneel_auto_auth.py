@@ -188,6 +188,21 @@ def normalize_bill_id(bill_id: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", bill_id.upper())
 
 
+def _get_bill_siblings(norm_bill: str, bills_map: dict, receipt_groups: dict) -> set:
+    """Return set of normalized bill_ids sharing the same receipt as *norm_bill*.
+
+    Enables receipt-URL fallback grouping: if two different bill_id strings
+    point to the same PDF, expenses on both are treated as one bill.
+    """
+    bill_data = bills_map.get(norm_bill)
+    if not bill_data:
+        return {norm_bill}
+    url = (bill_data.get("receipt_url") or "").strip()
+    if url and url in receipt_groups:
+        return receipt_groups[url]
+    return {norm_bill}
+
+
 # ============================================================================
 # Receipt hash (lightweight -- HTTP HEAD only, no file download)
 # ============================================================================
@@ -459,7 +474,7 @@ def run_health_check(expense: dict, config: dict, bills_map: dict) -> List[str]:
 
 def _get_expense_receipt(expense: dict, bills_map: dict) -> Optional[str]:
     """Resolve receipt URL: check bills table first, then legacy field."""
-    bill_id = (expense.get("bill_id") or "").strip()
+    bill_id = normalize_bill_id(expense.get("bill_id") or "")
     if bill_id and bill_id in bills_map:
         url = bills_map[bill_id].get("receipt_url")
         if url:
@@ -574,8 +589,8 @@ def check_duplicate(
             oth_hash = get_receipt_hash(oth_receipt)
 
             if exp_hash and oth_hash:
-                bill_info = bills_map.get((expense.get("bill_id") or "").strip(), {})
-                oth_bill_info = bills_map.get((other.get("bill_id") or "").strip(), {})
+                bill_info = bills_map.get(normalize_bill_id((expense.get("bill_id") or "")), {})
+                oth_bill_info = bills_map.get(normalize_bill_id((other.get("bill_id") or "")), {})
                 is_split = (bill_info.get("status") == "split"
                             or oth_bill_info.get("status") == "split")
 
@@ -1176,11 +1191,16 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         _save_config_key("daneel_auto_auth_last_run", now)
         return {"status": "ok", "message": "No new pending expenses", "authorized": 0}
 
-    # Load all bills metadata
+    # Load all bills metadata (normalized keys for case-insensitive lookup)
     bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
     bills_map = {}
+    receipt_groups = {}  # receipt_url -> set of normalized bill_ids
     for b in (bills_result.data or []):
-        bills_map[b["bill_id"]] = b
+        nb = normalize_bill_id(b["bill_id"])
+        bills_map[nb] = b
+        url = (b.get("receipt_url") or "").strip()
+        if url:
+            receipt_groups.setdefault(url, set()).add(nb)
 
     # Group by project
     projects = {}
@@ -1286,18 +1306,20 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             # then compare against the SUM of all expenses on the same bill.
             from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
             from urllib.parse import unquote
-            bill_id_str = (expense.get("bill_id") or "").strip()
+            bill_id_raw = (expense.get("bill_id") or "").strip()
+            bill_id_str = normalize_bill_id(bill_id_raw)
+            _siblings = _get_bill_siblings(bill_id_str, bills_map, receipt_groups)
             if bill_id_str and bill_id_str in bills_map:
                 receipt_url = bills_map[bill_id_str].get("receipt_url") or ""
                 # Extract filename from URL path and decode URL encoding
                 hint_source = unquote(receipt_url.rsplit("/", 1)[-1]) if "/" in receipt_url else unquote(receipt_url)
                 hint = parse_bill_hint(hint_source) if hint_source else {}
                 if hint and hint.get("amount_hint") is not None:
-                    # Sum ALL expenses with the same bill_id (bill total, not single line)
+                    # Sum ALL expenses on the same bill (including receipt-URL siblings)
                     bill_total = sum(
                         float(e.get("Amount") or 0)
                         for e in all_project_expenses
-                        if (e.get("bill_id") or "").strip() == bill_id_str
+                        if normalize_bill_id(e.get("bill_id") or "") in _siblings
                     )
                     exp_vendor_name = lookups["vendors"].get(expense.get("vendor_id"), "")
                     hint_val = cross_validate_bill_hint(
@@ -1317,10 +1339,10 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                         if bill_id_str not in _mismatch_notified:
                             _mismatch_notified.add(bill_id_str)
                             bill_expenses = [e for e in all_project_expenses
-                                             if (e.get("bill_id") or "").strip() == bill_id_str]
+                                             if normalize_bill_id(e.get("bill_id") or "") in _siblings]
                             n_items_hint = len(bill_expenses)
                             mismatch_msg = _build_mismatch_message(
-                                bill_id_str, hint["amount_hint"], bill_total, "hint",
+                                bill_id_raw, hint["amount_hint"], bill_total, "hint",
                                 bill_expenses, lookups, n_items=n_items_hint,
                                 notify_andrew=cfg.get("daneel_mismatch_notify_andrew", True))
                             post_daneel_message(
@@ -1330,7 +1352,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                           "source": "hint"})
                             # Trigger Andrew's reconciliation protocol
                             if cfg.get("daneel_mismatch_notify_andrew", True):
-                                _trigger_andrew_reconciliation(bill_id_str, pid, "daneel_hint")
+                                _trigger_andrew_reconciliation(bill_id_raw, pid, "daneel_hint")
                         continue
                     else:
                         exp_checks.append({"check": "bill_hint", "passed": True,
@@ -1347,11 +1369,11 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                             bill_total = sum(
                                 float(e.get("Amount") or 0)
                                 for e in all_project_expenses
-                                if (e.get("bill_id") or "").strip() == bill_id_str
+                                if normalize_bill_id(e.get("bill_id") or "") in _siblings
                             )
                             n_items = sum(
                                 1 for e in all_project_expenses
-                                if (e.get("bill_id") or "").strip() == bill_id_str
+                                if normalize_bill_id(e.get("bill_id") or "") in _siblings
                             )
                             tolerance_pct = float(cfg.get("daneel_amount_tolerance", 0.05))
                             vision_total = vision_result["total"]
@@ -1427,10 +1449,10 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                     _mismatch_notified.add(bill_id_str)
                                     bill_expenses = [
                                         e for e in all_project_expenses
-                                        if (e.get("bill_id") or "").strip() == bill_id_str
+                                        if normalize_bill_id(e.get("bill_id") or "") in _siblings
                                     ]
                                     mismatch_msg = _build_mismatch_message(
-                                        bill_id_str, vision_result, bill_total, "vision",
+                                        bill_id_raw, vision_result, bill_total, "vision",
                                         bill_expenses, lookups, n_items=n_items,
                                         notify_andrew=cfg.get("daneel_mismatch_notify_andrew", True))
                                     post_daneel_message(
@@ -1442,7 +1464,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                         })
                                     if cfg.get("daneel_mismatch_notify_andrew", True):
                                         _trigger_andrew_reconciliation(
-                                            bill_id_str, pid, "daneel_vision")
+                                            bill_id_raw, pid, "daneel_vision")
                                 continue
                         else:
                             exp_checks.append({"check": "bill_hint", "passed": True,
@@ -1467,9 +1489,9 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                             other_id = other_exp.get("expense_id") or other_exp.get("id")
                             if other_id == exp_id:
                                 continue
-                            other_bill = (other_exp.get("bill_id") or "").strip()
-                            if other_bill == bill_id_str:
-                                continue  # same bill is expected
+                            other_bill = normalize_bill_id(other_exp.get("bill_id") or "")
+                            if other_bill == bill_id_str or other_bill in _siblings:
+                                continue  # same bill / same receipt group
                             other_receipt_url = _get_expense_receipt(other_exp, bills_map)
                             if not other_receipt_url:
                                 continue
@@ -1484,8 +1506,8 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                             or oth_bill_info.get("status") == "split")
                                 if not is_split:
                                     reason_txt = (
-                                        f"Receipt hash match: same file used on bill #{bill_id_str} "
-                                        f"and bill #{other_bill} (not a split)"
+                                        f"Receipt hash match: same file used on bill #{bill_id_raw} "
+                                        f"and bill #{(other_exp.get('bill_id') or '').strip()} (not a split)"
                                     )
                                     exp_checks.append({"check": "receipt_hash", "passed": False, "detail": reason_txt})
                                     escalation_list.append({"expense": expense, "reason": reason_txt})
@@ -1712,9 +1734,9 @@ async def reprocess_pending_info() -> dict:
     if not pending:
         return {"status": "ok", "reprocessed": 0, "authorized": 0}
 
-    # Load bills
+    # Load bills (normalized keys)
     bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
-    bills_map = {b["bill_id"]: b for b in (bills_result.data or [])}
+    bills_map = {normalize_bill_id(b["bill_id"]): b for b in (bills_result.data or [])}
 
     reprocessed = 0
     authorized = 0
@@ -1818,9 +1840,9 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
 
         lookups = _load_lookups(sb)
 
-        # Load bills
+        # Load bills (normalized keys)
         bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
-        bills_map = {b["bill_id"]: b for b in (bills_result.data or [])}
+        bills_map = {normalize_bill_id(b["bill_id"]): b for b in (bills_result.data or [])}
 
         # Build checks trail for this expense
         rt_checks = []
@@ -1849,7 +1871,8 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
 
         # Receipt hash check (per-project, cross-bill)
         if cfg.get("daneel_receipt_hash_check_enabled", True):
-            exp_bill_str = (expense.get("bill_id") or "").strip()
+            exp_bill_raw = (expense.get("bill_id") or "").strip()
+            exp_bill_str = normalize_bill_id(exp_bill_raw)
             exp_receipt_url = _get_expense_receipt(expense, bills_map)
             if exp_receipt_url:
                 exp_hash = get_receipt_hash(exp_receipt_url)
@@ -1862,7 +1885,7 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                         .execute()
                     hash_collision = False
                     for other_exp in (all_proj_result.data or []):
-                        other_bill = (other_exp.get("bill_id") or "").strip()
+                        other_bill = normalize_bill_id(other_exp.get("bill_id") or "")
                         if other_bill == exp_bill_str:
                             continue
                         # Resolve receipt URL via bills_map
@@ -1879,8 +1902,8 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                                         or oth_bill_info.get("status") == "split")
                             if not is_split:
                                 reason_txt = (
-                                    f"Receipt hash match: same file on bill #{exp_bill_str} "
-                                    f"and bill #{other_bill} (not a split)"
+                                    f"Receipt hash match: same file on bill #{exp_bill_raw} "
+                                    f"and bill #{(other_exp.get('bill_id') or '').strip()} (not a split)"
                                 )
                                 rt_checks.append({"check": "receipt_hash", "passed": False, "detail": reason_txt})
                                 escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
