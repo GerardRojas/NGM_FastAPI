@@ -303,10 +303,10 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
         ai_client = OpenAI(api_key=api_key)
 
         if extracted_text:
-            # 3a. Text mode (pdfplumber succeeded) -- use gpt-4o-mini, no image needed
+            # 3a. Text mode (pdfplumber succeeded) -- no image needed
             prompt = _TEXT_BILL_TOTAL_PROMPT.format(text=extracted_text)
             response = ai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=200,

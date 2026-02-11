@@ -548,7 +548,7 @@ def scan_receipt(
         raise ValueError("File too large. Maximum size is 20MB.")
 
     client = _get_openai_client()
-    openai_model = "gpt-4o" if model == "heavy" else "gpt-4o-mini"
+    openai_model = "gpt-4o"
     print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
 
     # Fetch lookup data
@@ -569,19 +569,31 @@ def scan_receipt(
     base64_images = []
     media_type = file_type
 
-    # HEAVY MODE: Direct vision with gpt-4o
+    # HEAVY MODE: pdfplumber -> Vision with gpt-4o
     if model == "heavy":
-        print(f"[SCAN-RECEIPT] MODO HEAVY: Directo a Vision (gpt-4o)")
-        extraction_method = "vision_direct"
+        print(f"[SCAN-RECEIPT] MODO HEAVY (gpt-4o)")
 
         if file_type == "application/pdf":
-            try:
-                base64_images = _convert_pdf_to_images(file_content)
-                media_type = "image/png"
-                print(f"[SCAN-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
-            except Exception as pdf_error:
-                raise ValueError(f"Error processing PDF: {str(pdf_error)}")
+            # Try pdfplumber first even in heavy mode
+            print(f"[SCAN-RECEIPT] Intentando pdfplumber...")
+            text_success, text_result = extract_text_from_pdf(file_content)
+
+            if text_success:
+                use_text_mode = True
+                extraction_method = "pdfplumber"
+                extracted_text = text_result
+                print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
+            else:
+                print(f"[SCAN-RECEIPT] pdfplumber fallo ({text_result}), usando Vision...")
+                extraction_method = "vision_direct"
+                try:
+                    base64_images = _convert_pdf_to_images(file_content)
+                    media_type = "image/png"
+                    print(f"[SCAN-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
+                except Exception as pdf_error:
+                    raise ValueError(f"Error processing PDF: {str(pdf_error)}")
         else:
+            extraction_method = "vision_direct"
             base64_images = [base64.b64encode(file_content).decode('utf-8')]
             print(f"[SCAN-RECEIPT] Imagen lista para Vision")
 
