@@ -884,6 +884,15 @@ def _build_escalation_message(escalated: List[dict], lookups: dict, mention_str:
     return "\n".join(lines)
 
 
+_ANDREW_MISMATCH_CALLOUTS = [
+    "@Andrew Heads up -- the numbers on this bill don't add up. Can you take a look and sort it out?",
+    "@Andrew Found a discrepancy on this one. Mind double-checking the line items against the invoice total?",
+    "@Andrew Something's off here -- the invoice total and the expense breakdown aren't matching. Could you reconcile this?",
+    "@Andrew Hey, I ran the numbers and they don't line up. Can you review and fix the amounts on this bill?",
+    "@Andrew Flagging this for you -- there's a gap between the invoice total and what was logged. Please review when you get a chance.",
+]
+
+
 def _build_mismatch_message(
     bill_id: str,
     bill_total_expected: float,
@@ -897,6 +906,7 @@ def _build_mismatch_message(
     Build a bill total mismatch notification.
     source: 'hint' (filename) or 'vision' (GPT Vision OCR).
     """
+    import random
     diff = abs(bill_total_expected - expenses_sum)
     lines = [
         f"**Bill Amount Mismatch Detected** - Bill #{bill_id}",
@@ -922,7 +932,7 @@ def _build_mismatch_message(
         lines.append("")
 
     if notify_andrew:
-        lines.append("@Andrew Please review this bill mismatch and reconcile the expense amounts.")
+        lines.append(random.choice(_ANDREW_MISMATCH_CALLOUTS))
     else:
         lines.append("Please review this bill and reconcile the expense amounts.")
 
