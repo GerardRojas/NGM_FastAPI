@@ -65,6 +65,7 @@ _DEFAULT_CONFIG = {
     "daneel_gpt_fallback_enabled": False,
     "daneel_gpt_fallback_confidence": 75,
     "daneel_mismatch_notify_andrew": True,
+    "daneel_receipt_hash_check_enabled": True,
 }
 
 
@@ -977,6 +978,24 @@ def _resolve_mentions(sb, cfg: dict, key_users: str, key_role: str) -> str:
 
 
 # ============================================================================
+# Andrew mismatch protocol trigger
+# ============================================================================
+
+def _trigger_andrew_reconciliation(bill_id: str, project_id: str, source: str):
+    """Fire Andrew's mismatch reconciliation as a background coroutine."""
+    try:
+        from api.services.andrew_mismatch_protocol import run_mismatch_reconciliation
+        import asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(run_mismatch_reconciliation(bill_id, project_id, source=source))
+        else:
+            asyncio.run(run_mismatch_reconciliation(bill_id, project_id, source=source))
+    except Exception as e:
+        logger.warning(f"[DaneelAutoAuth] Andrew reconciliation trigger failed: {e}")
+
+
+# ============================================================================
 # Main orchestrator
 # ============================================================================
 
@@ -1073,6 +1092,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         auth_candidates = []  # (expense, rule, reason, checks) tuples
         _vision_cache = {}  # bill_id -> vision_total (avoid repeated GPT calls for same bill)
         _mismatch_notified = set()  # bill_ids already notified (one message per bill)
+        _hash_cache = {}  # receipt_url -> hash string (avoid repeated HTTP HEAD per run)
 
         for expense in expenses:
             exp_id = expense.get("expense_id") or expense.get("id")
@@ -1139,6 +1159,9 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                 channel_type="project_general",
                                 metadata={"type": "bill_mismatch", "bill_id": bill_id_str,
                                           "source": "hint"})
+                            # Trigger Andrew's reconciliation protocol
+                            if cfg.get("daneel_mismatch_notify_andrew", True):
+                                _trigger_andrew_reconciliation(bill_id_str, pid, "daneel_hint")
                         continue
                     else:
                         exp_checks.append({"check": "bill_hint", "passed": True,
@@ -1184,6 +1207,9 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                                         channel_type="project_general",
                                         metadata={"type": "bill_mismatch", "bill_id": bill_id_str,
                                                   "source": "vision"})
+                                    # Trigger Andrew's reconciliation protocol
+                                    if cfg.get("daneel_mismatch_notify_andrew", True):
+                                        _trigger_andrew_reconciliation(bill_id_str, pid, "daneel_vision")
                                 continue
                             else:
                                 exp_checks.append({"check": "bill_hint_vision", "passed": True,
@@ -1197,6 +1223,57 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             else:
                 exp_checks.append({"check": "bill_hint", "passed": True,
                                    "detail": "No bill" if not bill_id_str else "Bill not in bills table"})
+
+            # 1c. Per-project receipt hash check (detect same receipt on different bills)
+            if cfg.get("daneel_receipt_hash_check_enabled", True):
+                exp_receipt_url = _get_expense_receipt(expense, bills_map)
+                if exp_receipt_url:
+                    if exp_receipt_url not in _hash_cache:
+                        _hash_cache[exp_receipt_url] = get_receipt_hash(exp_receipt_url)
+                    exp_hash = _hash_cache[exp_receipt_url]
+                    if exp_hash:
+                        hash_collision = False
+                        for other_exp in all_project_expenses:
+                            other_id = other_exp.get("expense_id") or other_exp.get("id")
+                            if other_id == exp_id:
+                                continue
+                            other_bill = (other_exp.get("bill_id") or "").strip()
+                            if other_bill == bill_id_str:
+                                continue  # same bill is expected
+                            other_receipt_url = _get_expense_receipt(other_exp, bills_map)
+                            if not other_receipt_url:
+                                continue
+                            if other_receipt_url not in _hash_cache:
+                                _hash_cache[other_receipt_url] = get_receipt_hash(other_receipt_url)
+                            other_hash = _hash_cache[other_receipt_url]
+                            if other_hash and other_hash == exp_hash:
+                                # Same receipt file on different bills -- check for split
+                                exp_bill_info = bills_map.get(bill_id_str, {})
+                                oth_bill_info = bills_map.get(other_bill, {})
+                                is_split = (exp_bill_info.get("status") == "split"
+                                            or oth_bill_info.get("status") == "split")
+                                if not is_split:
+                                    reason_txt = (
+                                        f"Receipt hash match: same file used on bill #{bill_id_str} "
+                                        f"and bill #{other_bill} (not a split)"
+                                    )
+                                    exp_checks.append({"check": "receipt_hash", "passed": False, "detail": reason_txt})
+                                    escalation_list.append({"expense": expense, "reason": reason_txt})
+                                    decisions.append(_make_decision_entry(
+                                        expense, lookups, "escalated", rule="HASH_DUP",
+                                        reason=reason_txt, checks=exp_checks))
+                                    hash_collision = True
+                                    break
+                        if hash_collision:
+                            continue
+                        exp_checks.append({"check": "receipt_hash", "passed": True,
+                                           "detail": "No cross-bill hash collision in project"})
+                    else:
+                        exp_checks.append({"check": "receipt_hash", "passed": True,
+                                           "detail": "Could not compute receipt hash"})
+                else:
+                    exp_checks.append({"check": "receipt_hash", "passed": True,
+                                       "detail": "No receipt URL available"})
 
             # 2. Duplicate check
             vendor_id = expense.get("vendor_id")
@@ -1525,6 +1602,60 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
             )
             return  # don't authorize yet
         rt_checks.append({"check": "health", "passed": True, "detail": "All required fields present"})
+
+        # Receipt hash check (per-project, cross-bill)
+        if cfg.get("daneel_receipt_hash_check_enabled", True):
+            exp_bill_str = (expense.get("bill_id") or "").strip()
+            exp_receipt_url = _get_expense_receipt(expense, bills_map)
+            if exp_receipt_url:
+                exp_hash = get_receipt_hash(exp_receipt_url)
+                if exp_hash:
+                    # Check all expenses in the project for same hash, different bill
+                    all_proj_result = sb.table("expenses_manual_COGS") \
+                        .select("expense_id, bill_id") \
+                        .eq("project", project_id) \
+                        .neq("expense_id", expense_id) \
+                        .execute()
+                    hash_collision = False
+                    for other_exp in (all_proj_result.data or []):
+                        other_bill = (other_exp.get("bill_id") or "").strip()
+                        if other_bill == exp_bill_str:
+                            continue
+                        # Resolve receipt URL via bills_map
+                        other_receipt = None
+                        if other_bill and other_bill in bills_map:
+                            other_receipt = bills_map[other_bill].get("receipt_url")
+                        if not other_receipt:
+                            continue
+                        other_hash = get_receipt_hash(other_receipt)
+                        if other_hash and other_hash == exp_hash:
+                            exp_bill_info = bills_map.get(exp_bill_str, {})
+                            oth_bill_info = bills_map.get(other_bill, {})
+                            is_split = (exp_bill_info.get("status") == "split"
+                                        or oth_bill_info.get("status") == "split")
+                            if not is_split:
+                                reason_txt = (
+                                    f"Receipt hash match: same file on bill #{exp_bill_str} "
+                                    f"and bill #{other_bill} (not a split)"
+                                )
+                                rt_checks.append({"check": "receipt_hash", "passed": False, "detail": reason_txt})
+                                escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
+                                vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
+                                amt = f"${float(expense.get('Amount') or 0):,.2f}"
+                                msg = (f"{escalation_mentions} " if escalation_mentions else "") + \
+                                      f"Expense from **{vname}** ({amt}) flagged: {reason_txt}"
+                                post_daneel_message(
+                                    content=msg,
+                                    project_id=project_id,
+                                    channel_type="project_general",
+                                    metadata={"type": "auto_auth_escalation", "count": 1},
+                                )
+                                hash_collision = True
+                                break
+                    if hash_collision:
+                        return
+                    rt_checks.append({"check": "receipt_hash", "passed": True,
+                                       "detail": "No cross-bill hash collision"})
 
         # Duplicate check
         vendor_id = expense.get("vendor_id")
