@@ -340,10 +340,11 @@ def get_receipt(receipt_id: str):
 @router.post("/{receipt_id}/process")
 async def process_receipt(receipt_id: str):
     """
-    Process a pending receipt using OpenAI Vision API.
+    Process a pending receipt using the shared OCR service (scan_receipt).
+    Used by the human bookkeeper from the expenses pending-receipts panel.
 
-    Extracts: vendor, amount, date, suggested category
-    Updates the receipt record with parsed data.
+    Pipeline: fetch -> download -> OCR (scan_receipt) -> vendor match ->
+    auto-categorize -> update receipt to ready.
     """
     try:
         # Get receipt record
@@ -358,7 +359,6 @@ async def process_receipt(receipt_id: str):
 
         receipt_data = receipt.data
 
-        # Check if already processed
         if receipt_data.get("status") == "linked":
             raise HTTPException(status_code=400, detail="Receipt already linked to an expense")
 
@@ -369,11 +369,10 @@ async def process_receipt(receipt_id: str):
             .execute()
 
         try:
-            # Download file from storage
+            # Download file
             file_url = receipt_data.get("file_url")
             file_type = receipt_data.get("file_type")
 
-            # Fetch the file
             import httpx
             async with httpx.AsyncClient() as client:
                 response = await client.get(file_url)
@@ -381,127 +380,112 @@ async def process_receipt(receipt_id: str):
                     raise Exception("Failed to download receipt file")
                 file_content = response.content
 
-            # Get OpenAI API key
-            openai_api_key = os.getenv("OPENAI_API_KEY")
-            if not openai_api_key:
-                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            # ===== OCR via shared service (pdfplumber-first, 300 DPI, tax-aware) =====
+            scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
 
-            # Initialize OpenAI client
-            ai_client = OpenAI(api_key=openai_api_key)
+            line_items = scan_result.get("expenses", [])
+            validation = scan_result.get("validation", {})
 
-            # Get vendors list for matching
-            vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
-            vendors_list = [
-                {"id": v.get("id"), "name": v.get("vendor_name")}
-                for v in (vendors_resp.data or [])
-                if v.get("vendor_name")
-            ]
+            # Correction pass if validation failed
+            if not validation.get("validation_passed", True) and line_items:
+                try:
+                    corrected = _scan_receipt_core(
+                        file_content, file_type, model="heavy",
+                        correction_context={
+                            "invoice_total": validation.get("invoice_total", 0),
+                            "calculated_sum": validation.get("calculated_sum", 0),
+                            "items": line_items,
+                        }
+                    )
+                    if corrected.get("validation", {}).get("validation_passed", False):
+                        scan_result = corrected
+                        line_items = corrected.get("expenses", [])
+                        validation = corrected.get("validation", {})
+                except Exception:
+                    pass
 
-            # Get accounts list for category matching
-            accounts_resp = supabase.table("accounts").select("account_id, Name").execute()
-            accounts_list = [
-                {"id": a.get("account_id"), "name": a.get("Name")}
-                for a in (accounts_resp.data or [])
-                if a.get("Name")
-            ]
-
-            # Process image or PDF
-            base64_images = []
-            media_type = file_type
-
-            if file_type == "application/pdf":
-                # Convert PDF to images
-                import platform
-                poppler_path = None
-                if platform.system() == "Windows":
-                    poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin'
-
-                images = convert_from_bytes(file_content, dpi=200, poppler_path=poppler_path)
-                for img in images:
-                    buffer = io.BytesIO()
-                    img.save(buffer, format='PNG')
-                    buffer.seek(0)
-                    base64_images.append(base64.b64encode(buffer.getvalue()).decode('utf-8'))
-                media_type = "image/png"
-            else:
-                base64_images = [base64.b64encode(file_content).decode('utf-8')]
-
-            # Build prompt for OpenAI
-            prompt = f"""Analyze this receipt/invoice and extract the key information.
-
-AVAILABLE VENDORS (match to one if possible):
-{json.dumps([v["name"] for v in vendors_list], indent=2)}
-
-AVAILABLE EXPENSE CATEGORIES (match to one if possible):
-{json.dumps([a["name"] for a in accounts_list], indent=2)}
-
-Extract and return JSON with:
-{{
-    "vendor_name": "Matched vendor name or extracted name",
-    "vendor_id": "UUID if matched to list, null otherwise",
-    "amount": 123.45,
-    "receipt_date": "YYYY-MM-DD",
-    "description": "Brief description of purchase",
-    "suggested_category": "Matched category name",
-    "suggested_account_id": "UUID if matched to list, null otherwise",
-    "confidence": 0.95
-}}
-
-RULES:
-- Use the TOTAL amount, not subtotals or individual items
-- For vendor, try to match exactly to the list first
-- For category, match based on what was purchased
-- Date format must be YYYY-MM-DD
-- confidence is 0-1 indicating how sure you are of the extraction
-"""
-
-            # Build message content
-            content = [{"type": "text", "text": prompt}]
-            for img_b64 in base64_images[:3]:  # Limit to 3 pages
-                content.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{media_type};base64,{img_b64}",
-                        "detail": "high"
-                    }
-                })
-
-            # Call OpenAI Vision
-            response = ai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": content}],
-                max_tokens=1000,
-                response_format={"type": "json_object"}
+            # Derive summary from line items
+            first_item = line_items[0] if line_items else {}
+            vendor_name = first_item.get("vendor") or "Unknown"
+            amount = validation.get("invoice_total") or sum(
+                item.get("amount", 0) for item in line_items
             )
+            receipt_date = first_item.get("date")
+            description = first_item.get("description") or "Material purchase"
 
-            # Parse response
-            parsed_data = json.loads(response.choices[0].message.content)
-
-            # Find vendor_id if matched by name
-            vendor_id = parsed_data.get("vendor_id")
-            if not vendor_id and parsed_data.get("vendor_name"):
-                for v in vendors_list:
-                    if v["name"].lower() == parsed_data["vendor_name"].lower():
+            # ===== Vendor matching =====
+            vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
+            vendor_id = None
+            if vendor_name and vendor_name != "Unknown":
+                for v in (vendors_resp.data or []):
+                    if (v.get("vendor_name") or "").lower() == vendor_name.lower():
                         vendor_id = v["id"]
                         break
 
-            # Find account_id if matched by name
-            account_id = parsed_data.get("suggested_account_id")
-            if not account_id and parsed_data.get("suggested_category"):
-                for a in accounts_list:
-                    if a["name"].lower() == parsed_data["suggested_category"].lower():
-                        account_id = a["id"]
-                        break
+            # ===== Auto-categorize via shared service =====
+            project_id = receipt_data.get("project_id")
+            construction_stage = "General Construction"
+            if project_id:
+                try:
+                    proj = supabase.table("projects") \
+                        .select("project_stage") \
+                        .eq("project_id", project_id) \
+                        .single().execute()
+                    if proj.data and proj.data.get("project_stage"):
+                        construction_stage = proj.data["project_stage"]
+                except Exception:
+                    pass
 
-            # Update receipt with parsed data
+            categorizations = []
+            cat_expenses = [
+                {"rowIndex": i, "description": item.get("description", "")}
+                for i, item in enumerate(line_items)
+            ]
+            try:
+                if cat_expenses:
+                    categorizations = _auto_categorize_core(
+                        stage=construction_stage, expenses=cat_expenses
+                    )
+            except Exception:
+                pass
+
+            # Attach categorization to line items
+            cat_map = {c["rowIndex"]: c for c in categorizations}
+            for i, item in enumerate(line_items):
+                cat = cat_map.get(i, {})
+                item["account_id"] = cat.get("account_id")
+                item["account_name"] = cat.get("account_name")
+                item["confidence"] = cat.get("confidence", 0)
+
+            primary_cat = max(categorizations, key=lambda c: c.get("confidence", 0)) if categorizations else {}
+            final_account_id = primary_cat.get("account_id")
+            final_category = primary_cat.get("account_name")
+            final_confidence = primary_cat.get("confidence", 0)
+
+            # ===== Build parsed_data and update DB =====
+            parsed_data = {
+                "vendor_name": vendor_name,
+                "vendor_id": vendor_id,
+                "amount": amount,
+                "receipt_date": receipt_date,
+                "description": description,
+                "line_items": line_items,
+                "validation": validation,
+                "categorization": {
+                    "account_id": final_account_id,
+                    "account_name": final_category,
+                    "confidence": final_confidence,
+                },
+            }
+
             update_data = {
                 "status": "ready",
                 "parsed_data": parsed_data,
-                "vendor_name": parsed_data.get("vendor_name"),
-                "amount": parsed_data.get("amount"),
-                "receipt_date": parsed_data.get("receipt_date"),
-                "suggested_category": parsed_data.get("suggested_category"),
-                "suggested_account_id": account_id,
+                "vendor_name": vendor_name,
+                "amount": amount,
+                "receipt_date": receipt_date,
+                "suggested_category": final_category,
+                "suggested_account_id": final_account_id,
                 "processed_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat()
             }
@@ -519,7 +503,6 @@ RULES:
             }
 
         except Exception as process_error:
-            # Update status to error
             supabase.table("pending_receipts") \
                 .update({
                     "status": "error",
@@ -630,6 +613,35 @@ def _get_bookkeeping_mentions():
         return " ".join(mentions) if mentions else ""
     except Exception as e:
         print(f"[Agent] Error fetching bookkeeping mentions: {e}")
+        return ""
+
+
+def _get_auth_notify_mentions():
+    """Get @mention strings for users configured in andrew_auth_notify_users."""
+    try:
+        cfg = supabase.table("agent_config") \
+            .select("value") \
+            .eq("key", "andrew_auth_notify_users") \
+            .execute()
+        if not cfg.data:
+            return ""
+        user_ids = cfg.data[0]["value"]
+        if isinstance(user_ids, str):
+            user_ids = json.loads(user_ids)
+        if not user_ids:
+            return ""
+        result = supabase.table("users") \
+            .select("user_id, user_name") \
+            .in_("user_id", user_ids) \
+            .execute()
+        mentions = []
+        for u in (result.data or []):
+            name = (u.get("user_name") or "").replace(" ", "")
+            if name:
+                mentions.append(f"@{name}")
+        return " ".join(mentions) if mentions else ""
+    except Exception as e:
+        print(f"[Agent] Error fetching auth notify mentions: {e}")
         return ""
 
 
@@ -1300,14 +1312,18 @@ async def agent_process_receipt(receipt_id: str):
                 low_confidence_items.append({
                     "index": i,
                     "description": item.get("description", ""),
+                    "amount": item.get("amount"),
                     "suggested": item.get("account_name"),
+                    "suggested_account_id": item.get("account_id"),
                     "confidence": item_conf,
                 })
             elif not item.get("account_id"):
                 low_confidence_items.append({
                     "index": i,
                     "description": item.get("description", ""),
+                    "amount": item.get("amount"),
                     "suggested": None,
+                    "suggested_account_id": None,
                     "confidence": 0,
                 })
 
@@ -1447,6 +1463,7 @@ async def agent_process_receipt(receipt_id: str):
                 "receipt_flow_state": flow_state,
                 "receipt_flow_active": True,
                 "awaiting_text_input": awaiting_text,
+                "low_confidence_items": low_confidence_items if low_confidence_items else None,
             }
         )
 
@@ -2675,26 +2692,64 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
         # ── Category confirmation flow ──
         if current_state == "awaiting_category_confirmation":
-            text = (payload.payload or {}).get("text", "").strip() if payload.payload else ""
-
-            if not text:
-                raise HTTPException(status_code=400, detail="Text input required for category confirmation")
+            payload_data = payload.payload or {}
+            text = payload_data.get("text", "").strip() if isinstance(payload_data, dict) else ""
+            assignments = payload_data.get("assignments") if isinstance(payload_data, dict) else None
 
             low_items = receipt_flow.get("low_confidence_items", [])
             line_items = parsed_data.get("line_items", [])
 
+            if not text and not assignments:
+                raise HTTPException(status_code=400, detail="Text or assignments required for category confirmation")
+
             if text.lower() in ("all correct", "ok", "accept", "si", "yes"):
-                # Accept all suggested categories as-is
-                print(f"[ReceiptFlow] Category confirmation: user accepted all suggestions")
+                # Accept all suggested categories as-is — bump confidence so expense creation won't skip them
+                for lci in low_items:
+                    idx = lci["index"]
+                    if idx < len(line_items) and line_items[idx].get("account_id"):
+                        line_items[idx]["confidence"] = 100
+                        line_items[idx]["user_confirmed"] = True
+                print(f"[ReceiptFlow] Category confirmation: user accepted all suggestions ({len(low_items)} items bumped to 100%)")
+            elif assignments and isinstance(assignments, list):
+                # Structured assignment from interactive account picker (no fuzzy matching needed)
+                updates_applied = 0
+                for assign in assignments:
+                    idx = assign.get("index")
+                    account_id = assign.get("account_id")
+                    account_name = assign.get("account_name", "")
+                    if idx is None or not account_id:
+                        continue
+                    if idx < len(line_items):
+                        line_items[idx]["account_id"] = account_id
+                        line_items[idx]["account_name"] = account_name
+                        line_items[idx]["confidence"] = 100
+                        line_items[idx]["user_confirmed"] = True
+                        updates_applied += 1
+                        print(f"[ReceiptFlow] Structured assign: item {idx} -> {account_name} ({account_id})")
+
+                if updates_applied == 0:
+                    post_andrew_message(
+                        content="No valid account assignments found. Please try again.",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_flow_state": "awaiting_category_confirmation",
+                            "receipt_flow_active": True,
+                            "awaiting_text_input": True,
+                            "low_confidence_items": low_items,
+                        }
+                    )
+                    return {"success": True, "state": "awaiting_category_confirmation", "error": "no_valid_assignments"}
             else:
                 # Parse "N account_name" pairs: "1 Materials, 2 Delivery"
                 # Fetch accounts catalog for fuzzy matching
                 accounts_resp = supabase.table("accounts") \
-                    .select("account_id, account_name") \
+                    .select("account_id, Name") \
                     .execute()
                 accounts_list = [
-                    {"id": a["account_id"], "name": a["account_name"]}
-                    for a in (accounts_resp.data or []) if a.get("account_name")
+                    {"id": a["account_id"], "name": a["Name"]}
+                    for a in (accounts_resp.data or []) if a.get("Name")
                 ]
                 accounts_lower = {a["name"].lower(): a for a in accounts_list}
 
@@ -2982,7 +3037,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     count = len(created_expenses)
+                    auth_mentions = _get_auth_notify_mentions()
                     msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
+                    if auth_mentions:
+                        msg += f"\n\n{auth_mentions}"
                     post_andrew_message(
                         content=msg,
                         project_id=project_id,
@@ -3002,7 +3060,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     post_andrew_message(
-                        content="Processed. Ready for review.",
+                        content="I couldn't auto-create expenses (low confidence or missing category). Please add them manually from the Expenses tab.",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -3174,7 +3232,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         + f"\nTotal: ${other_total:,.2f}"
                     )
                     if created_other:
+                        split_auth_mentions = _get_auth_notify_mentions()
                         split_msg += f"\n\n{len(created_other)} expense(s) auto-created."
+                        if split_auth_mentions:
+                            split_msg += f"\n{split_auth_mentions}"
 
                     post_andrew_message(
                         content=split_msg,
@@ -3303,7 +3364,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     count = len(created_expenses)
+                    auth_mentions = _get_auth_notify_mentions()
                     msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
+                    if auth_mentions:
+                        msg += f"\n\n{auth_mentions}"
                     post_andrew_message(
                         content=msg,
                         project_id=project_id,
@@ -3323,7 +3387,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     post_andrew_message(
-                        content="Processed. Ready for review.",
+                        content="I couldn't auto-create expenses (low confidence or missing category). Please add them manually from the Expenses tab.",
                         project_id=project_id,
                         metadata={
                             "agent_message": True,
@@ -3802,7 +3866,7 @@ def get_agent_stats():
             if cat.get("confidence"):
                 confidences.append(cat["confidence"])
         avg_confidence = round(sum(confidences) / len(confidences)) if confidences else 0
-        success_rate = round((linked / total) * 100) if total > 0 else 0
+        success_rate = round(((total - errors) / total) * 100) if total > 0 else 0
 
         return {
             "total_processed": total,

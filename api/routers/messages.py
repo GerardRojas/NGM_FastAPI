@@ -12,6 +12,7 @@
 
 import re
 import asyncio
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -77,6 +78,12 @@ class ThreadReplyCreate(BaseModel):
     content: str = Field(..., min_length=1)
 
 
+class MarkReadRequest(BaseModel):
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct|group)$")
+    channel_id: Optional[str] = None
+    project_id: Optional[str] = None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -122,6 +129,14 @@ def normalize_channel(row: Dict[str, Any]) -> Dict[str, Any]:
         "unread_count": row.get("unread_count", 0),
         "members": row.get("members", []),
     }
+
+
+def build_channel_key(channel_type: str, channel_id: Optional[str], project_id: Optional[str]) -> str:
+    """Build the channel_key string matching the messages table generated column."""
+    if channel_type in ("custom", "direct", "group"):
+        return f"{channel_type}:{channel_id}"
+    else:
+        return f"{channel_type}:{project_id}"
 
 
 def get_reactions_for_message(message_id: str) -> Dict[str, List[str]]:
@@ -677,6 +692,61 @@ def get_channels(
                 channels.append(channel)
 
         return {"channels": channels}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.get("/unread-counts")
+def get_unread_counts(
+    current_user: dict = Depends(get_current_user)
+):
+    """Get unread message counts for all channels the user has access to."""
+    try:
+        user_id = current_user["user_id"]
+
+        result = supabase.rpc("get_unread_counts", {"p_user_id": user_id}).execute()
+
+        counts = {}
+        for row in (result.data or []):
+            counts[row["channel_key"]] = row["unread_count"]
+
+        return {"unread_counts": counts}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.post("/mark-read")
+def mark_channel_read(
+    payload: MarkReadRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Mark a channel as read for the current user (upsert last_read_at = now())."""
+    try:
+        user_id = current_user["user_id"]
+        channel_key = build_channel_key(payload.channel_type, payload.channel_id, payload.project_id)
+        now = datetime.now(timezone.utc).isoformat()
+
+        # SELECT + UPDATE/INSERT pattern (Supabase upsert can silently no-op)
+        existing = supabase.table("channel_read_status") \
+            .select("id") \
+            .eq("user_id", user_id) \
+            .eq("channel_key", channel_key) \
+            .execute()
+
+        if existing.data:
+            supabase.table("channel_read_status") \
+                .update({"last_read_at": now, "updated_at": now}) \
+                .eq("user_id", user_id) \
+                .eq("channel_key", channel_key) \
+                .execute()
+        else:
+            supabase.table("channel_read_status") \
+                .insert({"user_id": user_id, "channel_key": channel_key, "last_read_at": now, "updated_at": now}) \
+                .execute()
+
+        return {"ok": True, "channel_key": channel_key}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")

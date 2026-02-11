@@ -80,17 +80,7 @@ WHERE NOT EXISTS (
     SELECT 1 FROM role_permissions rp WHERE rp.rol_id = r.rol_id AND rp.module_key = 'budgets'
 );
 
--- 8) pnl_report
-INSERT INTO role_permissions (rol_id, module_key, module_name, module_url, can_view, can_edit, can_delete)
-SELECT r.rol_id, 'pnl_report', 'P&L Report', 'pnl-report.html',
-    CASE WHEN r.rol_name IN ('CEO', 'COO', 'Accounting Manager') THEN true ELSE false END,
-    false, false
-FROM rols r
-WHERE NOT EXISTS (
-    SELECT 1 FROM role_permissions rp WHERE rp.rol_id = r.rol_id AND rp.module_key = 'pnl_report'
-);
-
--- 9) reporting
+-- 8) reporting
 INSERT INTO role_permissions (rol_id, module_key, module_name, module_url, can_view, can_edit, can_delete)
 SELECT r.rol_id, 'reporting', 'Reporting', 'reporting.html',
     CASE WHEN r.rol_name IN ('CEO', 'COO', 'Accounting Manager', 'Bookkeeper') THEN true ELSE false END,

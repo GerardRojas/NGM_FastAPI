@@ -548,6 +548,20 @@ def scan_receipt(
     if len(file_content) > 20 * 1024 * 1024:
         raise ValueError("File too large. Maximum size is 20MB.")
 
+    try:
+        return _scan_receipt_inner(file_content, file_type, model, correction_context)
+    except Exception as e:
+        log_ocr_metric(
+            agent="receipt_scanner",
+            source="correction" if correction_context else ("human_parse" if model == "fast" else "agent_process"),
+            extraction_method="error",
+            success=False,
+            metadata={"error": str(e)},
+        )
+        raise
+
+
+def _scan_receipt_inner(file_content, file_type, model, correction_context):
     client = _get_openai_client()
     openai_model = "gpt-4o"
     print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")

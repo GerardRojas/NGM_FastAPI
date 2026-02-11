@@ -106,7 +106,7 @@ async def get_ocr_summary(
 
     pdfplumber_count = by_method.get("pdfplumber", 0)
     vision_count = sum(v for k, v in by_method.items() if k in ("vision", "vision_direct"))
-    error_count = by_method.get("error", 0)
+    error_count = fail_count
 
     return {
         "period_days": days,

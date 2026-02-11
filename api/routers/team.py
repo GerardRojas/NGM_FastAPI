@@ -24,6 +24,8 @@ SELECT_CLAUSE = """
   user_birthday,
   user_address,
   user_contract_url,
+  user_description,
+  user_position,
 
   rols!users_user_rol_fkey(rol_id, rol_name),
   users_seniority!users_user_seniority_fkey(id, user_seniority_name),
@@ -47,6 +49,8 @@ def normalize_user_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "user_birthday": r.get("user_birthday"),
         "user_address": r.get("user_address"),
         "user_contract_url": r.get("user_contract_url"),
+        "user_description": r.get("user_description"),
+        "user_position": r.get("user_position"),
         "role": None if not role else {"id": role.get("rol_id"), "name": role.get("rol_name")},
         "seniority": None if not sen else {"id": sen.get("id"), "name": sen.get("user_seniority_name")},
         "status": None if not st else {"id": st.get("id"), "name": st.get("user_status_name")},
@@ -80,6 +84,8 @@ class UserCreate(BaseModel):
     user_birthday: Optional[str] = None  # "YYYY-MM-DD"
     user_address: Optional[str] = None
     user_contract_url: Optional[str] = None
+    user_description: Optional[str] = None
+    user_position: Optional[str] = None
 
     password: Optional[str] = None  # plaintext opcional (se hashea)
 
@@ -99,6 +105,8 @@ class UserUpdate(BaseModel):
     user_birthday: Optional[str] = None  # "YYYY-MM-DD"
     user_address: Optional[str] = None
     user_contract_url: Optional[str] = None
+    user_description: Optional[str] = None
+    user_position: Optional[str] = None
 
     password: Optional[str] = None  # plaintext opcional (se hashea)
 
@@ -240,6 +248,8 @@ def create_user(payload: UserCreate) -> Dict[str, Any]:
         "user_birthday": data.get("user_birthday"),
         "user_address": data.get("user_address"),
         "user_contract_url": data.get("user_contract_url"),
+        "user_description": data.get("user_description"),
+        "user_position": data.get("user_position"),
         "user_rol": data.get("role_id"),
         "user_seniority": data.get("seniority_id"),
         "user_status": data.get("status_id"),
@@ -280,6 +290,8 @@ def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
         "user_birthday",
         "user_address",
         "user_contract_url",
+        "user_description",
+        "user_position",
     ]:
         if f in data:
             update_obj[f] = data[f]
