@@ -212,6 +212,117 @@ def get_receipt_hash(receipt_url: Optional[str]) -> Optional[str]:
 
 
 # ============================================================================
+# GPT Vision -- extract invoice total from receipt image
+# ============================================================================
+
+_VISION_BILL_TOTAL_PROMPT = (
+    "You are a financial document reader. Look at this invoice/receipt image "
+    "and extract the GRAND TOTAL amount (the final amount due, including taxes "
+    "and any additional charges).\n\n"
+    "RESPOND with ONLY a JSON object:\n"
+    "{\"total\": 1234.56, \"currency\": \"USD\", \"confidence\": 95}\n\n"
+    "Rules:\n"
+    "- \"total\" must be a number (no dollar signs, no commas)\n"
+    "- If you see multiple totals, use the GRAND TOTAL / AMOUNT DUE / BALANCE DUE\n"
+    "- \"confidence\" is 0-100 how sure you are this is the correct total\n"
+    "- If you cannot read the total clearly, set confidence below 50\n"
+    "- No preamble, no markdown, just the JSON object"
+)
+
+
+def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.05) -> Optional[float]:
+    """
+    Download a receipt image and ask GPT-4o-mini Vision for the invoice total.
+    Returns the extracted amount or None on any failure (fail-open).
+    """
+    if not receipt_url:
+        return None
+
+    import json as _json
+    import base64
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        logger.warning("[DaneelAutoAuth] Vision: no OPENAI_API_KEY")
+        return None
+
+    try:
+        # 1. Download the receipt file
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(receipt_url, follow_redirects=True)
+            if resp.status_code != 200:
+                logger.warning(f"[DaneelAutoAuth] Vision: download failed {resp.status_code}")
+                return None
+            file_content = resp.content
+            content_type = resp.headers.get("content-type", "")
+
+        # 2. Determine media type and convert to base64 image(s)
+        if "pdf" in content_type.lower() or receipt_url.lower().endswith(".pdf"):
+            # PDF: convert first page to image
+            try:
+                from pdf2image import convert_from_bytes
+                import io
+                import platform
+                poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin' if platform.system() == "Windows" else None
+                images = convert_from_bytes(file_content, dpi=150, first_page=1, last_page=1,
+                                            poppler_path=poppler_path)
+                if not images:
+                    logger.warning("[DaneelAutoAuth] Vision: PDF conversion produced no images")
+                    return None
+                buf = io.BytesIO()
+                images[0].save(buf, format='PNG')
+                buf.seek(0)
+                b64_image = base64.b64encode(buf.getvalue()).decode('utf-8')
+                media_type = "image/png"
+            except Exception as e:
+                logger.warning(f"[DaneelAutoAuth] Vision: PDF convert error: {e}")
+                return None
+        else:
+            # Image: direct base64
+            b64_image = base64.b64encode(file_content).decode('utf-8')
+            media_type = content_type if content_type else "image/jpeg"
+
+        # 3. Call GPT-4o-mini Vision
+        from openai import OpenAI
+        ai_client = OpenAI(api_key=api_key)
+        response = ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _VISION_BILL_TOTAL_PROMPT},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:{media_type};base64,{b64_image}",
+                        "detail": "high"
+                    }}
+                ]
+            }],
+            temperature=0.1,
+            max_tokens=100,
+        )
+        raw = response.choices[0].message.content.strip()
+
+        # 4. Parse response
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        data = _json.loads(raw)
+        total = float(data.get("total", 0))
+        confidence = int(data.get("confidence", 0))
+
+        if total <= 0 or confidence < 50:
+            logger.info(f"[DaneelAutoAuth] Vision: low confidence ({confidence}%) or zero total")
+            return None
+
+        logger.info(f"[DaneelAutoAuth] Vision: extracted total=${total:,.2f} (confidence={confidence}%)")
+        return total
+
+    except Exception as e:
+        logger.warning(f"[DaneelAutoAuth] Vision extract failed: {e}")
+        return None
+
+
+# ============================================================================
 # Health Check
 # ============================================================================
 
@@ -904,6 +1015,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         # Phase 1: Rule engine -- classify each expense
         # Each candidate tracks a checks trail: [{check, passed, detail}]
         auth_candidates = []  # (expense, rule, reason, checks) tuples
+        _vision_cache = {}  # bill_id -> vision_total (avoid repeated GPT calls for same bill)
 
         for expense in expenses:
             exp_id = expense.get("expense_id") or expense.get("id")
@@ -961,7 +1073,42 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                         exp_checks.append({"check": "bill_hint", "passed": True,
                                            "detail": f"Bill total ${bill_total:,.2f} matches hint ${hint['amount_hint']:,.2f}"})
                 else:
-                    exp_checks.append({"check": "bill_hint", "passed": True, "detail": "No amount hint in receipt filename"})
+                    # No amount in filename -- fall back to GPT Vision OCR
+                    if receipt_url:
+                        if bill_id_str in _vision_cache:
+                            vision_total = _vision_cache[bill_id_str]
+                        else:
+                            vision_total = gpt_vision_extract_bill_total(receipt_url)
+                            _vision_cache[bill_id_str] = vision_total
+                        if vision_total is not None:
+                            bill_total = sum(
+                                float(e.get("Amount") or 0)
+                                for e in all_project_expenses
+                                if (e.get("bill_id") or "").strip() == bill_id_str
+                            )
+                            tolerance = float(cfg.get("daneel_amount_tolerance", 0.05))
+                            larger = max(vision_total, bill_total) if bill_total else vision_total
+                            diff = abs(vision_total - bill_total)
+                            if larger > 0 and diff > larger * tolerance:
+                                reason_txt = (
+                                    f"Vision OCR amount mismatch: invoice total ${vision_total:,.2f} "
+                                    f"vs expenses sum ${bill_total:,.2f}"
+                                )
+                                exp_checks.append({"check": "bill_hint_vision", "passed": False, "detail": reason_txt})
+                                escalation_list.append({"expense": expense, "reason": reason_txt})
+                                decisions.append(_make_decision_entry(
+                                    expense, lookups, "escalated", rule="BILL_HINT_VISION", reason=reason_txt,
+                                    checks=exp_checks))
+                                continue
+                            else:
+                                exp_checks.append({"check": "bill_hint_vision", "passed": True,
+                                                   "detail": f"Vision OCR total ${vision_total:,.2f} matches expenses sum ${bill_total:,.2f}"})
+                        else:
+                            exp_checks.append({"check": "bill_hint", "passed": True,
+                                               "detail": "No filename hint; Vision OCR could not extract total"})
+                    else:
+                        exp_checks.append({"check": "bill_hint", "passed": True,
+                                           "detail": "No amount hint in receipt filename (no receipt URL)"})
             else:
                 exp_checks.append({"check": "bill_hint", "passed": True,
                                    "detail": "No bill" if not bill_id_str else "Bill not in bills table"})
