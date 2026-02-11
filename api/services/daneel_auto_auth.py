@@ -760,83 +760,6 @@ def gpt_resolve_ambiguous(
         return DuplicateResult("ambiguous", "GPT_ERROR", f"GPT fallback error: {e}")
 
 
-# ============================================================================
-# GPT Batch Review (final sanity check before authorizing)
-# ============================================================================
-
-_GPT_BATCH_REVIEW_PROMPT = (
-    "You are Daneel, a financial supervisor for a construction company. "
-    "A rule engine has cleared the following expenses for auto-authorization. "
-    "Review the batch and flag anything suspicious BEFORE they are authorized.\n\n"
-    "FLAG these patterns:\n"
-    "- Unusually high amounts compared to other expenses in the batch\n"
-    "- Multiple expenses from the same vendor on the same day with similar amounts\n"
-    "- Round-number amounts that look like estimates rather than real invoices (e.g. $10,000.00 exactly)\n"
-    "- Anything that feels off based on common construction expense patterns\n\n"
-    "RESPOND with ONLY a JSON object:\n"
-    "- If all clear: {\"approve\": true, \"note\": \"brief summary\"}\n"
-    "- If flagged: {\"approve\": false, \"flagged\": [list of 0-based indices], \"reason\": \"explanation\"}\n"
-    "- Be conservative: when in doubt, approve. Only flag truly suspicious patterns.\n"
-    "- No preamble, no markdown, just the JSON object"
-)
-
-
-def gpt_batch_review(candidates: List[dict], lookups: dict) -> dict:
-    """
-    GPT reviews a batch of expenses before authorization.
-    Returns {"approve_all": True} or {"approve_all": False, "flagged_indices": [...], "reason": "..."}.
-    Fails open (approves all) on any error.
-    """
-    if not candidates:
-        return {"approve_all": True}
-
-    import json as _json
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {"approve_all": True}
-
-    # Build summary table
-    lines = []
-    for i, exp in enumerate(candidates):
-        vendor = lookups["vendors"].get(exp.get("vendor_id"), "Unknown")
-        account = lookups["accounts"].get(exp.get("account_id"), "Unknown")
-        amt = f"${float(exp.get('Amount') or 0):,.2f}"
-        date = (exp.get("TxnDate") or "")[:10]
-        desc = (exp.get("LineDescription") or "-")[:60]
-        bill = exp.get("bill_id") or "-"
-        lines.append(f"[{i}] {vendor} | {amt} | {date} | {account} | Bill#{bill} | {desc}")
-
-    user_msg = f"Batch of {len(candidates)} expenses to authorize:\n\n" + "\n".join(lines)
-
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": _GPT_BATCH_REVIEW_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=300,
-        )
-        raw = response.choices[0].message.content.strip()
-        data = _json.loads(raw)
-
-        if data.get("approve", True):
-            logger.info(f"[DaneelAutoAuth] Batch review APPROVED {len(candidates)} expenses: {data.get('note', '')}")
-            return {"approve_all": True}
-
-        flagged = data.get("flagged", [])
-        reason = data.get("reason", "GPT flagged suspicious pattern")
-        logger.info(f"[DaneelAutoAuth] Batch review FLAGGED indices {flagged}: {reason}")
-        return {"approve_all": False, "flagged_indices": flagged, "reason": reason}
-
-    except Exception as e:
-        logger.warning(f"[DaneelAutoAuth] Batch review failed (approving all): {e}")
-        return {"approve_all": True}
-
 
 # ============================================================================
 # Authorize a single expense (mirrors update_expense_status logic)
@@ -1554,30 +1477,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             # 4. Rule engine cleared -- add to candidates (NOT authorized yet)
             auth_candidates.append((expense, dup_result.rule, dup_result.details, exp_checks))
 
-        # Phase 2: GPT batch review -- final sanity check before authorizing
-        if auth_candidates and cfg.get("daneel_gpt_fallback_enabled"):
-            review = gpt_batch_review([c[0] for c in auth_candidates], lookups)
-            if not review.get("approve_all"):
-                flagged_set = set(review.get("flagged_indices", []))
-                reason = review.get("reason", "GPT batch review flagged suspicious pattern")
-                surviving = []
-                for i, (exp, rule, det, chks) in enumerate(auth_candidates):
-                    if i in flagged_set:
-                        chks.append({"check": "gpt_batch", "passed": False, "detail": reason})
-                        escalation_list.append({"expense": exp, "reason": f"[Batch review] {reason}"})
-                        decisions.append(_make_decision_entry(
-                            exp, lookups, "escalated", rule="GPT_BATCH", reason=reason,
-                            checks=chks))
-                    else:
-                        chks.append({"check": "gpt_batch", "passed": True, "detail": "Batch review approved"})
-                        surviving.append((exp, rule, det, chks))
-                auth_candidates = surviving
-            else:
-                # All approved by batch review
-                for exp, rule, det, chks in auth_candidates:
-                    chks.append({"check": "gpt_batch", "passed": True, "detail": "Batch review approved"})
-
-        # Phase 3: Authorize all approved candidates
+        # Phase 2: Authorize all approved candidates
         for expense, rule, det, chks in auth_candidates:
             exp_id = expense.get("expense_id") or expense.get("id")
             if authorize_expense(sb, exp_id, pid, rule):
@@ -1956,26 +1856,6 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
 
         # Duplicate check passed
         rt_checks.append({"check": "duplicate", "passed": True, "detail": f"R1-R9 clear: {dup_result.details}"})
-
-        # GPT batch review as final check
-        if cfg.get("daneel_gpt_fallback_enabled"):
-            review = gpt_batch_review([expense], lookups)
-            if not review.get("approve_all"):
-                reason = review.get("reason", "GPT flagged suspicious pattern")
-                rt_checks.append({"check": "gpt_batch", "passed": False, "detail": reason})
-                escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
-                vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
-                amt = f"${float(expense.get('Amount') or 0):,.2f}"
-                msg = (f"{escalation_mentions} " if escalation_mentions else "") + \
-                      f"Expense from **{vname}** ({amt}) flagged by batch review: {reason}"
-                post_daneel_message(
-                    content=msg,
-                    project_id=project_id,
-                    channel_type="project_general",
-                    metadata={"type": "auto_auth_escalation", "count": 1},
-                )
-                return
-            rt_checks.append({"check": "gpt_batch", "passed": True, "detail": "Batch review approved"})
 
         # Authorize
         decision = None
