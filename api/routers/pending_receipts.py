@@ -1064,6 +1064,23 @@ async def agent_process_receipt(receipt_id: str):
             .eq("id", receipt_id) \
             .execute()
 
+        # Send immediate confirmation message
+        file_name = receipt_data.get("file_name", "receipt")
+        file_url = receipt_data.get("file_url", "")
+        file_link = f"[{file_name}]({file_url})" if file_url else file_name
+
+        post_andrew_message(
+            content=f"Got it! Processing {file_link}...",
+            project_id=project_id,
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "processing",
+                "processing_started": True,
+            }
+        )
+        print(f"[Agent] Sent immediate confirmation message for receipt {receipt_id}")
+
         # ===== STEP 2: Download file + duplicate check =====
         print(f"[Agent] Step 2: Downloading file...")
         file_url = receipt_data.get("file_url")
