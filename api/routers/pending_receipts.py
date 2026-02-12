@@ -3196,29 +3196,17 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
             if action == "confirm":
                 # Create expenses based on pre-resolved decisions
+                # Human clicked Confirm -- no confidence gate needed
                 decision = pre_resolved.get("project_decision", "all_this_project")
-
-                agent_cfg = {}
-                try:
-                    cfg_result = supabase.table("agent_config").select("key, value").execute()
-                    for row in (cfg_result.data or []):
-                        agent_cfg[row["key"]] = row["value"]
-                except Exception:
-                    pass
-
-                min_confidence = int(agent_cfg.get("min_confidence", 70))
                 cat = parsed_data.get("categorization", {})
                 vendor_id = parsed_data.get("vendor_id")
                 created_expenses = []
 
                 if decision == "all_this_project":
+                    # Human clicked Confirm -- no confidence gate needed
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
-                            continue
-                        # User explicitly clicked Confirm -- skip confidence gate
-                        item_confidence = item.get("confidence", 0)
-                        if not item.get("user_confirmed") and item_confidence < min_confidence:
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -3354,7 +3342,6 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     pass
 
                 auto_create = agent_cfg.get("auto_create_expense", True)
-                min_confidence = int(agent_cfg.get("min_confidence", 70))
                 cat = parsed_data.get("categorization", {})
                 vendor_id = parsed_data.get("vendor_id")
 
@@ -3362,13 +3349,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 line_items = parsed_data.get("line_items", [])
 
                 if auto_create and line_items:
+                    # Human clicked "All for this project" -- skip confidence gate
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
-                            continue
-                        # User-confirmed items bypass confidence gate
-                        item_confidence = item.get("confidence", 0)
-                        if not item.get("user_confirmed") and item_confidence < min_confidence:
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -3539,7 +3523,6 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     pass
 
                 auto_create = agent_cfg.get("auto_create_expense", True)
-                min_confidence = int(agent_cfg.get("min_confidence", 70))
                 cat = parsed_data.get("categorization", {})
                 vendor_id = parsed_data.get("vendor_id")
 
@@ -3547,13 +3530,13 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 summary_parts = []
 
                 # Create expenses for THIS project (unassigned items)
+                # Human assigned items -- skip confidence gate
                 if this_project_indices:
                     created_here = []
                     for idx in this_project_indices:
                         item = line_items[idx - 1]
                         item_account = item.get("account_id") or cat.get("account_id")
-                        conf_ok = item.get("user_confirmed") or item.get("confidence", 0) >= min_confidence
-                        if auto_create and item_account and conf_ok:
+                        if auto_create and item_account:
                             expense = _create_receipt_expense(
                                 project_id, parsed_data, receipt_data,
                                 vendor_id, item_account,
@@ -3574,8 +3557,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     for idx in pa["item_indices"]:
                         item = line_items[idx - 1]
                         item_account = item.get("account_id") or cat.get("account_id")
-                        conf_ok = item.get("user_confirmed") or item.get("confidence", 0) >= min_confidence
-                        if auto_create and item_account and conf_ok:
+                        if auto_create and item_account:
                             expense = _create_receipt_expense(
                                 pa["project_id"], parsed_data, receipt_data,
                                 vendor_id, item_account,
@@ -3680,27 +3662,19 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     pass
 
                 auto_create = agent_cfg.get("auto_create_expense", True)
-                min_confidence = int(agent_cfg.get("min_confidence", 70))
                 cat = parsed_data.get("categorization", {})
-                final_confidence = cat.get("confidence", 0)
                 vendor_id = parsed_data.get("vendor_id")
 
-                # Check if any items were user-confirmed (bypasses top-level confidence gate)
+                # Human clicked "Only this project" -- skip confidence gate entirely
                 line_items = parsed_data.get("line_items", [])
-                has_user_confirmed = any(it.get("user_confirmed") for it in line_items)
-                should_create = auto_create and (final_confidence >= min_confidence or has_user_confirmed)
+                should_create = auto_create
 
                 created_expenses = []
 
                 if should_create and line_items:
-                    # Create one expense per line item
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
-                            continue
-                        # User-confirmed items bypass confidence gate
-                        item_confidence = item.get("confidence", 0)
-                        if not item.get("user_confirmed") and item_confidence < min_confidence:
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
