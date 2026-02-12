@@ -1185,16 +1185,117 @@ async def agent_process_receipt(receipt_id: str):
                 check_context = _extract_check_context_sync(user_message, proj_name)
                 print(f"[CheckFlow] Extracted context: {json.dumps(check_context, ensure_ascii=False)[:200]}")
 
+            # Auto-create entries from context
+            auto_entries = []
+            is_split_detected = False
+            initial_state = "awaiting_check_number"
+
+            if check_context:
+                workers_list = check_context.get("workers_list") or []
+                split_projects = check_context.get("split_projects") or []
+                project_decision = check_context.get("project_decision")
+                labor_type_hint = check_context.get("labor_type_hint")
+                check_number_hint = check_context.get("check_number_hint")
+
+                # Helper: resolve project name to project_id
+                def resolve_project(project_name: str) -> Optional[str]:
+                    if not project_name:
+                        return None
+                    try:
+                        # Try exact match first
+                        result = supabase.table("projects") \
+                            .select("project_id").eq("project_name", project_name).execute()
+                        if result.data:
+                            return result.data[0]["project_id"]
+
+                        # Try fuzzy match (ILIKE)
+                        result = supabase.table("projects") \
+                            .select("project_id, project_name") \
+                            .ilike("project_name", f"%{project_name}%") \
+                            .execute()
+                        if result.data:
+                            return result.data[0]["project_id"]
+                    except Exception as e:
+                        print(f"[CheckFlow] Project resolution error for '{project_name}': {e}")
+                    return None
+
+                # Auto-create entries from workers_list
+                if workers_list:
+                    print(f"[CheckFlow] Auto-creating {len(workers_list)} entries from workers_list")
+                    for idx, worker in enumerate(workers_list):
+                        description = worker.get("description", "")
+                        amount = worker.get("amount")
+                        worker_project = worker.get("project", "")
+
+                        # Resolve project
+                        entry_project_id = None
+                        if worker_project:
+                            entry_project_id = resolve_project(worker_project)
+
+                        # Fallback to origin project if no specific project
+                        if not entry_project_id:
+                            entry_project_id = project_id
+
+                        if description and amount:
+                            auto_entries.append({
+                                "index": idx,
+                                "description": description,
+                                "amount": amount,
+                                "project_id": entry_project_id,
+                                "account_id": None,
+                                "account_name": None,
+                                "confidence": None,
+                                "reasoning": None,
+                                "labor_type_suggestion": labor_type_hint,  # Save for categorization
+                            })
+
+                            # Detect split if worker has different project
+                            if entry_project_id != project_id:
+                                is_split_detected = True
+
+                # Auto-create entries from split_projects (when no workers_list)
+                elif split_projects and len(split_projects) > 1:
+                    print(f"[CheckFlow] Auto-creating {len(split_projects)} entries from split_projects")
+                    is_split_detected = True
+                    for idx, proj_name in enumerate(split_projects):
+                        entry_project_id = resolve_project(proj_name)
+                        if not entry_project_id:
+                            entry_project_id = project_id
+
+                        auto_entries.append({
+                            "index": idx,
+                            "description": labor_type_hint or "Labor",
+                            "amount": None,  # User will need to fill
+                            "project_id": entry_project_id,
+                            "account_id": None,
+                            "account_name": None,
+                            "confidence": None,
+                            "reasoning": None,
+                            "labor_type_suggestion": labor_type_hint,
+                        })
+
+                # Determine initial state based on context
+                if check_number_hint:
+                    if auto_entries:
+                        # We have check number AND entries -> skip to entry review
+                        initial_state = "awaiting_entry_confirmation"
+                    else:
+                        # We have check number but no entries -> ask split decision
+                        initial_state = "awaiting_split_decision"
+                else:
+                    # No check number -> start from beginning
+                    initial_state = "awaiting_check_number"
+
             check_flow = {
-                "state": "awaiting_check_number",
+                "state": initial_state,
                 "detected_at": datetime.utcnow().isoformat(),
                 "check_type": "labor",
                 "channel_id": payroll_channel_id,
                 "origin_project_id": project_id,
-                "check_number": None,
-                "is_split": None,
-                "entries": [],
-                "date": None,
+                "check_number": check_context.get("check_number_hint"),
+                "is_split": is_split_detected if is_split_detected else None,
+                "entries": auto_entries,
+                "date": check_context.get("date_hint"),
                 "context": check_context,  # Store extracted context
             }
 
@@ -1217,11 +1318,40 @@ async def agent_process_receipt(receipt_id: str):
             file_url = receipt_data.get("file_url", "")
             file_link = f"[{file_name}]({file_url})" if file_url else file_name
 
+            # Check if we can auto-resolve check number from context
+            check_number_hint = check_context.get("check_number_hint")
+            context_summary = []
+
+            if check_number_hint:
+                check_flow["check_number"] = check_number_hint
+                check_flow["state"] = "awaiting_split_decision"
+                context_summary.append(f"Check #{check_number_hint}")
+                print(f"[CheckFlow] Auto-resolved check number from context: {check_number_hint}")
+
+            if check_context.get("labor_type_hint"):
+                context_summary.append(f"Labor: {check_context['labor_type_hint']}")
+
+            if check_context.get("project_decision") == "all_this_project":
+                context_summary.append(f"All for {proj_name}")
+            elif check_context.get("split_projects"):
+                projects = check_context["split_projects"]
+                if len(projects) > 1:
+                    context_summary.append(f"Split: {len(projects)} projects")
+
+            context_note = " (" + ", ".join(context_summary) + ")" if context_summary else ""
+
+            # Save check_flow to database
+            supabase.table("pending_receipts").update({
+                "status": "check_review",
+                "parsed_data": {"check_flow": check_flow},
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", receipt_id).execute()
+
             if payroll_channel_id:
                 # Redirect message in receipts channel
                 post_andrew_message(
                     content=(
-                        f"Labor check detected: {file_link}. Continuing in **Payroll**.\n\n"
+                        f"Labor check detected{context_note}: {file_link}. Continuing in **Payroll**.\n\n"
                         f"[Go to Payroll](/messages.html?channel={payroll_channel_id}&type=group)"
                     ),
                     project_id=project_id,
@@ -1234,46 +1364,128 @@ async def agent_process_receipt(receipt_id: str):
                         "payroll_channel_id": payroll_channel_id,
                     }
                 )
-                # Ask check number in Payroll
-                post_andrew_message(
-                    content=(
-                        f"Labor check from project **{proj_name}**: {file_link}\n\n"
-                        "What is the **check number**?"
-                    ),
-                    channel_id=payroll_channel_id,
-                    channel_type="group",
-                    metadata={
-                        "agent_message": True,
-                        "pending_receipt_id": receipt_id,
-                        "receipt_status": "check_review",
-                        "check_flow_state": "awaiting_check_number",
-                        "check_flow_active": True,
-                        "awaiting_text_input": True,
-                        "origin_project_id": project_id,
-                    }
-                )
+
+                # Ask check number, split decision, or show entry confirmation based on context
+                if initial_state == "awaiting_entry_confirmation":
+                    # We have check number AND entries -> show summary for confirmation
+                    entries_summary = "\n".join([
+                        f"- {e['description']}: ${e['amount']:,.2f}" if e.get('amount') else f"- {e['description']}: (amount needed)"
+                        for e in auto_entries
+                    ])
+                    post_andrew_message(
+                        content=(
+                            f"Labor check #{check_number_hint} from **{proj_name}**: {file_link}\n\n"
+                            f"I detected the following entries from your message:\n{entries_summary}\n\n"
+                            "Reply **'confirm'** to proceed with categorization or **'edit'** to modify."
+                        ),
+                        channel_id=payroll_channel_id,
+                        channel_type="group",
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "check_review",
+                            "check_flow_state": "awaiting_entry_confirmation",
+                            "check_flow_active": True,
+                            "awaiting_text_input": True,
+                            "origin_project_id": project_id,
+                        }
+                    )
+                elif check_number_hint:
+                    # Skip to split decision
+                    post_andrew_message(
+                        content=(
+                            f"Labor check #{check_number_hint} from project **{proj_name}**: {file_link}\n\n"
+                            f"Is this check for multiple projects or all for **{proj_name}**?"
+                        ),
+                        channel_id=payroll_channel_id,
+                        channel_type="group",
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "check_review",
+                            "check_flow_state": "awaiting_split_decision",
+                            "check_flow_active": True,
+                            "origin_project_id": project_id,
+                        }
+                    )
+                else:
+                    # Ask check number
+                    post_andrew_message(
+                        content=(
+                            f"Labor check from project **{proj_name}**: {file_link}\n\n"
+                            "What is the **check number**?"
+                        ),
+                        channel_id=payroll_channel_id,
+                        channel_type="group",
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "check_review",
+                            "check_flow_state": "awaiting_check_number",
+                            "check_flow_active": True,
+                            "awaiting_text_input": True,
+                            "origin_project_id": project_id,
+                        }
+                    )
             else:
                 # No Payroll channel -- continue in receipts
-                post_andrew_message(
-                    content=(
-                        f"Labor check detected: {file_link}\n\n"
-                        "What is the **check number**?"
-                    ),
-                    project_id=project_id,
-                    metadata={
-                        "agent_message": True,
-                        "pending_receipt_id": receipt_id,
-                        "receipt_status": "check_review",
-                        "check_flow_state": "awaiting_check_number",
-                        "check_flow_active": True,
-                        "awaiting_text_input": True,
-                    }
-                )
+                if initial_state == "awaiting_entry_confirmation":
+                    entries_summary = "\n".join([
+                        f"- {e['description']}: ${e['amount']:,.2f}" if e.get('amount') else f"- {e['description']}: (amount needed)"
+                        for e in auto_entries
+                    ])
+                    post_andrew_message(
+                        content=(
+                            f"Labor check #{check_number_hint} detected{context_note}: {file_link}\n\n"
+                            f"I detected the following entries:\n{entries_summary}\n\n"
+                            "Reply **'confirm'** to proceed or **'edit'** to modify."
+                        ),
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "check_review",
+                            "check_flow_state": "awaiting_entry_confirmation",
+                            "check_flow_active": True,
+                            "awaiting_text_input": True,
+                        }
+                    )
+                elif check_number_hint:
+                    post_andrew_message(
+                        content=(
+                            f"Labor check #{check_number_hint} detected{context_note}: {file_link}\n\n"
+                            f"Is this check for multiple projects or all for **{proj_name}**?"
+                        ),
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "check_review",
+                            "check_flow_state": "awaiting_split_decision",
+                            "check_flow_active": True,
+                        }
+                    )
+                else:
+                    post_andrew_message(
+                        content=(
+                            f"Labor check detected: {file_link}\n\n"
+                            "What is the **check number**?"
+                        ),
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "check_review",
+                            "check_flow_state": "awaiting_check_number",
+                            "check_flow_active": True,
+                            "awaiting_text_input": True,
+                        }
+                    )
 
             return {
                 "success": True,
                 "status": "check_review",
-                "message": "Labor check auto-detected, routed to Payroll",
+                "message": f"Labor check auto-detected{context_note}, routed to Payroll",
             }
 
         # ===== STEP 3: OCR Extraction (Shared Service) =====
@@ -2433,6 +2645,242 @@ def _handle_awaiting_check_number(receipt_id, project_id, check_flow, parsed_dat
     return {"success": True, "state": "awaiting_split_decision"}
 
 
+def _categorize_and_finish_check_flow(receipt_id, project_id, check_flow, parsed_data):
+    """Categorize check entries and transition to review/confirm state."""
+    # Get construction stage from origin project
+    stage_project_id = check_flow.get("origin_project_id", project_id)
+    construction_stage = "General Construction"
+    try:
+        proj = supabase.table("projects").select("project_stage").eq("project_id", stage_project_id).single().execute()
+        if proj.data and proj.data.get("project_stage"):
+            construction_stage = proj.data["project_stage"]
+    except Exception:
+        pass
+
+    # Categorize entries
+    entries = check_flow.get("entries", [])
+    categorization_result = _categorize_check_items(
+        entries,
+        construction_stage,
+        project_id=stage_project_id,
+        check_id=receipt_id
+    )
+    categorized = categorization_result["items"]
+    cat_metrics = categorization_result["metrics"]
+    check_flow["entries"] = categorized
+
+    # Check confidence vs min_confidence
+    agent_cfg = {}
+    try:
+        cfg_result = supabase.table("agent_config").select("key, value").execute()
+        for row in (cfg_result.data or []):
+            agent_cfg[row["key"]] = row["value"]
+    except Exception:
+        pass
+    min_confidence = int(agent_cfg.get("min_confidence", 70))
+
+    low_confidence = []
+    for i, entry in enumerate(categorized):
+        cat = entry.get("categorization", {})
+        conf = cat.get("confidence", 0)
+        if conf < min_confidence or not cat.get("account_id"):
+            low_confidence.append({
+                "index": i,
+                "description": entry.get("description", ""),
+                "suggested": cat.get("account_name"),
+                "confidence": conf,
+            })
+
+    # Build summary with cache performance info
+    perf_note = ""
+    if cat_metrics.get("cache_hits", 0) > 0:
+        perf_note = f" ⚡ {cat_metrics['cache_hits']}/{cat_metrics['total_items']} from cache"
+
+    lines = []
+    for i, entry in enumerate(categorized, 1):
+        cat = entry.get("categorization", {})
+        cat_name = cat.get("account_name", "Uncategorized")
+        cat_conf = cat.get("confidence", 0)
+        method = cat.get("method", "")
+        if method == "cache_hit":
+            method_label = "(cached)"
+        elif method == "fuzzy_match":
+            method_label = "(fuzzy)"
+        else:
+            method_label = "(AI)"
+        line = f"{i}. ${entry['amount']:,.2f} -- {entry.get('description', '')} -- **{cat_name}** ({cat_conf}%) {method_label}"
+        v_name = entry.get("vendor_name")
+        if v_name and v_name != "Unknown":
+            line += f" -- {v_name}"
+        p_name = entry.get("project_name")
+        if p_name and p_name != "This project":
+            line += f" -- {p_name}"
+        lines.append(line)
+
+    summary = "\n".join(lines)
+
+    if low_confidence:
+        mentions = _get_bookkeeping_mentions()
+        check_flow["state"] = "awaiting_category_review"
+        check_flow["low_confidence"] = low_confidence
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        low_items = ", ".join(f"#{lc['index']+1}" for lc in low_confidence)
+        post_andrew_message(
+            content=(
+                f"Check #{check_flow.get('check_number', '?')} categorization:{perf_note}\n\n"
+                f"{summary}\n\n"
+                f"Items {low_items} have low confidence (below {min_confidence}%).\n"
+                f"{mentions} Can you verify or correct?\n\n"
+                "Type the item number and correct account, e.g.:\n"
+                "**1 Drywall Subcontract Labor**\n\n"
+                "Or type **confirm** to accept as-is."
+            ),
+            **_check_flow_msg_kwargs(project_id, check_flow),
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_category_review",
+                "check_flow_active": True,
+                "awaiting_text_input": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_category_review"}
+    else:
+        check_flow["state"] = "awaiting_category_confirm"
+        _update_check_flow(receipt_id, check_flow, parsed_data)
+
+        post_andrew_message(
+            content=(
+                f"Check #{check_flow.get('check_number', '?')} summary:{perf_note}\n\n"
+                f"{summary}\n\n"
+                f"Date: {check_flow['date']}\n\n"
+                "Does everything look right?"
+            ),
+            **_check_flow_msg_kwargs(project_id, check_flow),
+            metadata={
+                "agent_message": True,
+                "pending_receipt_id": receipt_id,
+                "receipt_status": "check_review",
+                "check_flow_state": "awaiting_category_confirm",
+                "check_flow_active": True,
+            }
+        )
+        return {"success": True, "state": "awaiting_category_confirm"}
+
+
+def _handle_awaiting_entry_confirmation(receipt_id, project_id, check_flow, parsed_data, action, payload):
+    """Handle confirmation or edit of auto-created entries."""
+    if action == "submit_entry_confirmation":
+        text = (payload or {}).get("text", "").strip().lower()
+
+        if text in ["confirm", "yes", "ok", "confirmar", "si"]:
+            # User confirmed - proceed to categorization
+            entries = check_flow.get("entries", [])
+
+            # Check if all entries have amounts
+            missing_amounts = [e for e in entries if not e.get("amount")]
+            if missing_amounts:
+                # Ask for missing amounts
+                check_flow["state"] = "awaiting_split_entries"
+                _update_check_flow(receipt_id, check_flow, parsed_data)
+
+                post_andrew_message(
+                    content=(
+                        "Some entries are missing amounts. Please provide them:\n\n"
+                        "Send each entry as: **[amount] [description] for [project]**\n\n"
+                        "Type **done** when finished."
+                    ),
+                    **_check_flow_msg_kwargs(project_id, check_flow),
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "check_review",
+                        "check_flow_state": "awaiting_split_entries",
+                        "check_flow_active": True,
+                        "awaiting_text_input": True,
+                    }
+                )
+                return {"success": True, "state": "awaiting_split_entries"}
+
+            # All entries have amounts - check if we have date
+            if not check_flow.get("date"):
+                # Ask for date before categorization
+                check_flow["state"] = "awaiting_date_confirm"
+                _update_check_flow(receipt_id, check_flow, parsed_data)
+
+                date_hint = check_flow.get("context", {}).get("date_hint", "")
+                date_msg = f"Date hint from message: **{date_hint}**\n\n" if date_hint else ""
+
+                post_andrew_message(
+                    content=(
+                        f"{date_msg}When was this check dated? (MM/DD/YYYY format)\n\n"
+                        "Or type **today** to use today's date."
+                    ),
+                    **_check_flow_msg_kwargs(project_id, check_flow),
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "check_review",
+                        "check_flow_state": "awaiting_date_confirm",
+                        "check_flow_active": True,
+                        "awaiting_text_input": True,
+                    }
+                )
+                return {"success": True, "state": "awaiting_date_confirm"}
+
+            # All entries have amounts and date - proceed to categorization
+            check_flow["state"] = "categorizing"
+            _update_check_flow(receipt_id, check_flow, parsed_data)
+
+            # Trigger categorization (same logic as finish_split)
+            return _categorize_and_finish_check_flow(receipt_id, project_id, check_flow, parsed_data)
+
+        elif text in ["edit", "modify", "change", "editar", "modificar"]:
+            # User wants to edit - switch to manual split entry mode
+            check_flow["state"] = "awaiting_split_entries"
+            check_flow["entries"] = []  # Clear auto-entries
+            _update_check_flow(receipt_id, check_flow, parsed_data)
+
+            post_andrew_message(
+                content=(
+                    "Send each entry as:\n"
+                    "**[amount] [description] by [vendor] for [project]**\n\n"
+                    "Example: *500 drywall labor by Smith Plumbing for Oak Park*\n\n"
+                    "Type **done** when finished."
+                ),
+                **_check_flow_msg_kwargs(project_id, check_flow),
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "check_review",
+                    "check_flow_state": "awaiting_split_entries",
+                    "check_flow_active": True,
+                    "awaiting_text_input": True,
+                }
+            )
+            return {"success": True, "state": "awaiting_split_entries"}
+
+        else:
+            # Unknown response
+            post_andrew_message(
+                content="Reply **'confirm'** to proceed or **'edit'** to modify the entries.",
+                **_check_flow_msg_kwargs(project_id, check_flow),
+                metadata={
+                    "agent_message": True,
+                    "pending_receipt_id": receipt_id,
+                    "receipt_status": "check_review",
+                    "check_flow_state": "awaiting_entry_confirmation",
+                    "check_flow_active": True,
+                    "awaiting_text_input": True,
+                }
+            )
+            return {"success": True, "state": "awaiting_entry_confirmation", "error": "unknown_response"}
+
+    raise HTTPException(status_code=400, detail=f"Invalid action '{action}' for state 'awaiting_entry_confirmation'")
+
+
 def _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, action):
     """Handle split yes/no decision."""
     if action == "split_no":
@@ -3092,6 +3540,8 @@ async def check_action(receipt_id: str, payload: CheckActionRequest):
 
         if current_state == "awaiting_check_number":
             return _handle_awaiting_check_number(receipt_id, project_id, check_flow, parsed_data, action, payload.payload)
+        elif current_state == "awaiting_entry_confirmation":
+            return _handle_awaiting_entry_confirmation(receipt_id, project_id, check_flow, parsed_data, action, payload.payload)
         elif current_state == "awaiting_split_decision":
             return _handle_split_decision(receipt_id, project_id, check_flow, parsed_data, action)
         elif current_state == "awaiting_vendor_info":
