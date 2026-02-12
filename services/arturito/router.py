@@ -20,6 +20,12 @@ from .handlers import (
     handle_create_vendor,
     handle_create_project,
     handle_search_expenses,
+    handle_vault_search,
+    handle_vault_list,
+    handle_vault_create_folder,
+    handle_vault_delete,
+    handle_vault_organize,
+    handle_vault_upload,
 )
 from .permissions import is_action_permitted, get_permission_denial_message, check_role_permission
 from .persona import set_personality_level, get_identity_response
@@ -147,6 +153,50 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "required_entities": [],  # At least one of: amount, vendor, category, project
         "optional_entities": ["amount", "vendor", "category", "project"],
         "description": "Busca gastos por monto, vendor, categoría o proyecto",
+    },
+
+    # ---- Vault (Data Vault file storage) ----
+
+    "VAULT_SEARCH": {
+        "handler": handle_vault_search,
+        "required_entities": [],
+        "optional_entities": ["query", "file_name", "file_type", "project"],
+        "description": "Search files in the vault by name, type, or project",
+    },
+
+    "VAULT_LIST": {
+        "handler": handle_vault_list,
+        "required_entities": [],
+        "optional_entities": ["folder"],
+        "description": "List files and folders in the vault",
+    },
+
+    "VAULT_CREATE_FOLDER": {
+        "handler": handle_vault_create_folder,
+        "required_entities": ["folder_name"],
+        "optional_entities": [],
+        "description": "Create a new folder in the vault",
+    },
+
+    "VAULT_DELETE": {
+        "handler": handle_vault_delete,
+        "required_entities": [],
+        "optional_entities": ["file_name"],
+        "description": "Delete a file from the vault",
+    },
+
+    "VAULT_ORGANIZE": {
+        "handler": handle_vault_organize,
+        "required_entities": [],
+        "optional_entities": ["project_id"],
+        "description": "Auto-organize vault files by type into subfolders",
+    },
+
+    "VAULT_UPLOAD": {
+        "handler": handle_vault_upload,
+        "required_entities": [],
+        "optional_entities": [],
+        "description": "Upload files to the vault (redirects to UI)",
     },
 }
 

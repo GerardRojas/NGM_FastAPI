@@ -70,6 +70,10 @@ class ConceptMaterialAdd(BaseModel):
     sort_order: Optional[int] = 0
 
 
+class ConceptMaterialSync(BaseModel):
+    materials: List[ConceptMaterialAdd] = []
+
+
 class ConceptMaterialUpdate(BaseModel):
     quantity: Optional[float] = None
     unit_id: Optional[str] = None
@@ -426,6 +430,54 @@ async def delete_concept(concept_id: str):
 # ========================================
 # CONCEPT MATERIALS (materiales dentro de un concepto)
 # ========================================
+
+@router.put("/{concept_id}/materials/sync")
+async def sync_concept_materials(concept_id: str, payload: ConceptMaterialSync):
+    """
+    Reemplaza todos los materiales de un concepto atomicamente.
+    Borra los existentes e inserta los nuevos.
+    """
+    try:
+        concept = supabase.table("concepts").select("id").eq("id", concept_id).execute()
+        if not concept.data:
+            raise HTTPException(status_code=404, detail="Concept not found")
+
+        # Borrar todos los materiales existentes
+        supabase.table("concept_materials").delete().eq("concept_id", concept_id).execute()
+
+        # Insertar nuevos materiales
+        inserted = []
+        errors = []
+        for i, mat in enumerate(payload.materials):
+            try:
+                insert_data = {
+                    "concept_id": concept_id,
+                    "material_id": mat.material_id,
+                    "quantity": mat.quantity,
+                    "unit_id": mat.unit_id,
+                    "unit_cost_override": mat.unit_cost_override,
+                    "notes": mat.notes,
+                    "sort_order": mat.sort_order or i,
+                }
+                resp = supabase.table("concept_materials").insert(insert_data).execute()
+                if resp.data:
+                    inserted.append(resp.data[0])
+            except Exception as mat_err:
+                errors.append({"material_id": mat.material_id, "error": str(mat_err)})
+
+        # Recalcular costo
+        await recalculate_concept_cost(concept_id)
+
+        return {
+            "message": f"Synced {len(inserted)} materials" + (f" ({len(errors)} errors)" if errors else ""),
+            "inserted": len(inserted),
+            "errors": errors
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error syncing materials: {str(e)}")
+
 
 @router.get("/{concept_id}/materials")
 async def get_concept_materials(concept_id: str):

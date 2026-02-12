@@ -69,8 +69,15 @@ from api.routers.adu_calculator import router as adu_calculator_router
 from api.routers.daneel_auto_auth import router as daneel_auto_auth_router
 from api.routers.andrew_mismatch import router as andrew_mismatch_router
 
+# ========= VAULT: File Storage Module ==========
+from api.routers.vault import router as vault_router
+
 # ========= OCR METRICS: Extraction method tracking ==========
 from api.routers.ocr_metrics import router as ocr_metrics_router
+
+# ========= REVIT: BIM as Code definitions & manifests ==========
+from api.routers.revit import router as revit_router
+from api.routers.revit_ocr import router as revit_ocr_router
 
 
 # ========================================
@@ -189,8 +196,17 @@ app.include_router(daneel_auto_auth_router)
 # Andrew Mismatch Reconciliation (bill mismatch detection & correction)
 app.include_router(andrew_mismatch_router)
 
+# Vault (file storage with folders, versioning, chunked uploads)
+app.include_router(vault_router)
+
 # OCR Metrics (extraction method tracking across all agents)
 app.include_router(ocr_metrics_router)
+
+# Revit (BIM as Code - definitions, templates, manifests from submodule)
+app.include_router(revit_router)
+
+# Revit OCR (GPT-4o Vision floor plan analysis for Project Builder)
+app.include_router(revit_ocr_router)
 
 # ========================================
 # Root & Healthcheck

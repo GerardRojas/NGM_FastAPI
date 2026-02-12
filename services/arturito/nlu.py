@@ -33,6 +33,12 @@ VALID_INTENTS = [
     "CREATE_VENDOR",        # Crear nuevo vendor/proveedor
     "CREATE_PROJECT",       # Crear nuevo proyecto
     "SEARCH_EXPENSES",      # Buscar gastos por criterios
+    "VAULT_SEARCH",         # Search files in vault
+    "VAULT_LIST",           # List vault contents
+    "VAULT_CREATE_FOLDER",  # Create folder in vault
+    "VAULT_DELETE",         # Delete file from vault
+    "VAULT_ORGANIZE",       # Auto-organize vault by type
+    "VAULT_UPLOAD",         # Upload file to vault (redirect to UI)
     "UNKNOWN",              # No clasificado
 ]
 
@@ -339,6 +345,117 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
                 }
 
     # ================================
+    # Vault Commands
+    # ================================
+
+    # Upload to vault
+    vault_upload_patterns = [
+        r'(upload|subir?|sube)\s+.*(vault|bóveda|boveda|almacén|almacen)',
+        r'(upload|subir?)\s+.*(archivo|file|documento|document).*(vault|bóveda)',
+    ]
+    for pattern in vault_upload_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "VAULT_UPLOAD",
+                "entities": {},
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # Create folder in vault
+    vault_folder_patterns = [
+        r'(crear?|create|nueva?)\s+(una?\s+)?(carpeta|folder)\s+(llamada?\s+|called?\s+|named?\s+)?(.+)',
+        r'(new\s+folder|nueva\s+carpeta)\s+(.+)',
+    ]
+    for pattern in vault_folder_patterns:
+        match = re.search(pattern, t)
+        if match:
+            # Get folder name from last capture group
+            folder_name = match.group(match.lastindex).strip()
+            folder_name = re.sub(r'\s+(en|in|del?|para)\s+(el\s+)?(vault|bóveda).*$', '', folder_name, flags=re.IGNORECASE).strip()
+            folder_name = re.sub(r'\s+(por\s+favor|please|pls)$', '', folder_name, flags=re.IGNORECASE).strip()
+            if folder_name:
+                return {
+                    "intent": "VAULT_CREATE_FOLDER",
+                    "entities": {"folder_name": folder_name},
+                    "confidence": 0.95,
+                    "source": "local"
+                }
+
+    # Search/find files in vault
+    vault_search_patterns = [
+        r'(busca|buscar|find|search|encuentra|encontrar)\s+.*(archivo|file|revit|pdf|imagen|image|documento|document).*(vault|bóveda|boveda)?',
+        r'(busca|buscar|find|search)\s+.*(en|in)\s+(el\s+)?(vault|bóveda)',
+        r'(find|busca)\s+(all\s+|todos?\s+(los?\s+)?)?(revit|pdf|ngm|image)\s+(files?|archivos?)',
+        r'(show|muestra|dame)\s+.*(files?|archivos?)\s+.*(vault|bóveda)',
+    ]
+    for pattern in vault_search_patterns:
+        match = re.search(pattern, t)
+        if match:
+            entities = {}
+            # Try to extract file type
+            type_match = re.search(r'\b(revit|pdf|image|imagen|spreadsheet|hoja|ngm|rvt)\b', t)
+            if type_match:
+                entities["file_type"] = type_match.group(1)
+            # Try to extract search query
+            name_match = re.search(r'(?:called|llamado|named|nombre)\s+["\']?(.+?)["\']?\s*$', t)
+            if name_match:
+                entities["query"] = name_match.group(1).strip()
+            return {
+                "intent": "VAULT_SEARCH",
+                "entities": entities,
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # List vault contents
+    vault_list_patterns = [
+        r'(lista|listar?|mostrar?|muestra|show|ver|dame)\s+(los?\s+)?(archivos?|files?|contenido|contents?)\s+(del?\s+)?(vault|bóveda)',
+        r'(qué|que|what)\s+(hay|tenemos|archivos?|files?)\s+(en|in)\s+(el\s+)?(vault|bóveda)',
+        r'^(vault|bóveda)\s+(archivos?|files?|contenido|list)$',
+    ]
+    for pattern in vault_list_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "VAULT_LIST",
+                "entities": {},
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # Delete file from vault
+    vault_delete_patterns = [
+        r'(borrar?|eliminar?|delete|remove|quitar?)\s+.*(archivo|file|documento).*(vault|bóveda)?',
+        r'(borrar?|eliminar?|delete|remove)\s+["\']?(.+?)["\']?\s+(del?\s+)?(vault|bóveda)',
+    ]
+    for pattern in vault_delete_patterns:
+        match = re.search(pattern, t)
+        if match:
+            # Try to extract file name
+            name_match = re.search(r'(?:archivo|file|documento)\s+["\']?(.+?)["\']?\s*(?:del?|from|$)', t)
+            file_name = name_match.group(1).strip() if name_match else ""
+            return {
+                "intent": "VAULT_DELETE",
+                "entities": {"file_name": file_name},
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # Organize vault
+    vault_organize_patterns = [
+        r'(organizar?|organize|ordenar?|sort)\s+(el\s+)?(vault|bóveda|boveda|archivos?|files?)',
+        r'(auto[- ]?organiz)',
+    ]
+    for pattern in vault_organize_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "VAULT_ORGANIZE",
+                "entities": {},
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # ================================
     # Search Expenses
     # ================================
 
@@ -485,6 +602,7 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
         (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(equipo|team)', 'navigate_team'),
         (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(presupuestos|budgets)', 'navigate_budgets'),
         (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+)?(reportes|reports|reporting)', 'navigate_reporting'),
+        (r'(llevar?me|ir|abrir?|navegar?)\s+(a\s+|al\s+)?(vault|bóveda|data\s+vault)', 'navigate_vault'),
         # Pipeline actions
         (r'(crear?|agregar?|nuevo?)\s+(una?\s+)?(tarea|task)', 'open_add_task'),
     ]
