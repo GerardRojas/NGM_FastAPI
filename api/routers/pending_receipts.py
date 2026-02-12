@@ -3790,6 +3790,9 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 print(f"[ReceiptFlow] Category confirmation: user accepted all suggestions ({len(low_items)} items bumped to 100%)")
             elif assignments and isinstance(assignments, list):
                 # Structured assignment from interactive account picker (no fuzzy matching needed)
+                print(f"[DEBUG assignments] Received {len(assignments)} assignments from picker")
+                for a in assignments:
+                    print(f"  index={a.get('index')}, account_id={a.get('account_id')}, account_name={a.get('account_name')}")
 
                 # Fetch construction_stage for feedback loop
                 construction_stage = "General"
@@ -3966,6 +3969,12 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 # User context already answered the project question -- skip to confirmation
                 receipt_flow["state"] = "awaiting_user_confirm"
                 parsed_data["receipt_flow"] = receipt_flow
+
+                # DEBUG: Log line_items before saving to DB
+                print(f"[DEBUG pre_resolved] Saving to DB - {len(line_items)} line_items:")
+                for idx, item in enumerate(line_items):
+                    print(f"  [{idx}] account_id={item.get('account_id')}, name={item.get('account_name')}, desc={item.get('description', '')[:30]}")
+
                 supabase.table("pending_receipts").update({
                     "parsed_data": parsed_data,
                     "updated_at": datetime.utcnow().isoformat()
@@ -4149,6 +4158,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
             pre_resolved = receipt_flow.get("pre_resolved", {})
             line_items = parsed_data.get("line_items", [])
 
+            print(f"[DEBUG awaiting_user_confirm] action={action}, num_line_items={len(line_items)}")
+            for idx, item in enumerate(line_items):
+                print(f"[DEBUG line_item {idx}] account_id={item.get('account_id')}, account_name={item.get('account_name')}, desc={item.get('description', '')[:30]}")
+
             if action == "confirm":
                 # Create expenses based on pre-resolved decisions
                 # Human clicked Confirm -- no confidence gate needed
@@ -4157,11 +4170,14 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 vendor_id = parsed_data.get("vendor_id")
                 created_expenses = []
 
+                print(f"[DEBUG confirm] decision={decision}, cat_account_id={cat.get('account_id')}")
+
                 if decision == "all_this_project":
                     # Human clicked Confirm -- no confidence gate needed
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
+                            print(f"[DEBUG SKIP] Item has no account_id: {item.get('description', '')[:40]}")
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -5210,14 +5226,28 @@ def get_agent_config():
 def update_agent_config(payload: dict):
     """Update agent configuration (key-value pairs)."""
     try:
+        now = datetime.utcnow().isoformat()
         for key, value in payload.items():
-            supabase.table("agent_config") \
-                .upsert({
-                    "key": key,
-                    "value": json.dumps(value) if not isinstance(value, str) else value,
-                    "updated_at": datetime.utcnow().isoformat()
-                }) \
+            json_val = json.dumps(value) if not isinstance(value, str) else value
+
+            # Check if key exists (SELECT+UPDATE/INSERT pattern to avoid upsert issues)
+            existing = supabase.table("agent_config") \
+                .select("key") \
+                .eq("key", key) \
                 .execute()
+
+            if existing.data:
+                # Update existing
+                supabase.table("agent_config") \
+                    .update({"value": json_val, "updated_at": now}) \
+                    .eq("key", key) \
+                    .execute()
+            else:
+                # Insert new
+                supabase.table("agent_config") \
+                    .insert({"key": key, "value": json_val, "updated_at": now}) \
+                    .execute()
+
         return {"ok": True}
     except Exception as e:
         logger.error(f"[agent-config] Error updating agent config: {e}", exc_info=True)
