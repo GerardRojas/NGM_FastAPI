@@ -1754,7 +1754,7 @@ async def agent_process_receipt(receipt_id: str):
                 agent_cfg[row["key"]] = row["value"]
         except Exception:
             pass
-        min_confidence = int(agent_cfg.get("min_confidence", 70))
+        min_confidence = int(agent_cfg.get("min_confidence", 75))
 
         low_confidence_items = []
         for i, item in enumerate(line_items):
@@ -1878,9 +1878,8 @@ async def agent_process_receipt(receipt_id: str):
                     cat_lines.append(f"{idx}. '{desc}' -- no match found")
             cat_list = "\n".join(cat_lines)
             msg_content += (
-                f"\n\nI'm not sure about the category for these items:\n{cat_list}\n\n"
-                "Type the correct account for each, e.g.: `1 Materials, 2 Delivery`\n"
-                "Or reply **all correct** to accept the suggestions."
+                f"\n\nI need your help with these items:\n{cat_list}\n\n"
+                "Please review and confirm the suggested accounts, or select different ones from the dropdowns below."
             )
 
         # Store smart analysis in parsed_data for later use
@@ -3894,6 +3893,17 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
             if any(it.get("user_confirmed") for it in line_items):
                 cat_obj["confidence"] = 100
                 parsed_data["categorization"] = cat_obj
+
+            # CRITICAL FIX: Ensure ALL items have account_id before proceeding
+            # If user manually confirmed categories, we should use those for items without explicit assignment
+            top_level_account = cat_obj.get("account_id")
+            for item in line_items:
+                if not item.get("account_id") and top_level_account:
+                    # Apply top-level category to items that weren't explicitly assigned
+                    item["account_id"] = top_level_account
+                    item["account_name"] = cat_obj.get("account_name")
+                    item["confidence"] = 100  # User reviewed this receipt, so treat as confirmed
+                    print(f"[ReceiptFlow] Applied top-level category to item: {item.get('description', '')[:50]}")
 
             # Check if user context already resolved the project question
             pre_resolved = receipt_flow.get("pre_resolved", {})
