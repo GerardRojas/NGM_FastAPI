@@ -29,6 +29,7 @@ from api.services.vault_service import (
     get_download_url,
     search_files,
     detect_duplicates,
+    check_receipt_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -371,6 +372,22 @@ async def api_search_files(
         return results
     except Exception as e:
         logger.error("[Vault] Search error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/receipt-status")
+async def api_receipt_status(
+    hashes: str = Query(..., description="Comma-separated file hashes"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Check which file hashes correspond to processed receipts."""
+    try:
+        hash_list = [h.strip() for h in hashes.split(",") if h.strip()]
+        if not hash_list:
+            return {}
+        return check_receipt_status(hash_list)
+    except Exception as e:
+        logger.error("[Vault] Receipt status error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

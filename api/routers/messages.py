@@ -20,6 +20,7 @@ from uuid import UUID
 from api.supabase_client import supabase
 from api.auth import get_current_user
 from api.services.firebase_notifications import notify_mentioned_users, notify_message_recipients
+from api.services.agent_personas import is_bot_user, AGENT_PERSONAS
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
@@ -282,6 +283,89 @@ def _run_message_notifications(content, sender_user_id, sender_name,
         print(f"[Messages] Message notification error: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Agent Brain: @mention detection and dispatch
+# ---------------------------------------------------------------------------
+
+# Regex: matches @Andrew or @Daneel (case-insensitive)
+_AGENT_MENTION_RE = re.compile(
+    r"@(" + "|".join(p["name"] for p in AGENT_PERSONAS.values()) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_agent_mentions(
+    background_tasks: BackgroundTasks,
+    content: str,
+    user_id: str,
+    user_name: str,
+    project_id: str | None,
+    channel_type: str,
+    channel_id: str | None,
+    attachments: list | None = None,
+) -> None:
+    """
+    Scan message content for @Andrew/@Daneel mentions.
+    Launches a brain BackgroundTask for each mentioned agent.
+    """
+    matches = _AGENT_MENTION_RE.findall(content)
+    if not matches:
+        return
+
+    # Deduplicate (case-insensitive)
+    seen = set()
+    for name in matches:
+        agent_key = name.lower()
+        if agent_key in seen:
+            continue
+        seen.add(agent_key)
+
+        print(f"[Messages] Agent mention detected: @{name} by user {user_name}")
+        background_tasks.add_task(
+            _run_agent_brain,
+            agent_key,
+            content,
+            user_id,
+            user_name,
+            project_id,
+            channel_type,
+            channel_id,
+            attachments,
+        )
+
+
+def _run_agent_brain(
+    agent_name: str,
+    user_text: str,
+    user_id: str,
+    user_name: str,
+    project_id: str | None,
+    channel_type: str,
+    channel_id: str | None,
+    attachments: list | None = None,
+) -> None:
+    """Sync wrapper to run the async agent brain from a BackgroundTask."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from api.services.agent_brain import invoke_brain
+            loop.run_until_complete(invoke_brain(
+                agent_name=agent_name,
+                user_text=user_text,
+                user_id=user_id,
+                user_name=user_name,
+                project_id=project_id,
+                channel_type=channel_type,
+                channel_id=channel_id,
+                attachments=attachments,
+            ))
+        finally:
+            loop.close()
+    except Exception as e:
+        print(f"[Messages] Agent brain error ({agent_name}): {e}")
+
+
 async def send_message_notifications(
     content: str,
     sender_user_id: str,
@@ -490,6 +574,22 @@ def create_message(
             )
         except Exception as bg_err:
             print(f"[Messages] Background task setup error (non-blocking): {bg_err}")
+
+        # --- Agent Brain: detect @Andrew / @Daneel mentions ---
+        try:
+            if not is_bot_user(user_id):
+                _detect_agent_mentions(
+                    background_tasks,
+                    payload.content,
+                    user_id,
+                    sender_name,
+                    payload.project_id,
+                    payload.channel_type,
+                    payload.channel_id,
+                    payload.attachments,
+                )
+        except Exception as brain_err:
+            print(f"[Messages] Agent brain setup error (non-blocking): {brain_err}")
 
         return {"message": response}
 

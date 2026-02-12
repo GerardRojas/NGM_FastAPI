@@ -12,6 +12,7 @@ import re
 
 from openai import OpenAI
 from api.supabase_client import supabase
+from api.services.vault_service import save_to_project_folder
 
 # Para generación de PDF
 try:
@@ -124,7 +125,7 @@ def handle_budget_vs_actuals(
                 }
             }
 
-        pdf_url = generate_and_upload_pdf(project_name, report_data)
+        pdf_url = generate_and_upload_pdf(project_name, report_data, project_id=project_id)
 
         if not pdf_url:
             # Fallback si falla el PDF
@@ -287,7 +288,7 @@ def _gpt_fuzzy_match(query: str, candidates: List[str]) -> Optional[str]:
         client = OpenAI(api_key=api_key, timeout=10.0)
         candidates_str = "\n".join(f"- {c}" for c in candidates[:40])
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-nano",
             messages=[
                 {"role": "system", "content": (
                     "You are a fuzzy-matching helper. The user typed a name that may contain "
@@ -350,7 +351,7 @@ def _gpt_ask_missing_entity(
         client = OpenAI(api_key=api_key, timeout=8.0)
 
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": (
                     f"{persona}\n\n"
@@ -508,10 +509,10 @@ def process_report_data(
     }
 
 
-def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any]) -> Optional[str]:
+def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any], project_id: str = None) -> Optional[str]:
     """
-    Genera el PDF del reporte BVA y lo sube a Supabase Storage.
-    Retorna la URL pública del archivo.
+    Genera el PDF del reporte BVA y lo sube al Vault del proyecto.
+    Retorna la URL publica del archivo.
     """
     try:
         # Generar PDF en memoria
@@ -524,10 +525,16 @@ def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any]) -> O
         safe_project_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in project_name)
         filename = f"{safe_project_name}_BVA_{timestamp}.pdf"
 
-        # Subir a Supabase Storage
-        pdf_url = upload_to_storage(pdf_buffer.getvalue(), filename)
+        pdf_bytes = pdf_buffer.getvalue()
 
-        return pdf_url
+        # Upload to Vault (primary storage)
+        if project_id:
+            vault_result = save_to_project_folder(project_id, "Reports", pdf_bytes, filename, "application/pdf")
+            if vault_result and vault_result.get("public_url"):
+                return vault_result["public_url"]
+
+        # Fallback: upload to legacy bucket if no project_id
+        return upload_to_storage(pdf_bytes, filename)
 
     except Exception as e:
         print(f"[BVA] Error generating/uploading PDF: {e}")

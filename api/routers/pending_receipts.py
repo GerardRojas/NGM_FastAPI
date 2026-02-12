@@ -75,6 +75,7 @@ from services.receipt_scanner import (
     scan_receipt as _scan_receipt_core,
     auto_categorize as _auto_categorize_core,
 )
+from api.services.vault_service import save_to_project_folder
 
 router = APIRouter(prefix="/pending-receipts", tags=["Pending Receipts"])
 
@@ -204,32 +205,16 @@ async def upload_receipt(
         # Generate unique ID for this receipt
         receipt_id = str(uuid.uuid4())
 
-        # Ensure bucket exists
-        ensure_bucket_exists()
+        # Upload to Vault (primary storage)
+        vault_result = save_to_project_folder(project_id, "Receipts", file_content, file.filename, file.content_type)
+        if not vault_result or not vault_result.get("public_url"):
+            raise HTTPException(status_code=500, detail="Failed to upload file to vault")
 
-        # Generate storage path
-        storage_path = generate_storage_path(project_id, receipt_id, file.filename)
-
-        # Upload to Supabase Storage
-        try:
-            supabase.storage.from_(RECEIPTS_BUCKET).upload(
-                path=storage_path,
-                file=file_content,
-                file_options={"content-type": file.content_type}
-            )
-        except Exception as upload_error:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to upload file: {str(upload_error)}"
-            )
-
-        # Get public URL
-        file_url = supabase.storage.from_(RECEIPTS_BUCKET).get_public_url(storage_path)
+        file_url = vault_result["public_url"]
 
         # Generate thumbnail URL for images (Supabase can transform images)
         thumbnail_url = None
         if file.content_type.startswith("image/"):
-            # Use Supabase image transformation for thumbnail
             thumbnail_url = f"{file_url}?width=200&height=200&resize=contain"
 
         # Create pending_receipt record
@@ -824,6 +809,205 @@ def _build_agent_message(parsed_data, categorize_data, warnings, lang="en", expe
             body += "\n\nExpense saved -- ready for authorization."
 
     return f"{header}\n{body}"
+
+
+# ====== USER CONTEXT APPLICATION ======
+
+def _apply_user_context(
+    user_context: dict,
+    line_items: list,
+    low_confidence_items: list,
+    project_id: str,
+    project_name: str,
+    parsed_data: dict,
+) -> dict:
+    """
+    Apply user-provided context hints to auto-resolve receipt flow steps.
+
+    Returns dict with resolution results:
+    - skip_categories: bool - all low-confidence items resolved by hints
+    - skip_project_question: bool - user already specified project decision
+    - pre_resolved: dict - pre-computed decisions for awaiting_user_confirm state
+    - start_state: str - the receipt_flow state to start at
+    """
+    result = {
+        "skip_categories": False,
+        "skip_project_question": False,
+        "pre_resolved": {},
+        "start_state": None,
+        "resolved_items": [],
+    }
+
+    if not user_context:
+        return result
+
+    project_decision = user_context.get("project_decision")
+    split_projects = user_context.get("split_projects") or []
+    category_hints = user_context.get("category_hints") or []
+
+    # --- 1. Category resolution via hints ---
+    if category_hints and low_confidence_items:
+        # Fetch accounts for fuzzy matching
+        try:
+            accounts_resp = supabase.table("accounts") \
+                .select("account_id, Name") \
+                .execute()
+            accounts_list = [
+                {"id": a["account_id"], "name": a["Name"]}
+                for a in (accounts_resp.data or []) if a.get("Name")
+            ]
+        except Exception:
+            accounts_list = []
+
+        if accounts_list:
+            # Build lookup: lowercase account name -> account obj
+            accounts_lower = {a["name"].lower(): a for a in accounts_list}
+
+            for lci in low_confidence_items:
+                idx = lci["index"]
+                if idx >= len(line_items):
+                    continue
+
+                # Check if any category hint matches an account
+                matched_acct = None
+                for hint in category_hints:
+                    hint_lower = hint.lower()
+                    # Exact match
+                    if hint_lower in accounts_lower:
+                        matched_acct = accounts_lower[hint_lower]
+                        break
+                    # Partial match (hint substring of account name or vice versa)
+                    for aname, aobj in accounts_lower.items():
+                        if hint_lower in aname or aname in hint_lower:
+                            matched_acct = aobj
+                            break
+                    if matched_acct:
+                        break
+
+                if matched_acct:
+                    line_items[idx]["account_id"] = matched_acct["id"]
+                    line_items[idx]["account_name"] = matched_acct["name"]
+                    line_items[idx]["confidence"] = 95
+                    line_items[idx]["user_confirmed"] = True
+                    result["resolved_items"].append(idx)
+                    print(f"[UserContext] Category hint resolved item {idx} -> {matched_acct['name']}")
+
+            # Check if ALL low-confidence items were resolved
+            unresolved = [
+                lci for lci in low_confidence_items
+                if lci["index"] not in result["resolved_items"]
+            ]
+            if not unresolved:
+                result["skip_categories"] = True
+                print(f"[UserContext] All {len(low_confidence_items)} low-confidence items resolved by hints")
+
+    # --- 2. Project decision ---
+    if project_decision == "all_this_project":
+        result["skip_project_question"] = True
+        result["pre_resolved"]["project_decision"] = "all_this_project"
+        result["pre_resolved"]["project_id"] = project_id
+        result["pre_resolved"]["project_name"] = project_name
+        print(f"[UserContext] Project decision: all for {project_name}")
+
+    elif project_decision == "split" and split_projects:
+        # Resolve project names
+        resolved_splits = []
+        all_resolved = True
+        total_amount = float(parsed_data.get("amount") or 0)
+
+        for sp in split_projects:
+            sp_name = sp.get("name", "")
+            sp_portion = sp.get("portion")
+            sp_amount = sp.get("amount")
+
+            if sp_name == "this_project":
+                resolved_splits.append({
+                    "project_id": project_id,
+                    "project_name": project_name,
+                    "portion": sp_portion,
+                    "amount": sp_amount,
+                })
+            else:
+                project = _resolve_project_by_name(sp_name)
+                if project:
+                    resolved_splits.append({
+                        "project_id": project["project_id"],
+                        "project_name": project["project_name"],
+                        "portion": sp_portion,
+                        "amount": sp_amount,
+                    })
+                else:
+                    all_resolved = False
+                    print(f"[UserContext] Could not resolve project: '{sp_name}'")
+
+        if all_resolved and resolved_splits:
+            # Calculate amounts from portions if not explicitly given
+            for split in resolved_splits:
+                if split["amount"] is None and split["portion"] and total_amount > 0:
+                    portion = split["portion"]
+                    if portion == "half":
+                        split["amount"] = round(total_amount / 2, 2)
+                    elif portion == "third":
+                        split["amount"] = round(total_amount / 3, 2)
+                    elif portion == "quarter":
+                        split["amount"] = round(total_amount / 4, 2)
+
+            result["skip_project_question"] = True
+            result["pre_resolved"]["project_decision"] = "split"
+            result["pre_resolved"]["split_details"] = resolved_splits
+            print(f"[UserContext] Split resolved: {len(resolved_splits)} projects")
+
+    # --- 3. Determine start state ---
+    if result["skip_categories"] and result["skip_project_question"]:
+        result["start_state"] = "awaiting_user_confirm"
+    elif not result["skip_categories"] and low_confidence_items:
+        result["start_state"] = "awaiting_category_confirmation"
+    elif result["skip_project_question"]:
+        result["start_state"] = "awaiting_user_confirm"
+    else:
+        result["start_state"] = None  # Normal flow
+
+    return result
+
+
+def _build_confirm_summary(pre_resolved: dict, line_items: list, parsed_data: dict) -> str:
+    """Build Andrew's confirmation summary message from pre-resolved data."""
+    vendor = parsed_data.get("vendor_name") or "Unknown"
+    total = parsed_data.get("amount") or 0
+    decision = pre_resolved.get("project_decision")
+
+    parts = [f"Receipt scanned: **{vendor}** -- ${total:,.2f}"]
+
+    if decision == "all_this_project":
+        project_name = pre_resolved.get("project_name", "this project")
+        parts.append(f"\nAll items for **{project_name}**:")
+        for i, item in enumerate(line_items):
+            desc = (item.get("description") or "Item")[:60]
+            amt = item.get("amount", 0)
+            cat = item.get("account_name") or "Uncategorized"
+            parts.append(f"  {i+1}. {desc} -- ${amt:,.2f} -> {cat}")
+
+    elif decision == "split":
+        splits = pre_resolved.get("split_details", [])
+        parts.append("\nSplit between projects:")
+        for sp in splits:
+            sp_name = sp.get("project_name", "?")
+            sp_amt = sp.get("amount")
+            if sp_amt:
+                parts.append(f"  - **{sp_name}**: ${sp_amt:,.2f}")
+            else:
+                portion = sp.get("portion", "?")
+                parts.append(f"  - **{sp_name}**: {portion}")
+        if line_items:
+            parts.append("\nItems:")
+            for i, item in enumerate(line_items):
+                desc = (item.get("description") or "Item")[:60]
+                amt = item.get("amount", 0)
+                cat = item.get("account_name") or "Uncategorized"
+                parts.append(f"  {i+1}. {desc} -- ${amt:,.2f} -> {cat}")
+
+    parts.append("\n**Does this look right?**")
+    return "\n".join(parts)
 
 
 # ====== AGENT ENDPOINT ======
@@ -1703,7 +1887,7 @@ Return ONLY valid JSON:
 }}"""
 
         response = ai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": "Construction accounting expert. Return only valid JSON."},
                 {"role": "user", "content": prompt}
@@ -2802,17 +2986,12 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     )
                     return {"success": True, "state": "awaiting_category_confirmation", "error": "no_matches"}
 
-            # Transition to normal item selection flow
-            receipt_flow["state"] = "awaiting_item_selection"
+            # Check if user context already resolved the project question
+            pre_resolved = receipt_flow.get("pre_resolved", {})
             receipt_flow.pop("low_confidence_items", None)
             parsed_data["line_items"] = line_items
             parsed_data["receipt_flow"] = receipt_flow
-            supabase.table("pending_receipts").update({
-                "parsed_data": parsed_data,
-                "updated_at": datetime.utcnow().isoformat()
-            }).eq("id", receipt_id).execute()
 
-            # Get project name for follow-up question
             project_name = "this project"
             try:
                 proj_resp = supabase.table("projects").select("project_name") \
@@ -2822,18 +3001,52 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
             except Exception:
                 pass
 
-            post_andrew_message(
-                content=f"Categories confirmed. Is this entire bill for **{project_name}**?",
-                project_id=project_id,
-                metadata={
-                    "agent_message": True,
-                    "pending_receipt_id": receipt_id,
-                    "receipt_status": "ready",
-                    "receipt_flow_state": "awaiting_item_selection",
-                    "receipt_flow_active": True,
-                }
-            )
-            return {"success": True, "state": "awaiting_item_selection"}
+            if pre_resolved.get("project_decision"):
+                # User context already answered the project question -- skip to confirmation
+                receipt_flow["state"] = "awaiting_user_confirm"
+                parsed_data["receipt_flow"] = receipt_flow
+                supabase.table("pending_receipts").update({
+                    "parsed_data": parsed_data,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                confirm_msg = _build_confirm_summary(pre_resolved, line_items, parsed_data)
+                confirm_msg = "Categories confirmed.\n\n" + confirm_msg
+                post_andrew_message(
+                    content=confirm_msg,
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "ready",
+                        "receipt_flow_state": "awaiting_user_confirm",
+                        "receipt_flow_active": True,
+                        "pre_resolved": pre_resolved,
+                    }
+                )
+                print(f"[ReceiptFlow] Categories confirmed + pre_resolved -> awaiting_user_confirm")
+                return {"success": True, "state": "awaiting_user_confirm"}
+            else:
+                # Normal transition to item selection
+                receipt_flow["state"] = "awaiting_item_selection"
+                parsed_data["receipt_flow"] = receipt_flow
+                supabase.table("pending_receipts").update({
+                    "parsed_data": parsed_data,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                post_andrew_message(
+                    content=f"Categories confirmed. Is this entire bill for **{project_name}**?",
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "ready",
+                        "receipt_flow_state": "awaiting_item_selection",
+                        "receipt_flow_active": True,
+                    }
+                )
+                return {"success": True, "state": "awaiting_item_selection"}
 
         # ── Missing info flow (smart layer) ──
         if current_state == "awaiting_missing_info":
@@ -2969,6 +3182,146 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 )
                 return {"success": True, "state": "awaiting_item_selection",
                         "updated_fields": updated_fields}
+
+        # -- User confirmation flow (from smart context resolution) --
+        if current_state == "awaiting_user_confirm":
+            pre_resolved = receipt_flow.get("pre_resolved", {})
+            line_items = parsed_data.get("line_items", [])
+
+            if action == "confirm":
+                # Create expenses based on pre-resolved decisions
+                decision = pre_resolved.get("project_decision", "all_this_project")
+
+                agent_cfg = {}
+                try:
+                    cfg_result = supabase.table("agent_config").select("key, value").execute()
+                    for row in (cfg_result.data or []):
+                        agent_cfg[row["key"]] = row["value"]
+                except Exception:
+                    pass
+
+                min_confidence = int(agent_cfg.get("min_confidence", 70))
+                cat = parsed_data.get("categorization", {})
+                vendor_id = parsed_data.get("vendor_id")
+                created_expenses = []
+
+                if decision == "all_this_project":
+                    for item in line_items:
+                        item_account_id = item.get("account_id") or cat.get("account_id")
+                        item_confidence = item.get("confidence", 0)
+                        if not item_account_id or item_confidence < min_confidence:
+                            continue
+                        expense = _create_receipt_expense(
+                            project_id, parsed_data, receipt_data,
+                            vendor_id, item_account_id,
+                            amount=item.get("amount"),
+                            description=item.get("description"),
+                            bill_id=item.get("bill_id"),
+                            txn_date=item.get("date"),
+                        )
+                        if expense:
+                            created_expenses.append(expense)
+
+                elif decision == "split":
+                    split_details = pre_resolved.get("split_details", [])
+                    total_amount = float(parsed_data.get("amount") or 0)
+                    primary_account_id = (line_items[0].get("account_id") if line_items else None) or cat.get("account_id")
+
+                    for sp in split_details:
+                        sp_project_id = sp.get("project_id", project_id)
+                        sp_amount = sp.get("amount")
+                        if sp_amount and primary_account_id:
+                            expense = _create_receipt_expense(
+                                sp_project_id, parsed_data, receipt_data,
+                                vendor_id, primary_account_id,
+                                amount=sp_amount,
+                                description=parsed_data.get("description") or f"Split from {parsed_data.get('vendor_name', 'receipt')}",
+                            )
+                            if expense:
+                                created_expenses.append(expense)
+
+                # Update receipt flow
+                receipt_flow["state"] = "completed"
+                parsed_data["receipt_flow"] = receipt_flow
+                expense_id = created_expenses[0].get("expense_id") if created_expenses else None
+
+                if created_expenses:
+                    supabase.table("pending_receipts").update({
+                        "status": "linked",
+                        "expense_id": expense_id,
+                        "parsed_data": parsed_data,
+                        "linked_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", receipt_id).execute()
+
+                    count = len(created_expenses)
+                    auth_mentions = _get_auth_notify_mentions()
+                    msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
+                    if auth_mentions:
+                        msg += f"\n\n{auth_mentions}"
+                    post_andrew_message(
+                        content=msg,
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "linked",
+                            "receipt_flow_state": "completed",
+                            "receipt_flow_active": False,
+                        }
+                    )
+                    print(f"[ReceiptFlow] User confirmed -> {count} expense(s) created")
+                else:
+                    supabase.table("pending_receipts").update({
+                        "parsed_data": parsed_data,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", receipt_id).execute()
+
+                    post_andrew_message(
+                        content="I couldn't auto-create expenses (low confidence or missing category). Please add them manually from the Expenses tab.",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "ready",
+                            "receipt_flow_state": "completed",
+                            "receipt_flow_active": False,
+                        }
+                    )
+
+                return {"success": True, "state": "completed", "expense_id": expense_id}
+
+            elif action == "edit":
+                # User wants to change -- drop back to awaiting_item_selection
+                receipt_flow["state"] = "awaiting_item_selection"
+                receipt_flow.pop("pre_resolved", None)
+                parsed_data["receipt_flow"] = receipt_flow
+                supabase.table("pending_receipts").update({
+                    "parsed_data": parsed_data,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("id", receipt_id).execute()
+
+                project_name = "this project"
+                try:
+                    proj_resp = supabase.table("projects").select("project_name") \
+                        .eq("project_id", project_id).single().execute()
+                    if proj_resp.data and proj_resp.data.get("project_name"):
+                        project_name = proj_resp.data["project_name"]
+                except Exception:
+                    pass
+
+                post_andrew_message(
+                    content=f"No problem -- is this entire bill for **{project_name}**?",
+                    project_id=project_id,
+                    metadata={
+                        "agent_message": True,
+                        "pending_receipt_id": receipt_id,
+                        "receipt_status": "ready",
+                        "receipt_flow_state": "awaiting_item_selection",
+                        "receipt_flow_active": True,
+                    }
+                )
+                return {"success": True, "state": "awaiting_item_selection"}
 
         if current_state == "awaiting_item_selection":
             # Get project name
@@ -3789,13 +4142,16 @@ def delete_receipt(receipt_id: str):
         file_url = receipt.data.get("file_url", "")
         project_id = receipt.data.get("project_id")
 
-        # Try to delete from storage
+        # Try to delete from storage (supports both vault and legacy bucket URLs)
         try:
-            # Parse path from URL
-            if RECEIPTS_BUCKET in file_url:
-                path_start = file_url.find(RECEIPTS_BUCKET) + len(RECEIPTS_BUCKET) + 1
-                storage_path = file_url[path_start:].split("?")[0]
-                supabase.storage.from_(RECEIPTS_BUCKET).remove([storage_path])
+            if "vault" in file_url:
+                bucket = "vault"
+            else:
+                bucket = RECEIPTS_BUCKET
+            bucket_marker = f"/object/public/{bucket}/"
+            if bucket_marker in file_url:
+                storage_path = file_url.split(bucket_marker, 1)[1].split("?")[0]
+                supabase.storage.from_(bucket).remove([storage_path])
         except Exception as storage_error:
             print(f"[PendingReceipts] Warning: Could not delete file from storage: {storage_error}")
 

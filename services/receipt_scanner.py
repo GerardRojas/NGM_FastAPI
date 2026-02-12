@@ -595,7 +595,7 @@ def scan_receipt(
 
 def _scan_receipt_inner(file_content, file_type, model, correction_context):
     client = _get_openai_client()
-    openai_model = "gpt-4o"
+    openai_model = "gpt-5.1"
     print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
 
     # Fetch lookup data
@@ -606,7 +606,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
         print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
               f"calculated_sum={correction_context.get('calculated_sum')}, "
               f"items={len(correction_context.get('items', []))}")
-        openai_model = "gpt-4o"
+        openai_model = "gpt-5.2"
         model = "heavy"
 
     # Determine extraction mode
@@ -830,7 +830,7 @@ IMPORTANT:
 
     # Call OpenAI
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.1",
         messages=[
             {
                 "role": "system",

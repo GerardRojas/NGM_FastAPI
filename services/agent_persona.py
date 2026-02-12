@@ -64,7 +64,7 @@ def _call_gpt(persona: dict, raw_content: str) -> str:
     try:
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": persona["system_prompt"]},
                 {"role": "user", "content": raw_content},
@@ -87,7 +87,7 @@ async def _call_gpt_async(persona: dict, raw_content: str) -> str:
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": persona["system_prompt"]},
                 {"role": "user", "content": raw_content},

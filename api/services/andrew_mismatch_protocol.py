@@ -226,10 +226,10 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
         client = OpenAI(api_key=api_key)
 
         if extracted_text:
-            # Text mode (pdfplumber succeeded) -- gpt-4o for max accuracy
+            # Text mode (pdfplumber succeeded) -- gpt-5.2 for max accuracy
             prompt = _TEXT_LINE_ITEMS_PROMPT.format(text=extracted_text)
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.2",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=2000,
@@ -241,7 +241,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
                 return None
             b64_image, media_type = encoded
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.2",
                 messages=[{
                     "role": "user",
                     "content": [
@@ -300,7 +300,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
             agent="andrew",
             source="mismatch_reconciliation",
             extraction_method=data["_extraction_method"],
-            model_used="gpt-4o",
+            model_used="gpt-5.2",
             file_type="application/pdf" if is_pdf else (content_type or "unknown"),
             char_count=len(extracted_text) if extracted_text else None,
             success=True,

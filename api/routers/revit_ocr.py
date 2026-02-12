@@ -224,7 +224,7 @@ def _call_vision(client, prompt: str, img_b64: str, media_type: str, max_tokens:
         }
     ]
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.1",
         messages=[{"role": "user", "content": content}],
         max_tokens=max_tokens,
         response_format={"type": "json_object"},

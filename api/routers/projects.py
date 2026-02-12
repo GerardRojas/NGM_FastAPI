@@ -1,7 +1,13 @@
+import logging
+import uuid
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
 from api.supabase_client import supabase
-import uuid
+from api.services.vault_service import create_default_folders
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
@@ -76,6 +82,12 @@ def create_project(payload: ProjectCreate):
 
         # ===== INSERCIÓN =====
         res = supabase.table("projects").insert(data).execute()
+
+        # Create default Vault folders for the new project
+        try:
+            create_default_folders(data["project_id"])
+        except Exception as e:
+            logger.warning("[Projects] Failed to create default vault folders for %s: %s", data["project_id"], e)
 
         return {
             "message": "Project created",

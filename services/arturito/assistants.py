@@ -23,7 +23,7 @@ _assistant_cache: Dict[str, str] = {}  # personality_level -> assistant_id
 _thread_cache: Dict[str, str] = {}
 
 # Model to use
-MODEL = "gpt-4o-mini"
+MODEL = "gpt-5-mini"
 
 
 def _get_client() -> Optional[OpenAI]:

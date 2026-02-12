@@ -29,7 +29,7 @@ def generate_small_talk_response(
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text}
@@ -73,7 +73,7 @@ Si los datos no contienen la información solicitada, indica que no tienes esa i
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",  # Modelo más capaz para análisis de datos
+            model="gpt-5.1",  # Medium tier - data analysis
             messages=[
                 {"role": "system", "content": augmented_prompt},
                 {"role": "user", "content": user_text}

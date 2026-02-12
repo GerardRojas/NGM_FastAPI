@@ -227,7 +227,7 @@ async def analyze_screenshot(
 
         # Call OpenAI Vision
         response = ai_client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.1",
             messages=[{"role": "user", "content": content}],
             max_tokens=1500,
             response_format={"type": "json_object"},

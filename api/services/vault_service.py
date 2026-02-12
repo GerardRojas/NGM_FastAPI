@@ -152,6 +152,79 @@ def create_folder(
     return result.data[0] if result.data else {}
 
 
+DEFAULT_PROJECT_FOLDERS = [
+    "Plans",
+    "Archviz",
+    "Budgets",
+    "Contracts",
+    "Documents",
+    "Photos",
+    "Reports",
+    "Permits",
+    "Receipts",
+]
+
+
+def create_default_folders(project_id: str) -> List[Dict[str, Any]]:
+    """Create the default folder structure for a new project."""
+    created = []
+    for name in DEFAULT_PROJECT_FOLDERS:
+        row = {
+            "name": name,
+            "is_folder": True,
+            "parent_id": None,
+            "project_id": project_id,
+            "uploaded_by": None,
+        }
+        result = supabase.table("vault_files").insert(row).execute()
+        if result.data:
+            created.append(result.data[0])
+    logger.info("[Vault] Created %d default folders for project %s", len(created), project_id)
+    return created
+
+
+def save_to_project_folder(
+    project_id: str,
+    folder_name: str,
+    file_content: bytes,
+    filename: str,
+    content_type: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Save a file into a named root-level folder of a project's vault.
+    Finds the folder by name; creates it if missing. Then uploads the file.
+    Returns the vault_files record or None on failure.
+    """
+    try:
+        # Find existing folder
+        result = (
+            supabase.table("vault_files")
+            .select("id")
+            .eq("project_id", project_id)
+            .eq("is_folder", True)
+            .eq("name", folder_name)
+            .is_("parent_id", "null")
+            .eq("is_deleted", False)
+            .limit(1)
+            .execute()
+        )
+
+        if result.data:
+            folder_id = result.data[0]["id"]
+        else:
+            folder = create_folder(folder_name, None, project_id, None)
+            folder_id = folder.get("id")
+
+        if not folder_id:
+            logger.warning("[Vault] Could not resolve folder '%s' for project %s", folder_name, project_id)
+            return None
+
+        return upload_file(file_content, filename, content_type, folder_id, project_id, None)
+    except Exception as e:
+        logger.warning("[Vault] save_to_project_folder failed (%s/%s): %s", project_id, folder_name, e)
+        return None
+
+
 def get_folder_tree(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Get all folders as a flat list (frontend builds tree).
@@ -643,6 +716,35 @@ def search_files(
 
     result = q.order("updated_at", desc=True).limit(limit).execute()
     return result.data or []
+
+
+def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
+    """
+    Cross-reference vault file hashes with pending_receipts to determine
+    which receipts have been processed into expenses (status='linked').
+    Returns dict of {file_hash: status} for matched hashes.
+    """
+    if not file_hashes:
+        return {}
+    try:
+        result = (
+            supabase.table("pending_receipts")
+            .select("file_hash, status")
+            .in_("file_hash", file_hashes)
+            .execute()
+        )
+        status_map = {}
+        for row in (result.data or []):
+            h = row.get("file_hash")
+            s = row.get("status")
+            if h:
+                # If multiple receipts share a hash, prefer 'linked' status
+                if h not in status_map or s == "linked":
+                    status_map[h] = s
+        return status_map
+    except Exception as e:
+        logger.warning("[Vault] check_receipt_status error: %s", e)
+        return {}
 
 
 def detect_duplicates(file_hash: str, project_id: Optional[str] = None) -> List[Dict[str, Any]]:

@@ -144,7 +144,7 @@ CONTENIDO DEL SOW:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
