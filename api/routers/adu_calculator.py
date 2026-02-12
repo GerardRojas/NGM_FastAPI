@@ -229,7 +229,7 @@ async def analyze_screenshot(
         response = ai_client.chat.completions.create(
             model="gpt-5.1",
             messages=[{"role": "user", "content": content}],
-            max_tokens=1500,
+            max_completion_tokens=1500,
             response_format={"type": "json_object"},
             timeout=60
         )

@@ -70,7 +70,7 @@ def _call_gpt(persona: dict, raw_content: str) -> str:
                 {"role": "user", "content": raw_content},
             ],
             temperature=0.4,
-            max_tokens=300,
+            max_completion_tokens=300,
         )
         result = response.choices[0].message.content.strip()
         return result if result else raw_content
@@ -93,7 +93,7 @@ async def _call_gpt_async(persona: dict, raw_content: str) -> str:
                 {"role": "user", "content": raw_content},
             ],
             temperature=0.4,
-            max_tokens=300,
+            max_completion_tokens=300,
         )
         result = response.choices[0].message.content.strip()
         return result if result else raw_content

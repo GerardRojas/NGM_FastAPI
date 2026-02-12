@@ -328,7 +328,7 @@ async def _route(
                 {"role": "user", "content": user_text},
             ],
             temperature=0.1,
-            max_tokens=300,
+            max_completion_tokens=300,
         )
 
         raw = response.choices[0].message.content.strip()
@@ -946,7 +946,7 @@ async def _extract_user_context(
                 {"role": "system", "content": prompt},
             ],
             temperature=0.0,
-            max_tokens=250,
+            max_completion_tokens=250,
         )
 
         raw = response.choices[0].message.content.strip()
@@ -1570,7 +1570,7 @@ async def _personalize(agent_name: str, raw_text: str) -> str:
                 {"role": "user", "content": raw_text},
             ],
             temperature=0.4,
-            max_tokens=500,
+            max_completion_tokens=500,
         )
         result = response.choices[0].message.content.strip()
         return result if result else raw_text
@@ -1598,7 +1598,7 @@ async def _generate_conversation(
                 {"role": "user", "content": user_text},
             ],
             temperature=0.7,
-            max_tokens=300,
+            max_completion_tokens=300,
         )
         result = response.choices[0].message.content.strip()
         return result if result else "I'm not sure how to respond to that."

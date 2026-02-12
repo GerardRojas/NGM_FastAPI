@@ -232,7 +232,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
                 model="gpt-5.2",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=2000,
+                max_completion_tokens=2000,
             )
         else:
             # Vision mode (fallback)
@@ -253,7 +253,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
                     ]
                 }],
                 temperature=0.1,
-                max_tokens=2000,
+                max_completion_tokens=2000,
             )
 
         raw = response.choices[0].message.content.strip()

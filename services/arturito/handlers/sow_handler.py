@@ -150,7 +150,7 @@ CONTENIDO DEL SOW:
                 {"role": "user", "content": question}
             ],
             temperature=0.3,
-            max_tokens=1000
+            max_completion_tokens=1000
         )
 
         return response.choices[0].message.content.strip()

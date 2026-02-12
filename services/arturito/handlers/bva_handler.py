@@ -299,7 +299,7 @@ def _gpt_fuzzy_match(query: str, candidates: List[str]) -> Optional[str]:
                 {"role": "user", "content": f"User typed: \"{query}\"\n\nCandidates:\n{candidates_str}"}
             ],
             temperature=0,
-            max_tokens=80
+            max_completion_tokens=80
         )
         answer = resp.choices[0].message.content.strip().strip('"')
         if answer.upper() == "NONE" or answer not in candidates:
@@ -368,7 +368,7 @@ def _gpt_ask_missing_entity(
                 )}
             ],
             temperature=0.7,
-            max_tokens=100
+            max_completion_tokens=100
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:

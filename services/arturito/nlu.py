@@ -842,7 +842,7 @@ def interpret_with_gpt(text: str, context: Dict[str, Any] = None) -> Dict[str, A
                 {"role": "user", "content": f"Mensaje del usuario: {text}{context_info}"}
             ],
             temperature=0,
-            max_tokens=200
+            max_completion_tokens=200
         )
 
         raw_response = response.choices[0].message.content.strip()

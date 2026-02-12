@@ -325,7 +325,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
                 model="gpt-5.1",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=200,
+                max_completion_tokens=200,
             )
         else:
             # 3b. Vision mode (fallback) -- convert to image
@@ -365,7 +365,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
                     ]
                 }],
                 temperature=0.1,
-                max_tokens=200,
+                max_completion_tokens=200,
             )
 
         raw = response.choices[0].message.content.strip()
@@ -734,7 +734,7 @@ def gpt_resolve_ambiguous(
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.1,
-            max_tokens=150,
+            max_completion_tokens=150,
         )
         raw = response.choices[0].message.content.strip()
         data = _json.loads(raw)

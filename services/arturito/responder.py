@@ -35,7 +35,7 @@ def generate_small_talk_response(
                 {"role": "user", "content": user_text}
             ],
             temperature=0.7,
-            max_tokens=500
+            max_completion_tokens=500
         )
 
         return response.choices[0].message.content.strip()
@@ -79,7 +79,7 @@ Si los datos no contienen la información solicitada, indica que no tienes esa i
                 {"role": "user", "content": user_text}
             ],
             temperature=0.3,
-            max_tokens=800
+            max_completion_tokens=800
         )
 
         return response.choices[0].message.content.strip()

@@ -833,7 +833,7 @@ async def interpret_intent(request: IntentRequest, current_user: dict = Depends(
                 {"role": "user", "content": request.text[:500]},  # Limit input length
             ],
             temperature=0,
-            max_tokens=200,
+            max_completion_tokens=200,
             response_format={"type": "json_object"},
         )
 
@@ -937,7 +937,7 @@ If you can't interpret the command as a filter action, return:
                 {"role": "user", "content": request.text[:500]}
             ],
             temperature=0,
-            max_tokens=150
+            max_completion_tokens=150
         )
 
         result_text = response.choices[0].message.content.strip()
@@ -1012,7 +1012,7 @@ If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}
                 {"role": "user", "content": f"Find accounts matching: {query[:200]}"}
             ],
             temperature=0,
-            max_tokens=200
+            max_completion_tokens=200
         )
 
         result_text = response.choices[0].message.content.strip()
