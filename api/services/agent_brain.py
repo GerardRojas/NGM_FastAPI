@@ -920,6 +920,76 @@ Rules:
 """
 
 
+# ---------------------------------------------------------------------------
+# Check context extraction (for smart check/payroll flow)
+# ---------------------------------------------------------------------------
+
+CHECK_CONTEXT_PROMPT = """\
+You are analyzing a user's message that accompanies a payroll check/labor payment upload.
+Extract structured intent from their text. The user may write in English or Spanish.
+
+Current project: {project_name}
+
+User message: "{user_text}"
+
+Extract a JSON object with these fields (use null for anything not mentioned):
+
+{{
+  "labor_type_hint": "<labor category>" or null,
+  "project_decision": "all_this_project" | "split" | null,
+  "split_projects": [
+    {{"name": "<project name or 'this_project'>", "portion": "<half/third/etc or null>", "amount": <number or null>}}
+  ] or null,
+  "worker_hint": "<worker/vendor name>" or null,
+  "amount_hint": <number> or null,
+  "check_number_hint": "<check number>" or null,
+  "date_hint": "<date string>" or null,
+  "workers_list": [
+    {{"description": "<worker name/role>", "amount": <number or null>, "project": "<project name or 'this_project'>" or null}}
+  ] or null
+}}
+
+Rules for LABOR TYPE extraction (most important!):
+- Extract the type of labor from the user's message
+- Common labor types in construction:
+  * Drywall/Sheetrock → "Drywall Labor"
+  * Framing/Carpentry/Carpenter → "Framing Labor"
+  * Electrical/Electrician → "Electrical Labor"
+  * Plumbing/Plumber → "Plumbing Labor"
+  * HVAC/Air conditioning → "HVAC Labor"
+  * Painting/Painter → "Painting Labor"
+  * Roofing/Roofer → "Roofing Labor"
+  * Concrete/Concreting → "Concrete Labor"
+  * Flooring/Floors/Pisos → "Flooring Labor"
+  * Tile/Tiling → "Tile Labor"
+  * Cleanup/Cleaning/Limpieza → "General Labor"
+  * General/Helper/Ayudante → "General Labor"
+- If multiple labor types mentioned, use the primary/first one
+- If unclear, use null
+
+Rules for PROJECT extraction:
+- "all_this_project": user says ALL hours/payment are for the current project (e.g. "all for this project", "todo para este proyecto")
+- "split": user mentions splitting between projects (e.g. "half for X, half for Y", "3 days on X, 2 days on Y")
+- If the user says "this project" or "este proyecto" or "aqui" in split_projects, use the literal string "this_project"
+- For portions like "half"/"mitad" → "half", "third"/"tercio" → "third", "most"/"majority" → "most"
+
+Rules for WORKERS LIST extraction:
+- Extract individual worker entries if the user lists multiple workers with amounts
+- Examples:
+  * "Juan $500, Pedro $400" → [{{"description": "Juan", "amount": 500, "project": null}}, {{"description": "Pedro", "amount": 400, "project": null}}]
+  * "drywall crew: Jose $600 for Trasher, Maria $500 for Main St" → [{{"description": "Jose", "amount": 600, "project": "Trasher"}}, {{"description": "Maria", "amount": 500, "project": "Main St"}}]
+- If no individual breakdown, use null
+
+Examples:
+- "pago de drywall para trasher" → {{"labor_type_hint": "Drywall Labor", "project_decision": "all_this_project", "split_projects": [{{"name": "trasher", "portion": null, "amount": null}}], ...}}
+- "check #1234 for framing work, split between Main St ($800) and Oak Ave ($600)" → {{"labor_type_hint": "Framing Labor", "project_decision": "split", "split_projects": [{{"name": "Main St", "amount": 800}}, {{"name": "Oak Ave", "amount": 600}}], "check_number_hint": "1234", ...}}
+- "electrician payment for this project, $1200" → {{"labor_type_hint": "Electrical Labor", "project_decision": "all_this_project", "amount_hint": 1200, ...}}
+- "payroll: Juan drywall $500, Pedro framing $400" → {{"labor_type_hint": "Drywall Labor", "workers_list": [{{"description": "Juan drywall", "amount": 500}}, {{"description": "Pedro framing", "amount": 400}}], ...}}
+
+Return ONLY the JSON object. No explanation.
+"""
+
+
 async def _extract_user_context(
     user_text: str,
     project_name: str,
@@ -960,6 +1030,54 @@ async def _extract_user_context(
 
     except Exception as e:
         print(f"[UserContext] Extraction failed (non-blocking): {e}")
+        return {}
+
+
+async def _extract_check_context(
+    user_text: str,
+    project_name: str,
+) -> Dict[str, Any]:
+    """
+    Use gpt-4.1-nano to extract structured intent from user's check/payroll message.
+    Returns dict with labor_type_hint, project_decision, split_projects, workers_list, etc.
+    Returns empty dict on failure (graceful fallback).
+
+    Examples:
+        "pago de drywall para trasher" → {labor_type_hint: "Drywall Labor", split_projects: [{"name": "trasher", ...}]}
+        "check for framing, split Main St $800 and Oak $600" → {labor_type_hint: "Framing Labor", split_projects: [...]}
+        "payroll: Juan $500, Pedro $400" → {workers_list: [{description: "Juan", amount: 500}, ...]}
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {}
+
+    prompt = CHECK_CONTEXT_PROMPT.format(
+        project_name=project_name,
+        user_text=user_text,
+    )
+
+    try:
+        client = AsyncOpenAI(api_key=api_key)
+        response = await client.chat.completions.create(
+            model="gpt-4.1-nano",
+            messages=[
+                {"role": "system", "content": prompt},
+            ],
+            temperature=0.0,
+            max_completion_tokens=350,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+
+        result = json.loads(raw)
+        print(f"[CheckContext] Extracted: {json.dumps(result, ensure_ascii=False)[:250]}")
+        return result
+
+    except Exception as e:
+        print(f"[CheckContext] Extraction failed (non-blocking): {e}")
         return {}
 
 
@@ -1059,6 +1177,14 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         public_url = vault_result.get("public_url", "")
 
         # 4. Create pending_receipt record
+        # Save user_text in parsed_data for smart context extraction (labor checks)
+        user_text = params.get("_user_text", "")
+        initial_parsed_data = {}
+        if user_text:
+            clean_text = re.sub(r'@\w+\s*', '', user_text).strip()
+            if len(clean_text) > 3:
+                initial_parsed_data["user_message"] = clean_text
+
         receipt_data = {
             "id": receipt_id,
             "project_id": project_id,
@@ -1072,6 +1198,9 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
         }
+
+        if initial_parsed_data:
+            receipt_data["parsed_data"] = initial_parsed_data
 
         # Add thumbnail for images
         if file_type.startswith("image/"):

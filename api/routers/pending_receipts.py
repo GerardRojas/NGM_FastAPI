@@ -67,6 +67,8 @@ from datetime import datetime, timedelta
 from openai import OpenAI
 import json
 import io
+import time
+import asyncio
 
 logger = logging.getLogger(__name__)
 from pdf2image import convert_from_bytes
@@ -1163,6 +1165,26 @@ async def agent_process_receipt(receipt_id: str):
 
             payroll_channel_id = _get_payroll_channel_id()
 
+            # Extract smart context from user message (if available)
+            parsed_data = receipt_data.get("parsed_data") or {}
+            user_message = parsed_data.get("user_message", "")
+            check_context = {}
+
+            if user_message:
+                # Get project name for context
+                proj_name = "Unknown"
+                try:
+                    proj = supabase.table("projects") \
+                        .select("project_name").eq("project_id", project_id).single().execute()
+                    if proj.data:
+                        proj_name = proj.data.get("project_name", "Unknown")
+                except Exception:
+                    pass
+
+                print(f"[CheckFlow] Extracting context from user message: {user_message[:100]}")
+                check_context = _extract_check_context_sync(user_message, proj_name)
+                print(f"[CheckFlow] Extracted context: {json.dumps(check_context, ensure_ascii=False)[:200]}")
+
             check_flow = {
                 "state": "awaiting_check_number",
                 "detected_at": datetime.utcnow().isoformat(),
@@ -1173,6 +1195,7 @@ async def agent_process_receipt(receipt_id: str):
                 "is_split": None,
                 "entries": [],
                 "date": None,
+                "context": check_context,  # Store extracted context
             }
 
             supabase.table("pending_receipts").update({
@@ -1448,9 +1471,17 @@ async def agent_process_receipt(receipt_id: str):
         ]
 
         categorizations = []
+        cat_metrics = {}
         try:
             if cat_expenses:
-                categorizations = _auto_categorize_core(stage=construction_stage, expenses=cat_expenses)
+                cat_result = _auto_categorize_core(
+                    stage=construction_stage,
+                    expenses=cat_expenses,
+                    project_id=project_id,
+                    receipt_id=receipt_id
+                )
+                categorizations = cat_result.get("categorizations", [])
+                cat_metrics = cat_result.get("metrics", {})
         except Exception as cat_err:
             print(f"[Agent] Auto-categorization failed: {cat_err}")
 
@@ -1825,6 +1856,164 @@ def _get_purchase_txn_type_id() -> Optional[str]:
     return None
 
 
+# ================================================================
+# CHECK CONTEXT EXTRACTION - SMART CHECK FLOW
+# ================================================================
+
+def _extract_check_context_sync(user_text: str, project_name: str) -> dict:
+    """
+    Synchronous wrapper for _extract_check_context (async).
+    Extracts labor type, projects, and worker info from user's message.
+
+    Examples:
+        "pago de drywall para trasher" → {labor_type_hint: "Drywall Labor", split_projects: [{"name": "trasher"}]}
+        "check for framing, split $800 Main St and $600 Oak" → {labor_type_hint: "Framing Labor", split_projects: [...]}
+
+    Returns empty dict on failure (graceful fallback).
+    """
+    try:
+        from api.services.agent_brain import _extract_check_context
+
+        # Run async function in new event loop (same pattern as agent_brain notifications)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(_extract_check_context(user_text, project_name))
+            return result or {}
+        finally:
+            loop.close()
+    except Exception as e:
+        print(f"[CheckContext] Sync wrapper error: {e}")
+        return {}
+
+
+# ================================================================
+# LABOR CATEGORIZATION - CACHE, FEEDBACK LOOP, AND METRICS
+# ================================================================
+
+def _generate_labor_description_hash(description: str) -> str:
+    """Generate MD5 hash of normalized description for labor cache lookups."""
+    normalized = description.lower().strip()
+    return hashlib.md5(normalized.encode('utf-8')).hexdigest()
+
+
+def _get_cached_labor_categorization(description: str, stage: str) -> Optional[dict]:
+    """
+    Lookup labor categorization in cache.
+    Returns cached result if found and < 30 days old, else None.
+    """
+    try:
+        desc_hash = _generate_labor_description_hash(description)
+        result = supabase.table("labor_categorization_cache") \
+            .select("account_id, account_name, confidence, reasoning, cache_id") \
+            .eq("description_hash", desc_hash) \
+            .eq("construction_stage", stage) \
+            .gte("created_at", (datetime.utcnow() - timedelta(days=30)).isoformat()) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if result.data and len(result.data) > 0:
+            cache_entry = result.data[0]
+            # Update hit count and last_used_at
+            supabase.table("labor_categorization_cache").update({
+                "hit_count": cache_entry.get("hit_count", 1) + 1,
+                "last_used_at": datetime.utcnow().isoformat()
+            }).eq("cache_id", cache_entry["cache_id"]).execute()
+
+            return {
+                "account_id": cache_entry["account_id"],
+                "account_name": cache_entry["account_name"],
+                "confidence": cache_entry["confidence"],
+                "reasoning": cache_entry.get("reasoning"),
+                "from_cache": True
+            }
+    except Exception as e:
+        print(f"[LaborCache] Lookup error: {e}")
+
+    return None
+
+
+def _save_to_labor_cache(description: str, stage: str, categorization: dict):
+    """Save a labor categorization result to cache."""
+    try:
+        desc_hash = _generate_labor_description_hash(description)
+        supabase.table("labor_categorization_cache").insert({
+            "description_hash": desc_hash,
+            "description_raw": description,
+            "construction_stage": stage,
+            "account_id": categorization["account_id"],
+            "account_name": categorization["account_name"],
+            "confidence": categorization["confidence"],
+            "reasoning": categorization.get("reasoning"),
+        }).execute()
+    except Exception as e:
+        print(f"[LaborCache] Save error: {e}")
+
+
+def _get_recent_labor_corrections(project_id: Optional[str], stage: str, limit: int = 5) -> list:
+    """
+    Fetch recent user corrections for labor in this project/stage to use as GPT context.
+    Returns list of correction examples.
+    """
+    if not project_id:
+        return []
+
+    try:
+        result = supabase.rpc("get_recent_labor_corrections", {
+            "p_project_id": project_id,
+            "p_stage": stage,
+            "p_limit": limit
+        }).execute()
+
+        return result.data or []
+    except Exception as e:
+        print(f"[LaborFeedback] Correction fetch error: {e}")
+        return []
+
+
+def _save_labor_categorization_metrics(
+    project_id: Optional[str],
+    check_id: Optional[str],
+    stage: str,
+    categorizations: list,
+    metrics: dict
+):
+    """Save labor categorization metrics to database for analytics."""
+    if not categorizations:
+        return
+
+    try:
+        # Calculate confidence distribution
+        confidences = [c.get("confidence", 0) for c in categorizations]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0
+        min_conf = min(confidences) if confidences else 0
+        max_conf = max(confidences) if confidences else 0
+
+        below_70 = len([c for c in confidences if c < 70])
+        below_60 = len([c for c in confidences if c < 60])
+        below_50 = len([c for c in confidences if c < 50])
+
+        supabase.table("labor_categorization_metrics").insert({
+            "project_id": project_id,
+            "check_id": check_id,
+            "construction_stage": stage,
+            "total_workers": metrics.get("total_items", len(categorizations)),
+            "avg_confidence": round(avg_conf, 2),
+            "min_confidence": min_conf,
+            "max_confidence": max_conf,
+            "items_below_70": below_70,
+            "items_below_60": below_60,
+            "items_below_50": below_50,
+            "cache_hits": metrics.get("cache_hits", 0),
+            "cache_misses": metrics.get("cache_misses", 0),
+            "gpt_tokens_used": metrics.get("tokens_used", 0),
+            "processing_time_ms": metrics.get("processing_time_ms", 0),
+        }).execute()
+    except Exception as e:
+        print(f"[LaborMetrics] Save error: {e}")
+
+
 def _get_labor_accounts() -> list:
     """Fetch accounts with 'Labor' in the name from the database."""
     try:
@@ -1866,9 +2055,29 @@ def _fuzzy_match_labor_account(description: str, accounts: list) -> Optional[dic
     return best_match if best_match and best_score >= THRESHOLD else None
 
 
-def _gpt_categorize_labor(description: str, labor_accounts: list,
-                          construction_stage: str = "General") -> dict:
-    """GPT fallback for matching a labor description to a Labor account."""
+def _gpt_categorize_labor(
+    description: str,
+    labor_accounts: list,
+    construction_stage: str = "General",
+    corrections_context: str = ""
+) -> dict:
+    """
+    Enhanced GPT categorization for labor with examples and feedback loop.
+
+    Args:
+        description: Labor description to categorize
+        labor_accounts: List of available labor accounts
+        construction_stage: Current construction stage
+        corrections_context: Recent user corrections for feedback loop
+
+    Returns:
+        {
+            "account_id": str,
+            "account_name": str,
+            "confidence": int,
+            "reasoning": str
+        }
+    """
     openai_api_key = os.getenv("OPENAI_API_KEY")
     if not openai_api_key:
         return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
@@ -1876,7 +2085,8 @@ def _gpt_categorize_labor(description: str, labor_accounts: list,
     try:
         ai_client = OpenAI(api_key=openai_api_key)
 
-        prompt = f"""You are a construction accountant. Match this labor description to the best account.
+        # Build enhanced prompt with examples and feedback
+        prompt = f"""You are an expert construction accountant specializing in labor categorization.
 
 CONSTRUCTION STAGE: {construction_stage}
 
@@ -1884,6 +2094,55 @@ AVAILABLE LABOR ACCOUNTS:
 {json.dumps(labor_accounts, indent=2)}
 
 DESCRIPTION: "{description}"
+
+EXAMPLES OF GOOD CATEGORIZATIONS:
+
+Example 1:
+- Description: "Drywall installation crew"
+- Stage: "Drywall"
+- Best Match: "Drywall Labor"
+- Confidence: 98
+- Reasoning: "Direct stage match for drywall work crew"
+
+Example 2:
+- Description: "Framing carpenter for walls"
+- Stage: "Framing"
+- Best Match: "Framing Labor"
+- Confidence: 95
+- Reasoning: "Framing stage carpentry work"
+
+Example 3:
+- Description: "General labor for cleanup"
+- Stage: "Rough Plumbing"
+- Best Match: "General Labor"
+- Confidence: 85
+- Reasoning: "Cleanup work is general labor regardless of stage"
+
+Example 4:
+- Description: "Electrician rough-in"
+- Stage: "Electrical"
+- Best Match: "Electrical Labor"
+- Confidence: 97
+- Reasoning: "Electrical work during electrical stage"
+
+Example 5:
+- Description: "HVAC technician for install"
+- Stage: "HVAC"
+- Best Match: "HVAC Labor"
+- Confidence: 96
+- Reasoning: "HVAC installation labor during HVAC stage"{corrections_context}
+
+INSTRUCTIONS:
+- Match the description to the most appropriate labor account
+- Use construction stage to guide your choice (e.g., "carpenter" in Framing stage → Framing Labor)
+- Be stage-aware: same worker type can have different accounts based on stage
+- Confidence scale:
+  - 90-100: Perfect match (description + stage clearly indicate account)
+  - 70-89: Good match (strong indicators, minor ambiguity)
+  - 50-69: Uncertain (could fit multiple accounts)
+  - 0-49: Low confidence (description too vague or no good match)
+- Use exact account_id and account_name from the AVAILABLE LABOR ACCOUNTS list
+- Be conservative with confidence - better to under-estimate
 
 Return ONLY valid JSON:
 {{
@@ -1900,46 +2159,150 @@ Return ONLY valid JSON:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_completion_tokens=300,
+            max_completion_tokens=400,
             response_format={"type": "json_object"}
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        print(f"[CheckFlow] GPT categorization error: {e}")
+        print(f"[LaborGPT] Categorization error: {e}")
         return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
 
 
-def _categorize_check_items(items: list, construction_stage: str = "General") -> list:
+def _categorize_check_items(
+    items: list,
+    construction_stage: str = "General",
+    project_id: Optional[str] = None,
+    check_id: Optional[str] = None
+) -> dict:
     """
-    Categorize one or more labor descriptions.
-    Each item: {"amount": float, "description": str, "project_name": str (optional)}
-    Returns items with added "categorization" key.
-    """
-    labor_accounts = _get_labor_accounts()
+    Enhanced labor categorization with caching, feedback loop, and metrics.
 
+    Args:
+        items: List of labor items with "description" and optionally "amount", "project_name"
+        construction_stage: Current construction stage
+        project_id: Optional project ID for feedback loop context
+        check_id: Optional check ID for metrics tracking
+
+    Returns:
+        {
+            "items": [...items with added "categorization" key...],
+            "metrics": {
+                "cache_hits": int,
+                "cache_misses": int,
+                "fuzzy_matches": int,
+                "gpt_calls": int,
+                "total_items": int,
+                "processing_time_ms": int,
+                "tokens_used": int
+            }
+        }
+    """
+    start_time = time.time()
+
+    # Metrics tracking
+    cache_hits = 0
+    cache_misses = 0
+    fuzzy_matches = 0
+    gpt_calls = 0
+    total_tokens = 0
+
+    labor_accounts = _get_labor_accounts()
+    items_needing_gpt = []
+    categorizations = []
+
+    # Step 1: Try cache first for each item
     for item in items:
         desc = item.get("description", "")
-        # Try fuzzy match first
-        match = _fuzzy_match_labor_account(desc, labor_accounts)
-        if match and match["score"] >= 60:
+        cached = _get_cached_labor_categorization(desc, construction_stage)
+
+        if cached:
+            cache_hits += 1
             item["categorization"] = {
-                "account_id": match["account_id"],
-                "account_name": match["name"],
-                "confidence": match["score"],
-                "method": "fuzzy_match"
+                "account_id": cached["account_id"],
+                "account_name": cached["account_name"],
+                "confidence": cached["confidence"],
+                "reasoning": cached.get("reasoning", "") + " [from cache]",
+                "method": "cache_hit"
             }
         else:
-            # GPT fallback
-            gpt_result = _gpt_categorize_labor(desc, labor_accounts, construction_stage)
-            item["categorization"] = {
-                "account_id": gpt_result.get("account_id"),
-                "account_name": gpt_result.get("account_name", "Uncategorized"),
-                "confidence": gpt_result.get("confidence", 0),
-                "method": "gpt_fallback",
-                "reasoning": gpt_result.get("reasoning")
-            }
+            cache_misses += 1
+            # Try fuzzy match
+            match = _fuzzy_match_labor_account(desc, labor_accounts)
+            if match and match["score"] >= 60:
+                fuzzy_matches += 1
+                item["categorization"] = {
+                    "account_id": match["account_id"],
+                    "account_name": match["name"],
+                    "confidence": match["score"],
+                    "method": "fuzzy_match"
+                }
+                # Save fuzzy match to cache for future use
+                _save_to_labor_cache(desc, construction_stage, item["categorization"])
+            else:
+                # Needs GPT
+                items_needing_gpt.append(item)
 
-    return items
+    # Step 2: If GPT needed, fetch feedback loop corrections
+    corrections_context = ""
+    if items_needing_gpt and project_id:
+        corrections = _get_recent_labor_corrections(project_id, construction_stage, limit=5)
+        if corrections:
+            corrections_list = []
+            for c in corrections:
+                corrections_list.append(
+                    f"- '{c['description']}' was corrected from "
+                    f"'{c['original_account']}' to '{c['corrected_account']}'"
+                )
+            corrections_context = "\n\nRECENT CORRECTIONS (learn from these):\n" + "\n".join(corrections_list)
+
+    # Step 3: GPT categorization for remaining items
+    for item in items_needing_gpt:
+        desc = item.get("description", "")
+        gpt_result = _gpt_categorize_labor(desc, labor_accounts, construction_stage, corrections_context)
+        gpt_calls += 1
+
+        item["categorization"] = {
+            "account_id": gpt_result.get("account_id"),
+            "account_name": gpt_result.get("account_name", "Uncategorized"),
+            "confidence": gpt_result.get("confidence", 0),
+            "method": "gpt_fallback",
+            "reasoning": gpt_result.get("reasoning")
+        }
+
+        # Save GPT result to cache
+        if gpt_result.get("account_id"):
+            _save_to_labor_cache(desc, construction_stage, item["categorization"])
+
+    # Step 4: Calculate metrics
+    elapsed_ms = int((time.time() - start_time) * 1000)
+
+    # Collect all categorizations
+    categorizations = [item.get("categorization", {}) for item in items if item.get("categorization")]
+
+    metrics = {
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "fuzzy_matches": fuzzy_matches,
+        "gpt_calls": gpt_calls,
+        "total_items": len(items),
+        "processing_time_ms": elapsed_ms,
+        "tokens_used": gpt_calls * 400  # Approximate tokens per GPT call
+    }
+
+    # Step 5: Save metrics to database
+    if categorizations:
+        _save_labor_categorization_metrics(
+            project_id=project_id,
+            check_id=check_id,
+            stage=construction_stage,
+            categorizations=categorizations,
+            metrics=metrics
+        )
+
+    return {
+        "items": items,
+        "metrics": metrics
+    }
 
 
 def _update_check_flow(receipt_id: str, check_flow: dict, parsed_data: dict):
@@ -2418,7 +2781,14 @@ def _handle_date_confirm(receipt_id, project_id, check_flow, parsed_data, action
         pass
 
     entries = check_flow.get("entries", [])
-    categorized = _categorize_check_items(entries, construction_stage)
+    categorization_result = _categorize_check_items(
+        entries,
+        construction_stage,
+        project_id=stage_project_id,
+        check_id=receipt_id
+    )
+    categorized = categorization_result["items"]
+    cat_metrics = categorization_result["metrics"]
     check_flow["entries"] = categorized
 
     # === Check confidence vs agent_config.min_confidence ===
@@ -2443,14 +2813,23 @@ def _handle_date_confirm(receipt_id, project_id, check_flow, parsed_data, action
                 "confidence": conf,
             })
 
-    # Build summary lines
+    # Build summary lines with cache performance info
+    perf_note = ""
+    if cat_metrics.get("cache_hits", 0) > 0:
+        perf_note = f" ⚡ {cat_metrics['cache_hits']}/{cat_metrics['total_items']} from cache"
+
     lines = []
     for i, entry in enumerate(categorized, 1):
         cat = entry.get("categorization", {})
         cat_name = cat.get("account_name", "Uncategorized")
         cat_conf = cat.get("confidence", 0)
         method = cat.get("method", "")
-        method_label = "(fuzzy)" if method == "fuzzy_match" else "(AI)"
+        if method == "cache_hit":
+            method_label = "(cached)"
+        elif method == "fuzzy_match":
+            method_label = "(fuzzy)"
+        else:
+            method_label = "(AI)"
         line = f"{i}. ${entry['amount']:,.2f} -- {entry.get('description', '')} -- **{cat_name}** ({cat_conf}%) {method_label}"
         v_name = entry.get("vendor_name")
         if v_name and v_name != "Unknown":
@@ -2471,7 +2850,7 @@ def _handle_date_confirm(receipt_id, project_id, check_flow, parsed_data, action
         low_items = ", ".join(f"#{lc['index']+1}" for lc in low_confidence)
         post_andrew_message(
             content=(
-                f"Check #{check_flow.get('check_number', '?')} categorization:\n\n"
+                f"Check #{check_flow.get('check_number', '?')} categorization:{perf_note}\n\n"
                 f"{summary}\n\n"
                 f"Items {low_items} have low confidence (below {min_confidence}%).\n"
                 f"{mentions} Can you verify or correct?\n\n"
@@ -2496,7 +2875,7 @@ def _handle_date_confirm(receipt_id, project_id, check_flow, parsed_data, action
 
         post_andrew_message(
             content=(
-                f"Check #{check_flow.get('check_number', '?')} summary:\n\n"
+                f"Check #{check_flow.get('check_number', '?')} summary:{perf_note}\n\n"
                 f"{summary}\n\n"
                 f"Date: {check_flow['date']}\n\n"
                 "Does everything look right?"
