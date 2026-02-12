@@ -1143,7 +1143,7 @@ IMPORTANT:
             }
         ],
         temperature=0.3,
-        max_completion_tokens=2000
+        max_completion_tokens=8000  # Increased from 2000 to handle large batches
     )
     gpt_elapsed = int((time.time() - gpt_start) * 1000)
 

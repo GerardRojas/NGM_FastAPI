@@ -83,6 +83,22 @@ ANDREW_FUNCTIONS: List[Dict[str, Any]] = [
         "handler": "_builtin:explain_categorization",
         "long_running": False,
     },
+    {
+        "name": "edit_bill_categories",
+        "description": (
+            "Review and modify expense categories for items in an existing bill. "
+            "Shows an interactive card with dropdowns to change account assignments. "
+            "USE THIS when the user wants to review, change, or fix categories for materials/items in a bill."
+        ),
+        "parameters": [
+            {"name": "bill_identifier", "type": "string", "required": True,
+             "description": "Bill number, ID, or reference (e.g., 'Bill 1234', 'bill #45', or receipt hash)"},
+            {"name": "material_name", "type": "string", "required": False,
+             "description": "Optional - specific material/item name to focus on"},
+        ],
+        "handler": "api.routers.pending_receipts:edit_bill_categories",
+        "long_running": False,
+    },
 ]
 
 DANEEL_FUNCTIONS: List[Dict[str, Any]] = [

@@ -139,6 +139,12 @@ class ReceiptActionRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+class EditCategoriesRequest(BaseModel):
+    """User confirmation of category changes for bill items"""
+    assignments: List[Dict[str, Any]]  # [{ expense_id, account_id, account_name }]
+    user_id: Optional[str] = None
+
+
 # ====== HELPERS ======
 
 def ensure_bucket_exists():
@@ -1864,6 +1870,9 @@ async def agent_process_receipt(receipt_id: str):
         if enforce_threshold:
             for i, item in enumerate(line_items):
                 item_conf = item.get("confidence", 0)
+                # ALWAYS skip items that were manually confirmed by user
+                if item.get("user_confirmed"):
+                    continue
                 if item_conf < min_confidence and item.get("account_id"):
                     low_confidence_items.append({
                         "index": i,
@@ -1883,8 +1892,11 @@ async def agent_process_receipt(receipt_id: str):
                         "confidence": 0,
                     })
         else:
-            # Threshold enforcement is OFF - only flag items WITHOUT account_id
+            # Threshold enforcement is OFF - only flag items WITHOUT account_id (unless manually confirmed)
             for i, item in enumerate(line_items):
+                # Skip items that were manually confirmed by user
+                if item.get("user_confirmed"):
+                    continue
                 if not item.get("account_id"):
                     low_confidence_items.append({
                         "index": i,
@@ -5288,9 +5300,13 @@ def get_unprocessed_counts():
 def get_agent_stats():
     """Return aggregate stats for the receipt agent."""
     try:
+        # Get receipts from last 30 days
+        thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).isoformat()
         all_receipts = supabase.table("pending_receipts") \
-            .select("id, status, parsed_data") \
+            .select("id, status, parsed_data, project_id, created_at") \
             .in_("status", ["ready", "linked", "error", "duplicate", "check_review"]) \
+            .gte("created_at", thirty_days_ago) \
+            .order("created_at", desc=True) \
             .execute()
 
         data = all_receipts.data or []
@@ -5299,6 +5315,33 @@ def get_agent_stats():
         errors = sum(1 for r in data if r["status"] == "error")
         duplicates = sum(1 for r in data if r["status"] == "duplicate")
         ready = sum(1 for r in data if r["status"] == "ready")
+
+        # Count manual reviews and OCR failures
+        manual_reviews = 0
+        ocr_failures = 0
+        error_logs = []
+
+        for r in data:
+            parsed = r.get("parsed_data") or {}
+
+            # Check for manual confirmations
+            line_items = parsed.get("line_items", [])
+            if any(item.get("user_confirmed") for item in line_items):
+                manual_reviews += 1
+
+            # Check for OCR failures (missing vendor/amount/date)
+            if not parsed.get("vendor_name") or not parsed.get("amount"):
+                ocr_failures += 1
+
+            # Collect error logs (last 10 errors)
+            if r["status"] == "error" and len(error_logs) < 10:
+                error_logs.append({
+                    "id": r["id"],
+                    "project_id": r.get("project_id"),
+                    "created_at": r.get("created_at"),
+                    "error_type": "Processing Error",
+                    "details": parsed.get("error_message", "Unknown error")
+                })
 
         confidences = []
         for r in data:
@@ -5316,6 +5359,9 @@ def get_agent_stats():
             "duplicates_caught": duplicates,
             "success_rate": success_rate,
             "avg_confidence": avg_confidence,
+            "manual_reviews": manual_reviews,
+            "ocr_failures": ocr_failures,
+            "error_logs": error_logs,
         }
 
     except Exception as e:
@@ -5330,7 +5376,13 @@ def get_agent_config():
         result = supabase.table("agent_config").select("*").execute()
         config = {}
         for row in (result.data or []):
-            config[row["key"]] = row["value"]
+            raw_value = row["value"]
+            # Parse JSON values back to their original types
+            try:
+                config[row["key"]] = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+            except (json.JSONDecodeError, ValueError):
+                # If not valid JSON, keep as-is (backward compat for plain strings)
+                config[row["key"]] = raw_value
         return config
     except Exception as e:
         logger.error(f"[agent-config] Error loading agent config: {e}", exc_info=True)
@@ -5374,6 +5426,28 @@ def update_agent_config(payload: dict):
         raise HTTPException(status_code=500, detail=f"Error updating agent config: {str(e)}")
 
 
+@router.delete("/agent-metrics")
+def clear_agent_metrics():
+    """Clear error and duplicate records from Andrew metrics."""
+    try:
+        # Delete all receipts with status 'error' or 'duplicate'
+        # This will reset the error and duplicate counters in agent-stats
+        result = supabase.table("pending_receipts") \
+            .delete() \
+            .in_("status", ["error", "duplicate"]) \
+            .execute()
+
+        deleted_count = len(result.data) if result.data else 0
+        return {
+            "ok": True,
+            "message": f"Cleared {deleted_count} error/duplicate records",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.error(f"[agent-metrics] Error clearing metrics: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error clearing metrics: {str(e)}")
+
+
 @router.post("/check-stale")
 async def check_stale_receipts_endpoint():
     """
@@ -5386,3 +5460,210 @@ async def check_stale_receipts_endpoint():
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stale receipt check error: {str(e)}")
+
+
+# ====== EDIT BILL CATEGORIES ======
+
+async def edit_bill_categories(
+    bill_identifier: str,
+    material_name: Optional[str] = None,
+    project_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Agent function to review and edit categories for items in an existing bill.
+    Shows an interactive card with dropdowns for each expense item.
+
+    Args:
+        bill_identifier: Bill number, ID, or receipt reference
+        material_name: Optional - filter to specific material
+        project_id: Project context
+        user_id: User making the request
+        channel_id: Channel to post the message in
+    """
+    try:
+        # 1. Try to find the bill (search by number, ID, or receipt_url)
+        bill_id = None
+        bill_number = None
+        receipt_url = None
+
+        # Clean identifier (remove 'Bill', '#', etc)
+        clean_id = re.sub(r'(?i)bill\s*#?\s*', '', bill_identifier).strip()
+
+        # Try as UUID first
+        if len(clean_id) == 36 and '-' in clean_id:
+            bill_result = supabase.table("bills") \
+                .select("id, bill_number, receipt_url, project_id") \
+                .eq("id", clean_id) \
+                .execute()
+
+            if bill_result.data:
+                bill_data = bill_result.data[0]
+                bill_id = bill_data["id"]
+                bill_number = bill_data.get("bill_number")
+                receipt_url = bill_data.get("receipt_url")
+                if not project_id:
+                    project_id = bill_data.get("project_id")
+
+        # Try as bill number
+        if not bill_id and clean_id.isdigit():
+            bill_result = supabase.table("bills") \
+                .select("id, bill_number, receipt_url, project_id") \
+                .eq("bill_number", int(clean_id))
+
+            if project_id:
+                bill_result = bill_result.eq("project_id", project_id)
+
+            bill_result = bill_result.execute()
+
+            if bill_result.data:
+                bill_data = bill_result.data[0]
+                bill_id = bill_data["id"]
+                bill_number = bill_data.get("bill_number")
+                receipt_url = bill_data.get("receipt_url")
+                if not project_id:
+                    project_id = bill_data.get("project_id")
+
+        # Try by receipt_url hash (in pending_receipts -> bills)
+        if not bill_id:
+            pending_result = supabase.table("pending_receipts") \
+                .select("file_hash") \
+                .ilike("file_url", f"%{clean_id}%") \
+                .limit(1) \
+                .execute()
+
+            if pending_result.data:
+                file_hash = pending_result.data[0]["file_hash"]
+                bill_result = supabase.table("bills") \
+                    .select("id, bill_number, receipt_url, project_id") \
+                    .eq("receipt_url", file_hash)
+
+                if project_id:
+                    bill_result = bill_result.eq("project_id", project_id)
+
+                bill_result = bill_result.execute()
+
+                if bill_result.data:
+                    bill_data = bill_result.data[0]
+                    bill_id = bill_data["id"]
+                    bill_number = bill_data.get("bill_number")
+                    receipt_url = bill_data.get("receipt_url")
+                    if not project_id:
+                        project_id = bill_data.get("project_id")
+
+        if not bill_id:
+            return {
+                "status": "error",
+                "message": f"Bill '{bill_identifier}' not found. Please check the bill number or ID."
+            }
+
+        # 2. Load expenses for this bill
+        expenses_query = supabase.table("expenses_manual_COGS") \
+            .select("id, description, amount, account_id, accounts(id, Name, AccountCategory)") \
+            .eq("bill_id", bill_id)
+
+        if material_name:
+            expenses_query = expenses_query.ilike("description", f"%{material_name}%")
+
+        expenses_result = expenses_query.execute()
+
+        if not expenses_result.data:
+            return {
+                "status": "error",
+                "message": f"No expense items found for Bill #{bill_number or bill_id}."
+            }
+
+        # 3. Format items for interactive card
+        editable_items = []
+        for exp in expenses_result.data:
+            account = exp.get("accounts") or {}
+            editable_items.append({
+                "expense_id": exp["id"],
+                "description": exp.get("description") or "Unnamed item",
+                "amount": float(exp.get("amount") or 0),
+                "current_account_id": exp.get("account_id"),
+                "current_account_name": account.get("Name"),
+                "current_account_category": account.get("AccountCategory"),
+            })
+
+        # 4. Post Andrew message with interactive card
+        bill_ref = f"Bill #{bill_number}" if bill_number else f"Bill {bill_id[:8]}"
+        content = f"Here are the items for {bill_ref}. You can change the category for each item below:"
+
+        metadata = {
+            "agent_message": True,
+            "edit_categories_card": True,
+            "bill_id": bill_id,
+            "bill_number": bill_number,
+            "editable_items": editable_items,
+        }
+
+        post_andrew_message(
+            content=content,
+            project_id=project_id,
+            channel_id=channel_id,
+            metadata=metadata,
+        )
+
+        return {
+            "status": "success",
+            "message": f"Interactive card posted for {bill_ref} with {len(editable_items)} items"
+        }
+
+    except Exception as e:
+        logger.error(f"[edit_bill_categories] Error: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"Error loading bill categories: {str(e)}"
+        }
+
+
+@router.post("/bill-categories/confirm")
+async def confirm_bill_category_changes(payload: EditCategoriesRequest):
+    """
+    Process user confirmation of category changes for bill items.
+    Updates account_id for each expense.
+    """
+    try:
+        assignments = payload.assignments
+        user_id = payload.user_id
+
+        if not assignments:
+            raise HTTPException(status_code=400, detail="No assignments provided")
+
+        updated_count = 0
+        errors = []
+
+        for assignment in assignments:
+            expense_id = assignment.get("expense_id")
+            new_account_id = assignment.get("account_id")
+
+            if not expense_id or not new_account_id:
+                continue
+
+            try:
+                supabase.table("expenses_manual_COGS") \
+                    .update({
+                        "account_id": new_account_id,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }) \
+                    .eq("id", expense_id) \
+                    .execute()
+
+                updated_count += 1
+            except Exception as e:
+                logger.error(f"[bill-categories] Error updating expense {expense_id}: {e}")
+                errors.append(str(e))
+
+        return {
+            "success": True,
+            "updated_count": updated_count,
+            "errors": errors if errors else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[bill-categories] Error confirming changes: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error confirming category changes: {str(e)}")
