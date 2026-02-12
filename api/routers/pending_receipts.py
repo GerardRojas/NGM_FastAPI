@@ -639,6 +639,48 @@ def _get_auth_notify_mentions():
         return ""
 
 
+def _get_authorization_message():
+    """
+    Get authorization notification message based on Daneel status.
+
+    If Daneel auto-auth is enabled: mention Daneel (without @) so humans know it's automated.
+    If Daneel is disabled: @mention human users configured in andrew_auth_notify_users.
+
+    Returns:
+        str: Message to append to expense creation notification
+    """
+    try:
+        # Check if Daneel auto-auth is enabled
+        daneel_cfg = supabase.table("agent_config") \
+            .select("value") \
+            .eq("key", "daneel_auto_auth_enabled") \
+            .execute()
+
+        daneel_enabled = False
+        if daneel_cfg.data:
+            val = daneel_cfg.data[0].get("value")
+            if isinstance(val, str):
+                daneel_enabled = val.lower() == "true"
+            else:
+                daneel_enabled = bool(val)
+
+        if daneel_enabled:
+            # Daneel is active - mention it (without @) so humans know auto-auth is running
+            return "\n\nDaneel will review this automatically."
+        else:
+            # Daneel is off - notify human reviewers with @mentions
+            auth_mentions = _get_auth_notify_mentions()
+            if auth_mentions:
+                return f"\n\n{auth_mentions}"
+            else:
+                return ""
+    except Exception as e:
+        print(f"[Agent] Error getting authorization message: {e}")
+        # Fallback to human mentions if error
+        auth_mentions = _get_auth_notify_mentions()
+        return f"\n\n{auth_mentions}" if auth_mentions else ""
+
+
 def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, account_id,
                             amount=None, description=None, bill_id=None, txn_date=None,
                             txn_type_id=None, payment_method_id=None):
@@ -4165,10 +4207,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     count = len(created_expenses)
-                    auth_mentions = _get_auth_notify_mentions()
                     msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
-                    if auth_mentions:
-                        msg += f"\n\n{auth_mentions}"
+                    auth_msg = _get_authorization_message()
+                    if auth_msg:
+                        msg += auth_msg
                     post_andrew_message(
                         content=msg,
                         project_id=project_id,
@@ -4299,10 +4341,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     count = len(created_expenses)
-                    auth_mentions = _get_auth_notify_mentions()
                     msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
-                    if auth_mentions:
-                        msg += f"\n\n{auth_mentions}"
+                    auth_msg = _get_authorization_message()
+                    if auth_msg:
+                        msg += auth_msg
                     post_andrew_message(
                         content=msg,
                         project_id=project_id,
@@ -4494,10 +4536,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         + f"\nTotal: ${other_total:,.2f}"
                     )
                     if created_other:
-                        split_auth_mentions = _get_auth_notify_mentions()
                         split_msg += f"\n\n{len(created_other)} expense(s) auto-created."
-                        if split_auth_mentions:
-                            split_msg += f"\n{split_auth_mentions}"
+                        split_auth_msg = _get_authorization_message()
+                        if split_auth_msg:
+                            split_msg += split_auth_msg
 
                     post_andrew_message(
                         content=split_msg,
@@ -4623,10 +4665,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }).eq("id", receipt_id).execute()
 
                     count = len(created_expenses)
-                    auth_mentions = _get_auth_notify_mentions()
                     msg = f"{count} expense(s) saved -- ready for authorization." if count > 1 else "Expense saved -- ready for authorization."
-                    if auth_mentions:
-                        msg += f"\n\n{auth_mentions}"
+                    auth_msg = _get_authorization_message()
+                    if auth_msg:
+                        msg += auth_msg
                     post_andrew_message(
                         content=msg,
                         project_id=project_id,
