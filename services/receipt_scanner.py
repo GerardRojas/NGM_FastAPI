@@ -159,6 +159,23 @@ def _parse_json_response(result_text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
+    # Detect if response was likely truncated due to token limit
+    if len(result_text) > 15000:
+        # Long response that's still invalid JSON = likely truncated
+        raise RuntimeError(
+            "RECEIPT_TOO_LONG: The receipt is too complex to process. "
+            "Please try: 1) Using Heavy mode for better accuracy, or 2) Splitting the receipt into smaller sections."
+        )
+
+    # Check for mismatched brackets (common truncation symptom)
+    open_braces = result_text.count('{')
+    close_braces = result_text.count('}')
+    if abs(open_braces - close_braces) > 2:
+        raise RuntimeError(
+            "RECEIPT_TOO_LONG: The receipt appears too long and the response was truncated. "
+            "Try using Heavy mode or split into smaller receipts."
+        )
+
     raise RuntimeError(f"OpenAI returned invalid JSON: {result_text[:500]}")
 
 
