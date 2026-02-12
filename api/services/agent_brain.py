@@ -322,7 +322,7 @@ async def _route(
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-5-1",
+            model="gpt-5.1",  # Medium tier - brain routing
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
@@ -1011,7 +1011,7 @@ async def _extract_user_context(
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.1",  # Internal tier - context extraction
             messages=[
                 {"role": "system", "content": prompt},
             ],
@@ -1059,7 +1059,7 @@ async def _extract_check_context(
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.1",  # Internal tier - context extraction
             messages=[
                 {"role": "system", "content": prompt},
             ],
@@ -1695,7 +1695,7 @@ async def _personalize(agent_name: str, raw_text: str) -> str:
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5.1",  # Chat tier - personality wrapper
             messages=[
                 {"role": "system", "content": persona["conversation_prompt"]},
                 {"role": "user", "content": raw_text},
@@ -1723,7 +1723,7 @@ async def _generate_conversation(
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5.1",  # Chat tier - personality wrapper
             messages=[
                 {"role": "system", "content": persona["conversation_prompt"]},
                 {"role": "user", "content": user_text},

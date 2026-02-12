@@ -553,7 +553,7 @@ def scan_receipt(
     Args:
         file_content: Raw file bytes (image or PDF)
         file_type: MIME type (e.g. "image/jpeg", "application/pdf")
-        model: "fast" (gpt-4o-mini) or "heavy" (gpt-4o)
+        model: "fast" (gpt-5.1) or "heavy" (gpt-5.2)
         correction_context: Optional dict for correction pass (2nd pass)
 
     Returns:
@@ -595,15 +595,15 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
 
     # Map requested model to OpenAI model names
     if correction_context:
-        openai_model = "gpt-5-2"  # Heavy for correction passes
+        openai_model = "gpt-5.2"  # Heavy tier - correction passes
         model = "heavy"
         print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
               f"calculated_sum={correction_context.get('calculated_sum')}, "
               f"items={len(correction_context.get('items', []))}")
     elif model == "heavy":
-        openai_model = "gpt-5-2"  # Heavy mode
+        openai_model = "gpt-5.2"  # Heavy tier - max accuracy OCR
     else:
-        openai_model = "gpt-5-1"  # Fast mode (default)
+        openai_model = "gpt-5.1"  # Medium tier - fast mode (default)
 
     print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
 
@@ -1060,7 +1060,7 @@ IMPORTANT:
     client = _get_openai_client()
     gpt_start = time.time()
     response = client.chat.completions.create(
-        model="gpt-5-1",
+        model="gpt-5.1",  # Medium tier - auto-categorization
         messages=[
             {
                 "role": "system",

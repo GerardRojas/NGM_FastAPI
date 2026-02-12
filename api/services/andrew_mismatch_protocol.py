@@ -229,7 +229,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
             # Text mode (pdfplumber succeeded) -- gpt-5-2 for max accuracy
             prompt = _TEXT_LINE_ITEMS_PROMPT.format(text=extracted_text)
             response = client.chat.completions.create(
-                model="gpt-5-2",
+                model="gpt-5.2",  # Heavy tier - mismatch reconciliation
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_completion_tokens=2000,
@@ -241,7 +241,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
                 return None
             b64_image, media_type = encoded
             response = client.chat.completions.create(
-                model="gpt-5-2",
+                model="gpt-5.2",  # Heavy tier - mismatch reconciliation
                 messages=[{
                     "role": "user",
                     "content": [
