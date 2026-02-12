@@ -265,13 +265,18 @@ IMPORTANT RULES:
 
 6. FEES ARE LINE ITEMS (not distributed):
    - These are NOT taxes and should be separate line items:
-     * Delivery Fee, Shipping, Freight
-     * Service Fee, Convenience Fee, Processing Fee
-     * Handling Fee, Restocking Fee
-     * Tip, Gratuity
-     * Environmental fees (CA LUMBER FEE, recycling fee, etc.)
-     * Fuel surcharge
-   - Only actual TAX amounts (Sales Tax, VAT, GST, HST) get distributed
+     * DELIVERY & FREIGHT: "Outside Delivery", "Delivery Fee", "Delivery Charge", "Shipping", "Freight", "Freight Charge"
+       → Extract as separate line items with descriptions that clearly indicate delivery/freight service
+     * OTHER FEES: "Service Fee", "Convenience Fee", "Processing Fee", "Handling Fee", "Restocking Fee"
+       → Extract as separate line items with descriptive names
+     * ENVIRONMENTAL FEES: "CA LUMBER FEE", "Recycling Fee", "Environmental Charge", "Hazmat Fee"
+       → Extract with the exact fee name from the receipt
+     * SURCHARGES: "Fuel Surcharge", "Energy Surcharge"
+       → Extract as separate line items
+     * TIP/GRATUITY: "Tip", "Gratuity"
+       → Extract as separate line items
+   - Only actual TAX amounts (Sales Tax, VAT, GST, HST, IVA) get distributed across items
+   - IMPORTANT: Keep fee descriptions clear and specific (e.g., "Outside Delivery" not just "Fee")
 
 7. SINGLE TOTAL FALLBACK:
    - If the receipt shows only ONE total with no itemization, create ONE expense with that total amount
@@ -405,11 +410,18 @@ IMPORTANT RULES:
 
 6. FEES ARE LINE ITEMS (not distributed):
    - These are NOT taxes and should be separate line items:
-     * Delivery Fee, Shipping, Freight
-     * Service Fee, Convenience Fee
-     * Environmental fees (CA LUMBER FEE, recycling fee, etc.)
-     * Tip, Gratuity
-   - Only actual TAX amounts (Sales Tax, VAT, GST) get distributed
+     * DELIVERY & FREIGHT: "Outside Delivery", "Delivery Fee", "Delivery Charge", "Shipping", "Freight", "Freight Charge"
+       → Extract as separate line items with descriptions that clearly indicate delivery/freight service
+     * OTHER FEES: "Service Fee", "Convenience Fee", "Processing Fee", "Handling Fee", "Restocking Fee"
+       → Extract as separate line items with descriptive names
+     * ENVIRONMENTAL FEES: "CA LUMBER FEE", "Recycling Fee", "Environmental Charge", "Hazmat Fee"
+       → Extract with the exact fee name from the receipt
+     * SURCHARGES: "Fuel Surcharge", "Energy Surcharge"
+       → Extract as separate line items
+     * TIP/GRATUITY: "Tip", "Gratuity"
+       → Extract as separate line items
+   - Only actual TAX amounts (Sales Tax, VAT, GST, HST, IVA) get distributed across items
+   - IMPORTANT: Keep fee descriptions clear and specific (e.g., "Outside Delivery" not just "Fee")
 
 7. SINGLE TOTAL FALLBACK:
    - If the receipt shows only ONE total with no itemization, create ONE expense
@@ -1015,6 +1027,34 @@ Example 5:
 - Best Match: "Tools & Supplies" or "Base Materials"
 - Confidence: 85
 - Reasoning: "Consumable supplies for tools - valid COGS"
+
+Example 6:
+- Description: "Outside Delivery"
+- Stage: "Any"
+- Best Match: <account with "Freight" in name from available accounts>
+- Confidence: 98
+- Reasoning: "Delivery service charge - matches freight/delivery account"
+
+Example 7:
+- Description: "Delivery Charge"
+- Stage: "Any"
+- Best Match: <account with "Freight" in name from available accounts>
+- Confidence: 98
+- Reasoning: "Freight service for materials delivery"
+
+Example 8:
+- Description: "CA LUMBER FEE"
+- Stage: "Any"
+- Best Match: "Base Materials"
+- Confidence: 90
+- Reasoning: "Environmental fee associated with lumber purchase"
+
+Example 9:
+- Description: "Fuel Surcharge"
+- Stage: "Any"
+- Best Match: "Base Materials"
+- Confidence: 85
+- Reasoning: "Additional fee charged on materials - not freight/delivery"
 {corrections_context}
 
 INSTRUCTIONS:
@@ -1026,11 +1066,25 @@ INSTRUCTIONS:
    - Description specificity and clarity (20% weight)
 4. ONLY use account_id values from the provided accounts list - do NOT invent accounts
 5. If no good match exists, use the most general/appropriate account with confidence <60
+6. For DELIVERY/FREIGHT items: Search the accounts list for any account containing "Freight", "Delivery", or "Shipping" (case-insensitive partial match). Use the best match found.
 
 SPECIAL RULES - VERY IMPORTANT:
 - POWER TOOLS (drills, saws, grinders, nail guns, sanders, etc.) are CAPITAL ASSETS
    - Set confidence to 0 and add warning: "WARNING: Power tool - not a COGS expense"
    - Consumables FOR tools (bits, blades, nails, sandpaper) ARE valid COGS
+
+- DELIVERY & FREIGHT (Outside Delivery, Delivery Fee, Freight, Shipping) -> Account with "Freight" in name
+   - Search for accounts containing keywords: "Freight", "Delivery", "Shipping", "Transportation"
+   - Common descriptions: "Outside Delivery", "Delivery Charge", "Freight Fee", "Shipping & Handling"
+   - Use partial/fuzzy matching to find the best freight-related account (e.g., "Freight In", "Freight-In", "Freight Costs")
+   - High confidence (95+) when description clearly indicates delivery/freight service
+   - If no freight account exists, use the most appropriate materials/expense account with lower confidence (70-80)
+
+- FEES & CHARGES (Service Fee, Environmental Fee, Fuel Surcharge, etc.) -> "Base Materials"
+   - Examples: "CA LUMBER FEE", "Environmental Fee", "Fuel Surcharge", "Processing Fee", "Handling Fee"
+   - IMPORTANT: Exclude delivery/freight fees (those go to freight account, see rule above)
+   - Exclude tax (tax is distributed, not a line item)
+   - These are miscellaneous fees associated with material purchases
 
 - BEVERAGES & REFRESHMENTS (water, energy drinks, coffee) -> "Base Materials"
    - These are crew provisions and valid construction expenses

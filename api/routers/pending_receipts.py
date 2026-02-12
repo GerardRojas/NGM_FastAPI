@@ -1841,6 +1841,9 @@ async def agent_process_receipt(receipt_id: str):
             warnings.append("Low categorization confidence - manual review recommended")
 
         # ===== STEP 5.5: Detect low-confidence categories =====
+        # NOTE: This threshold check is for BULK PROCESSING only.
+        # Manual confirmations (when user approves via @Andrew) ALWAYS bypass this check
+        # by setting confidence=100 and user_confirmed=true.
         agent_cfg = {}
         try:
             cfg_result = supabase.table("agent_config").select("key, value").execute()
@@ -1848,32 +1851,52 @@ async def agent_process_receipt(receipt_id: str):
                 agent_cfg[row["key"]] = row["value"]
         except Exception:
             pass
-        min_confidence = int(agent_cfg.get("min_confidence", 75))
+
+        # Check if threshold enforcement is enabled (default: false to avoid blocking)
+        enforce_threshold = agent_cfg.get("enforce_confidence_threshold", "false")
+        enforce_threshold = enforce_threshold in ("true", "True", True, "1", 1)
+
+        min_confidence = int(agent_cfg.get("min_confidence", 70))
 
         low_confidence_items = []
-        for i, item in enumerate(line_items):
-            item_conf = item.get("confidence", 0)
-            if item_conf < min_confidence and item.get("account_id"):
-                low_confidence_items.append({
-                    "index": i,
-                    "description": item.get("description", ""),
-                    "amount": item.get("amount"),
-                    "suggested": item.get("account_name"),
-                    "suggested_account_id": item.get("account_id"),
-                    "confidence": item_conf,
-                })
-            elif not item.get("account_id"):
-                low_confidence_items.append({
-                    "index": i,
-                    "description": item.get("description", ""),
-                    "amount": item.get("amount"),
-                    "suggested": None,
-                    "suggested_account_id": None,
-                    "confidence": 0,
-                })
+
+        # Only enforce threshold if the switch is ON
+        if enforce_threshold:
+            for i, item in enumerate(line_items):
+                item_conf = item.get("confidence", 0)
+                if item_conf < min_confidence and item.get("account_id"):
+                    low_confidence_items.append({
+                        "index": i,
+                        "description": item.get("description", ""),
+                        "amount": item.get("amount"),
+                        "suggested": item.get("account_name"),
+                        "suggested_account_id": item.get("account_id"),
+                        "confidence": item_conf,
+                    })
+                elif not item.get("account_id"):
+                    low_confidence_items.append({
+                        "index": i,
+                        "description": item.get("description", ""),
+                        "amount": item.get("amount"),
+                        "suggested": None,
+                        "suggested_account_id": None,
+                        "confidence": 0,
+                    })
+        else:
+            # Threshold enforcement is OFF - only flag items WITHOUT account_id
+            for i, item in enumerate(line_items):
+                if not item.get("account_id"):
+                    low_confidence_items.append({
+                        "index": i,
+                        "description": item.get("description", ""),
+                        "amount": item.get("amount"),
+                        "suggested": None,
+                        "suggested_account_id": None,
+                        "confidence": 0,
+                    })
 
         if low_confidence_items:
-            print(f"[Agent] Step 5.5: {len(low_confidence_items)} item(s) with low confidence - will ask user")
+            print(f"[Agent] Step 5.5: {len(low_confidence_items)} item(s) with low confidence - will ask user (enforce_threshold={enforce_threshold})")
 
         # ===== STEP 6: Update receipt with enriched data =====
         if warnings:
