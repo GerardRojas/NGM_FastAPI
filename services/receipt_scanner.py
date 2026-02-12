@@ -688,7 +688,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
         response = client.chat.completions.create(
             model=openai_model,
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=4000,
+            max_completion_tokens=8000,
             temperature=0.1
         )
         print(f"[SCAN-RECEIPT] Respuesta recibida de OpenAI (modo texto)")
@@ -707,7 +707,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
         response = client.chat.completions.create(
             model=openai_model,
             messages=[{"role": "user", "content": message_content}],
-            max_completion_tokens=4000,
+            max_completion_tokens=8000,
             temperature=0.1
         )
         print(f"[SCAN-RECEIPT] Respuesta recibida de OpenAI (modo vision)")
