@@ -592,19 +592,23 @@ def scan_receipt(
 
 def _scan_receipt_inner(file_content, file_type, model, correction_context):
     client = _get_openai_client()
-    openai_model = "gpt-5.1"
+
+    # Map requested model to OpenAI model names
+    if correction_context:
+        openai_model = "gpt-5-2"  # Heavy for correction passes
+        model = "heavy"
+        print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
+              f"calculated_sum={correction_context.get('calculated_sum')}, "
+              f"items={len(correction_context.get('items', []))}")
+    elif model == "heavy":
+        openai_model = "gpt-5-2"  # Heavy mode
+    else:
+        openai_model = "gpt-5-1"  # Fast mode (default)
+
     print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
 
     # Fetch lookup data
     vendors_list, txn_types_list, payment_methods_list = _fetch_lookup_data()
-
-    # Handle correction context
-    if correction_context:
-        print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
-              f"calculated_sum={correction_context.get('calculated_sum')}, "
-              f"items={len(correction_context.get('items', []))}")
-        openai_model = "gpt-5.2"
-        model = "heavy"
 
     # Determine extraction mode
     use_text_mode = False
@@ -613,19 +617,10 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
     base64_images = []
     media_type = file_type
 
-    # Both modes try pdfplumber first for PDFs
-    if file_type == "application/pdf":
-        print(f"[SCAN-RECEIPT] PDF detectado, intentando pdfplumber...")
-        text_success, text_result = extract_text_from_pdf(file_content)
-
-        if text_success:
-            use_text_mode = True
-            extraction_method = "pdfplumber"
-            extracted_text = text_result
-            print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
-        elif model == "heavy":
-            # HEAVY: fall back to Vision
-            print(f"[SCAN-RECEIPT] pdfplumber fallo ({text_result}), falling back to Vision...")
+    # HEAVY MODE: Always use Vision OCR (skip pdfplumber for max accuracy)
+    if model == "heavy":
+        if file_type == "application/pdf":
+            print(f"[SCAN-RECEIPT] HEAVY MODE: PDF detectado, usando Vision OCR (saltando pdfplumber)...")
             extraction_method = "vision_direct"
             try:
                 base64_images = _convert_pdf_to_images(file_content)
@@ -634,18 +629,29 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
             except Exception as pdf_error:
                 raise ValueError(f"Error processing PDF: {str(pdf_error)}")
         else:
+            # Images always use Vision in heavy mode
+            extraction_method = "vision_direct"
+            base64_images = [base64.b64encode(file_content).decode('utf-8')]
+            print(f"[SCAN-RECEIPT] HEAVY MODE: Imagen lista para Vision")
+
+    # FAST MODE: Only pdfplumber (no Vision fallback)
+    elif file_type == "application/pdf":
+        print(f"[SCAN-RECEIPT] FAST MODE: PDF detectado, intentando pdfplumber...")
+        text_success, text_result = extract_text_from_pdf(file_content)
+
+        if text_success:
+            use_text_mode = True
+            extraction_method = "pdfplumber"
+            extracted_text = text_result
+            print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
+        else:
             # FAST: no Vision fallback, return error
             raise ValueError(
                 f"Fast mode: PDF has no extractable text ({text_result}). "
                 f"Use heavy mode for scanned documents."
             )
-    elif model == "heavy":
-        # Images always need Vision
-        extraction_method = "vision_direct"
-        base64_images = [base64.b64encode(file_content).decode('utf-8')]
-        print(f"[SCAN-RECEIPT] Imagen lista para Vision")
     else:
-        # FAST + image: no Vision, return error
+        # FAST + image: not supported
         raise ValueError(
             "Fast mode only supports PDFs with extractable text. "
             "Use heavy mode for images and scanned documents."
@@ -1054,7 +1060,7 @@ IMPORTANT:
     client = _get_openai_client()
     gpt_start = time.time()
     response = client.chat.completions.create(
-        model="gpt-5.1",
+        model="gpt-5-1",
         messages=[
             {
                 "role": "system",

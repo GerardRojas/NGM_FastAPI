@@ -322,7 +322,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             # 3a. Text mode (pdfplumber succeeded) -- no image needed
             prompt = _TEXT_BILL_TOTAL_PROMPT.format(text=extracted_text)
             response = ai_client.chat.completions.create(
-                model="gpt-5.1",
+                model="gpt-5-1",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_completion_tokens=200,
@@ -353,7 +353,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
                 media_type = content_type if content_type else "image/jpeg"
 
             response = ai_client.chat.completions.create(
-                model="gpt-5.1",
+                model="gpt-5-1",
                 messages=[{
                     "role": "user",
                     "content": [
@@ -417,7 +417,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             agent="daneel",
             source="hint_review",
             extraction_method=_extraction_method,
-            model_used="gpt-5.1",
+            model_used="gpt-5-1",
             file_type="application/pdf" if is_pdf else content_type,
             char_count=len(extracted_text) if extracted_text else None,
             success=True,
@@ -728,7 +728,7 @@ def gpt_resolve_ambiguous(
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-5.2",
+            model="gpt-5-2",
             messages=[
                 {"role": "system", "content": _GPT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},

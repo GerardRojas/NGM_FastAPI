@@ -73,7 +73,7 @@ Si los datos no contienen la información solicitada, indica que no tienes esa i
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5.1",  # Medium tier - data analysis
+            model="gpt-5-1",  # Medium tier - data analysis
             messages=[
                 {"role": "system", "content": augmented_prompt},
                 {"role": "user", "content": user_text}

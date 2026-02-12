@@ -720,28 +720,91 @@ def search_files(
 
 def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
     """
-    Cross-reference vault file hashes with pending_receipts to determine
-    which receipts have been processed into expenses (status='linked').
-    Returns dict of {file_hash: status} for matched hashes.
+    Cross-reference vault file hashes with pending_receipts and expenses to determine
+    which receipts have been fully authorized.
+    Returns dict of {file_hash: status} where:
+    - 'linked': All expenses for this receipt are authorized
+    - 'pending': Receipt exists but expenses are not all authorized yet
+    - (not in dict): Receipt not found
     """
     if not file_hashes:
         return {}
     try:
-        result = (
+        # Step 1: Get pending_receipts that match the hashes
+        receipts_result = (
             supabase.table("pending_receipts")
-            .select("file_hash, status")
+            .select("file_hash, receipt_url, status")
             .in_("file_hash", file_hashes)
             .execute()
         )
-        status_map = {}
-        for row in (result.data or []):
+
+        if not receipts_result.data:
+            return {}
+
+        # Step 2: Build map of file_hash -> receipt_url
+        hash_to_url = {}
+        for row in receipts_result.data:
             h = row.get("file_hash")
+            url = row.get("receipt_url")
             s = row.get("status")
-            if h:
-                # If multiple receipts share a hash, prefer 'linked' status
-                if h not in status_map or s == "linked":
-                    status_map[h] = s
+            if h and url and s in ("ready", "linked"):
+                hash_to_url[h] = url
+
+        if not hash_to_url:
+            return {}
+
+        # Step 3: Get bills for these receipt URLs
+        receipt_urls = list(set(hash_to_url.values()))
+        bills_result = (
+            supabase.table("bills")
+            .select("bill_id, receipt_url")
+            .in_("receipt_url", receipt_urls)
+            .execute()
+        )
+
+        # Build map of receipt_url -> [bill_ids]
+        url_to_bills = {}
+        for bill in (bills_result.data or []):
+            url = bill.get("receipt_url")
+            bid = bill.get("bill_id")
+            if url and bid:
+                if url not in url_to_bills:
+                    url_to_bills[url] = []
+                url_to_bills[url].append(bid)
+
+        # Step 4: Check authorization status for expenses in these bills
+        status_map = {}
+        for file_hash, receipt_url in hash_to_url.items():
+            bill_ids = url_to_bills.get(receipt_url, [])
+            if not bill_ids:
+                # No bills found for this receipt yet
+                status_map[file_hash] = "pending"
+                continue
+
+            # Get all expenses for these bill_ids
+            expenses_result = (
+                supabase.table("expenses_manual_COGS")
+                .select("auth_status, status")
+                .in_("bill_id", bill_ids)
+                .execute()
+            )
+
+            expenses = expenses_result.data or []
+            if not expenses:
+                # No expenses created yet
+                status_map[file_hash] = "pending"
+                continue
+
+            # Check if ALL expenses are authorized
+            all_authorized = all(
+                exp.get("auth_status") is True or exp.get("status") == "auth"
+                for exp in expenses
+            )
+
+            status_map[file_hash] = "linked" if all_authorized else "pending"
+
         return status_map
+
     except Exception as e:
         logger.warning("[Vault] check_receipt_status error: %s", e)
         return {}

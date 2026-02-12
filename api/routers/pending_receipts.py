@@ -456,6 +456,45 @@ async def process_receipt(receipt_id: str):
             final_category = primary_cat.get("account_name")
             final_confidence = primary_cat.get("confidence", 0)
 
+            # ===== Resolve txn_type_id and payment_method_id from OCR =====
+            # Default: type = "Purchase", payment = "Debit" when OCR returns Unknown/empty
+            txn_types_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
+            txn_types_map = {
+                t["TnxType_name"].lower(): t["TnxType_id"]
+                for t in (txn_types_resp.data or []) if t.get("TnxType_name")
+            }
+            payment_resp = supabase.table("paymet_methods").select("id, payment_method_name").execute()
+            payment_map = {
+                p["payment_method_name"].lower(): p["id"]
+                for p in (payment_resp.data or []) if p.get("payment_method_name")
+            }
+
+            # Always default to Purchase for receipt-based expenses
+            default_txn_type_id = txn_types_map.get("purchase")
+            # Default to Debit when OCR can't determine payment method
+            # Try multiple variations to handle different DB naming conventions
+            default_payment_id = (
+                payment_map.get("debit") or
+                payment_map.get("debit card") or
+                payment_map.get("ach debit") or
+                payment_map.get("bank account")
+            )
+
+            # If still no default found, use first available payment method as last resort
+            if not default_payment_id and payment_resp.data:
+                default_payment_id = payment_resp.data[0].get("id")
+                print(f"[WARNING] No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
+
+            ocr_txn_type = first_item.get("transaction_type", "Unknown")
+            resolved_txn_type_id = txn_types_map.get(ocr_txn_type.lower()) if ocr_txn_type and ocr_txn_type != "Unknown" else None
+            txn_type_id = resolved_txn_type_id or default_txn_type_id
+
+            ocr_payment = first_item.get("payment_method", "Unknown")
+            resolved_payment_id = payment_map.get(ocr_payment.lower()) if ocr_payment and ocr_payment != "Unknown" else None
+            payment_method_id = resolved_payment_id or default_payment_id
+
+            print(f"[Receipt] Resolved payment: OCR='{ocr_payment}' -> ID={payment_method_id} (default={default_payment_id})")
+
             # ===== Build parsed_data and update DB =====
             parsed_data = {
                 "vendor_name": vendor_name,
@@ -465,6 +504,8 @@ async def process_receipt(receipt_id: str):
                 "description": description,
                 "line_items": line_items,
                 "validation": validation,
+                "txn_type_id": txn_type_id,
+                "payment_method_id": payment_method_id,
                 "categorization": {
                     "account_id": final_account_id,
                     "account_name": final_category,
@@ -1644,7 +1685,18 @@ async def agent_process_receipt(receipt_id: str):
         # Always default to Purchase for receipt-based expenses
         default_txn_type_id = txn_types_map.get("purchase")
         # Default to Debit when OCR can't determine payment method
-        default_payment_id = payment_map.get("debit")
+        # Try multiple variations to handle different DB naming conventions
+        default_payment_id = (
+            payment_map.get("debit") or
+            payment_map.get("debit card") or
+            payment_map.get("ach debit") or
+            payment_map.get("bank account")
+        )
+
+        # If still no default found, use first available payment method as last resort
+        if not default_payment_id and payment_resp.data:
+            default_payment_id = payment_resp.data[0].get("id")
+            print(f"[Agent] WARNING: No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
 
         ocr_txn_type = first_item.get("transaction_type", "Unknown")
         resolved_txn_type_id = txn_types_map.get(ocr_txn_type.lower()) if ocr_txn_type and ocr_txn_type != "Unknown" else None
@@ -1654,7 +1706,7 @@ async def agent_process_receipt(receipt_id: str):
         resolved_payment_id = payment_map.get(ocr_payment.lower()) if ocr_payment and ocr_payment != "Unknown" else None
         payment_method_id = resolved_payment_id or default_payment_id
 
-        print(f"[Agent] Step 3: Resolved txn_type_id={txn_type_id} (ocr={ocr_txn_type}), payment_method_id={payment_method_id} (ocr={ocr_payment})")
+        print(f"[Agent] Step 3: Resolved txn_type_id={txn_type_id} (ocr={ocr_txn_type}), payment_method_id={payment_method_id} (ocr={ocr_payment}, default={default_payment_id})")
 
         parsed_data = {
             "vendor_name": vendor_name,
@@ -2423,7 +2475,7 @@ Return ONLY valid JSON:
 }}"""
 
         response = ai_client.chat.completions.create(
-            model="gpt-5.1",
+            model="gpt-5-1",
             messages=[
                 {"role": "system", "content": "Construction accounting expert. Return only valid JSON."},
                 {"role": "user", "content": prompt}
@@ -3975,10 +4027,20 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 for idx, item in enumerate(line_items):
                     print(f"  [{idx}] account_id={item.get('account_id')}, name={item.get('account_name')}, desc={item.get('description', '')[:30]}")
 
-                supabase.table("pending_receipts").update({
+                update_result = supabase.table("pending_receipts").update({
                     "parsed_data": parsed_data,
                     "updated_at": datetime.utcnow().isoformat()
                 }).eq("id", receipt_id).execute()
+
+                print(f"[DEBUG pre_resolved] UPDATE result: {update_result.data is not None}")
+
+                # Verify the update by reading back
+                verify_receipt = supabase.table("pending_receipts").select("parsed_data").eq("id", receipt_id).single().execute()
+                if verify_receipt.data:
+                    verify_items = verify_receipt.data.get("parsed_data", {}).get("line_items", [])
+                    print(f"[DEBUG pre_resolved] VERIFY after UPDATE - {len(verify_items)} line_items in DB:")
+                    for idx, item in enumerate(verify_items[:3]):  # Show first 3
+                        print(f"  [{idx}] account_id={item.get('account_id')}, name={item.get('account_name')}")
 
                 confirm_msg = _build_confirm_summary(pre_resolved, line_items, parsed_data)
                 confirm_msg = "Categories confirmed.\n\n" + confirm_msg
@@ -4165,6 +4227,41 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
             if action == "confirm":
                 # Create expenses based on pre-resolved decisions
                 # Human clicked Confirm -- no confidence gate needed
+
+                # Check auto_create setting
+                agent_cfg = {}
+                try:
+                    cfg_result = supabase.table("agent_config").select("key, value").execute()
+                    for row in (cfg_result.data or []):
+                        agent_cfg[row["key"]] = row["value"]
+                except Exception:
+                    pass
+                auto_create = agent_cfg.get("auto_create_expense", True)
+                print(f"[DEBUG confirm] auto_create_expense setting = {auto_create}")
+
+                if not auto_create:
+                    print(f"[DEBUG confirm] BLOCKED: auto_create_expense is OFF - skipping expense creation")
+                    # Still complete the flow but don't create expenses
+                    receipt_flow["state"] = "completed"
+                    parsed_data["receipt_flow"] = receipt_flow
+                    supabase.table("pending_receipts").update({
+                        "parsed_data": parsed_data,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", receipt_id).execute()
+
+                    post_andrew_message(
+                        content="Auto-create is disabled in settings. Please create expenses manually from the Expenses tab.",
+                        project_id=project_id,
+                        metadata={
+                            "agent_message": True,
+                            "pending_receipt_id": receipt_id,
+                            "receipt_status": "ready",
+                            "receipt_flow_state": "completed",
+                            "receipt_flow_active": False,
+                        }
+                    )
+                    return {"success": True, "state": "completed"}
+
                 decision = pre_resolved.get("project_decision", "all_this_project")
                 cat = parsed_data.get("categorization", {})
                 vendor_id = parsed_data.get("vendor_id")

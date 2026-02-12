@@ -322,7 +322,7 @@ async def _route(
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-5.1",
+            model="gpt-5-1",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
@@ -995,7 +995,7 @@ async def _extract_user_context(
     project_name: str,
 ) -> Dict[str, Any]:
     """
-    Use gpt-4.1-nano to extract structured intent from user's message text.
+    Use gpt-5-nano to extract structured intent from user's message text.
     Returns dict with project_decision, split_projects, category_hints, etc.
     Returns empty dict on failure (graceful fallback).
     """
@@ -1011,7 +1011,7 @@ async def _extract_user_context(
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-4.1-nano",
+            model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": prompt},
             ],
@@ -1038,7 +1038,7 @@ async def _extract_check_context(
     project_name: str,
 ) -> Dict[str, Any]:
     """
-    Use gpt-4.1-nano to extract structured intent from user's check/payroll message.
+    Use gpt-5-nano to extract structured intent from user's check/payroll message.
     Returns dict with labor_type_hint, project_decision, split_projects, workers_list, etc.
     Returns empty dict on failure (graceful fallback).
 
@@ -1059,7 +1059,7 @@ async def _extract_check_context(
     try:
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-4.1-nano",
+            model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": prompt},
             ],

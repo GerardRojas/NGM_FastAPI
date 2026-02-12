@@ -836,7 +836,7 @@ def interpret_with_gpt(text: str, context: Dict[str, Any] = None) -> Dict[str, A
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4.1-nano",  # Internal tier - fast classification
+            model="gpt-5-nano",  # Internal tier - fast classification
             messages=[
                 {"role": "system", "content": NLU_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Mensaje del usuario: {text}{context_info}"}
