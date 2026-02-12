@@ -2986,6 +2986,12 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     )
                     return {"success": True, "state": "awaiting_category_confirmation", "error": "no_matches"}
 
+            # Bump top-level categorization confidence so downstream gates don't block
+            cat_obj = parsed_data.get("categorization", {})
+            if any(it.get("user_confirmed") for it in line_items):
+                cat_obj["confidence"] = 100
+                parsed_data["categorization"] = cat_obj
+
             # Check if user context already resolved the project question
             pre_resolved = receipt_flow.get("pre_resolved", {})
             receipt_flow.pop("low_confidence_items", None)
@@ -3208,8 +3214,11 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 if decision == "all_this_project":
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
+                        if not item_account_id:
+                            continue
+                        # User explicitly clicked Confirm -- skip confidence gate
                         item_confidence = item.get("confidence", 0)
-                        if not item_account_id or item_confidence < min_confidence:
+                        if not item.get("user_confirmed") and item_confidence < min_confidence:
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -3355,8 +3364,11 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 if auto_create and line_items:
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
+                        if not item_account_id:
+                            continue
+                        # User-confirmed items bypass confidence gate
                         item_confidence = item.get("confidence", 0)
-                        if not item_account_id or item_confidence < min_confidence:
+                        if not item.get("user_confirmed") and item_confidence < min_confidence:
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -3540,7 +3552,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     for idx in this_project_indices:
                         item = line_items[idx - 1]
                         item_account = item.get("account_id") or cat.get("account_id")
-                        if auto_create and item_account and item.get("confidence", 0) >= min_confidence:
+                        conf_ok = item.get("user_confirmed") or item.get("confidence", 0) >= min_confidence
+                        if auto_create and item_account and conf_ok:
                             expense = _create_receipt_expense(
                                 project_id, parsed_data, receipt_data,
                                 vendor_id, item_account,
@@ -3561,7 +3574,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     for idx in pa["item_indices"]:
                         item = line_items[idx - 1]
                         item_account = item.get("account_id") or cat.get("account_id")
-                        if auto_create and item_account and item.get("confidence", 0) >= min_confidence:
+                        conf_ok = item.get("user_confirmed") or item.get("confidence", 0) >= min_confidence
+                        if auto_create and item_account and conf_ok:
                             expense = _create_receipt_expense(
                                 pa["project_id"], parsed_data, receipt_data,
                                 vendor_id, item_account,
@@ -3671,17 +3685,22 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 final_confidence = cat.get("confidence", 0)
                 vendor_id = parsed_data.get("vendor_id")
 
-                should_create = auto_create and final_confidence >= min_confidence
+                # Check if any items were user-confirmed (bypasses top-level confidence gate)
+                line_items = parsed_data.get("line_items", [])
+                has_user_confirmed = any(it.get("user_confirmed") for it in line_items)
+                should_create = auto_create and (final_confidence >= min_confidence or has_user_confirmed)
 
                 created_expenses = []
-                line_items = parsed_data.get("line_items", [])
 
                 if should_create and line_items:
                     # Create one expense per line item
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
+                        if not item_account_id:
+                            continue
+                        # User-confirmed items bypass confidence gate
                         item_confidence = item.get("confidence", 0)
-                        if not item_account_id or item_confidence < min_confidence:
+                        if not item.get("user_confirmed") and item_confidence < min_confidence:
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
