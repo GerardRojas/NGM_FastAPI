@@ -15,11 +15,13 @@ from api.services.ocr_metrics import log_ocr_metric, ocr_timer
 from openai import OpenAI
 from typing import Optional
 import base64
+import hashlib
 import io
 import json
 import os
 import platform
 import re
+import time
 
 import pdfplumber
 from pdf2image import convert_from_bytes
@@ -242,7 +244,6 @@ IMPORTANT RULES:
    - description: Item description (include quantity if shown, e.g., "3x Lumber 2x4", "Labor - 4 hours")
    - vendor: Match to AVAILABLE VENDORS list using partial/fuzzy matching. If not found, use "Unknown"
    - amount: The LINE TOTAL as a number (no currency symbols) - NOT the unit price!
-   - category: Expense category (e.g., "Materials", "Labor", "Office Supplies", "Food & Beverage", "Transportation", "Utilities", "Equipment Rental", etc.)
    - transaction_type: Match to AVAILABLE TRANSACTION TYPES by document type. If uncertain, use "Unknown"
    - payment_method: Match to AVAILABLE PAYMENT METHODS by payment indicators on receipt. If uncertain, use "Unknown"
 
@@ -299,7 +300,6 @@ Return ONLY valid JSON in this exact format:
       "description": "Item name or description",
       "vendor": "Exact vendor name from VENDORS list or Unknown",
       "amount": 45.99,
-      "category": "Category name",
       "transaction_type": "Exact name from TRANSACTION TYPES list or Unknown",
       "payment_method": "Exact name from PAYMENT METHODS list or Unknown",
       "tax_included": 3.45
@@ -380,7 +380,6 @@ IMPORTANT RULES:
    - description: Item description (include quantity if shown, e.g., "80x PGT2 Pipe Grip Tie")
    - vendor: Match to AVAILABLE VENDORS list. If not found, use "Unknown"
    - amount: The LINE TOTAL as a number (no currency symbols) - NOT the unit price!
-   - category: Expense category (Materials, Labor, Office Supplies, etc.)
    - transaction_type: Match to AVAILABLE TRANSACTION TYPES or use "Unknown"
    - payment_method: Match to AVAILABLE PAYMENT METHODS or use "Unknown"
 
@@ -435,7 +434,6 @@ Return ONLY valid JSON in this exact format:
       "description": "Item name or description",
       "vendor": "Exact vendor name from list or Unknown",
       "amount": 45.99,
-      "category": "Category name",
       "transaction_type": "Exact name from list or Unknown",
       "payment_method": "Exact name from list or Unknown",
       "tax_included": 3.45
@@ -517,7 +515,6 @@ Return ONLY valid JSON in this exact format:
       "description": "item description",
       "vendor": "vendor name from list or Unknown",
       "amount": 0.00,
-      "category": "category",
       "transaction_type": "from list or Unknown",
       "payment_method": "from list or Unknown",
       "tax_included": 0.00
@@ -737,31 +734,208 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
     }
 
 
-def auto_categorize(stage: str, expenses: list) -> list:
+def _generate_description_hash(description: str) -> str:
+    """Generate MD5 hash of normalized description for cache lookups."""
+    normalized = description.lower().strip()
+    return hashlib.md5(normalized.encode('utf-8')).hexdigest()
+
+
+def _get_cached_categorization(description: str, stage: str) -> Optional[dict]:
     """
-    Core auto-categorization logic. Categorizes expense descriptions using GPT-4o.
+    Lookup categorization in cache.
+    Returns cached result if found and < 30 days old, else None.
+    """
+    try:
+        desc_hash = _generate_description_hash(description)
+        result = supabase.table("categorization_cache") \
+            .select("account_id, account_name, confidence, reasoning, warning, cache_id") \
+            .eq("description_hash", desc_hash) \
+            .eq("construction_stage", stage) \
+            .gte("created_at", (time.time() - 30*24*60*60)) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if result.data and len(result.data) > 0:
+            cache_entry = result.data[0]
+            # Update hit count and last_used_at
+            supabase.table("categorization_cache").update({
+                "hit_count": supabase.rpc("increment", {"x": 1, "row_id": cache_entry["cache_id"]}),
+                "last_used_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            }).eq("cache_id", cache_entry["cache_id"]).execute()
+
+            return {
+                "account_id": cache_entry["account_id"],
+                "account_name": cache_entry["account_name"],
+                "confidence": cache_entry["confidence"],
+                "reasoning": cache_entry.get("reasoning"),
+                "warning": cache_entry.get("warning"),
+                "from_cache": True
+            }
+    except Exception as e:
+        print(f"[Cache] Lookup error: {e}")
+
+    return None
+
+
+def _save_to_cache(description: str, stage: str, categorization: dict):
+    """Save a categorization result to cache."""
+    try:
+        desc_hash = _generate_description_hash(description)
+        supabase.table("categorization_cache").insert({
+            "description_hash": desc_hash,
+            "description_raw": description,
+            "construction_stage": stage,
+            "account_id": categorization["account_id"],
+            "account_name": categorization["account_name"],
+            "confidence": categorization["confidence"],
+            "reasoning": categorization.get("reasoning"),
+            "warning": categorization.get("warning"),
+        }).execute()
+    except Exception as e:
+        print(f"[Cache] Save error: {e}")
+
+
+def _get_recent_corrections(project_id: Optional[str], stage: str, limit: int = 5) -> list:
+    """
+    Fetch recent user corrections for this project/stage to use as GPT context.
+    Returns list of correction examples.
+    """
+    if not project_id:
+        return []
+
+    try:
+        result = supabase.rpc("get_recent_corrections", {
+            "p_project_id": project_id,
+            "p_stage": stage,
+            "p_limit": limit
+        }).execute()
+
+        return result.data or []
+    except Exception as e:
+        print(f"[Feedback] Correction fetch error: {e}")
+        return []
+
+
+def _save_categorization_metrics(
+    project_id: Optional[str],
+    receipt_id: Optional[str],
+    stage: str,
+    categorizations: list,
+    metrics: dict
+):
+    """Save categorization metrics to database for analytics."""
+    if not categorizations:
+        return
+
+    try:
+        # Calculate confidence distribution
+        confidences = [c.get("confidence", 0) for c in categorizations]
+        avg_conf = sum(confidences) / len(confidences) if confidences else 0
+        min_conf = min(confidences) if confidences else 0
+        max_conf = max(confidences) if confidences else 0
+
+        below_70 = len([c for c in confidences if c < 70])
+        below_60 = len([c for c in confidences if c < 60])
+        below_50 = len([c for c in confidences if c < 50])
+
+        supabase.table("categorization_metrics").insert({
+            "project_id": project_id,
+            "receipt_id": receipt_id,
+            "construction_stage": stage,
+            "total_items": metrics.get("total_items", len(categorizations)),
+            "avg_confidence": round(avg_conf, 2),
+            "min_confidence": min_conf,
+            "max_confidence": max_conf,
+            "items_below_70": below_70,
+            "items_below_60": below_60,
+            "items_below_50": below_50,
+            "cache_hits": metrics.get("cache_hits", 0),
+            "cache_misses": metrics.get("cache_misses", 0),
+            "gpt_tokens_used": metrics.get("tokens_used", 0),
+            "processing_time_ms": metrics.get("processing_time_ms", 0),
+        }).execute()
+    except Exception as e:
+        print(f"[Metrics] Save error: {e}")
+
+
+def auto_categorize(
+    stage: str,
+    expenses: list,
+    project_id: Optional[str] = None,
+    receipt_id: Optional[str] = None
+) -> dict:
+    """
+    Core auto-categorization logic with caching and feedback loop.
 
     Args:
         stage: Construction stage (e.g. "Framing", "Rough Plumbing")
         expenses: List of {"rowIndex": int, "description": str}
+        project_id: Optional project ID for feedback loop context
+        receipt_id: Optional receipt ID for metrics tracking
 
     Returns:
-        List of {"rowIndex", "account_id", "account_name", "confidence", "reasoning", "warning"}
+        {
+            "categorizations": [...],
+            "metrics": {
+                "cache_hits": int,
+                "cache_misses": int,
+                "total_items": int,
+                "processing_time_ms": int
+            }
+        }
 
     Raises:
         ValueError: If stage or expenses empty
         RuntimeError: OpenAI failure, missing accounts
     """
+    start_time = time.time()
+
     if not stage or not expenses:
         raise ValueError("Missing stage or expenses")
 
-    # Fetch accounts
+    # Metrics tracking
+    cache_hits = 0
+    cache_misses = 0
+    gpt_elapsed = 0
+    categorizations = []
+    expenses_needing_gpt = []
+
+    # Step 1: Check cache for each expense
+    for exp in expenses:
+        cached = _get_cached_categorization(exp["description"], stage)
+        if cached:
+            cache_hits += 1
+            categorizations.append({
+                "rowIndex": exp["rowIndex"],
+                "account_id": cached["account_id"],
+                "account_name": cached["account_name"],
+                "confidence": cached["confidence"],
+                "reasoning": cached.get("reasoning", "") + " [from cache]",
+                "warning": cached.get("warning"),
+            })
+        else:
+            cache_misses += 1
+            expenses_needing_gpt.append(exp)
+
+    # Step 2: If all cached, return early
+    if not expenses_needing_gpt:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return {
+            "categorizations": categorizations,
+            "metrics": {
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "total_items": len(expenses),
+                "processing_time_ms": elapsed_ms
+            }
+        }
+
+    # Step 3: Fetch accounts
     accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum").execute()
     accounts = accounts_resp.data or []
     if not accounts:
         raise RuntimeError("No accounts found in database")
-
-    client = _get_openai_client()
 
     # Build accounts list (exclude Labor accounts)
     accounts_list = []
@@ -775,7 +949,19 @@ def auto_categorize(stage: str, expenses: list) -> list:
             "number": acc.get("AcctNum")
         })
 
-    # Build prompt
+    # Step 4: Get recent corrections for feedback loop
+    corrections = _get_recent_corrections(project_id, stage, limit=5)
+    corrections_context = ""
+    if corrections:
+        corrections_list = []
+        for c in corrections:
+            corrections_list.append(
+                f"- '{c['description']}' was corrected from "
+                f"'{c['original_account']}' to '{c['corrected_account']}'"
+            )
+        corrections_context = "\n\nRECENT CORRECTIONS (learn from these):\n" + "\n".join(corrections_list)
+
+    # Step 5: Build enhanced prompt with examples
     prompt = f"""You are an expert construction accountant specializing in categorizing expenses.
 
 CONSTRUCTION STAGE: {stage}
@@ -784,28 +970,64 @@ AVAILABLE ACCOUNTS:
 {json.dumps(accounts_list, indent=2)}
 
 EXPENSE DESCRIPTIONS TO CATEGORIZE:
-{json.dumps([{"rowIndex": e["rowIndex"], "description": e["description"]} for e in expenses], indent=2)}
+{json.dumps([{"rowIndex": e["rowIndex"], "description": e["description"]} for e in expenses_needing_gpt], indent=2)}
+
+EXAMPLES OF GOOD CATEGORIZATIONS:
+
+Example 1:
+- Description: "80x PGT2 Pipe Grip Tie"
+- Stage: "Framing"
+- Best Match: "Lumber & Materials" (account_id from list)
+- Confidence: 95
+- Reasoning: "Framing-stage fasteners are structural materials"
+
+Example 2:
+- Description: "Wood Stud 2x4x8"
+- Stage: "Framing"
+- Best Match: "Lumber & Materials"
+- Confidence: 98
+- Reasoning: "Primary framing lumber for wall construction"
+
+Example 3:
+- Description: "Wood Stud 2x4x8"
+- Stage: "Roofing"
+- Best Match: "Roofing Materials"
+- Confidence: 90
+- Reasoning: "Same material, different stage-specific account - roofing framing"
+
+Example 4:
+- Description: "DeWalt Cordless Drill Kit"
+- Stage: "Any"
+- Best Match: None
+- Confidence: 0
+- Reasoning: "Power tool - not a COGS expense"
+- Warning: "WARNING: Power tool - not a COGS expense"
+
+Example 5:
+- Description: "Drill bits set (20pc)"
+- Stage: "Any"
+- Best Match: "Tools & Supplies" or "Base Materials"
+- Confidence: 85
+- Reasoning: "Consumable supplies for tools - valid COGS"
+{corrections_context}
 
 INSTRUCTIONS:
 1. For each expense description, determine the MOST APPROPRIATE account from the available accounts list.
-2. Consider the construction stage when categorizing. For example:
-   - "Wood stud" in "Framing" stage -> likely "Lumber & Materials" or similar
-   - "Wood stud" in "Roof" stage -> likely "Roofing Materials" or similar
-   - Same material can have different categorizations based on stage
+2. Consider the construction stage when categorizing (as shown in examples above)
 3. Calculate a confidence score (0-100) based on:
-   - How well the description matches the account (50% weight)
-   - How appropriate the stage is for this account (30% weight)
-   - How specific/detailed the description is (20% weight)
+   - Description-to-account match quality (50% weight)
+   - Stage appropriateness for this account (30% weight)
+   - Description specificity and clarity (20% weight)
 4. ONLY use account_id values from the provided accounts list - do NOT invent accounts
 5. If no good match exists, use the most general/appropriate account with confidence <60
 
 SPECIAL RULES - VERY IMPORTANT:
-- POWER TOOLS (drills, saws, grinders, nail guns, etc.) are CAPITAL ASSETS and should NOT be categorized in COGS accounts.
-   - If you detect a power tool (the tool itself, not consumables), set confidence to 0 and add "WARNING: Power tool - not a COGS expense" in reasoning
-   - Consumables FOR power tools (drill bits, saw blades, nails, etc.) ARE valid COGS and should be categorized normally
+- POWER TOOLS (drills, saws, grinders, nail guns, sanders, etc.) are CAPITAL ASSETS
+   - Set confidence to 0 and add warning: "WARNING: Power tool - not a COGS expense"
+   - Consumables FOR tools (bits, blades, nails, sandpaper) ARE valid COGS
 
-- BEVERAGES & REFRESHMENTS (water bottles, energy drinks, coffee, sports drinks, etc.) should be categorized under "Base Materials" account
-   - These are considered crew provisions and ARE valid construction expenses
+- BEVERAGES & REFRESHMENTS (water, energy drinks, coffee) -> "Base Materials"
+   - These are crew provisions and valid construction expenses
 
 Return ONLY valid JSON in this format:
 {{
@@ -816,7 +1038,7 @@ Return ONLY valid JSON in this format:
       "account_name": "exact-account-name-from-list",
       "confidence": 85,
       "reasoning": "Brief explanation of why this account was chosen",
-      "warning": "Optional warning message for special cases like power tools"
+      "warning": "Optional warning for special cases"
     }}
   ]
 }}
@@ -825,10 +1047,12 @@ IMPORTANT:
 - Match rowIndex from input to output
 - Use EXACT account_id and Name from the accounts list
 - Confidence must be 0-100
-- Be conservative with confidence scores - better to under-estimate than over-estimate
+- Be conservative with confidence - better to under-estimate
 - DO NOT include any text before or after the JSON"""
 
-    # Call OpenAI
+    # Step 6: Call OpenAI
+    client = _get_openai_client()
+    gpt_start = time.time()
     response = client.chat.completions.create(
         model="gpt-5.1",
         messages=[
@@ -844,6 +1068,7 @@ IMPORTANT:
         temperature=0.3,
         max_completion_tokens=2000
     )
+    gpt_elapsed = int((time.time() - gpt_start) * 1000)
 
     # Parse response
     result_text = response.choices[0].message.content.strip()
@@ -853,11 +1078,47 @@ IMPORTANT:
     if "categorizations" not in parsed_data or not isinstance(parsed_data["categorizations"], list):
         raise RuntimeError("OpenAI response missing 'categorizations' array")
 
-    for cat in parsed_data["categorizations"]:
+    gpt_categorizations = parsed_data["categorizations"]
+
+    for cat in gpt_categorizations:
         required_fields = ["rowIndex", "account_id", "account_name", "confidence"]
         if not all(field in cat for field in required_fields):
             raise RuntimeError(f"Categorization missing required fields: {cat}")
         if not (0 <= cat["confidence"] <= 100):
             cat["confidence"] = max(0, min(100, cat["confidence"]))
 
-    return parsed_data["categorizations"]
+    # Step 7: Save new categorizations to cache
+    for i, cat in enumerate(gpt_categorizations):
+        exp = expenses_needing_gpt[i]
+        _save_to_cache(exp["description"], stage, cat)
+        categorizations.append(cat)
+
+    # Step 8: Sort by rowIndex to maintain order
+    categorizations.sort(key=lambda x: x["rowIndex"])
+
+    # Step 9: Calculate final metrics
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    tokens_used = response.usage.total_tokens if (expenses_needing_gpt and hasattr(response, 'usage')) else 0
+
+    metrics = {
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "total_items": len(expenses),
+        "processing_time_ms": elapsed_ms,
+        "gpt_time_ms": gpt_elapsed if expenses_needing_gpt else 0,
+        "tokens_used": tokens_used
+    }
+
+    # Step 10: Save metrics to database
+    _save_categorization_metrics(
+        project_id=project_id,
+        receipt_id=receipt_id,
+        stage=stage,
+        categorizations=categorizations,
+        metrics=metrics
+    )
+
+    return {
+        "categorizations": categorizations,
+        "metrics": metrics
+    }

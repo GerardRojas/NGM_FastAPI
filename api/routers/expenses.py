@@ -1298,19 +1298,22 @@ async def auto_categorize_expenses(payload: dict):
     """
     Auto-categorizes expenses using GPT-4 based on construction stage and description.
     Delegates to shared service: services/receipt_scanner.auto_categorize()
+    Now includes caching and feedback loop support.
     """
     try:
         stage = payload.get("stage")
         expenses = payload.get("expenses", [])
+        project_id = payload.get("project_id")  # Optional for feedback loop
 
         if not stage or not expenses:
             raise HTTPException(status_code=400, detail="Missing stage or expenses")
 
-        categorizations = _auto_categorize_core(stage=stage, expenses=expenses)
+        result = _auto_categorize_core(stage=stage, expenses=expenses, project_id=project_id)
 
         return {
             "success": True,
-            "categorizations": categorizations
+            "categorizations": result["categorizations"],
+            "metrics": result.get("metrics", {})
         }
 
     except ValueError as e:
@@ -1321,6 +1324,75 @@ async def auto_categorize_expenses(payload: dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error auto-categorizing expenses: {str(e)}")
+
+
+@router.post("/categorization-correction")
+async def save_categorization_correction(payload: dict):
+    """
+    Save a user correction to auto-categorization for feedback loop.
+    This helps improve future categorizations by learning from user corrections.
+
+    Expected payload:
+    {
+        "project_id": "uuid",
+        "expense_id": "uuid",  # optional
+        "description": "Item description",
+        "construction_stage": "Framing",
+        "original_account_id": "uuid",
+        "original_account_name": "Materials",
+        "original_confidence": 85,
+        "corrected_account_id": "uuid",
+        "corrected_account_name": "Lumber & Materials",
+        "correction_reason": "Optional reason",  # optional
+        "user_id": "uuid"  # from auth
+    }
+    """
+    try:
+        required_fields = [
+            "project_id", "description", "construction_stage",
+            "corrected_account_id", "corrected_account_name", "user_id"
+        ]
+        for field in required_fields:
+            if not payload.get(field):
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+
+        # Insert into categorization_corrections table
+        correction_data = {
+            "project_id": payload["project_id"],
+            "user_id": payload["user_id"],
+            "description": payload["description"],
+            "construction_stage": payload["construction_stage"],
+            "corrected_account_id": payload["corrected_account_id"],
+            "corrected_account_name": payload["corrected_account_name"],
+        }
+
+        # Optional fields
+        if payload.get("expense_id"):
+            correction_data["expense_id"] = payload["expense_id"]
+        if payload.get("original_account_id"):
+            correction_data["original_account_id"] = payload["original_account_id"]
+        if payload.get("original_account_name"):
+            correction_data["original_account_name"] = payload["original_account_name"]
+        if payload.get("original_confidence"):
+            correction_data["original_confidence"] = payload["original_confidence"]
+        if payload.get("correction_reason"):
+            correction_data["correction_reason"] = payload["correction_reason"]
+
+        result = supabase.table("categorization_corrections").insert(correction_data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to save correction")
+
+        return {
+            "success": True,
+            "correction_id": result.data[0].get("correction_id"),
+            "message": "Correction saved successfully. Future categorizations will learn from this."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving correction: {str(e)}")
 
 
 # ====== PDF TEXT EXTRACTION HELPER ======

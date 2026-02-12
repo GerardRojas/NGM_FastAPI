@@ -422,16 +422,23 @@ async def process_receipt(receipt_id: str):
                     pass
 
             categorizations = []
+            cat_metrics = {}
             cat_expenses = [
                 {"rowIndex": i, "description": item.get("description", "")}
                 for i, item in enumerate(line_items)
             ]
             try:
                 if cat_expenses:
-                    categorizations = _auto_categorize_core(
-                        stage=construction_stage, expenses=cat_expenses
+                    cat_result = _auto_categorize_core(
+                        stage=construction_stage,
+                        expenses=cat_expenses,
+                        project_id=project_id,
+                        receipt_id=receipt_id
                     )
-            except Exception:
+                    categorizations = cat_result.get("categorizations", [])
+                    cat_metrics = cat_result.get("metrics", {})
+            except Exception as cat_err:
+                print(f"[Categorization] Error: {cat_err}")
                 pass
 
             # Attach categorization to line items
@@ -2896,7 +2903,22 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 print(f"[ReceiptFlow] Category confirmation: user accepted all suggestions ({len(low_items)} items bumped to 100%)")
             elif assignments and isinstance(assignments, list):
                 # Structured assignment from interactive account picker (no fuzzy matching needed)
+
+                # Fetch construction_stage for feedback loop
+                construction_stage = "General"
+                try:
+                    proj_resp = supabase.table("projects") \
+                        .select("project_stage") \
+                        .eq("project_id", project_id) \
+                        .single().execute()
+                    if proj_resp.data and proj_resp.data.get("project_stage"):
+                        construction_stage = proj_resp.data["project_stage"]
+                except Exception as e:
+                    print(f"[ReceiptFlow] Could not fetch project stage: {e}")
+
                 updates_applied = 0
+                corrections_logged = 0
+
                 for assign in assignments:
                     idx = assign.get("index")
                     account_id = assign.get("account_id")
@@ -2904,12 +2926,47 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     if idx is None or not account_id:
                         continue
                     if idx < len(line_items):
+                        # Check if user corrected the suggestion (feedback loop)
+                        original_suggestion = next(
+                            (item for item in low_items if item.get("index") == idx),
+                            None
+                        )
+                        if original_suggestion:
+                            suggested_id = original_suggestion.get("suggested_account_id")
+                            suggested_name = original_suggestion.get("suggested_account_name", "")
+                            suggested_conf = original_suggestion.get("confidence", 0)
+                            description = original_suggestion.get("description", line_items[idx].get("description", ""))
+
+                            # If user selected different account, log as correction for feedback loop
+                            if suggested_id and suggested_id != account_id:
+                                try:
+                                    supabase.table("categorization_corrections").insert({
+                                        "project_id": project_id,
+                                        "user_id": payload.user_id,
+                                        "description": description,
+                                        "construction_stage": construction_stage,
+                                        "original_account_id": suggested_id,
+                                        "original_account_name": suggested_name,
+                                        "original_confidence": suggested_conf,
+                                        "corrected_account_id": account_id,
+                                        "corrected_account_name": account_name,
+                                        "correction_reason": "User correction from low-confidence modal"
+                                    }).execute()
+                                    corrections_logged += 1
+                                    print(f"[FeedbackLoop] Logged correction: '{description}' from '{suggested_name}' -> '{account_name}' (stage: {construction_stage})")
+                                except Exception as e:
+                                    print(f"[FeedbackLoop] Failed to log correction: {e}")
+
+                        # Apply the user's selection
                         line_items[idx]["account_id"] = account_id
                         line_items[idx]["account_name"] = account_name
                         line_items[idx]["confidence"] = 100
                         line_items[idx]["user_confirmed"] = True
                         updates_applied += 1
                         print(f"[ReceiptFlow] Structured assign: item {idx} -> {account_name} ({account_id})")
+
+                if corrections_logged > 0:
+                    print(f"[FeedbackLoop] Logged {corrections_logged} user corrections for learning")
 
                 if updates_applied == 0:
                     post_andrew_message(

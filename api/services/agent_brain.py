@@ -1111,8 +1111,10 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                     {"rowIndex": i, "description": e.get("description", "")}
                     for i, e in enumerate(expenses)
                 ]
-                categorize_data = auto_categorize(construction_stage, cat_input)
-                print(f"{tag} Categorized {len(categorize_data)} items")
+                cat_result = auto_categorize(construction_stage, cat_input, project_id=project_id)
+                categorize_data = cat_result.get("categorizations", [])
+                metrics = cat_result.get("metrics", {})
+                print(f"{tag} Categorized {len(categorize_data)} items (cache hits: {metrics.get('cache_hits', 0)}/{metrics.get('total_items', 0)})")
             except Exception as cat_err:
                 print(f"{tag} Categorization failed (non-blocking): {cat_err}")
 
