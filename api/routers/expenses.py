@@ -4,6 +4,7 @@ from api.supabase_client import supabase
 from api.auth import get_current_user
 from typing import Optional, List
 import json
+import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.receipt_scanner import (
     extract_text_from_pdf as _extract_text_from_pdf,
@@ -16,11 +17,28 @@ router = APIRouter(prefix="/expenses", tags=["Expenses"])
 
 # ====== MODELOS ======
 
+def _validate_uuid_or_none(v, field_name=''):
+    """Validate string is a valid UUID; return None if empty/invalid."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        stripped = v.strip()
+        if stripped == '':
+            return None
+        try:
+            _uuid.UUID(stripped)
+            return stripped
+        except (ValueError, AttributeError):
+            print(f"[VALIDATION] Invalid UUID for {field_name}: {repr(v)}")
+            return None
+    return v
+
+
 class ExpenseCreate(BaseModel):
     project: str  # UUID del proyecto
     txn_type: Optional[str] = None  # UUID del tipo de transacción
     TxnDate: Optional[str] = None  # Fecha en formato ISO
-    bill_id: Optional[str] = None  # Invoice/Bill number
+    bill_id: Optional[str] = None  # Invoice/Bill number (TEXT, not UUID)
     vendor_id: Optional[str] = None  # UUID del vendor
     payment_type: Optional[str] = None  # UUID del método de pago
     Amount: Optional[float] = None
@@ -34,12 +52,22 @@ class ExpenseCreate(BaseModel):
 
     @field_validator('project', mode='before')
     @classmethod
-    def project_not_empty(cls, v):
+    def project_must_be_valid_uuid(cls, v):
         if isinstance(v, str) and v.strip() == '':
             raise ValueError('project is required and cannot be empty')
+        if isinstance(v, str):
+            try:
+                _uuid.UUID(v.strip())
+            except (ValueError, AttributeError):
+                raise ValueError(f'project must be a valid UUID, got: {repr(v)}')
         return v
 
-    @field_validator('txn_type', 'bill_id', 'vendor_id', 'payment_type', 'account_id', 'created_by', 'LineUID', mode='before')
+    @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'created_by', mode='before')
+    @classmethod
+    def uuid_field_validate(cls, v, info):
+        return _validate_uuid_or_none(v, info.field_name)
+
+    @field_validator('bill_id', 'LineUID', mode='before')
     @classmethod
     def empty_str_to_none(cls, v):
         if isinstance(v, str) and v.strip() == '':
@@ -55,7 +83,7 @@ class ExpenseBatchCreate(BaseModel):
 class ExpenseUpdate(BaseModel):
     txn_type: Optional[str] = None
     TxnDate: Optional[str] = None
-    bill_id: Optional[str] = None  # Invoice/Bill number
+    bill_id: Optional[str] = None  # Invoice/Bill number (TEXT, not UUID)
     vendor_id: Optional[str] = None
     payment_type: Optional[str] = None
     Amount: Optional[float] = None
@@ -71,7 +99,12 @@ class ExpenseUpdate(BaseModel):
     status: Optional[str] = None  # 'pending', 'auth', 'review' - for auto-review on field changes
     status_reason: Optional[str] = None  # Reason for status change (used with auto-review)
 
-    @field_validator('txn_type', 'bill_id', 'vendor_id', 'payment_type', 'account_id', 'auth_by', 'LineUID', mode='before')
+    @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'auth_by', mode='before')
+    @classmethod
+    def uuid_field_validate(cls, v, info):
+        return _validate_uuid_or_none(v, info.field_name)
+
+    @field_validator('bill_id', 'LineUID', mode='before')
     @classmethod
     def empty_str_to_none(cls, v):
         if isinstance(v, str) and v.strip() == '':
