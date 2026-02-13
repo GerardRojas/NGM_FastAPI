@@ -170,8 +170,17 @@ def _parse_json_response(result_text: str) -> dict:
     raise RuntimeError(f"OpenAI returned invalid JSON: {result_text[:500]}")
 
 
+# ====== LOOKUP CACHE (5-minute TTL) ======
+_lookup_cache = {"data": None, "ts": 0}
+_LOOKUP_TTL = 300  # seconds
+
+
 def _fetch_lookup_data():
-    """Fetch vendors, transaction types, and payment methods from DB."""
+    """Fetch vendors, transaction types, and payment methods from DB (cached 5 min)."""
+    now = time.time()
+    if _lookup_cache["data"] and (now - _lookup_cache["ts"]) < _LOOKUP_TTL:
+        return _lookup_cache["data"]
+
     vendors_resp = supabase.table("Vendors").select("vendor_name").execute()
     vendors_list = [v.get("vendor_name") for v in (vendors_resp.data or []) if v.get("vendor_name")]
     if "Unknown" not in vendors_list:
@@ -189,7 +198,11 @@ def _fetch_lookup_data():
         for p in (payment_resp.data or []) if p.get("payment_method_name")
     ]
 
-    return vendors_list, txn_types_list, payment_methods_list
+    result = (vendors_list, txn_types_list, payment_methods_list)
+    _lookup_cache["data"] = result
+    _lookup_cache["ts"] = now
+    print(f"[SCAN-RECEIPT] Lookup cache refreshed: {len(vendors_list)} vendors, {len(txn_types_list)} txn types, {len(payment_methods_list)} payment methods")
+    return result
 
 
 # ====== PROMPTS ======
@@ -507,6 +520,40 @@ DO NOT include any text before or after the JSON. ONLY return the JSON object.
 --- RECEIPT TEXT END ---"""
 
 
+def _build_text_prompt_slim(vendors_list, txn_types_list, payment_methods_list, extracted_text):
+    """Optimized prompt for text mode (pdfplumber). ~60% smaller than full prompt.
+    Used by both fast (gpt-5.2) and fast-beta (gpt-5-mini) text modes.
+    Relies on json_mode=True so no JSON template needed."""
+    vendor_names = ", ".join(vendors_list)
+    txn_names = ", ".join(t["name"] for t in txn_types_list)
+    pmt_names = ", ".join(p["name"] for p in payment_methods_list)
+
+    return f"""Extract ALL expense line items from this receipt text.
+
+VENDORS (match one or "Unknown"): {vendor_names}
+TRANSACTION TYPES (match one or "Unknown"): {txn_names}
+PAYMENT METHODS (match one or "Unknown"): {pmt_names}
+
+RULES:
+1. Use LINE TOTALS (extended amount), never unit prices. The line total is the largest dollar amount per item.
+2. Extract EVERY line item separately. Include: date (YYYY-MM-DD), bill_id (invoice/receipt number), description (with qty if shown), vendor, amount (number, no $), transaction_type, payment_method.
+3. TAX: If a separate tax line exists, distribute it proportionally across items by their share of the subtotal. Each item "amount" = pre-tax + proportional tax. Do NOT create a tax line item. Set tax_included per item. If no tax line, set tax_included=0.
+4. FEES (delivery, freight, environmental, surcharges, tips) are separate line items, NOT distributed like tax.
+5. Prefer "Debit" over "Unknown" for payment_method when any card/electronic indicator exists.
+6. If only one total with no itemization, create one expense with that total.
+
+VALIDATION (mandatory):
+- invoice_total = exact grand total printed on receipt
+- calculated_sum = sum of all your expense amounts
+- validation_passed = true if they match within $0.02
+- If calculated_sum equals subtotal instead of grand total, you forgot tax distribution - fix it
+
+Return JSON: {{"expenses": [{{"date","bill_id","description","vendor","amount","transaction_type","payment_method","tax_included"}}], "tax_summary": {{"total_tax_detected","tax_label","subtotal","grand_total","distribution":[{{"description","original_amount","tax_added","final_amount"}}]}} or null, "validation": {{"invoice_total","calculated_sum","validation_passed","validation_warning"}}}}
+
+--- RECEIPT TEXT ---
+{extracted_text}"""
+
+
 def _build_correction_prompt(correction_context, vendors_list, txn_types_list, payment_methods_list):
     """Build the correction prompt for 2nd pass validation."""
     items_json = json.dumps(correction_context.get("items", []), indent=2)
@@ -589,7 +636,7 @@ def scan_receipt(
     Args:
         file_content: Raw file bytes (image or PDF)
         file_type: MIME type (e.g. "image/jpeg", "application/pdf")
-        model: "fast" (gpt-5.2 text-only) or "heavy" (gpt-5.2 vision)
+        model: "fast" (pdfplumber+gpt-5.2), "fast-beta" (pdfplumber+gpt-5-mini), "heavy" (vision+gpt-5.2)
         correction_context: Optional dict for correction pass (2nd pass)
 
     Returns:
@@ -599,7 +646,7 @@ def scan_receipt(
             "tax_summary": {...} or None,
             "validation": {invoice_total, calculated_sum, validation_passed, ...},
             "extraction_method": "pdfplumber" | "vision" | "vision_direct" | "correction",
-            "model_used": "fast" | "heavy"
+            "model_used": "fast" | "fast-beta" | "heavy"
         }
 
     Raises:
@@ -631,15 +678,17 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
 
     # Map requested model to OpenAI model names
     if correction_context:
-        openai_model = HEAVY_MODEL  # Heavy tier - correction passes
+        openai_model = HEAVY_MODEL
         model = "heavy"
         print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
               f"calculated_sum={correction_context.get('calculated_sum')}, "
               f"items={len(correction_context.get('items', []))}")
+    elif model == "fast-beta":
+        openai_model = MINI_MODEL
     elif model == "heavy":
-        openai_model = HEAVY_MODEL  # Heavy tier - max accuracy OCR
+        openai_model = HEAVY_MODEL
     else:
-        openai_model = HEAVY_MODEL  # Vision always uses heavy; text mode overrides to mini below
+        openai_model = HEAVY_MODEL  # fast default
 
     print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
 
@@ -670,9 +719,10 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
             base64_images = [base64.b64encode(file_content).decode('utf-8')]
             print(f"[SCAN-RECEIPT] HEAVY MODE: Imagen lista para Vision")
 
-    # FAST MODE: Only pdfplumber (no Vision fallback)
+    # FAST / FAST-BETA MODE: Only pdfplumber (no Vision fallback)
     elif file_type == "application/pdf":
-        print(f"[SCAN-RECEIPT] FAST MODE: PDF detectado, intentando pdfplumber...")
+        mode_label = "FAST-BETA" if model == "fast-beta" else "FAST"
+        print(f"[SCAN-RECEIPT] {mode_label} MODE: PDF detectado, intentando pdfplumber...")
         text_success, text_result = extract_text_from_pdf(file_content)
 
         if text_success:
@@ -681,13 +731,11 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
             extracted_text = text_result
             print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
         else:
-            # FAST: no Vision fallback, return error
             raise ValueError(
-                f"Fast mode: PDF has no extractable text ({text_result}). "
+                f"{mode_label} mode: PDF has no extractable text ({text_result}). "
                 f"Use heavy mode for scanned documents."
             )
     else:
-        # FAST + image: not supported
         raise ValueError(
             "Fast mode only supports PDFs with extractable text. "
             "Use heavy mode for images and scanned documents."
@@ -699,7 +747,9 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
         extraction_method = "correction"
         prompt = _build_correction_prompt(correction_context, vendors_list, txn_types_list, payment_methods_list)
     elif use_text_mode:
-        prompt = _build_text_prompt(vendors_list, txn_types_list, payment_methods_list, extracted_text)
+        # Text modes (fast, fast-beta) use the slim prompt
+        prompt = _build_text_prompt_slim(vendors_list, txn_types_list, payment_methods_list, extracted_text)
+        print(f"[SCAN-RECEIPT] Slim prompt: {len(prompt)} chars")
     else:
         page_count_hint = ""
         if len(base64_images) > 1:
@@ -708,45 +758,49 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
 
     # Call OpenAI
     if use_text_mode:
-        if not correction_context and model != "heavy":
-            # Fast text mode: pdfplumber gave us clean text -> use gpt-5.2 (mini was too slow)
-            print(f"[SCAN-RECEIPT] Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
-            result_text = gpt.heavy(
-                system="Analyze this receipt.",
-                user=prompt,
-                temperature=0.1,
+        if model == "fast-beta":
+            # FAST-BETA: pdfplumber text -> gpt-5-mini via responses API
+            print(f"[SCAN-RECEIPT] FAST-BETA: Enviando texto a gpt-5-mini ({len(extracted_text)} chars)...")
+            result_text = gpt.mini(
+                instructions="You extract structured expense data from receipts. Return ONLY valid JSON.",
+                input=prompt,
+                json_mode=True,
                 max_tokens=8000,
             )
             if not result_text:
+                raise RuntimeError("GPT mini returned empty for text mode OCR")
+            openai_model = MINI_MODEL
+            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5-mini (texto)")
+        elif not correction_context and model != "heavy":
+            # FAST: pdfplumber text -> gpt-5.2 via chat.completions
+            print(f"[SCAN-RECEIPT] FAST: Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
+            result_text = gpt.heavy(
+                system="You extract structured expense data from receipts.",
+                user=prompt,
+                temperature=0.1,
+                max_tokens=8000,
+                json_mode=True,
+            )
+            if not result_text:
                 raise RuntimeError("GPT heavy returned empty for text mode OCR")
-            openai_model = HEAVY_MODEL  # Track actual model used
+            openai_model = HEAVY_MODEL
             print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
         else:
-            # Correction/heavy text mode: use gpt-5.2
+            # Correction/heavy text mode: gpt-5.2
             print(f"[SCAN-RECEIPT] Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
             result_text = gpt.heavy(
                 system="You extract structured data from receipts.",
                 user=prompt,
                 temperature=0.1,
                 max_tokens=8000,
+                json_mode=True,
             )
             if not result_text:
                 raise RuntimeError("GPT heavy returned empty for correction/text mode")
             print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
     else:
         # Vision mode: always gpt-5.2
-        message_content = [{"type": "text", "text": prompt}]
-        for base64_img in base64_images:
-            message_content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{media_type};base64,{base64_img}",
-                    "detail": "high"
-                }
-            })
-
         print(f"[SCAN-RECEIPT] Enviando {len(base64_images)} imagen(es) a gpt-5.2 Vision...")
-        # Vision: prompt in system, images in user content
         vision_user = [{"type": "image_url", "image_url": {
             "url": f"data:{media_type};base64,{b64}", "detail": "high"
         }} for b64 in base64_images]
