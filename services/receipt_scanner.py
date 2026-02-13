@@ -847,6 +847,71 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
             "Use heavy mode for images and scanned documents."
         )
 
+    # ── FAST-BETA: try regex-first path (no GPT) ──
+    if model == "fast-beta" and use_text_mode:
+        from services.receipt_regex import (
+            clean_receipt_text, extract_receipt_metadata,
+            assemble_scan_result,
+        )
+
+        # Pass 1: Clean noise
+        cleaned_text = clean_receipt_text(extracted_text)
+        chars_removed = len(extracted_text) - len(cleaned_text)
+        print(f"[SCAN-RECEIPT] FAST-BETA Pass 1: {len(extracted_text)} -> {len(cleaned_text)} chars "
+              f"({chars_removed} noise removed)")
+
+        # Pass 2: Regex extraction
+        regex_meta = extract_receipt_metadata(cleaned_text)
+        conf = regex_meta['confidence']
+        n_items = len(regex_meta['line_items'])
+        items_ok = conf.get('items_match_subtotal') or conf.get('items_match_grand')
+
+        print(f"[SCAN-RECEIPT] FAST-BETA Pass 2: grand_total={regex_meta['grand_total']}, "
+              f"items={n_items}, items_sum={regex_meta['items_sum']}, "
+              f"confidence={conf['grand_total']}, cross={conf['cross_validated']}, "
+              f"items_match_sub={conf['items_match_subtotal']}, items_match_grand={conf['items_match_grand']}")
+
+        if conf['grand_total'] == 'high' and n_items > 0 and items_ok:
+            # HIGH confidence → build result without GPT
+            print(f"[SCAN-RECEIPT] FAST-BETA REGEX: High confidence! Skipping GPT entirely.")
+            parsed_data = assemble_scan_result(
+                regex_meta, vendors_list, txn_types_list, payment_methods_list,
+                original_text=extracted_text,
+            )
+
+            # Run tax safety net (should be no-op since we distribute in code)
+            parsed_data = _redistribute_tax_items(parsed_data)
+
+            extraction_method = "regex"
+            print(f"[SCAN-RECEIPT] COMPLETADO - metodo: regex, items: {len(parsed_data['expenses'])}")
+
+            # Log metric
+            log_ocr_metric(
+                agent="receipt_scanner",
+                source="human_parse",
+                extraction_method="regex",
+                scan_mode="fast-beta",
+                file_type=file_type,
+                char_count=len(extracted_text),
+                success=True,
+                confidence=100 if parsed_data.get("validation", {}).get("validation_passed") else 50,
+                items_count=len(parsed_data["expenses"]),
+                tax_detected=bool(regex_meta.get('tax_amount')),
+            )
+
+            return {
+                "expenses": parsed_data["expenses"],
+                "tax_summary": parsed_data.get("tax_summary"),
+                "validation": parsed_data.get("validation"),
+                "extraction_method": "regex",
+                "model_used": "fast-beta",
+            }
+
+        # LOW confidence → fall back to GPT but with cleaned text (smaller input)
+        print(f"[SCAN-RECEIPT] FAST-BETA REGEX: Low confidence, falling back to GPT mini "
+              f"(using cleaned text: {len(cleaned_text)} chars)")
+        extracted_text = cleaned_text
+
     # Build prompt
     if correction_context:
         use_text_mode = False
@@ -982,7 +1047,7 @@ def _get_cached_categorization(description: str, stage: str) -> Optional[dict]:
             .select("account_id, account_name, confidence, reasoning, warning, cache_id") \
             .eq("description_hash", desc_hash) \
             .eq("construction_stage", stage) \
-            .gte("created_at", (time.time() - 30*24*60*60)) \
+            .gte("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 30*24*60*60))) \
             .order("created_at", desc=True) \
             .limit(1) \
             .execute()

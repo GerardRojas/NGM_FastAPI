@@ -121,6 +121,8 @@ def create_expense(payload: ExpenseCreate, background_tasks: BackgroundTasks, cu
     """
     try:
         data = payload.model_dump(exclude_none=True)
+        # Safety net: remove any remaining empty strings (prevents UUID parse errors)
+        data = {k: v for k, v in data.items() if not (isinstance(v, str) and v.strip() == '')}
 
         # Validar project
         if data.get("project"):
@@ -187,6 +189,8 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
         for idx, exp in enumerate(payload.expenses):
             try:
                 data = exp.model_dump(exclude_none=True)
+                # Safety net: remove any remaining empty strings (prevents UUID parse errors)
+                data = {k: v for k, v in data.items() if not (isinstance(v, str) and v.strip() == '')}
                 expenses_data.append(data)
             except Exception as e:
                 failed.append({
