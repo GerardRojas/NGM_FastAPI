@@ -11,7 +11,9 @@
 """
 
 import re
+import time
 import asyncio
+import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -22,7 +24,13 @@ from api.auth import get_current_user
 from api.services.firebase_notifications import notify_mentioned_users, notify_message_recipients
 from api.services.agent_personas import is_bot_user, AGENT_PERSONAS
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/messages", tags=["messages"])
+
+# In-memory cache for unread-counts (per user_id): {user_id: {"data": {...}, "ts": float}}
+_unread_cache: Dict[str, dict] = {}
+_UNREAD_CACHE_TTL = 30  # seconds
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -334,6 +342,10 @@ def _detect_agent_mentions(
         )
 
 
+_RECEIPT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp", "image/gif"}
+_RECEIPT_EXTS = (".pdf", ".jpg", ".jpeg", ".png", ".webp")
+
+
 def _run_agent_brain(
     agent_name: str,
     user_text: str,
@@ -346,6 +358,30 @@ def _run_agent_brain(
 ) -> None:
     """Sync wrapper to run the async agent brain from a BackgroundTask."""
     try:
+        # Immediate ack for Andrew + file attachments (before GPT routing)
+        if agent_name == "andrew" and attachments:
+            for att in attachments:
+                att_type = (att.get("type") or "").lower()
+                att_name = (att.get("name") or "").lower()
+                if att_type in _RECEIPT_TYPES or att_name.endswith(_RECEIPT_EXTS):
+                    try:
+                        from api.helpers.andrew_messenger import post_andrew_message
+                        post_andrew_message(
+                            content=f"Got it! Processing **{att.get('name', 'receipt')}**...",
+                            project_id=project_id,
+                            channel_type=channel_type,
+                            channel_id=channel_id,
+                            metadata={
+                                "agent_message": True,
+                                "receipt_status": "processing",
+                                "processing_started": True,
+                            },
+                        )
+                        print(f"[Messages] Immediate ack posted for {att.get('name')}")
+                    except Exception as e:
+                        print(f"[Messages] Immediate ack failed (non-blocking): {e}")
+                    break
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -805,16 +841,25 @@ def get_unread_counts(
     try:
         user_id = current_user["user_id"]
 
+        # Check in-memory cache first
+        cached = _unread_cache.get(user_id)
+        if cached and (time.time() - cached["ts"]) < _UNREAD_CACHE_TTL:
+            return {"unread_counts": cached["data"]}
+
         result = supabase.rpc("get_unread_counts", {"p_user_id": user_id}).execute()
 
         counts = {}
         for row in (result.data or []):
             counts[row["channel_key"]] = row["unread_count"]
 
+        # Store in cache
+        _unread_cache[user_id] = {"data": counts, "ts": time.time()}
+
         return {"unread_counts": counts}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        logger.error(f"[unread-counts] RPC failed for user {current_user.get('user_id','?')}: {e}")
+        return {"unread_counts": {}}
 
 
 @router.post("/mark-read")
@@ -845,6 +890,9 @@ def mark_channel_read(
             supabase.table("channel_read_status") \
                 .insert({"user_id": user_id, "channel_key": channel_key, "last_read_at": now, "updated_at": now}) \
                 .execute()
+
+        # Invalidate unread cache so next poll reflects the change
+        _unread_cache.pop(user_id, None)
 
         return {"ok": True, "channel_key": channel_key}
 
