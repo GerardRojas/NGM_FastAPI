@@ -77,6 +77,91 @@ def extract_text_from_pdf(file_content: bytes, min_chars: int = 100) -> tuple:
 
 # ====== HELPERS ======
 
+# Tax-like descriptions that should never be a line item
+_TAX_PATTERNS = re.compile(
+    r'^(sales\s*tax|state\s*tax|county\s*tax|city\s*tax|local\s*tax|'
+    r'tax\s*amount|total\s*tax|hst|gst|pst|vat|iva|'
+    r'tax)$',
+    re.IGNORECASE,
+)
+
+
+def _redistribute_tax_items(parsed_data: dict) -> dict:
+    """
+    Safety net: if GPT created a tax line item despite prompt instructions,
+    detect it, remove it, and redistribute its amount across real items.
+    Returns the (possibly modified) parsed_data.
+    """
+    expenses = parsed_data.get("expenses", [])
+    if not expenses:
+        return parsed_data
+
+    tax_items = []
+    real_items = []
+    for exp in expenses:
+        desc = (exp.get("description") or "").strip()
+        if _TAX_PATTERNS.match(desc):
+            tax_items.append(exp)
+        else:
+            real_items.append(exp)
+
+    if not tax_items or not real_items:
+        return parsed_data
+
+    # Calculate total tax to redistribute
+    tax_total = sum(float(t.get("amount", 0)) for t in tax_items)
+    print(f"[SCAN-RECEIPT] TAX SAFETY NET: Found {len(tax_items)} tax line item(s) "
+          f"totaling ${tax_total:.2f} - redistributing across {len(real_items)} items")
+
+    # Calculate subtotal of real items
+    subtotal = sum(float(r.get("amount", 0)) for r in real_items)
+    if subtotal <= 0:
+        return parsed_data
+
+    # Distribute proportionally
+    distributed_so_far = 0.0
+    for i, item in enumerate(real_items):
+        item_amount = float(item.get("amount", 0))
+        if i == len(real_items) - 1:
+            # Last item gets remainder to avoid rounding drift
+            tax_share = round(tax_total - distributed_so_far, 2)
+        else:
+            proportion = item_amount / subtotal
+            tax_share = round(tax_total * proportion, 2)
+            distributed_so_far += tax_share
+
+        item["amount"] = round(item_amount + tax_share, 2)
+        item["tax_included"] = round(float(item.get("tax_included", 0)) + tax_share, 2)
+
+    # Update tax_summary if present
+    tax_summary = parsed_data.get("tax_summary")
+    if tax_summary:
+        tax_summary["total_tax_detected"] = tax_total
+        tax_summary["distribution"] = [
+            {
+                "description": item.get("description", ""),
+                "original_amount": round(float(item["amount"]) - float(item.get("tax_included", 0)), 2),
+                "tax_added": float(item.get("tax_included", 0)),
+                "final_amount": float(item["amount"]),
+            }
+            for item in real_items
+        ]
+
+    # Update validation
+    new_sum = round(sum(float(r["amount"]) for r in real_items), 2)
+    validation = parsed_data.get("validation", {})
+    invoice_total = float(validation.get("invoice_total", new_sum))
+    validation["calculated_sum"] = new_sum
+    validation["validation_passed"] = abs(new_sum - invoice_total) <= 0.02
+    if not validation.get("validation_warning"):
+        validation["validation_warning"] = None
+    parsed_data["validation"] = validation
+
+    parsed_data["expenses"] = real_items
+    print(f"[SCAN-RECEIPT] TAX SAFETY NET: Redistributed. New sum=${new_sum:.2f}")
+    return parsed_data
+
+
 def _get_poppler_path():
     """Get poppler path for PDF conversion on Windows."""
     if platform.system() == "Windows":
@@ -268,15 +353,22 @@ IMPORTANT RULES:
    - transaction_type: Match to AVAILABLE TRANSACTION TYPES by document type. If uncertain, use "Unknown"
    - payment_method: Match to AVAILABLE PAYMENT METHODS by payment indicators on receipt. If uncertain, use "Unknown"
 
-5. TAX DISTRIBUTION - CRITICAL:
-   - If the receipt shows Sales Tax, Tax, HST, GST, VAT, IVA, or similar tax amounts, DO NOT create a separate tax line item
+5. TAX DISTRIBUTION - CRITICAL (READ THIS CAREFULLY):
+   - ABSOLUTE RULE: NEVER create a line item for "Sales Tax", "Tax", "HST", "GST", "VAT", "IVA", or ANY tax amount. Tax is NEVER an expense line item.
    - Instead, DISTRIBUTE the tax proportionally across all product/service line items based on each item's percentage of the subtotal
    - Example: Subtotal $100, Item A $60 (60%), Item B $40 (40%), Tax $8:
      * Item A final = $60 + ($8 x 0.60) = $64.80
      * Item B final = $40 + ($8 x 0.40) = $43.20
-   - The sum of all final amounts MUST equal the receipt's TOTAL (including tax)
+     * CORRECT: Return 2 items totaling $108.00
+     * WRONG: Return 3 items including "Sales Tax $8.00" - NEVER DO THIS
+   - The sum of all final amounts MUST equal the receipt's GRAND TOTAL (including tax)
    - Add "tax_included" field to each item showing the tax amount added to it
    - NOTE: Even if tax rate shows 0%, check for actual tax line amounts
+
+   FORBIDDEN DESCRIPTIONS (never use these as expense line items):
+   "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "Local Tax",
+   "HST", "GST", "PST", "VAT", "IVA", "Tax Amount", "Total Tax"
+   If you catch yourself creating any of these, STOP and redistribute instead.
 
    TAX-INCLUSIVE DETECTION - Use these criteria to determine if prices already include tax:
    a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. In this case set tax_included=0 for all items and use the amounts as-is.
@@ -350,6 +442,7 @@ Return ONLY valid JSON in this exact format:
 }}
 
 IMPORTANT:
+- NEVER create an expense line item for tax. "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions. If the receipt has a tax line, you MUST distribute it proportionally across the other items so their amounts sum to the GRAND TOTAL.
 - If NO tax was detected on the receipt, set "tax_summary" to null
 - The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
 - The "invoice_total" MUST be the exact total shown on the receipt/invoice document
@@ -421,8 +514,8 @@ IMPORTANT RULES:
    - transaction_type: Match to AVAILABLE TRANSACTION TYPES by document type. If uncertain, use "Unknown"
    - payment_method: Match to AVAILABLE PAYMENT METHODS by payment indicators in the text. Look for keywords like "DEBIT", "CREDIT", "VISA", "MASTERCARD", "AMEX", "CASH", "CHECK", "ACH", "CARD ENDING", "APPROVAL CODE", etc. Most store/supplier receipts are paid by Debit card - default to "Debit" when payment indicators suggest card payment or are ambiguous. Only use "Unknown" if there are truly no payment clues in the text.
 
-5. TAX DISTRIBUTION - CRITICAL:
-   - If the receipt shows Sales Tax, Tax, HST, GST, VAT, IVA, or similar tax amounts, DO NOT create a separate tax line item
+5. TAX DISTRIBUTION - CRITICAL (READ THIS CAREFULLY):
+   - ABSOLUTE RULE: NEVER create a line item for "Sales Tax", "Tax", "HST", "GST", "VAT", "IVA", or ANY tax amount. Tax is NEVER an expense line item.
    - Instead, DISTRIBUTE the tax proportionally across all product/service line items based on each item's percentage of the subtotal
    - Example: Subtotal $1595.17, Item A $1479.68, Item B $115.49, Tax $123.63:
      * Item A: $1479.68 / $1595.17 = 92.76% -> tax = $123.63 x 0.9276 = $114.68
@@ -430,10 +523,17 @@ IMPORTANT RULES:
      * Item A final amount = $1479.68 + $114.68 = $1594.36
      * Item B final amount = $115.49 + $8.95 = $124.44
      * Total = $1594.36 + $124.44 = $1718.80 (matches invoice!)
+     * CORRECT: Return 2 items totaling $1718.80
+     * WRONG: Return 3 items including "Sales Tax $123.63" - NEVER DO THIS
    - PRECISION: Round tax_included to 2 decimal places
-   - The sum of all final amounts MUST equal the receipt's TOTAL (including tax)
+   - The sum of all final amounts MUST equal the receipt's GRAND TOTAL (including tax)
    - Add "tax_included" field to each item showing the tax amount added to it
    - NOTE: Even if tax rate shows 0%, check for actual tax line amounts
+
+   FORBIDDEN DESCRIPTIONS (never use these as expense line items):
+   "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "Local Tax",
+   "HST", "GST", "PST", "VAT", "IVA", "Tax Amount", "Total Tax"
+   If you catch yourself creating any of these, STOP and redistribute instead.
 
    TAX-INCLUSIVE DETECTION - Use these criteria to determine if prices already include tax:
    a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. In this case set tax_included=0 for all items and use the amounts as-is.
@@ -507,6 +607,7 @@ Return ONLY valid JSON in this exact format:
 }}
 
 IMPORTANT:
+- NEVER create an expense line item for tax. "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions. If the receipt has a tax line, you MUST distribute it proportionally across the other items so their amounts sum to the GRAND TOTAL.
 - If NO tax was detected on the receipt, set "tax_summary" to null
 - The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
 - The "invoice_total" MUST be the exact total shown on the receipt/invoice document
@@ -541,6 +642,8 @@ RULES:
 4. FEES (delivery, freight, environmental, surcharges, tips) are separate line items, NOT distributed like tax.
 5. Prefer "Debit" over "Unknown" for payment_method when any card/electronic indicator exists.
 6. If only one total with no itemization, create one expense with that total.
+
+IMPORTANT: NEVER create an expense for "Sales Tax", "Tax", "State Tax", "HST", "GST", "VAT", or any tax. Distribute tax across items instead.
 
 VALIDATION (mandatory):
 - invoice_total = exact grand total printed on receipt
@@ -588,6 +691,9 @@ TAX RULES:
 - If the receipt shows a separate tax line, distribute tax proportionally across items
 - Each expense "amount" = final amount WITH tax included
 - The sum of ALL "amount" fields MUST equal the invoice total (${invoice_total:.2f})
+- NEVER create a "Sales Tax" or "Tax" expense line item. Distribute tax across the real items instead.
+
+IMPORTANT: "Sales Tax", "Tax", "State Tax", "County Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions. If the OCR items include a tax line item, REMOVE it and redistribute its amount proportionally across the real product/service items. The final item amounts must sum to ${invoice_total:.2f}.
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -827,6 +933,9 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
     for expense in parsed_data["expenses"]:
         if not all(key in expense for key in ["date", "description", "amount"]):
             raise RuntimeError("Some expenses are missing required fields (date, description, amount)")
+
+    # Safety net: catch and redistribute any tax line items GPT created
+    parsed_data = _redistribute_tax_items(parsed_data)
 
     print(f"[SCAN-RECEIPT] COMPLETADO - metodo: {extraction_method}, items: {len(parsed_data['expenses'])}")
 

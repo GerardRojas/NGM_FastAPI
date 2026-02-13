@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from api.supabase_client import supabase
 from api.auth import get_current_user
 from typing import Optional, List
@@ -32,6 +32,20 @@ class ExpenseCreate(BaseModel):
     account_id: Optional[str] = None
     created_by: Optional[str] = None
 
+    @field_validator('project', mode='before')
+    @classmethod
+    def project_not_empty(cls, v):
+        if isinstance(v, str) and v.strip() == '':
+            raise ValueError('project is required and cannot be empty')
+        return v
+
+    @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'created_by', 'LineUID', mode='before')
+    @classmethod
+    def empty_str_to_none(cls, v):
+        if isinstance(v, str) and v.strip() == '':
+            return None
+        return v
+
 
 class ExpenseBatchCreate(BaseModel):
     """Modelo para crear múltiples gastos en una sola llamada"""
@@ -56,6 +70,13 @@ class ExpenseUpdate(BaseModel):
     receipt_url: Optional[str] = None  # URL del recibo/factura en Storage
     status: Optional[str] = None  # 'pending', 'auth', 'review' - for auto-review on field changes
     status_reason: Optional[str] = None  # Reason for status change (used with auto-review)
+
+    @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'auth_by', 'LineUID', mode='before')
+    @classmethod
+    def empty_str_to_none(cls, v):
+        if isinstance(v, str) and v.strip() == '':
+            return None
+        return v
 
 
 class ExpenseUpdateItem(BaseModel):
