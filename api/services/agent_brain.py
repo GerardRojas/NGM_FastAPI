@@ -1247,6 +1247,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
             file_content=file_content,
             file_type=file_type,
             model="heavy",
+            filename=file_name,
         )
 
         expenses = scan_result.get("expenses", [])

@@ -735,6 +735,7 @@ def scan_receipt(
     file_type: str,
     model: str = "fast",
     correction_context: Optional[dict] = None,
+    filename: Optional[str] = None,
 ) -> dict:
     """
     Core receipt scanning logic. Extracts line items from a receipt image/PDF.
@@ -744,6 +745,8 @@ def scan_receipt(
         file_type: MIME type (e.g. "image/jpeg", "application/pdf")
         model: "fast" (pdfplumber+gpt-5.2), "fast-beta" (pdfplumber+gpt-5-mini), "heavy" (vision+gpt-5.2)
         correction_context: Optional dict for correction pass (2nd pass)
+        filename: Original filename (optional). Used to extract vendor, date,
+                  and total hints for cross-validation in fast-beta regex mode.
 
     Returns:
         {
@@ -767,7 +770,7 @@ def scan_receipt(
         raise ValueError("File too large. Maximum size is 20MB.")
 
     try:
-        return _scan_receipt_inner(file_content, file_type, model, correction_context)
+        return _scan_receipt_inner(file_content, file_type, model, correction_context, filename)
     except Exception as e:
         log_ocr_metric(
             agent="receipt_scanner",
@@ -779,7 +782,7 @@ def scan_receipt(
         raise
 
 
-def _scan_receipt_inner(file_content, file_type, model, correction_context):
+def _scan_receipt_inner(file_content, file_type, model, correction_context, filename=None):
     from api.services.gpt_client import gpt, HEAVY_MODEL, MINI_MODEL
 
     # Map requested model to OpenAI model names
@@ -861,10 +864,10 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
               f"({chars_removed} noise removed)")
 
         # Pass 2: Best extraction (general + vendor-specific layers + scoring)
-        regex_meta, scoring = extract_best(cleaned_text)
+        regex_meta, scoring = extract_best(cleaned_text, filename=filename)
         conf = regex_meta['confidence']
         n_items = len(regex_meta['line_items'])
-        items_ok = conf.get('items_match_subtotal') or conf.get('items_match_grand')
+        items_ok = conf.get('items_match_subtotal') or conf.get('items_match_grand') or conf.get('items_plus_tax_match')
 
         print(f"[SCAN-RECEIPT] FAST-BETA Pass 2: vendor={scoring['vendor_detected']}, "
               f"winner={scoring['winner']}, score={scoring.get('vendor_score') or scoring['general_score']}/100, "
