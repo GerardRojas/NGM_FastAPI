@@ -850,7 +850,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
     # ── FAST-BETA: try regex-first path (no GPT) ──
     if model == "fast-beta" and use_text_mode:
         from services.receipt_regex import (
-            clean_receipt_text, extract_receipt_metadata,
+            clean_receipt_text, extract_best,
             assemble_scan_result,
         )
 
@@ -860,16 +860,16 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
         print(f"[SCAN-RECEIPT] FAST-BETA Pass 1: {len(extracted_text)} -> {len(cleaned_text)} chars "
               f"({chars_removed} noise removed)")
 
-        # Pass 2: Regex extraction
-        regex_meta = extract_receipt_metadata(cleaned_text)
+        # Pass 2: Best extraction (general + vendor-specific layers + scoring)
+        regex_meta, scoring = extract_best(cleaned_text)
         conf = regex_meta['confidence']
         n_items = len(regex_meta['line_items'])
         items_ok = conf.get('items_match_subtotal') or conf.get('items_match_grand')
 
-        print(f"[SCAN-RECEIPT] FAST-BETA Pass 2: grand_total={regex_meta['grand_total']}, "
-              f"items={n_items}, items_sum={regex_meta['items_sum']}, "
-              f"confidence={conf['grand_total']}, cross={conf['cross_validated']}, "
-              f"items_match_sub={conf['items_match_subtotal']}, items_match_grand={conf['items_match_grand']}")
+        print(f"[SCAN-RECEIPT] FAST-BETA Pass 2: vendor={scoring['vendor_detected']}, "
+              f"winner={scoring['winner']}, score={scoring.get('vendor_score') or scoring['general_score']}/100, "
+              f"grand_total={regex_meta['grand_total']}, items={n_items}, "
+              f"items_sum={regex_meta['items_sum']}, cross={conf['cross_validated']}")
 
         if conf['grand_total'] == 'high' and n_items > 0 and items_ok:
             # HIGH confidence → build result without GPT

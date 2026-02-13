@@ -39,7 +39,7 @@ class ExpenseCreate(BaseModel):
             raise ValueError('project is required and cannot be empty')
         return v
 
-    @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'created_by', 'LineUID', mode='before')
+    @field_validator('txn_type', 'bill_id', 'vendor_id', 'payment_type', 'account_id', 'created_by', 'LineUID', mode='before')
     @classmethod
     def empty_str_to_none(cls, v):
         if isinstance(v, str) and v.strip() == '':
@@ -71,7 +71,7 @@ class ExpenseUpdate(BaseModel):
     status: Optional[str] = None  # 'pending', 'auth', 'review' - for auto-review on field changes
     status_reason: Optional[str] = None  # Reason for status change (used with auto-review)
 
-    @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'auth_by', 'LineUID', mode='before')
+    @field_validator('txn_type', 'bill_id', 'vendor_id', 'payment_type', 'account_id', 'auth_by', 'LineUID', mode='before')
     @classmethod
     def empty_str_to_none(cls, v):
         if isinstance(v, str) and v.strip() == '':
@@ -268,6 +268,8 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, current_user: dict = Depe
             try:
                 # Preparar datos para actualización (excluir None)
                 update_data = item.data.model_dump(exclude_none=True)
+                # Safety net: remove any remaining empty strings (prevents UUID parse errors)
+                update_data = {k: v for k, v in update_data.items() if not (isinstance(v, str) and v.strip() == '')}
 
                 if not update_data:
                     failed.append({
