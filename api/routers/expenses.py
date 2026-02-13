@@ -202,6 +202,13 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
         if not expenses_data:
             raise HTTPException(status_code=400, detail="No valid expenses to create")
 
+        # Debug: log fields being inserted to catch UUID issues
+        for i, ed in enumerate(expenses_data):
+            empty_fields = {k: repr(v) for k, v in ed.items() if isinstance(v, str) and v.strip() == ''}
+            if empty_fields:
+                print(f"[BATCH-CREATE] WARNING: expense {i} still has empty strings: {empty_fields}")
+            print(f"[BATCH-CREATE] expense {i} fields: {list(ed.keys())}")
+
         # Inserción bulk - una sola operación a la base de datos
         res = supabase.table("expenses_manual_COGS").insert(expenses_data).execute()
 
@@ -659,6 +666,8 @@ def update_expense(expense_id: str, payload: ExpenseUpdate, current_user: dict =
 
         # Preparar datos para actualizar (only fields the client actually sent)
         data = payload.model_dump(exclude_unset=True)
+        # Safety net: remove any remaining empty strings (prevents UUID parse errors)
+        data = {k: v for k, v in data.items() if not (isinstance(v, str) and v.strip() == '')}
 
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -715,6 +724,8 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
 
         # Preparar datos para actualizar (only fields the client actually sent)
         data = payload.model_dump(exclude_unset=True)
+        # Safety net: remove any remaining empty strings (prevents UUID parse errors)
+        data = {k: v for k, v in data.items() if not (isinstance(v, str) and v.strip() == '')}
 
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -1492,6 +1503,7 @@ async def parse_receipt(
             file_type=file.content_type,
             model=model,
             correction_context=correction_data,
+            filename=file.filename,
         )
 
         execution_time = round(time.time() - start_time, 2)
