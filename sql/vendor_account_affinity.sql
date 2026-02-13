@@ -46,18 +46,17 @@ DECLARE
     v_total INTEGER;
     v_vendor_name TEXT;
 BEGIN
-    -- Get vendor name
-    SELECT vendor INTO v_vendor_name
+    -- Get vendor name (vendor_id is UUID in DB, cast for comparison)
+    SELECT vendor_id::TEXT INTO v_vendor_name
     FROM "expenses_manual_COGS"
-    WHERE vendor_id = p_vendor_id
+    WHERE vendor_id = p_vendor_id::UUID
     LIMIT 1;
 
     -- Count total expenses for this vendor
     SELECT COUNT(*) INTO v_total
     FROM "expenses_manual_COGS"
-    WHERE vendor_id = p_vendor_id
-      AND account_id IS NOT NULL
-      AND account_id != '';
+    WHERE vendor_id = p_vendor_id::UUID
+      AND account_id IS NOT NULL;
 
     IF v_total = 0 THEN
         RETURN;
@@ -68,16 +67,15 @@ BEGIN
     SELECT
         p_vendor_id,
         v_vendor_name,
-        e.account_id,
+        e.account_id::TEXT,
         a."Name",
         COUNT(*),
         v_total,
         NOW()
     FROM "expenses_manual_COGS" e
-    LEFT JOIN accounts a ON a.id::TEXT = e.account_id
-    WHERE e.vendor_id = p_vendor_id
+    LEFT JOIN accounts a ON a.account_id = e.account_id
+    WHERE e.vendor_id = p_vendor_id::UUID
       AND e.account_id IS NOT NULL
-      AND e.account_id != ''
     GROUP BY e.account_id, a."Name"
     ON CONFLICT (vendor_id, account_id)
     DO UPDATE SET
@@ -131,9 +129,9 @@ CREATE OR REPLACE FUNCTION trigger_refresh_vendor_affinity()
 RETURNS TRIGGER AS $$
 BEGIN
     -- Only refresh if vendor_id and account_id are present
-    IF NEW.vendor_id IS NOT NULL AND NEW.vendor_id != ''
-       AND NEW.account_id IS NOT NULL AND NEW.account_id != '' THEN
-        PERFORM refresh_vendor_affinity(NEW.vendor_id);
+    -- Note: no != '' checks needed - UUID columns cannot contain empty strings
+    IF NEW.vendor_id IS NOT NULL AND NEW.account_id IS NOT NULL THEN
+        PERFORM refresh_vendor_affinity(NEW.vendor_id::TEXT);
     END IF;
     RETURN NEW;
 END;

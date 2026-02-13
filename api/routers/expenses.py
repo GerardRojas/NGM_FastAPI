@@ -235,19 +235,8 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
         if not expenses_data:
             raise HTTPException(status_code=400, detail="No valid expenses to create")
 
-        # Debug: log all string values to catch UUID issues
-        uuid_fields = ['project', 'txn_type', 'bill_id', 'vendor_id', 'payment_type', 'account_id', 'created_by', 'LineUID']
-        for i, ed in enumerate(expenses_data):
-            str_vals = {k: repr(v) for k, v in ed.items() if k in uuid_fields}
-            print(f"[BATCH-CREATE] expense {i} uuid_fields: {str_vals}")
-
         # Inserción bulk - una sola operación a la base de datos
-        try:
-            res = supabase.table("expenses_manual_COGS").insert(expenses_data).execute()
-        except Exception as insert_err:
-            print(f"[BATCH-CREATE] INSERT FAILED: {insert_err}")
-            print(f"[BATCH-CREATE] Full payload: {expenses_data}")
-            raise
+        res = supabase.table("expenses_manual_COGS").insert(expenses_data).execute()
 
         created_expenses = res.data or []
 
@@ -1493,6 +1482,38 @@ async def save_categorization_correction(payload: dict, current_user: dict = Dep
 # ====== PDF TEXT EXTRACTION HELPER ======
 # Delegated to shared service: services/receipt_scanner.extract_text_from_pdf()
 extract_text_from_pdf = _extract_text_from_pdf
+
+
+@router.post("/check-receipt-type")
+async def check_receipt_type(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Quick check: is this file a text-based PDF (fast-mode compatible)
+    or an image/scanned PDF (heavy-mode only)?
+
+    Returns:
+        { "has_text": bool, "file_type": str, "char_count": int }
+    """
+    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "application/pdf"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    # Images are never text-extractable
+    if file.content_type != "application/pdf":
+        return {"has_text": False, "file_type": "image", "char_count": 0}
+
+    # For PDFs, try pdfplumber
+    file_content = await file.read()
+    text_success, text_result = _extract_text_from_pdf(file_content)
+
+    char_count = len(text_result) if text_success else 0
+    return {
+        "has_text": text_success,
+        "file_type": "pdf_text" if text_success else "pdf_scan",
+        "char_count": char_count,
+    }
 
 
 @router.post("/parse-receipt")
