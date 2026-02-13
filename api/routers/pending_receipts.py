@@ -5350,7 +5350,7 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest, curr
 def update_receipt(receipt_id: str, payload: PendingReceiptUpdate, current_user: dict = Depends(get_current_user)):
     """Update a pending receipt's status or parsed data"""
     try:
-        update_data = payload.model_dump(exclude_none=True)
+        update_data = payload.model_dump(exclude_unset=True)
         update_data["updated_at"] = datetime.utcnow().isoformat()
 
         result = supabase.table("pending_receipts") \
