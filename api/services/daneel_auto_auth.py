@@ -23,6 +23,7 @@ from supabase import create_client, Client
 
 from api.helpers.daneel_messenger import post_daneel_message, DANEEL_BOT_USER_ID
 from api.services.ocr_metrics import log_ocr_metric
+from api.services.gpt_client import gpt
 
 logger = logging.getLogger(__name__)
 
@@ -286,11 +287,6 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
     import json as _json
     import base64
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.warning("[DaneelAutoAuth] Vision: no OPENAI_API_KEY")
-        return None
-
     try:
         # 1. Download the receipt file
         with httpx.Client(timeout=15.0) as client:
@@ -315,18 +311,24 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             except Exception as e:
                 logger.info(f"[DaneelAutoAuth] pdfplumber unavailable: {e}")
 
-        from openai import OpenAI
-        ai_client = OpenAI(api_key=api_key)
-
         if extracted_text:
-            # 3a. Text mode (pdfplumber succeeded) -- no image needed
+            # 3a. Text mode (pdfplumber succeeded) -- mini w/ fallback to heavy
             prompt = _TEXT_BILL_TOTAL_PROMPT.format(text=extracted_text)
-            response = ai_client.chat.completions.create(
-                model="gpt-5.1",  # Medium tier - categorization
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_completion_tokens=200,
-            )
+            raw = gpt.mini(prompt, "Analyze this bill.", max_tokens=200)
+            # Confidence fallback: escalate to heavy if mini < 75%
+            if raw:
+                try:
+                    _t = raw
+                    if _t.startswith("```"):
+                        _t = _t.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                    _conf = int(_json.loads(_t).get("confidence", 0))
+                    if _conf < 75:
+                        logger.info("[DaneelAutoAuth] mini confidence %d%% < 75%%, escalating to heavy", _conf)
+                        raw = None
+                except (ValueError, _json.JSONDecodeError, TypeError):
+                    pass
+            if not raw:
+                raw = gpt.heavy(prompt, "Analyze this bill.", temperature=0.1, max_tokens=200)
         else:
             # 3b. Vision mode (fallback) -- convert to image
             if is_pdf:
@@ -335,7 +337,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
                     import io
                     import platform
                     poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin' if platform.system() == "Windows" else None
-                    images = convert_from_bytes(file_content, dpi=300, first_page=1, last_page=1,
+                    images = convert_from_bytes(file_content, dpi=250, first_page=1, last_page=1,
                                                 poppler_path=poppler_path)
                     if not images:
                         logger.warning("[DaneelAutoAuth] Vision: PDF conversion produced no images")
@@ -352,23 +354,19 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
                 b64_image = base64.b64encode(file_content).decode('utf-8')
                 media_type = content_type if content_type else "image/jpeg"
 
-            response = ai_client.chat.completions.create(
-                model="gpt-5.1",  # Medium tier - categorization
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _VISION_BILL_TOTAL_PROMPT},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:{media_type};base64,{b64_image}",
-                            "detail": "high"
-                        }}
-                    ]
-                }],
+            raw = gpt.heavy(
+                system=_VISION_BILL_TOTAL_PROMPT,
+                user=[{"type": "image_url", "image_url": {
+                    "url": f"data:{media_type};base64,{b64_image}",
+                    "detail": "high"
+                }}],
                 temperature=0.1,
-                max_completion_tokens=200,
+                max_tokens=200,
             )
 
-        raw = response.choices[0].message.content.strip()
+        if not raw:
+            logger.info("[DaneelAutoAuth] GPT returned empty response")
+            return None
 
         # 4. Parse response
         # Strip markdown code fences if present
@@ -417,7 +415,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             agent="daneel",
             source="hint_review",
             extraction_method=_extraction_method,
-            model_used="gpt-5.1",
+            model_used="gpt-5-mini" if extracted_text else "gpt-5.2",
             file_type="application/pdf" if is_pdf else content_type,
             char_count=len(extracted_text) if extracted_text else None,
             success=True,
@@ -716,32 +714,45 @@ def gpt_resolve_ambiguous(
     """
     import json as _json
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return DuplicateResult("ambiguous", "GPT_NO_KEY", "OpenAI API key not configured")
-
     exp_a = _format_expense_for_gpt(expense, lookups)
     exp_b = _format_expense_for_gpt(other, lookups)
     user_msg = f"Expense A:\n{exp_a}\n\nExpense B:\n{exp_b}\n\nAre these duplicates?"
 
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-5.2",  # Heavy tier - duplicate resolution
-            messages=[
-                {"role": "system", "content": _GPT_SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.1,
-            max_completion_tokens=150,
-        )
-        raw = response.choices[0].message.content.strip()
-        data = _json.loads(raw)
+        # Step 1: Try gpt-5-mini first (fast, cheap)
+        raw = gpt.mini(_GPT_SYSTEM_PROMPT, user_msg, json_mode=True, max_tokens=150)
+        tier_used = "mini"
 
+        if raw:
+            try:
+                data = _json.loads(raw)
+                confidence = int(data.get("confidence", 0))
+                if confidence < min_confidence:
+                    logger.info(
+                        f"[DaneelAutoAuth] mini confidence {confidence}% < {min_confidence}%, "
+                        f"escalating to heavy"
+                    )
+                    raw = None  # trigger fallback
+            except (ValueError, _json.JSONDecodeError):
+                raw = None  # trigger fallback
+
+        # Step 2: Fallback to gpt-5.2 (heavy tier)
+        if not raw:
+            raw = gpt.heavy(
+                _GPT_SYSTEM_PROMPT, user_msg,
+                temperature=0.1, max_tokens=150, json_mode=True,
+            )
+            tier_used = "heavy"
+
+        if not raw:
+            return DuplicateResult("ambiguous", "GPT_EMPTY", "Both GPT tiers returned empty")
+
+        data = _json.loads(raw)
         verdict = data.get("verdict", "").lower()
         confidence = int(data.get("confidence", 0))
         reason = data.get("reason", "GPT analysis")
+
+        logger.info(f"[DaneelAutoAuth] duplicate resolution via {tier_used}: {verdict} ({confidence}%)")
 
         if confidence < min_confidence:
             return DuplicateResult("ambiguous", "GPT_LOW_CONF",
@@ -749,11 +760,11 @@ def gpt_resolve_ambiguous(
 
         if verdict == "duplicate":
             return DuplicateResult("duplicate", "GPT_DUP",
-                                   f"GPT ({confidence}%): {reason}",
+                                   f"GPT-{tier_used} ({confidence}%): {reason}",
                                    paired_expense_id=other.get("expense_id") or other.get("id"))
         else:
             return DuplicateResult("not_duplicate", "GPT_CLEAR",
-                                   f"GPT ({confidence}%): {reason}")
+                                   f"GPT-{tier_used} ({confidence}%): {reason}")
 
     except Exception as e:
         logger.warning(f"[DaneelAutoAuth] GPT fallback failed: {e}")

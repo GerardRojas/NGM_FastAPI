@@ -8,7 +8,7 @@ import re
 import json
 import os
 from typing import Dict, Any, Optional
-from openai import OpenAI
+from api.services.gpt_client import gpt
 from .persona import get_persona_prompt
 
 # ================================
@@ -17,6 +17,7 @@ from .persona import get_persona_prompt
 
 VALID_INTENTS = [
     "BUDGET_VS_ACTUALS",    # Reporte BVA global
+    "PNL_COGS",             # P&L COGS report (actuals only, no budget)
     "CONSULTA_ESPECIFICA",  # Consulta sobre categoría específica del BVA
     "SCOPE_OF_WORK",        # Consultas sobre SOW
     "INFO",                 # Información del sistema / ayuda
@@ -216,6 +217,36 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             return {
                 "intent": "BUDGET_VS_ACTUALS",
                 "entities": {"project": None},  # No project specified
+                "confidence": 1.0,
+                "source": "local"
+            }
+
+    # ================================
+    # P&L COGS with project: "pnl del rio", "pnl arthur neal"
+    # ================================
+    match_pnl = re.match(r'^(pnl|p&l|p&l\s*cogs|pnlcogs)\s+(.+)$', t)
+    if match_pnl:
+        prefix_len = match_pnl.end(1)
+        original_project = text.strip()[prefix_len:].strip()
+        return {
+            "intent": "PNL_COGS",
+            "entities": {"project": original_project},
+            "confidence": 1.0,
+            "source": "local"
+        }
+
+    # P&L COGS without project: "pnl", "reporte pnl", "genera pnl", etc.
+    pnl_no_project_patterns = [
+        r'^(pnl|p&l|p&l\s*cogs|pnlcogs)$',
+        r'^(reporte|report|genera|generar|dame|muéstrame|muestrame|quiero)\s+(el\s+)?(pnl|p&l|p&l\s*cogs)',
+        r'^(pnl|p&l|p&l\s*cogs)\s+(report|reporte)?$',
+        r'(necesito|quiero|dame)\s+(un\s+)?(reporte\s+)?(pnl|p&l|p&l\s*cogs)',
+    ]
+    for pattern in pnl_no_project_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "PNL_COGS",
+                "entities": {"project": None},
                 "confidence": 1.0,
                 "source": "local"
             }
@@ -822,17 +853,6 @@ def interpret_with_gpt(text: str, context: Dict[str, Any] = None) -> Dict[str, A
     """
     Usa OpenAI para clasificar el intent cuando las reglas locales no matchean.
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {
-            "intent": "UNKNOWN",
-            "entities": {},
-            "confidence": 0.0,
-            "error": "OPENAI_API_KEY not configured"
-        }
-
-    client = OpenAI(api_key=api_key)
-
     # Agregar contexto del espacio si existe
     context_info = ""
     if context:
@@ -840,17 +860,20 @@ def interpret_with_gpt(text: str, context: Dict[str, Any] = None) -> Dict[str, A
             context_info = f"\n\nContexto: El usuario está en el espacio '{context['space_name']}'"
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-5.1",  # Internal tier - fast classification
-            messages=[
-                {"role": "system", "content": NLU_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Mensaje del usuario: {text}{context_info}"}
-            ],
-            temperature=0,
-            max_completion_tokens=200
+        raw_response = gpt.mini(
+            NLU_SYSTEM_PROMPT,
+            f"Mensaje del usuario: {text}{context_info}",
+            json_mode=True,
+            max_tokens=200,
         )
 
-        raw_response = response.choices[0].message.content.strip()
+        if not raw_response:
+            return {
+                "intent": "UNKNOWN",
+                "entities": {},
+                "confidence": 0.0,
+                "error": "GPT returned empty response"
+            }
 
         # Limpiar respuesta (quitar markdown fences si los hay)
         cleaned = raw_response

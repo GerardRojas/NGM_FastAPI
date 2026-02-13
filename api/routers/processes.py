@@ -4,11 +4,15 @@ Process Manager API Router
 Endpoints for managing business processes - both implemented (from code) and drafts.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import get_current_user
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 from api.services.process_parser import (
     get_all_implemented_processes,
@@ -62,7 +66,8 @@ class ProcessUpdate(BaseModel):
 async def get_all_processes(
     include_implemented: bool = Query(True, description="Include code-based processes"),
     include_drafts: bool = Query(True, description="Include database draft processes"),
-    category: Optional[str] = Query(None, description="Filter by category")
+    category: Optional[str] = Query(None, description="Filter by category"),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get all processes (both implemented from code and drafts from database).
@@ -79,7 +84,7 @@ async def get_all_processes(
             implemented = get_all_implemented_processes(api_root)
             processes.extend(implemented)
         except Exception as e:
-            print(f"Error parsing implemented processes: {e}")
+            logger.warning("Error parsing implemented processes: %s", e)
 
     # Get draft processes from database
     if include_drafts:
@@ -104,7 +109,7 @@ async def get_all_processes(
                     })
         except Exception as e:
             # Table might not exist yet - that's OK
-            print(f"Note: Could not fetch draft processes: {e}")
+            logger.info("Could not fetch draft processes: %s", e)
 
     # Filter by category if specified
     if category:
@@ -128,8 +133,57 @@ async def get_all_processes(
     }
 
 
+@router.get("/categories/list")
+async def get_process_categories(current_user: dict = Depends(get_current_user)):
+    """
+    Get list of available process categories.
+    """
+    return {
+        "categories": [
+            {"id": "coordination", "name": "Coordination", "description": "Project and team coordination processes"},
+            {"id": "bookkeeping", "name": "Bookkeeping", "description": "Financial and accounting processes"},
+            {"id": "operations", "name": "Operations", "description": "Day-to-day operational processes"},
+            {"id": "finance", "name": "Finance", "description": "Financial management and budgeting"},
+            {"id": "hr", "name": "Human Resources", "description": "HR and team management processes"},
+            {"id": "sales", "name": "Sales", "description": "Sales and client acquisition processes"},
+        ]
+    }
+
+
+@router.get("/triggers/list")
+async def get_trigger_types(current_user: dict = Depends(get_current_user)):
+    """
+    Get list of available trigger types.
+    """
+    return {
+        "triggers": [
+            {"id": "manual", "name": "Manual", "description": "Triggered manually by a user"},
+            {"id": "scheduled", "name": "Scheduled", "description": "Runs on a schedule (daily, weekly, etc.)"},
+            {"id": "event", "name": "Event", "description": "Triggered by a system event"},
+            {"id": "webhook", "name": "Webhook", "description": "Triggered by an external webhook call"},
+        ]
+    }
+
+
+@router.get("/step-types/list")
+async def get_step_types(current_user: dict = Depends(get_current_user)):
+    """
+    Get list of available step types.
+    """
+    return {
+        "step_types": [
+            {"id": "condition", "name": "Condition", "description": "Evaluate a condition to determine flow", "icon": "split"},
+            {"id": "action", "name": "Action", "description": "Perform an action or operation", "icon": "play"},
+            {"id": "notification", "name": "Notification", "description": "Send a notification", "icon": "bell"},
+            {"id": "wait", "name": "Wait", "description": "Wait for time or event", "icon": "clock"},
+            {"id": "assignment", "name": "Assignment", "description": "Assign task to user/role", "icon": "user"},
+            {"id": "approval", "name": "Approval", "description": "Require approval to continue", "icon": "check"},
+        ]
+    }
+
+
 @router.get("/{process_id}")
-async def get_process(process_id: str):
+async def get_process(process_id: str, current_user: dict = Depends(get_current_user)):
     """
     Get a single process by ID.
     Checks both implemented (code) and draft (database) processes.
@@ -142,7 +196,7 @@ async def get_process(process_id: str):
             if p['id'] == process_id:
                 return p
     except Exception as e:
-        print(f"Error checking implemented processes: {e}")
+        logger.warning("Error checking implemented processes: %s", e)
 
     # Then check database drafts
     try:
@@ -164,13 +218,13 @@ async def get_process(process_id: str):
                 'updated_at': draft.get('updated_at')
             }
     except Exception as e:
-        print(f"Error checking draft processes: {e}")
+        logger.warning("Error checking draft processes: %s", e)
 
     raise HTTPException(status_code=404, detail=f"Process '{process_id}' not found")
 
 
 @router.post("/drafts")
-async def create_draft_process(process: ProcessCreate):
+async def create_draft_process(process: ProcessCreate, current_user: dict = Depends(get_current_user)):
     """
     Create a new draft process.
     Draft processes are proposals that haven't been implemented in code yet.
@@ -210,7 +264,7 @@ async def create_draft_process(process: ProcessCreate):
         "trigger_type": process.trigger,
         "description": process.description,
         "owner": process.owner,
-        "steps": [step.dict() for step in process.steps],
+        "steps": [step.model_dump() for step in process.steps],
         "position": process.position,
         "status": "draft"
     }
@@ -226,7 +280,7 @@ async def create_draft_process(process: ProcessCreate):
 
 
 @router.patch("/drafts/{process_id}")
-async def update_draft_process(process_id: str, update: ProcessUpdate):
+async def update_draft_process(process_id: str, update: ProcessUpdate, current_user: dict = Depends(get_current_user)):
     """
     Update a draft process.
     Only draft processes can be updated - implemented processes require code changes.
@@ -259,7 +313,7 @@ async def update_draft_process(process_id: str, update: ProcessUpdate):
     if update.owner is not None:
         update_data["owner"] = update.owner
     if update.steps is not None:
-        update_data["steps"] = [step.dict() for step in update.steps]
+        update_data["steps"] = [step.model_dump() for step in update.steps]
     if update.position is not None:
         update_data["position"] = update.position
     if update.status is not None:
@@ -280,7 +334,7 @@ async def update_draft_process(process_id: str, update: ProcessUpdate):
 
 
 @router.delete("/drafts/{process_id}")
-async def delete_draft_process(process_id: str):
+async def delete_draft_process(process_id: str, current_user: dict = Depends(get_current_user)):
     """
     Delete a draft process.
     Only draft processes can be deleted.
@@ -306,51 +360,4 @@ async def delete_draft_process(process_id: str):
         raise HTTPException(status_code=500, detail=f"Error deleting draft: {str(e)}")
 
 
-@router.get("/categories/list")
-async def get_process_categories():
-    """
-    Get list of available process categories.
-    """
-    return {
-        "categories": [
-            {"id": "coordination", "name": "Coordination", "description": "Project and team coordination processes"},
-            {"id": "bookkeeping", "name": "Bookkeeping", "description": "Financial and accounting processes"},
-            {"id": "operations", "name": "Operations", "description": "Day-to-day operational processes"},
-            {"id": "finance", "name": "Finance", "description": "Financial management and budgeting"},
-            {"id": "hr", "name": "Human Resources", "description": "HR and team management processes"},
-            {"id": "sales", "name": "Sales", "description": "Sales and client acquisition processes"},
-        ]
-    }
-
-
-@router.get("/triggers/list")
-async def get_trigger_types():
-    """
-    Get list of available trigger types.
-    """
-    return {
-        "triggers": [
-            {"id": "manual", "name": "Manual", "description": "Triggered manually by a user"},
-            {"id": "scheduled", "name": "Scheduled", "description": "Runs on a schedule (daily, weekly, etc.)"},
-            {"id": "event", "name": "Event", "description": "Triggered by a system event"},
-            {"id": "webhook", "name": "Webhook", "description": "Triggered by an external webhook call"},
-        ]
-    }
-
-
-@router.get("/step-types/list")
-async def get_step_types():
-    """
-    Get list of available step types.
-    """
-    return {
-        "step_types": [
-            {"id": "condition", "name": "Condition", "description": "Evaluate a condition to determine flow", "icon": "split"},
-            {"id": "action", "name": "Action", "description": "Perform an action or operation", "icon": "play"},
-            {"id": "notification", "name": "Notification", "description": "Send a notification", "icon": "bell"},
-            {"id": "wait", "name": "Wait", "description": "Wait for time or event", "icon": "clock"},
-            {"id": "assignment", "name": "Assignment", "description": "Assign task to user/role", "icon": "user"},
-            {"id": "approval", "name": "Approval", "description": "Require approval to continue", "icon": "check"},
-        ]
-    }
 

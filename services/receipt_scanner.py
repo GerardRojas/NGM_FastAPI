@@ -12,7 +12,6 @@
 
 from api.supabase_client import supabase
 from api.services.ocr_metrics import log_ocr_metric, ocr_timer
-from openai import OpenAI
 from typing import Optional
 import base64
 import hashlib
@@ -78,14 +77,6 @@ def extract_text_from_pdf(file_content: bytes, min_chars: int = 100) -> tuple:
 
 # ====== HELPERS ======
 
-def _get_openai_client():
-    """Get OpenAI client. Raises RuntimeError if key not configured."""
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key or openai_api_key == "your-openai-api-key-here":
-        raise RuntimeError("OpenAI API key not configured")
-    return OpenAI(api_key=openai_api_key)
-
-
 def _get_poppler_path():
     """Get poppler path for PDF conversion on Windows."""
     if platform.system() == "Windows":
@@ -96,7 +87,7 @@ def _get_poppler_path():
 def _convert_pdf_to_images(file_content: bytes):
     """Convert PDF bytes to list of base64-encoded PNG strings."""
     poppler_path = _get_poppler_path()
-    images = convert_from_bytes(file_content, dpi=300, poppler_path=poppler_path)
+    images = convert_from_bytes(file_content, dpi=250, poppler_path=poppler_path)
     if not images:
         raise ValueError("Could not convert PDF to image")
 
@@ -620,19 +611,19 @@ def scan_receipt(
 
 
 def _scan_receipt_inner(file_content, file_type, model, correction_context):
-    client = _get_openai_client()
+    from api.services.gpt_client import gpt, HEAVY_MODEL, MINI_MODEL
 
     # Map requested model to OpenAI model names
     if correction_context:
-        openai_model = "gpt-5.2"  # Heavy tier - correction passes
+        openai_model = HEAVY_MODEL  # Heavy tier - correction passes
         model = "heavy"
         print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
               f"calculated_sum={correction_context.get('calculated_sum')}, "
               f"items={len(correction_context.get('items', []))}")
     elif model == "heavy":
-        openai_model = "gpt-5.2"  # Heavy tier - max accuracy OCR
+        openai_model = HEAVY_MODEL  # Heavy tier - max accuracy OCR
     else:
-        openai_model = "gpt-5.1"  # Medium tier - fast mode (default)
+        openai_model = HEAVY_MODEL  # Vision always uses heavy; text mode overrides to mini below
 
     print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
 
@@ -701,15 +692,28 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
 
     # Call OpenAI
     if use_text_mode:
-        print(f"[SCAN-RECEIPT] Enviando texto a OpenAI ({len(extracted_text)} chars)...")
-        response = client.chat.completions.create(
-            model=openai_model,
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=8000,
-            temperature=0.1
-        )
-        print(f"[SCAN-RECEIPT] Respuesta recibida de OpenAI (modo texto)")
+        if not correction_context and model != "heavy":
+            # Fast text mode: pdfplumber gave us clean text -> use gpt-5-mini (cheap, fast)
+            print(f"[SCAN-RECEIPT] Enviando texto a gpt-5-mini ({len(extracted_text)} chars)...")
+            result_text = gpt.mini(prompt, "Analyze this receipt.", max_tokens=8000)
+            if not result_text:
+                raise RuntimeError("GPT mini returned empty for text mode OCR")
+            openai_model = MINI_MODEL  # Track actual model used
+            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5-mini (texto)")
+        else:
+            # Correction/heavy text mode: use gpt-5.2
+            print(f"[SCAN-RECEIPT] Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
+            result_text = gpt.heavy(
+                system="You extract structured data from receipts.",
+                user=prompt,
+                temperature=0.1,
+                max_tokens=8000,
+            )
+            if not result_text:
+                raise RuntimeError("GPT heavy returned empty for correction/text mode")
+            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
     else:
+        # Vision mode: always gpt-5.2
         message_content = [{"type": "text", "text": prompt}]
         for base64_img in base64_images:
             message_content.append({
@@ -720,17 +724,23 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
                 }
             })
 
-        print(f"[SCAN-RECEIPT] Enviando {len(base64_images)} imagen(es) a OpenAI Vision API...")
-        response = client.chat.completions.create(
-            model=openai_model,
-            messages=[{"role": "user", "content": message_content}],
-            max_completion_tokens=8000,
-            temperature=0.1
+        print(f"[SCAN-RECEIPT] Enviando {len(base64_images)} imagen(es) a gpt-5.2 Vision...")
+        # Vision: prompt in system, images in user content
+        vision_user = [{"type": "image_url", "image_url": {
+            "url": f"data:{media_type};base64,{b64}", "detail": "high"
+        }} for b64 in base64_images]
+        result_text = gpt.heavy(
+            system=prompt,
+            user=vision_user,
+            temperature=0.1,
+            max_tokens=8000,
+            timeout=120,
         )
-        print(f"[SCAN-RECEIPT] Respuesta recibida de OpenAI (modo vision)")
+        if not result_text:
+            raise RuntimeError("GPT heavy returned empty for Vision OCR")
+        print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (vision)")
 
     # Parse response
-    result_text = response.choices[0].message.content.strip()
     parsed_data = _parse_json_response(result_text)
 
     # Validate structure
@@ -898,7 +908,8 @@ def auto_categorize(
     stage: str,
     expenses: list,
     project_id: Optional[str] = None,
-    receipt_id: Optional[str] = None
+    receipt_id: Optional[str] = None,
+    min_confidence: int = 60
 ) -> dict:
     """
     Core auto-categorization logic with caching and feedback loop.
@@ -1127,29 +1138,36 @@ IMPORTANT:
 - Be conservative with confidence - better to under-estimate
 - DO NOT include any text before or after the JSON"""
 
-    # Step 6: Call OpenAI
-    client = _get_openai_client()
+    # Step 6: Call GPT (mini tier w/ fallback to heavy if low confidence)
+    from api.services.gpt_client import gpt
+    system_inst = "You are a construction accounting expert. You always return valid JSON with accurate account categorizations."
     gpt_start = time.time()
-    response = client.chat.completions.create(
-        model="gpt-5.1",  # Medium tier - auto-categorization
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a construction accounting expert. You always return valid JSON with accurate account categorizations."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0.3,
-        max_completion_tokens=8000  # Increased from 2000 to handle large batches
-    )
+    raw_response = gpt.mini(system_inst, prompt, json_mode=True, max_tokens=8000)
+    tier_used = "mini"
+
+    # Confidence fallback: if any categorization < min_confidence%, retry with heavy
+    if raw_response:
+        try:
+            _check = _parse_json_response(raw_response)
+            _cats = _check.get("categorizations", [])
+            if _cats:
+                _min_conf = min(int(c.get("confidence", 0)) for c in _cats)
+                if _min_conf < min_confidence:
+                    print(f"[SCAN-RECEIPT] auto-categorize: min confidence {_min_conf}% < {min_confidence}%, escalating to heavy")
+                    raw_response = None
+        except Exception:
+            pass
+    if not raw_response:
+        raw_response = gpt.heavy(system_inst, prompt, temperature=0.1, max_tokens=8000, json_mode=True)
+        tier_used = "heavy"
+
     gpt_elapsed = int((time.time() - gpt_start) * 1000)
+    print(f"[SCAN-RECEIPT] auto-categorize via {tier_used} ({gpt_elapsed}ms)")
 
     # Parse response
-    result_text = response.choices[0].message.content.strip()
-    parsed_data = _parse_json_response(result_text)
+    if not raw_response:
+        raise RuntimeError("GPT returned empty response for auto-categorization")
+    parsed_data = _parse_json_response(raw_response)
 
     # Validate
     if "categorizations" not in parsed_data or not isinstance(parsed_data["categorizations"], list):

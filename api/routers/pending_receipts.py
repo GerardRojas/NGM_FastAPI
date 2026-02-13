@@ -65,7 +65,6 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta
-from openai import OpenAI
 import json
 import io
 import time
@@ -565,7 +564,7 @@ async def process_receipt(receipt_id: str, current_user: dict = Depends(get_curr
                     raise Exception("Failed to download receipt file")
                 file_content = response.content
 
-            # ===== OCR via shared service (pdfplumber-first, 300 DPI, tax-aware) =====
+            # ===== OCR via shared service (pdfplumber-first, 250 DPI, tax-aware) =====
             scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
 
             line_items = scan_result.get("expenses", [])
@@ -627,13 +626,16 @@ async def process_receipt(receipt_id: str, current_user: dict = Depends(get_curr
                 {"rowIndex": i, "description": item.get("description", "")}
                 for i, item in enumerate(line_items)
             ]
+            _cfg = _load_agent_config()
+            _min_conf = int(_cfg.get("min_confidence", 60))
             try:
                 if cat_expenses:
                     cat_result = _auto_categorize_core(
                         stage=construction_stage,
                         expenses=cat_expenses,
                         project_id=project_id,
-                        receipt_id=receipt_id
+                        receipt_id=receipt_id,
+                        min_confidence=_min_conf
                     )
                     categorizations = cat_result.get("categorizations", [])
                     cat_metrics = cat_result.get("metrics", {})
@@ -2006,6 +2008,10 @@ async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(ge
             for i, item in enumerate(line_items)
         ]
 
+        # Load agent config BEFORE categorization so GPT fallback uses DB threshold
+        agent_cfg = _load_agent_config()
+        _min_conf = int(agent_cfg.get("min_confidence", 60))
+
         categorizations = []
         cat_metrics = {}
         try:
@@ -2014,7 +2020,8 @@ async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(ge
                     stage=construction_stage,
                     expenses=cat_expenses,
                     project_id=project_id,
-                    receipt_id=receipt_id
+                    receipt_id=receipt_id,
+                    min_confidence=_min_conf
                 )
                 categorizations = cat_result.get("categorizations", [])
                 cat_metrics = cat_result.get("metrics", {})
@@ -2057,7 +2064,7 @@ async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(ge
         # NOTE: This threshold check is for BULK PROCESSING only.
         # Manual confirmations (when user approves via @Andrew) ALWAYS bypass this check
         # by setting confidence=100 and user_confirmed=true.
-        agent_cfg = _load_agent_config()
+        # agent_cfg already loaded before categorization (Step 5)
 
         # Check if threshold enforcement is enabled (default: false to avoid blocking)
         enforce_threshold = agent_cfg.get("enforce_confidence_threshold", "false")
@@ -2617,7 +2624,8 @@ def _gpt_categorize_labor(
     description: str,
     labor_accounts: list,
     construction_stage: str = "General",
-    corrections_context: str = ""
+    corrections_context: str = "",
+    min_confidence: int = 70
 ) -> dict:
     """
     Enhanced GPT categorization for labor with examples and feedback loop.
@@ -2636,13 +2644,7 @@ def _gpt_categorize_labor(
             "reasoning": str
         }
     """
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
-
     try:
-        ai_client = OpenAI(api_key=openai_api_key)
-
         # Build enhanced prompt with examples and feedback
         prompt = f"""You are an expert construction accountant specializing in labor categorization.
 
@@ -2710,17 +2712,16 @@ Return ONLY valid JSON:
   "reasoning": "Brief explanation"
 }}"""
 
-        response = ai_client.chat.completions.create(
-            model="gpt-5.1",
-            messages=[
-                {"role": "system", "content": "Construction accounting expert. Return only valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_completion_tokens=400,
-            response_format={"type": "json_object"}
+        from api.services.gpt_client import gpt
+        raw = gpt.with_fallback(
+            "Construction accounting expert. Return only valid JSON.",
+            prompt,
+            min_confidence=min_confidence,
+            max_tokens=400,
         )
-        return json.loads(response.choices[0].message.content)
+        if not raw:
+            return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
+        return json.loads(raw)
     except Exception as e:
         logger.error(f"[LaborGPT] Categorization error: {e}")
         return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
@@ -2730,7 +2731,8 @@ def _categorize_check_items(
     items: list,
     construction_stage: str = "General",
     project_id: Optional[str] = None,
-    check_id: Optional[str] = None
+    check_id: Optional[str] = None,
+    min_confidence: int = 70
 ) -> dict:
     """
     Enhanced labor categorization with caching, feedback loop, and metrics.
@@ -2816,7 +2818,7 @@ def _categorize_check_items(
     # Step 3: GPT categorization for remaining items
     for item in items_needing_gpt:
         desc = item.get("description", "")
-        gpt_result = _gpt_categorize_labor(desc, labor_accounts, construction_stage, corrections_context)
+        gpt_result = _gpt_categorize_labor(desc, labor_accounts, construction_stage, corrections_context, min_confidence=min_confidence)
         gpt_calls += 1
 
         item["categorization"] = {
@@ -3005,21 +3007,24 @@ def _categorize_and_finish_check_flow(receipt_id, project_id, check_flow, parsed
     except Exception:
         pass
 
+    # Load agent config BEFORE categorization so GPT fallback uses DB threshold
+    agent_cfg = _load_agent_config()
+    min_confidence = int(agent_cfg.get("min_confidence", 70))
+
     # Categorize entries
     entries = check_flow.get("entries", [])
     categorization_result = _categorize_check_items(
         entries,
         construction_stage,
         project_id=stage_project_id,
-        check_id=receipt_id
+        check_id=receipt_id,
+        min_confidence=min_confidence
     )
     categorized = categorization_result["items"]
     cat_metrics = categorization_result["metrics"]
     check_flow["entries"] = categorized
 
     # Check confidence vs min_confidence
-    agent_cfg = _load_agent_config()
-    min_confidence = int(agent_cfg.get("min_confidence", 70))
 
     low_confidence = []
     for i, entry in enumerate(categorized):
@@ -3570,20 +3575,23 @@ def _handle_date_confirm(receipt_id, project_id, check_flow, parsed_data, action
     except Exception:
         pass
 
+    # Load agent config BEFORE categorization so GPT fallback uses DB threshold
+    agent_cfg = _load_agent_config()
+    min_confidence = int(agent_cfg.get("min_confidence", 70))
+
     entries = check_flow.get("entries", [])
     categorization_result = _categorize_check_items(
         entries,
         construction_stage,
         project_id=stage_project_id,
-        check_id=receipt_id
+        check_id=receipt_id,
+        min_confidence=min_confidence
     )
     categorized = categorization_result["items"]
     cat_metrics = categorization_result["metrics"]
     check_flow["entries"] = categorized
 
     # === Check confidence vs agent_config.min_confidence ===
-    agent_cfg = _load_agent_config()
-    min_confidence = int(agent_cfg.get("min_confidence", 70))
 
     low_confidence = []
     for i, entry in enumerate(categorized):

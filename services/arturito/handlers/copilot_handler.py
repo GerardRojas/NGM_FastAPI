@@ -13,7 +13,7 @@ import os
 import json
 from typing import Optional
 from datetime import datetime, timedelta
-from openai import OpenAI
+from api.services.gpt_client import gpt
 
 from ..ngm_knowledge import (
     COPILOT_ACTIONS,
@@ -108,18 +108,15 @@ Si no puedes interpretar el comando, responde:
 }}"""
 
     try:
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-5.1",
-            messages=[
-                {"role": "system", "content": "Eres un intérprete preciso de comandos. Respondes SOLO con JSON válido."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_completion_tokens=300
+        raw_response = gpt.mini(
+            "Eres un intérprete preciso de comandos. Respondes SOLO con JSON válido.",
+            prompt,
+            json_mode=True,
+            max_tokens=300,
         )
 
-        raw_response = response.choices[0].message.content.strip()
+        if not raw_response:
+            return None
 
         # Clean markdown fences if present
         cleaned = raw_response

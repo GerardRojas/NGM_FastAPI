@@ -10,7 +10,7 @@ import io
 import os
 import re
 
-from openai import OpenAI
+from api.services.gpt_client import gpt
 from api.supabase_client import supabase
 from api.services.vault_service import save_to_project_folder
 
@@ -281,27 +281,19 @@ def _gpt_fuzzy_match(query: str, candidates: List[str]) -> Optional[str]:
     """
     if not candidates:
         return None
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
     try:
-        client = OpenAI(api_key=api_key, timeout=10.0)
         candidates_str = "\n".join(f"- {c}" for c in candidates[:40])
-        resp = client.chat.completions.create(
-            model="gpt-5.1",
-            messages=[
-                {"role": "system", "content": (
-                    "You are a fuzzy-matching helper. The user typed a name that may contain "
-                    "typos, abbreviations, or be in a different language. Pick the BEST match "
-                    "from the candidate list. Reply with ONLY the exact candidate string, or "
-                    "\"NONE\" if nothing is a reasonable match. No explanation."
-                )},
-                {"role": "user", "content": f"User typed: \"{query}\"\n\nCandidates:\n{candidates_str}"}
-            ],
-            temperature=0,
-            max_completion_tokens=80
+        answer = gpt.mini(
+            "You are a fuzzy-matching helper. The user typed a name that may contain "
+            "typos, abbreviations, or be in a different language. Pick the BEST match "
+            "from the candidate list. Reply with ONLY the exact candidate string, or "
+            "\"NONE\" if nothing is a reasonable match. No explanation.",
+            f"User typed: \"{query}\"\n\nCandidates:\n{candidates_str}",
+            max_tokens=80,
         )
-        answer = resp.choices[0].message.content.strip().strip('"')
+        if not answer:
+            return None
+        answer = answer.strip('"')
         if answer.upper() == "NONE" or answer not in candidates:
             return None
         return answer
@@ -342,35 +334,19 @@ def _gpt_ask_missing_entity(
             return f"Que categoria? {hint_str}" if hint_str else "Que categoria?"
         return f"Which category? {hint_str}" if hint_str else "Which category?"
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return _fallback(missing, hint)
-
     try:
         persona = get_persona_prompt(space_id)
-        client = OpenAI(api_key=api_key, timeout=8.0)
-
-        resp = client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[
-                {"role": "system", "content": (
-                    f"{persona}\n\n"
-                    f"The user asked a budget question but didn't specify the {missing}. "
-                    f"Generate a SHORT follow-up question asking for the {missing}. "
-                    f"Reply in the SAME LANGUAGE the user wrote in. "
-                    f"Keep it to 1-2 sentences max. "
-                    f"If there's a hint with options, weave them in naturally."
-                )},
-                {"role": "user", "content": (
-                    f"User said: \"{raw_text}\"\n"
-                    f"Missing: {missing}\n"
-                    f"Options hint: {hint}"
-                )}
-            ],
-            temperature=0.7,
-            max_completion_tokens=100
+        result = gpt.mini(
+            f"{persona}\n\n"
+            f"The user asked a budget question but didn't specify the {missing}. "
+            f"Generate a SHORT follow-up question asking for the {missing}. "
+            f"Reply in the SAME LANGUAGE the user wrote in. "
+            f"Keep it to 1-2 sentences max. "
+            f"If there's a hint with options, weave them in naturally.",
+            f"User said: \"{raw_text}\"\nMissing: {missing}\nOptions hint: {hint}",
+            max_tokens=100,
         )
-        return resp.choices[0].message.content.strip()
+        return result if result else _fallback(missing, hint)
     except Exception as e:
         print(f"[BVA] GPT ask missing entity error: {e}")
         return _fallback(missing, hint)

@@ -6,7 +6,8 @@ This includes: node positions, custom modules, flow positions, draft states.
 All authorized users share the same state.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import get_current_user
 from pydantic import BaseModel
 from typing import Optional, Union, List, Any
 
@@ -44,7 +45,7 @@ VALID_STATE_KEYS = [
 # ========================================
 
 @router.get("/state/{state_key}")
-async def get_process_manager_state(state_key: str):
+async def get_process_manager_state(state_key: str, current_user: dict = Depends(get_current_user)):
     """
     Get a specific state from the process manager shared state.
     Valid keys: node_positions, custom_modules, flow_positions, draft_states, module_connections
@@ -77,7 +78,7 @@ async def get_process_manager_state(state_key: str):
 
 
 @router.put("/state/{state_key}")
-async def update_process_manager_state(state_key: str, update: ProcessManagerStateUpdate):
+async def update_process_manager_state(state_key: str, update: ProcessManagerStateUpdate, current_user: dict = Depends(get_current_user)):
     """
     Update a specific state in the process manager shared state.
     Creates the entry if it doesn't exist (upsert behavior).
@@ -119,7 +120,7 @@ async def update_process_manager_state(state_key: str, update: ProcessManagerSta
 
 
 @router.get("/state")
-async def get_all_process_manager_states():
+async def get_all_process_manager_states(current_user: dict = Depends(get_current_user)):
     """
     Get all process manager states.
     Returns all state keys with their data.
@@ -142,7 +143,8 @@ async def get_all_process_manager_states():
 @router.get("/history/{state_key}")
 async def get_process_manager_history(
     state_key: str,
-    limit: int = Query(10, description="Number of history entries to return", ge=1, le=100)
+    limit: int = Query(10, description="Number of history entries to return", ge=1, le=100),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get history of changes for a specific state key.
@@ -169,7 +171,7 @@ async def get_process_manager_history(
 
 
 @router.post("/history/{state_key}/restore/{history_id}")
-async def restore_from_history(state_key: str, history_id: str):
+async def restore_from_history(state_key: str, history_id: str, current_user: dict = Depends(get_current_user)):
     """
     Restore a state from a specific history entry.
     Useful for recovering from accidental changes.

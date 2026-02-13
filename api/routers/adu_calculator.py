@@ -14,7 +14,7 @@ from api.supabase_client import supabase
 import base64
 import os
 import json
-from openai import OpenAI
+from api.services.gpt_client import gpt
 
 router = APIRouter(prefix="/adu-calculator", tags=["ADU Calculator"])
 
@@ -199,43 +199,29 @@ async def analyze_screenshot(
                 detail=f"File too large. Maximum size is 10MB, got {len(file_content) / (1024*1024):.1f}MB."
             )
 
-        # Get OpenAI API key
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-
-        # Initialize OpenAI client
-        ai_client = OpenAI(api_key=openai_api_key)
-
         # Encode image to base64
         img_b64 = base64.b64encode(file_content).decode("utf-8")
         media_type = file.content_type
 
-        # Build message content
+        # Build prompt
         prompt_with_label = f"Floor being analyzed: {floor_label}\n\n{SCREENSHOT_ANALYSIS_PROMPT}"
 
-        content = [
-            {"type": "text", "text": prompt_with_label},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{media_type};base64,{img_b64}",
-                    "detail": "high"
-                }
-            }
-        ]
-
-        # Call OpenAI Vision
-        response = ai_client.chat.completions.create(
-            model="gpt-5.1",
-            messages=[{"role": "user", "content": content}],
-            max_completion_tokens=1500,
-            response_format={"type": "json_object"},
-            timeout=60
+        # Call GPT-5.2 Vision
+        raw = gpt.heavy(
+            system=prompt_with_label,
+            user=[{"type": "image_url", "image_url": {
+                "url": f"data:{media_type};base64,{img_b64}",
+                "detail": "high"
+            }}],
+            max_tokens=1500,
+            json_mode=True,
+            timeout=60,
         )
+        if not raw:
+            raise HTTPException(status_code=500, detail="GPT Vision returned empty response")
 
         # Parse response
-        parsed_data = json.loads(response.choices[0].message.content)
+        parsed_data = json.loads(raw)
 
         # Override floor_label with what the user specified
         parsed_data["floor_label"] = floor_label

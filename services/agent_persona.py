@@ -13,8 +13,7 @@
 #   from services.agent_persona import personalize_async
 #   content = await personalize_async("andrew", raw_content)
 
-import os
-from openai import OpenAI, AsyncOpenAI
+from api.services.gpt_client import gpt
 
 AGENT_PERSONAS = {
     "andrew": {
@@ -58,53 +57,19 @@ AGENT_PERSONAS = {
 
 def _call_gpt(persona: dict, raw_content: str) -> str:
     """Sync GPT call for personality. Returns raw_content on failure."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return raw_content
-    try:
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[
-                {"role": "system", "content": persona["system_prompt"]},
-                {"role": "user", "content": raw_content},
-            ],
-            temperature=0.4,
-            max_completion_tokens=300,
-        )
-        result = response.choices[0].message.content.strip()
-        return result if result else raw_content
-    except Exception as e:
-        print(f"[AgentPersona] personalize failed, using raw: {e}")
-        return raw_content
+    result = gpt.mini(persona["system_prompt"], raw_content, max_tokens=300)
+    return result if result else raw_content
 
 
 async def _call_gpt_async(persona: dict, raw_content: str) -> str:
     """Async GPT call for personality. Returns raw_content on failure."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return raw_content
-    try:
-        client = AsyncOpenAI(api_key=api_key)
-        response = await client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[
-                {"role": "system", "content": persona["system_prompt"]},
-                {"role": "user", "content": raw_content},
-            ],
-            temperature=0.4,
-            max_completion_tokens=300,
-        )
-        result = response.choices[0].message.content.strip()
-        return result if result else raw_content
-    except Exception as e:
-        print(f"[AgentPersona] personalize_async failed, using raw: {e}")
-        return raw_content
+    result = await gpt.mini_async(persona["system_prompt"], raw_content, max_tokens=300)
+    return result if result else raw_content
 
 
 def personalize(agent: str, raw_content: str) -> str:
     """
-    Sync: Pass a message through gpt-4o-mini to add personality flavor.
+    Sync: Pass a message through gpt-5-mini to add personality flavor.
     Falls back to raw_content on any error.
     """
     persona = AGENT_PERSONAS.get(agent)
@@ -115,7 +80,7 @@ def personalize(agent: str, raw_content: str) -> str:
 
 async def personalize_async(agent: str, raw_content: str) -> str:
     """
-    Async: Pass a message through gpt-4o-mini to add personality flavor.
+    Async: Pass a message through gpt-5-mini to add personality flavor.
     Falls back to raw_content on any error.
     """
     persona = AGENT_PERSONAS.get(agent)

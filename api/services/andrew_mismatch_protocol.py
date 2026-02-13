@@ -29,6 +29,7 @@ import httpx
 
 from api.helpers.andrew_messenger import post_andrew_message, ANDREW_BOT_USER_ID
 from api.services.ocr_metrics import log_ocr_metric
+from api.services.gpt_client import gpt
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,7 @@ def _encode_to_vision_image(file_content: bytes, content_type: str, receipt_url:
             import io
             import platform
             poppler_path = r'C:\poppler\poppler-24.08.0\Library\bin' if platform.system() == "Windows" else None
-            images = convert_from_bytes(file_content, dpi=300, first_page=1, last_page=1,
+            images = convert_from_bytes(file_content, dpi=250, first_page=1, last_page=1,
                                         poppler_path=poppler_path)
             if not images:
                 return None
@@ -204,11 +205,6 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
     file_content, content_type = downloaded
     is_pdf = "pdf" in content_type.lower() or receipt_url.lower().endswith(".pdf")
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.warning("[AndrewMismatch] No OPENAI_API_KEY")
-        return None
-
     # Try pdfplumber text extraction first for PDFs
     extracted_text = None
     if is_pdf:
@@ -222,41 +218,43 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
             logger.info(f"[AndrewMismatch] pdfplumber unavailable: {e}")
 
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-
         if extracted_text:
-            # Text mode (pdfplumber succeeded) -- gpt-5-2 for max accuracy
+            # Text mode (pdfplumber succeeded) -- mini w/ fallback to heavy
             prompt = _TEXT_LINE_ITEMS_PROMPT.format(text=extracted_text)
-            response = client.chat.completions.create(
-                model="gpt-5.2",  # Heavy tier - mismatch reconciliation
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_completion_tokens=2000,
-            )
+            raw = gpt.mini(prompt, "Analyze this invoice.", max_tokens=2000)
+            # Confidence fallback: escalate to heavy if mini < 60%
+            if raw:
+                try:
+                    _t = raw
+                    if _t.startswith("```"):
+                        _t = _t.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                    _conf = int(json.loads(_t).get("confidence", 0))
+                    if _conf < 60:
+                        logger.info("[AndrewMismatch] mini confidence %d%% < 60%%, escalating to heavy", _conf)
+                        raw = None
+                except (ValueError, json.JSONDecodeError, TypeError):
+                    pass
+            if not raw:
+                raw = gpt.heavy(prompt, "Analyze this invoice.", temperature=0.1, max_tokens=2000)
         else:
-            # Vision mode (fallback)
+            # Vision mode (fallback) -- gpt-5.2
             encoded = _encode_to_vision_image(file_content, content_type, receipt_url)
             if not encoded:
                 return None
             b64_image, media_type = encoded
-            response = client.chat.completions.create(
-                model="gpt-5.2",  # Heavy tier - mismatch reconciliation
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _VISION_LINE_ITEMS_PROMPT},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:{media_type};base64,{b64_image}",
-                            "detail": "high"
-                        }}
-                    ]
-                }],
+            raw = gpt.heavy(
+                system=_VISION_LINE_ITEMS_PROMPT,
+                user=[{"type": "image_url", "image_url": {
+                    "url": f"data:{media_type};base64,{b64_image}",
+                    "detail": "high"
+                }}],
                 temperature=0.1,
-                max_completion_tokens=2000,
+                max_tokens=2000,
             )
 
-        raw = response.choices[0].message.content.strip()
+        if not raw:
+            logger.info("[AndrewMismatch] GPT returned empty response")
+            return None
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         data = json.loads(raw)
@@ -300,7 +298,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
             agent="andrew",
             source="mismatch_reconciliation",
             extraction_method=data["_extraction_method"],
-            model_used="gpt-5.2",
+            model_used="gpt-5-mini" if extracted_text else "gpt-5.2",
             file_type="application/pdf" if is_pdf else (content_type or "unknown"),
             char_count=len(extracted_text) if extracted_text else None,
             success=True,

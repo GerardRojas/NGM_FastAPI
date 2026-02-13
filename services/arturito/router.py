@@ -8,6 +8,7 @@ from typing import Dict, Any, Callable, Optional, List
 from .handlers import (
     handle_budget_vs_actuals,
     handle_consulta_especifica,
+    handle_pnl_cogs,
     handle_info,
     handle_scope_of_work,
     handle_ngm_help,
@@ -41,6 +42,13 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "required_entities": [],  # Handler manages missing project internally (ask_project flow)
         "optional_entities": ["project", "category"],
         "description": "Genera reporte Budget vs Actuals de un proyecto",
+    },
+
+    "PNL_COGS": {
+        "handler": handle_pnl_cogs,
+        "required_entities": [],  # Handler manages missing project internally (ask_project flow)
+        "optional_entities": ["project"],
+        "description": "Genera reporte P&L COGS (actuals only, sin budget)",
     },
 
     "CONSULTA_ESPECIFICA": {
@@ -208,6 +216,9 @@ INTENT_ALIASES = {
     "AYUDA": "INFO",
     "IDENTITY": "INFO",
     "BVA": "BUDGET_VS_ACTUALS",
+    "PNL": "PNL_COGS",
+    "P&L": "PNL_COGS",
+    "P&L COGS": "PNL_COGS",
 }
 
 
@@ -451,13 +462,28 @@ def route_slash_command(
         project = args.strip() if args else ctx.get("space_name", "")
         if not project or project.lower() in ["default", "general"]:
             return {
-                "text": "⚠️ Especifica un proyecto. Ej: `/BudgetvsActuals Del Rio`",
+                "text": "Specify a project. E.g.: `/BudgetvsActuals Del Rio`",
                 "action": "missing_project"
             }
 
-        # Fabricar intent y delegar al router normal
         fake_intent = {
             "intent": "BUDGET_VS_ACTUALS",
+            "entities": {"project": project},
+            "confidence": 1.0,
+            "raw_text": f"/{command} {args}"
+        }
+        return route(fake_intent, ctx)
+
+    if cmd == "pnl" or cmd == "pnlcogs":
+        project = args.strip() if args else ctx.get("space_name", "")
+        if not project or project.lower() in ["default", "general"]:
+            return {
+                "text": "Specify a project. E.g.: `/pnl Del Rio`",
+                "action": "missing_project"
+            }
+
+        fake_intent = {
+            "intent": "PNL_COGS",
             "entities": {"project": project},
             "confidence": 1.0,
             "raw_text": f"/{command} {args}"

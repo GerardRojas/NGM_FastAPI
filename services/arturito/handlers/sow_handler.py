@@ -6,7 +6,7 @@
 
 from typing import Dict, Any, Optional
 import os
-from openai import OpenAI
+from api.services.gpt_client import gpt
 from ..persona import get_persona_prompt
 
 
@@ -128,9 +128,7 @@ async def answer_sow_question(
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return "⚠️ OpenAI no está configurado."
-
-    client = OpenAI(api_key=api_key)
+        return "OpenAI not configured."
 
     system_prompt = f"""{get_persona_prompt(space_id)}
 
@@ -142,18 +140,5 @@ CONTENIDO DEL SOW:
 {sow_content}
 """
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-5-1",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question}
-            ],
-            temperature=0.3,
-            max_completion_tokens=1000
-        )
-
-        return response.choices[0].message.content.strip()
-
-    except Exception as e:
-        return f"⚠️ Error consultando el SOW: {str(e)}"
+    result = gpt.mini(system_prompt, question, max_tokens=1000)
+    return result if result else "Error querying the SOW. Please try again."

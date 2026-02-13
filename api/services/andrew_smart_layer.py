@@ -108,29 +108,9 @@ RULES:
 
 def _call_gpt(system_prompt: str, user_content: str, max_tokens: int = 400,
               temperature: float = 0.4, json_mode: bool = False) -> Optional[str]:
-    """Sync GPT call. Returns None on failure."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        kwargs = {
-            "model": "gpt-5.1",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": temperature,
-            "max_completion_tokens": max_tokens,
-        }
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        response = client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.warning(f"[AndrewSmart] GPT call failed: {e}")
-        return None
+    """Sync GPT call via gpt-5-mini. Returns None on failure."""
+    from api.services.gpt_client import gpt
+    return gpt.mini(system_prompt, user_content, json_mode=json_mode, max_tokens=max_tokens)
 
 
 # ============================================================================

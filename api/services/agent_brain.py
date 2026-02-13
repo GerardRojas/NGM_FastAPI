@@ -8,7 +8,7 @@
 # Architecture:
 #   1. Build context (project, user, recent messages)
 #   2. Build function menu from registry
-#   3. GPT-5.1 routing call -> decision
+#   3. gpt-5-mini routing call -> decision (fallback to gpt-5.2 if low confidence)
 #   4. Dispatch: function_call | free_chat | cross_agent | clarify
 
 import os
@@ -18,7 +18,7 @@ import time
 import asyncio
 import traceback
 from typing import Dict, Any, Optional, Tuple
-from openai import AsyncOpenAI
+from api.services.gpt_client import gpt
 
 from api.services.agent_registry import get_functions, get_function, format_functions_for_llm
 from api.services.agent_personas import (
@@ -70,6 +70,9 @@ Analyze the user's message and respond with a JSON object (no markdown fences):
 
 4. If you need more information to proceed:
    {{"action": "clarify", "question": "<what you need to know>"}}
+
+IMPORTANT: Always include a "confidence" field (0.0-1.0) in your JSON response
+indicating how certain you are about your routing decision.
 
 ## Context
 - Project: {project_name} (ID: {project_id})
@@ -319,31 +322,43 @@ async def _route(
         recent_messages=recent,
     )
 
+    # Configurable min confidence for routing (default 0.9)
+    # Below this threshold, we escalate from mini to heavy model
+    min_confidence = 0.9  # TODO: read from agent_config
+
+    def _parse_routing_json(raw_text):
+        """Parse routing JSON, stripping markdown fences if present."""
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        return json.loads(cleaned)
+
     try:
-        client = AsyncOpenAI(api_key=api_key)
-        response = await client.chat.completions.create(
-            model="gpt-5.1",  # Medium tier - brain routing
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=0.1,
-            max_completion_tokens=300,
-        )
+        # Step 1: Try gpt-5-mini (fast, cheap)
+        raw = await gpt.mini_async(system_prompt, user_text, json_mode=True, max_tokens=300)
+        if raw:
+            try:
+                parsed = _parse_routing_json(raw)
+                confidence = float(parsed.get("confidence", 0))
+                if confidence >= min_confidence:
+                    print(f"[AgentBrain:{agent_name}] mini routing confident ({confidence:.2f})")
+                    return parsed
+                print(f"[AgentBrain:{agent_name}] mini confidence {confidence:.2f} < {min_confidence}, escalating to heavy")
+            except (json.JSONDecodeError, ValueError):
+                print(f"[AgentBrain:{agent_name}] mini JSON parse failed, escalating to heavy")
 
-        raw = response.choices[0].message.content.strip()
+        # Step 2: Fallback to gpt-5.2 (heavy, reliable)
+        raw = await gpt.heavy_async(system_prompt, user_text, temperature=0.1,
+                                    max_tokens=300, json_mode=True)
+        if raw:
+            try:
+                return _parse_routing_json(raw)
+            except json.JSONDecodeError:
+                print(f"[AgentBrain:{agent_name}] heavy JSON parse also failed: {raw[:200]}")
+                return {"action": "free_chat", "response": raw}
 
-        # Strip markdown fences if present
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-
-        return json.loads(raw)
-
-    except json.JSONDecodeError:
-        print(f"[AgentBrain:{agent_name}] Failed to parse routing JSON: {raw[:200]}")
-        # Fallback: treat as free chat
-        return {"action": "free_chat", "response": raw}
+        return None
 
     except Exception as e:
         print(f"[AgentBrain:{agent_name}] Routing GPT error: {e}")
@@ -1000,27 +1015,16 @@ async def _extract_user_context(
     Returns dict with project_decision, split_projects, category_hints, etc.
     Returns empty dict on failure (graceful fallback).
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {}
-
     prompt = USER_CONTEXT_PROMPT.format(
         project_name=project_name,
         user_text=user_text,
     )
 
     try:
-        client = AsyncOpenAI(api_key=api_key)
-        response = await client.chat.completions.create(
-            model="gpt-5.1",  # Internal tier - context extraction
-            messages=[
-                {"role": "system", "content": prompt},
-            ],
-            temperature=0.0,
-            max_completion_tokens=250,
-        )
+        raw = await gpt.mini_async(prompt, user_text, json_mode=True, max_tokens=250)
+        if not raw:
+            return {}
 
-        raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
@@ -1048,27 +1052,16 @@ async def _extract_check_context(
         "check for framing, split Main St $800 and Oak $600" → {labor_type_hint: "Framing Labor", split_projects: [...]}
         "payroll: Juan $500, Pedro $400" → {workers_list: [{description: "Juan", amount: 500}, ...]}
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {}
-
     prompt = CHECK_CONTEXT_PROMPT.format(
         project_name=project_name,
         user_text=user_text,
     )
 
     try:
-        client = AsyncOpenAI(api_key=api_key)
-        response = await client.chat.completions.create(
-            model="gpt-5.1",  # Internal tier - context extraction
-            messages=[
-                {"role": "system", "content": prompt},
-            ],
-            temperature=0.0,
-            max_completion_tokens=350,
-        )
+        raw = await gpt.mini_async(prompt, user_text, json_mode=True, max_tokens=350)
+        if not raw:
+            return {}
 
-        raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
@@ -1239,11 +1232,21 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                 project_name = (proj.data or {}).get("project_name", "this project")
 
                 from services.receipt_scanner import auto_categorize
+                # Load min_confidence from agent_config for GPT fallback threshold
+                _cfg = {}
+                try:
+                    _cfg_r = sb.table("agent_config").select("key, value").execute()
+                    for row in (_cfg_r.data or []):
+                        _cfg[row["key"]] = row["value"]
+                except Exception:
+                    pass
+                _min_conf = int(_cfg.get("min_confidence", 60))
+
                 cat_input = [
                     {"rowIndex": i, "description": e.get("description", "")}
                     for i, e in enumerate(expenses)
                 ]
-                cat_result = auto_categorize(construction_stage, cat_input, project_id=project_id)
+                cat_result = auto_categorize(construction_stage, cat_input, project_id=project_id, min_confidence=_min_conf)
                 categorize_data = cat_result.get("categorizations", [])
                 metrics = cat_result.get("metrics", {})
                 print(f"{tag} Categorized {len(categorize_data)} items (cache hits: {metrics.get('cache_hits', 0)}/{metrics.get('total_items', 0)})")
@@ -1746,27 +1749,11 @@ async def _personalize(agent_name: str, raw_text: str) -> str:
     persona = get_persona(agent_name)
     if not persona:
         return raw_text
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+    result = await gpt.mini_async(persona["conversation_prompt"], raw_text, max_tokens=500)
+    if not result:
+        print(f"[AgentBrain:{agent_name}] Personality pass returned empty, using raw")
         return raw_text
-
-    try:
-        client = AsyncOpenAI(api_key=api_key)
-        response = await client.chat.completions.create(
-            model="gpt-5.1",  # Chat tier - personality wrapper
-            messages=[
-                {"role": "system", "content": persona["conversation_prompt"]},
-                {"role": "user", "content": raw_text},
-            ],
-            temperature=0.4,
-            max_completion_tokens=500,
-        )
-        result = response.choices[0].message.content.strip()
-        return result if result else raw_text
-    except Exception as e:
-        print(f"[AgentBrain:{agent_name}] Personality pass failed: {e}")
-        return raw_text
+    return result
 
 
 async def _generate_conversation(
@@ -1775,26 +1762,11 @@ async def _generate_conversation(
     user_text: str,
 ) -> str:
     """Generate a full conversational response (for free chat when router didn't provide one)."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return "I'm having trouble connecting right now."
-
-    try:
-        client = AsyncOpenAI(api_key=api_key)
-        response = await client.chat.completions.create(
-            model="gpt-5.1",  # Chat tier - personality wrapper
-            messages=[
-                {"role": "system", "content": persona["conversation_prompt"]},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=0.7,
-            max_completion_tokens=300,
-        )
-        result = response.choices[0].message.content.strip()
-        return result if result else "I'm not sure how to respond to that."
-    except Exception as e:
-        print(f"[AgentBrain:{agent_name}] Conversation generation failed: {e}")
+    result = await gpt.mini_async(persona["conversation_prompt"], user_text, max_tokens=300)
+    if not result:
+        print(f"[AgentBrain:{agent_name}] Conversation generation failed")
         return "I'm having a moment. Try again."
+    return result
 
 
 # ---------------------------------------------------------------------------

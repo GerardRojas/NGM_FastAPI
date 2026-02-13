@@ -14,6 +14,7 @@ import json
 import time
 
 from api.auth import get_current_user
+from api.services.gpt_client import gpt
 
 # Importar el engine de Arturito
 from services.arturito import (
@@ -793,16 +794,7 @@ async def interpret_intent(request: IntentRequest, current_user: dict = Depends(
     GPT-first intent interpreter. Classifies user messages based on
     the current page context and returns structured action JSON.
     """
-    from openai import OpenAI
-    import os
-
     try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return IntentResponse(type="chat")
-
-        client = OpenAI(api_key=api_key, timeout=30.0)
-
         # Normalize page name
         page = request.current_page or "dashboard.html"
         if "/" in page:
@@ -826,18 +818,9 @@ async def interpret_intent(request: IntentRequest, current_user: dict = Depends(
         if account_groups:
             system_prompt += f"\nACCOUNT GROUPS (budget categories): {', '.join(account_groups)}\n"
 
-        response = client.chat.completions.create(
-            model="gpt-5.1",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request.text[:500]},  # Limit input length
-            ],
-            temperature=0,
-            max_completion_tokens=200,
-            response_format={"type": "json_object"},
-        )
-
-        raw = response.choices[0].message.content.strip()
+        raw = gpt.mini(system_prompt, request.text[:500], json_mode=True, max_tokens=200)
+        if not raw:
+            return IntentResponse(type="chat")
 
         # Parse JSON
         parsed = json.loads(raw)
@@ -876,17 +859,7 @@ async def interpret_filter_command(request: FilterInterpretRequest):
     Use GPT to interpret a natural language expense filter command.
     Returns the detected action and parameters.
     """
-    from openai import OpenAI
-    import os
-    import json
-
     try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return FilterInterpretResponse(understood=False)
-
-        client = OpenAI(api_key=api_key, timeout=30.0)
-
         # System prompt for filter interpretation
         system_prompt = """You are a command interpreter for an expense management system.
 Your job is to interpret natural language commands and return structured actions.
@@ -909,7 +882,7 @@ CONFIRMATION RESPONSES:
 When user confirms an account choice (after seeing options), interpret as filter_account:
 - "Hauling And Dump" → filter_account with value "Hauling And Dump"
 - "filtrar hauling and dump" → filter_account with value "hauling and dump"
-- "la primera" / "opción 1" / "1" → (cannot handle numbers - return null to let widget handle)
+- "la primera" / "opcion 1" / "1" → (cannot handle numbers - return null to let widget handle)
 - Just an account name without "filtrar" keyword → filter_account
 
 Examples:
@@ -930,17 +903,9 @@ For filter_account, extract the account/category name from the command.
 If you can't interpret the command as a filter action, return:
 {"action": null, "value": null, "message": null}"""
 
-        response = client.chat.completions.create(
-            model="gpt-5.1",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request.text[:500]}
-            ],
-            temperature=0,
-            max_completion_tokens=150
-        )
-
-        result_text = response.choices[0].message.content.strip()
+        result_text = gpt.mini(system_prompt, request.text[:500], json_mode=True, max_tokens=150)
+        if not result_text:
+            return FilterInterpretResponse(understood=False)
 
         # Parse JSON response
         try:
@@ -1002,20 +967,9 @@ Response format:
 
 If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}}"""
 
-        from openai import OpenAI
-        import os
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=30.0)
-        response = client.chat.completions.create(
-            model="gpt-5.1",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Find accounts matching: {query[:200]}"}
-            ],
-            temperature=0,
-            max_completion_tokens=200
-        )
-
-        result_text = response.choices[0].message.content.strip()
+        result_text = gpt.mini(system_prompt, f"Find accounts matching: {query[:200]}", json_mode=True, max_tokens=200)
+        if not result_text:
+            return []
 
         # Parse JSON response
         if result_text.startswith("```"):

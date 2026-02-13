@@ -14,7 +14,7 @@ import base64
 import os
 import io
 import json
-from openai import OpenAI
+from api.services.gpt_client import gpt
 
 router = APIRouter(prefix="/revit/ocr", tags=["Revit OCR"])
 
@@ -181,13 +181,6 @@ RULES:
 
 # ====== HELPERS ======
 
-def _get_openai_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-    return OpenAI(api_key=api_key)
-
-
 def _validate_image(file_content: bytes, content_type: str):
     allowed = ["image/jpeg", "image/jpg", "image/png", "image/webp"]
     if content_type not in allowed:
@@ -212,26 +205,21 @@ def _get_image_dimensions(file_content: bytes):
         return (0, 0)
 
 
-def _call_vision(client, prompt: str, img_b64: str, media_type: str, max_tokens: int = 2000):
-    content = [
-        {"type": "text", "text": prompt},
-        {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:{media_type};base64,{img_b64}",
-                "detail": "high"
-            }
-        }
-    ]
-    response = client.chat.completions.create(
-        model="gpt-5.1",
-        messages=[{"role": "user", "content": content}],
-        max_completion_tokens=max_tokens,
-        response_format={"type": "json_object"},
+def _call_vision(prompt: str, img_b64: str, media_type: str, max_tokens: int = 2000):
+    raw = gpt.heavy(
+        system=prompt,
+        user=[{"type": "image_url", "image_url": {
+            "url": f"data:{media_type};base64,{img_b64}",
+            "detail": "high"
+        }}],
         temperature=0.1,
-        timeout=120
+        max_tokens=max_tokens,
+        json_mode=True,
+        timeout=120,
     )
-    return json.loads(response.choices[0].message.content)
+    if not raw:
+        raise HTTPException(status_code=500, detail="GPT Vision returned empty response")
+    return json.loads(raw)
 
 
 # ====== ENDPOINT ======
@@ -268,7 +256,6 @@ async def analyze_floorplan(
         if not requested_layers:
             raise HTTPException(status_code=400, detail="At least one layer required")
 
-        client = _get_openai_client()
         img_b64 = base64.b64encode(file_content).decode("utf-8")
 
         prompt = _build_analyze_prompt(width_px, height_px, requested_layers, context.strip())
@@ -277,7 +264,7 @@ async def analyze_floorplan(
         max_tokens = 2000 + len(requested_layers) * 1500
         max_tokens = min(max_tokens, 16000)
 
-        parsed = _call_vision(client, prompt, img_b64, file.content_type, max_tokens=max_tokens)
+        parsed = _call_vision(prompt, img_b64, file.content_type, max_tokens=max_tokens)
 
         # Extract response sections
         scale_data = parsed.get("scale", {})

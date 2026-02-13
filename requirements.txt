@@ -39,7 +39,7 @@ typing_extensions==4.15.0
 uvicorn==0.38.0
 websockets==15.0.1
 yarl==1.22.0
-openai==1.60.0
+openai>=2.20.0
 pdf2image==1.17.0
 pdfplumber>=0.10.0
 Pillow>=12.1.0

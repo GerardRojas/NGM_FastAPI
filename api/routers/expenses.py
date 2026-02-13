@@ -1319,7 +1319,16 @@ async def auto_categorize_expenses(payload: dict, current_user: dict = Depends(g
         if not stage or not expenses:
             raise HTTPException(status_code=400, detail="Missing stage or expenses")
 
-        result = _auto_categorize_core(stage=stage, expenses=expenses, project_id=project_id)
+        # Read GPT fallback threshold from agent_config (DB-persisted)
+        _min_conf = 60
+        try:
+            cfg_r = supabase.table("agent_config").select("key, value").eq("key", "min_confidence").single().execute()
+            if cfg_r.data:
+                _min_conf = int(cfg_r.data["value"])
+        except Exception:
+            pass
+
+        result = _auto_categorize_core(stage=stage, expenses=expenses, project_id=project_id, min_confidence=_min_conf)
 
         return {
             "success": True,
