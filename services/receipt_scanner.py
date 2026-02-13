@@ -377,29 +377,40 @@ IMPORTANT RULES:
    - If you see both a total AND a per-unit price, ALWAYS use the total (larger amount)
 
 2. DOCUMENT STRUCTURE - Adapt to ANY format:
-   A) SIMPLE RECEIPTS: item name followed by price on same line
-   B) ITEMIZED INVOICES: Use the AMOUNT column (rightmost), not Rate
-   C) COMPLEX MULTI-SECTION INVOICES (Home Depot, Lowe's):
-      - May have multiple sections: "CARRY OUT", "DELIVERY #1", "DELIVERY #2"
+
+   A) SIMPLE RECEIPTS (grocery stores, restaurants, retail):
+      - Usually single page with items listed vertically
+      - Look for: item name followed by price on the same line
+      - Total at the bottom
+
+   B) ITEMIZED INVOICES (contractors, services):
+      - May have: Description, Quantity, Rate, Amount columns
+      - Use the AMOUNT column (rightmost), not Rate
+
+   C) COMPLEX MULTI-SECTION INVOICES (Home Depot, Lowe's, supply stores):
+      - May have multiple sections: "CARRY OUT", "DELIVERY #1", "DELIVERY #2", etc.
       - Extract items from ALL sections
-      - Don't stop at section subtotals (MERCHANDISE TOTAL)
-   D) STATEMENTS: Extract each category as a line item
+      - Don't stop at section subtotals (MERCHANDISE TOTAL) - continue to find all items
+      - The GRAND TOTAL at the end covers everything
+
+   D) STATEMENTS/SUMMARIES:
+      - May show only totals per category
+      - Extract each category as a line item if no detail available
 
 3. Extract EVERY line item as a separate expense (don't combine items)
 
 4. For each item, extract:
-   - date: Transaction date in YYYY-MM-DD format
-   - bill_id: Invoice/Receipt number (same for all items in one receipt)
-   - description: Item description (include quantity if shown, e.g., "80x PGT2 Pipe Grip Tie")
-   - vendor: Match to AVAILABLE VENDORS list. If not found, use "Unknown"
+   - date: Transaction date in YYYY-MM-DD format (look for: Date, Invoice Date, Transaction Date, or use document date)
+   - bill_id: Invoice/Bill/Receipt number - extract from: "Invoice #", "Invoice No.", "Bill #", "Receipt #", "Ref #", "PO #", "Order #", "Transaction ID", "Document #", "Confirmation #", or any similar reference number at the top of the document. This is typically the same for all items in one receipt/invoice.
+   - description: Item description (include quantity if shown, e.g., "80x PGT2 Pipe Grip Tie", "Labor - 4 hours")
+   - vendor: Match to AVAILABLE VENDORS list using partial/fuzzy matching. If not found, use "Unknown"
    - amount: The LINE TOTAL as a number (no currency symbols) - NOT the unit price!
-   - transaction_type: Match to AVAILABLE TRANSACTION TYPES or use "Unknown"
-   - payment_method: Match to AVAILABLE PAYMENT METHODS or use "Unknown"
+   - transaction_type: Match to AVAILABLE TRANSACTION TYPES by document type. If uncertain, use "Unknown"
+   - payment_method: Match to AVAILABLE PAYMENT METHODS by payment indicators in the text. Look for keywords like "DEBIT", "CREDIT", "VISA", "MASTERCARD", "AMEX", "CASH", "CHECK", "ACH", "CARD ENDING", "APPROVAL CODE", etc. Most store/supplier receipts are paid by Debit card - default to "Debit" when payment indicators suggest card payment or are ambiguous. Only use "Unknown" if there are truly no payment clues in the text.
 
 5. TAX DISTRIBUTION - CRITICAL:
-   - If the receipt shows Sales Tax, DO NOT create a separate tax line item
-   - DISTRIBUTE the tax proportionally across all product/service line items
-   - Calculate each item's percentage of the subtotal, then apply that % to the tax
+   - If the receipt shows Sales Tax, Tax, HST, GST, VAT, IVA, or similar tax amounts, DO NOT create a separate tax line item
+   - Instead, DISTRIBUTE the tax proportionally across all product/service line items based on each item's percentage of the subtotal
    - Example: Subtotal $1595.17, Item A $1479.68, Item B $115.49, Tax $123.63:
      * Item A: $1479.68 / $1595.17 = 92.76% -> tax = $123.63 x 0.9276 = $114.68
      * Item B: $115.49 / $1595.17 = 7.24% -> tax = $123.63 x 0.0724 = $8.95
@@ -407,14 +418,15 @@ IMPORTANT RULES:
      * Item B final amount = $115.49 + $8.95 = $124.44
      * Total = $1594.36 + $124.44 = $1718.80 (matches invoice!)
    - PRECISION: Round tax_included to 2 decimal places
-   - The sum of all "amount" fields MUST equal the receipt's GRAND TOTAL exactly
+   - The sum of all final amounts MUST equal the receipt's TOTAL (including tax)
    - Add "tax_included" field to each item showing the tax amount added to it
+   - NOTE: Even if tax rate shows 0%, check for actual tax line amounts
 
-   TAX-INCLUSIVE DETECTION - Use these criteria:
-   a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. Set tax_included=0 for all items and use amounts as-is.
-   b) If the receipt shows SUBTOTAL + TAX LINE + GRAND TOTAL, line item prices are PRE-TAX. You MUST add distributed tax so amounts sum to GRAND TOTAL (not subtotal).
-   c) If item prices already sum to the grand total, do NOT add tax again. Set tax_included=0.
-   d) SELF-CHECK: After computing all amounts, verify SUM(all expense amounts) == GRAND TOTAL. If your sum equals SUBTOTAL instead, you forgot to distribute tax - go back and fix it.
+   TAX-INCLUSIVE DETECTION - Use these criteria to determine if prices already include tax:
+   a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. In this case set tax_included=0 for all items and use the amounts as-is.
+   b) If the receipt shows a SUBTOTAL + TAX LINE + GRAND TOTAL structure, the line item prices are PRE-TAX. You MUST add the distributed tax to each item so the amounts sum to the GRAND TOTAL (not the subtotal).
+   c) If item prices already look like they include tax (e.g., the sum of line items already equals the grand total), do NOT add tax again. Set tax_included=0.
+   d) SELF-CHECK: After computing all amounts, verify SUM(all expense amounts) == GRAND TOTAL on receipt. If your sum equals the SUBTOTAL instead of the GRAND TOTAL, you forgot to distribute the tax - go back and fix it.
 
 6. FEES ARE LINE ITEMS (not distributed):
    - These are NOT taxes and should be separate line items:
@@ -432,18 +444,22 @@ IMPORTANT RULES:
    - IMPORTANT: Keep fee descriptions clear and specific (e.g., "Outside Delivery" not just "Fee")
 
 7. SINGLE TOTAL FALLBACK:
-   - If the receipt shows only ONE total with no itemization, create ONE expense
+   - If the receipt shows only ONE total with no itemization, create ONE expense with that total amount
+   - Use the vendor name or document title as the description
 
-8. CRITICAL: vendor, transaction_type, payment_method MUST exactly match one from their lists, or use "Unknown"
+8. Use the currency shown on the receipt (default to USD if not specified)
+
+9. CRITICAL: vendor, transaction_type, and payment_method MUST exactly match one from their respective lists. For payment_method, prefer "Debit" over "Unknown" when any card/electronic payment indicator is present.
 
 VALIDATION - MANDATORY (do this BEFORE returning your response):
-1. Find the GRAND TOTAL / TOTAL DUE shown on the receipt - this is "invoice_total"
-2. Calculate the sum of all your expense amounts - this is "calculated_sum"
+1. Find the GRAND TOTAL / TOTAL DUE / AMOUNT DUE shown on the receipt - this is "invoice_total"
+2. Calculate the arithmetic sum of all your expense amounts - this is "calculated_sum"
 3. Compare them:
    - If they match (within $0.02 tolerance), set "validation_passed" to true
-   - If they DON'T match, set "validation_passed" to false and include "validation_warning"
-4. CRITICAL TAX SELF-CHECK: If calculated_sum equals the SUBTOTAL (pre-tax) instead of the GRAND TOTAL, you have NOT distributed the tax. Go back, recalculate each item's amount with its proportional tax share, and try again.
-5. If there is a tax line on the receipt, the sum of all "tax_included" values must equal the total tax amount shown (within $0.02).
+   - If they DON'T match, set "validation_passed" to false and include a "validation_warning" message
+4. The "invoice_total" must be the EXACT value printed on the receipt, not your calculation
+5. CRITICAL TAX SELF-CHECK: If calculated_sum equals the SUBTOTAL (pre-tax) instead of the GRAND TOTAL, you have NOT distributed the tax. Go back, recalculate each item's amount with its proportional tax share, and try again. The final amounts MUST sum to the GRAND TOTAL.
+6. If there is a tax line on the receipt, the sum of all "tax_included" values across items must equal the total tax amount shown on the receipt (within $0.02).
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -452,10 +468,10 @@ Return ONLY valid JSON in this exact format:
       "date": "2025-01-17",
       "bill_id": "INV-12345",
       "description": "Item name or description",
-      "vendor": "Exact vendor name from list or Unknown",
+      "vendor": "Exact vendor name from VENDORS list or Unknown",
       "amount": 45.99,
-      "transaction_type": "Exact name from list or Unknown",
-      "payment_method": "Exact name from list or Unknown",
+      "transaction_type": "Exact name from TRANSACTION TYPES list or Unknown",
+      "payment_method": "Exact name from PAYMENT METHODS list or Unknown",
       "tax_included": 3.45
     }}
   ],
@@ -478,10 +494,10 @@ Return ONLY valid JSON in this exact format:
 }}
 
 IMPORTANT:
-- If NO tax was detected, set "tax_summary" to null
-- The "tax_included" field should be the tax added to that item (0 for fees)
-- The "invoice_total" MUST be the exact total shown on the receipt
-- If validation fails, explain in "validation_warning" why
+- If NO tax was detected on the receipt, set "tax_summary" to null
+- The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
+- The "invoice_total" MUST be the exact total shown on the receipt/invoice document
+- If validation fails, explain in "validation_warning" why the numbers don't match (e.g., "Calculated sum $105.00 does not match invoice total $108.00 - possible missing item or rounding issue")
 - REMEMBER: Each expense "amount" should be the FINAL amount (with tax distributed). The sum of ALL "amount" fields = invoice_total.
 
 DO NOT include any text before or after the JSON. ONLY return the JSON object.
@@ -573,7 +589,7 @@ def scan_receipt(
     Args:
         file_content: Raw file bytes (image or PDF)
         file_type: MIME type (e.g. "image/jpeg", "application/pdf")
-        model: "fast" (gpt-5.1) or "heavy" (gpt-5.2)
+        model: "fast" (gpt-5.2 text-only) or "heavy" (gpt-5.2 vision)
         correction_context: Optional dict for correction pass (2nd pass)
 
     Returns:
@@ -693,13 +709,18 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
     # Call OpenAI
     if use_text_mode:
         if not correction_context and model != "heavy":
-            # Fast text mode: pdfplumber gave us clean text -> use gpt-5-mini (cheap, fast)
-            print(f"[SCAN-RECEIPT] Enviando texto a gpt-5-mini ({len(extracted_text)} chars)...")
-            result_text = gpt.mini(prompt, "Analyze this receipt.", max_tokens=8000)
+            # Fast text mode: pdfplumber gave us clean text -> use gpt-5.2 (mini was too slow)
+            print(f"[SCAN-RECEIPT] Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
+            result_text = gpt.heavy(
+                system="Analyze this receipt.",
+                user=prompt,
+                temperature=0.1,
+                max_tokens=8000,
+            )
             if not result_text:
-                raise RuntimeError("GPT mini returned empty for text mode OCR")
-            openai_model = MINI_MODEL  # Track actual model used
-            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5-mini (texto)")
+                raise RuntimeError("GPT heavy returned empty for text mode OCR")
+            openai_model = HEAVY_MODEL  # Track actual model used
+            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
         else:
             # Correction/heavy text mode: use gpt-5.2
             print(f"[SCAN-RECEIPT] Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
@@ -1193,7 +1214,7 @@ IMPORTANT:
 
     # Step 9: Calculate final metrics
     elapsed_ms = int((time.time() - start_time) * 1000)
-    tokens_used = response.usage.total_tokens if (expenses_needing_gpt and hasattr(response, 'usage')) else 0
+    tokens_used = 0
 
     metrics = {
         "cache_hits": cache_hits,
