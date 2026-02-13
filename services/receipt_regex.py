@@ -680,7 +680,16 @@ def match_payment_method(hints: List[str], payment_methods_list: List[dict]) -> 
         hints: e.g. ['Visa', 'Credit'] from _extract_payment_hints
         payment_methods_list: [{'id': ..., 'name': 'Debit'}, ...]
     """
-    if not hints or not payment_methods_list:
+    if not payment_methods_list:
+        return "Unknown"
+
+    pm_names = [p.get('name', '') for p in payment_methods_list]
+
+    # No hints at all → default to Debit
+    if not hints:
+        for pm_name in pm_names:
+            if 'debit' in pm_name.lower():
+                return pm_name
         return "Unknown"
 
     # Map hint keywords to what the DB name might contain
@@ -696,8 +705,6 @@ def match_payment_method(hints: List[str], payment_methods_list: List[dict]) -> 
         'ACH': ['ach', 'transfer'],
     }
 
-    pm_names = [p.get('name', '') for p in payment_methods_list]
-
     for hint in hints:
         keywords = hint_keywords.get(hint, [hint.lower()])
         for pm_name in pm_names:
@@ -705,12 +712,10 @@ def match_payment_method(hints: List[str], payment_methods_list: List[dict]) -> 
                 if kw in pm_name.lower():
                     return pm_name
 
-    # Default: if any card hint, prefer Debit
-    card_hints = {'Visa', 'Mastercard', 'Amex', 'Discover', 'Debit', 'Credit'}
-    if any(h in card_hints for h in hints):
-        for pm_name in pm_names:
-            if 'debit' in pm_name.lower():
-                return pm_name
+    # Fallback: always default to Debit (most receipts are card payments)
+    for pm_name in pm_names:
+        if 'debit' in pm_name.lower():
+            return pm_name
 
     return "Unknown"
 

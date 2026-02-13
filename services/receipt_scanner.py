@@ -792,7 +792,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
         print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
               f"calculated_sum={correction_context.get('calculated_sum')}, "
               f"items={len(correction_context.get('items', []))}")
-    elif model == "fast-beta":
+    elif model in ("fast-beta", "super-fast"):
         openai_model = MINI_MODEL
     elif model == "heavy":
         openai_model = HEAVY_MODEL
@@ -828,9 +828,9 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             base64_images = [base64.b64encode(file_content).decode('utf-8')]
             print(f"[SCAN-RECEIPT] HEAVY MODE: Imagen lista para Vision")
 
-    # FAST / FAST-BETA MODE: Only pdfplumber (no Vision fallback)
+    # FAST / FAST-BETA / SUPER-FAST MODE: Only pdfplumber (no Vision fallback)
     elif file_type == "application/pdf":
-        mode_label = "FAST-BETA" if model == "fast-beta" else "FAST"
+        mode_label = {"super-fast": "SUPER-FAST", "fast-beta": "FAST-BETA"}.get(model, "FAST")
         print(f"[SCAN-RECEIPT] {mode_label} MODE: PDF detectado, intentando pdfplumber...")
         text_success, text_result = extract_text_from_pdf(file_content)
 
@@ -848,6 +848,66 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
         raise ValueError(
             "Fast mode only supports PDFs with extractable text. "
             "Use heavy mode for images and scanned documents."
+        )
+
+    # ── SUPER-FAST: regex-only path (no GPT at all) ──
+    if model == "super-fast" and use_text_mode:
+        from services.receipt_regex import (
+            clean_receipt_text, extract_best,
+            assemble_scan_result,
+        )
+
+        cleaned_text = clean_receipt_text(extracted_text)
+        chars_removed = len(extracted_text) - len(cleaned_text)
+        print(f"[SCAN-RECEIPT] SUPER-FAST Pass 1: {len(extracted_text)} -> {len(cleaned_text)} chars "
+              f"({chars_removed} noise removed)")
+
+        regex_meta, scoring = extract_best(cleaned_text, filename=filename)
+        conf = regex_meta['confidence']
+        n_items = len(regex_meta['line_items'])
+        items_ok = conf.get('items_match_subtotal') or conf.get('items_match_grand') or conf.get('items_plus_tax_match')
+        best_score = scoring.get('vendor_score') or scoring['general_score']
+
+        print(f"[SCAN-RECEIPT] SUPER-FAST Pass 2: vendor={scoring['vendor_detected']}, "
+              f"winner={scoring['winner']}, score={best_score}/100, "
+              f"grand_total={regex_meta['grand_total']}, items={n_items}, "
+              f"items_sum={regex_meta['items_sum']}, cross={conf['cross_validated']}")
+
+        if conf['grand_total'] == 'high' and n_items > 0 and items_ok:
+            parsed_data = assemble_scan_result(
+                regex_meta, vendors_list, txn_types_list, payment_methods_list,
+                original_text=extracted_text,
+            )
+            parsed_data = _redistribute_tax_items(parsed_data)
+
+            print(f"[SCAN-RECEIPT] SUPER-FAST COMPLETADO - metodo: regex, items: {len(parsed_data['expenses'])}, score: {best_score}/100")
+
+            log_ocr_metric(
+                agent="receipt_scanner",
+                source="human_parse",
+                extraction_method="regex",
+                scan_mode="super-fast",
+                file_type=file_type,
+                char_count=len(extracted_text),
+                success=True,
+                confidence=100 if parsed_data.get("validation", {}).get("validation_passed") else 50,
+                items_count=len(parsed_data["expenses"]),
+                tax_detected=bool(regex_meta.get('tax_amount')),
+            )
+
+            return {
+                "expenses": parsed_data["expenses"],
+                "tax_summary": parsed_data.get("tax_summary"),
+                "validation": parsed_data.get("validation"),
+                "extraction_method": "regex",
+                "model_used": "super-fast",
+            }
+
+        # LOW confidence → error (no GPT fallback in super-fast mode)
+        raise ValueError(
+            f"Super Fast mode: Regex confidence too low (score {best_score}/100, "
+            f"grand_total={conf['grand_total']}, items={n_items}). "
+            f"Use Fast or Heavy mode for better accuracy."
         )
 
     # ── FAST-BETA: try regex-first path (no GPT) ──
@@ -1271,7 +1331,44 @@ def auto_categorize(
             expenses_needing_gpt = still_need_gpt
             print(f"[VendorAffinity] Applied affinity for vendor {vendor_id}: {affinity_hits} items -> {affinity['account_name']}")
 
-    # Step 2: If all resolved (cache + affinity), return early
+    # Step 1.75: ML classification for remaining uncached items
+    # TF-IDF + k-NN trained on historical expenses (zero GPT cost, ~1-5ms)
+    ml_hits = 0
+    if expenses_needing_gpt:
+        try:
+            from api.services.categorization_ml import get_ml_service
+            ml_service = get_ml_service()
+            ml_service.ensure_trained(supabase)
+
+            if ml_service.is_trained:
+                ml_results = ml_service.predict_batch(
+                    expenses_needing_gpt,
+                    construction_stage=stage,
+                    min_confidence=90.0,
+                )
+                still_need_gpt = []
+                for exp, ml_result in zip(expenses_needing_gpt, ml_results):
+                    if ml_result:
+                        ml_hits += 1
+                        categorizations.append({
+                            "rowIndex": exp["rowIndex"],
+                            "account_id": ml_result["account_id"],
+                            "account_name": ml_result["account_name"],
+                            "confidence": ml_result["confidence"],
+                            "reasoning": f"ML classification (confidence {ml_result['confidence']}%)",
+                            "warning": None,
+                            "source": "ml",
+                        })
+                        # Save to cache so next identical item is instant
+                        _save_to_cache(exp["description"], stage, ml_result)
+                    else:
+                        still_need_gpt.append(exp)
+                expenses_needing_gpt = still_need_gpt
+                print(f"[ML-CAT] Classified {ml_hits}/{ml_hits + len(expenses_needing_gpt)} items via ML")
+        except Exception as e:
+            print(f"[ML-CAT] ML tier error (falling through to GPT): {e}")
+
+    # Step 2: If all resolved (cache + affinity + ML), return early
     if not expenses_needing_gpt:
         elapsed_ms = int((time.time() - start_time) * 1000)
         return {
@@ -1280,6 +1377,7 @@ def auto_categorize(
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
                 "affinity_hits": affinity_hits,
+                "ml_hits": ml_hits,
                 "total_items": len(expenses),
                 "processing_time_ms": elapsed_ms
             }
@@ -1510,6 +1608,8 @@ IMPORTANT:
     metrics = {
         "cache_hits": cache_hits,
         "cache_misses": cache_misses,
+        "affinity_hits": affinity_hits,
+        "ml_hits": ml_hits,
         "total_items": len(expenses),
         "processing_time_ms": elapsed_ms,
         "gpt_time_ms": gpt_elapsed if expenses_needing_gpt else 0,
