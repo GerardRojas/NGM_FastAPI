@@ -382,7 +382,8 @@ async def _execute_function_call(
     tag = f"[AgentBrain:{agent_name}]"
 
     # Post acknowledgment for long-running functions
-    if fn_def["long_running"] and ack_msg:
+    # Skip if handler posts its own ack (e.g. process_receipt)
+    if fn_def["long_running"] and ack_msg and not fn_def.get("requires_attachments"):
         await _post_response(
             agent_name, project_id, channel_type, channel_id,
             await _personalize(agent_name, ack_msg),
@@ -1123,6 +1124,19 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "Attachment has no URL. The file may not have uploaded correctly."}
 
     tag = "[AgentBrain:process_receipt]"
+
+    # Post immediate ack so the user sees a response right away
+    from api.helpers.andrew_messenger import post_andrew_message as _post_ack
+    _post_ack(
+        content=f"Got it! Processing **{file_name}**...",
+        project_id=project_id,
+        metadata={
+            "agent_message": True,
+            "receipt_status": "processing",
+            "processing_started": True,
+        },
+    )
+    print(f"{tag} Posted immediate processing ack for {file_name}")
 
     try:
         # 1. Download file bytes from the attachment URL

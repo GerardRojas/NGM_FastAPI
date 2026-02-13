@@ -309,6 +309,162 @@ def get_project_receipts(
         raise HTTPException(status_code=500, detail=f"Error fetching receipts: {str(e)}")
 
 
+# ====== AGENT MANAGER ENDPOINTS ======
+# NOTE: These MUST be defined before /{receipt_id} catch-all route
+# to prevent FastAPI from matching "/agent-stats" as a receipt_id.
+
+@router.get("/agent-stats")
+def get_agent_stats():
+    """Return aggregate stats for the receipt agent."""
+    try:
+        # Get receipts from last 30 days
+        thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        all_receipts = supabase.table("pending_receipts") \
+            .select("id, status, parsed_data, project_id, created_at") \
+            .in_("status", ["ready", "linked", "error", "duplicate", "check_review"]) \
+            .gte("created_at", thirty_days_ago) \
+            .order("created_at", desc=True) \
+            .execute()
+
+        data = all_receipts.data or []
+        total = len(data)
+        linked = sum(1 for r in data if r["status"] == "linked")
+        errors = sum(1 for r in data if r["status"] == "error")
+        duplicates = sum(1 for r in data if r["status"] == "duplicate")
+        ready = sum(1 for r in data if r["status"] == "ready")
+
+        # Count manual reviews and OCR failures
+        manual_reviews = 0
+        ocr_failures = 0
+        error_logs = []
+
+        for r in data:
+            parsed = r.get("parsed_data") or {}
+
+            # Check for manual confirmations
+            line_items = parsed.get("line_items", [])
+            if any(item.get("user_confirmed") for item in line_items):
+                manual_reviews += 1
+
+            # Check for OCR failures (missing vendor/amount/date)
+            if not parsed.get("vendor_name") or not parsed.get("amount"):
+                ocr_failures += 1
+
+            # Collect error logs (last 10 errors)
+            if r["status"] == "error" and len(error_logs) < 10:
+                error_logs.append({
+                    "id": r["id"],
+                    "project_id": r.get("project_id"),
+                    "created_at": r.get("created_at"),
+                    "error_type": "Processing Error",
+                    "details": parsed.get("error_message", "Unknown error")
+                })
+
+        confidences = []
+        for r in data:
+            cat = (r.get("parsed_data") or {}).get("categorization") or {}
+            if cat.get("confidence"):
+                confidences.append(cat["confidence"])
+        avg_confidence = round(sum(confidences) / len(confidences)) if confidences else 0
+        success_rate = round(((total - errors) / total) * 100) if total > 0 else 0
+
+        return {
+            "total_processed": total,
+            "expenses_created": linked,
+            "pending_review": ready,
+            "errors": errors,
+            "duplicates_caught": duplicates,
+            "success_rate": success_rate,
+            "avg_confidence": avg_confidence,
+            "manual_reviews": manual_reviews,
+            "ocr_failures": ocr_failures,
+            "error_logs": error_logs,
+        }
+
+    except Exception as e:
+        logger.error(f"[agent-stats] Error getting agent stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting agent stats: {str(e)}")
+
+
+@router.get("/agent-config")
+def get_agent_config():
+    """Return current agent configuration."""
+    try:
+        result = supabase.table("agent_config").select("*").execute()
+        config = {}
+        for row in (result.data or []):
+            raw_value = row["value"]
+            # Parse JSON values back to their original types
+            try:
+                config[row["key"]] = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+            except (json.JSONDecodeError, ValueError):
+                # If not valid JSON, keep as-is (backward compat for plain strings)
+                config[row["key"]] = raw_value
+        return config
+    except Exception as e:
+        logger.error(f"[agent-config] Error loading agent config: {e}", exc_info=True)
+        # Table might not exist yet -- return defaults
+        return {
+            "auto_create_expense": True,
+            "min_confidence": 70,
+            "auto_skip_duplicates": False,
+        }
+
+
+@router.patch("/agent-config")
+def update_agent_config(payload: dict):
+    """Update agent configuration (key-value pairs)."""
+    try:
+        now = datetime.utcnow().isoformat()
+        for key, value in payload.items():
+            json_val = json.dumps(value) if not isinstance(value, str) else value
+
+            # Check if key exists (SELECT+UPDATE/INSERT pattern to avoid upsert issues)
+            existing = supabase.table("agent_config") \
+                .select("key") \
+                .eq("key", key) \
+                .execute()
+
+            if existing.data:
+                # Update existing
+                supabase.table("agent_config") \
+                    .update({"value": json_val, "updated_at": now}) \
+                    .eq("key", key) \
+                    .execute()
+            else:
+                # Insert new
+                supabase.table("agent_config") \
+                    .insert({"key": key, "value": json_val, "updated_at": now}) \
+                    .execute()
+
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"[agent-config] Error updating agent config: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error updating agent config: {str(e)}")
+
+
+@router.delete("/agent-metrics")
+def clear_agent_metrics():
+    """Clear error and duplicate records from Andrew metrics."""
+    try:
+        # Delete all receipts with status 'error' or 'duplicate'
+        # This will reset the error and duplicate counters in agent-stats
+        result = supabase.table("pending_receipts") \
+            .delete() \
+            .in_("status", ["error", "duplicate"]) \
+            .execute()
+
+        deleted_count = len(result.data) if result.data else 0
+        return {
+            "ok": True,
+            "message": f"Cleared {deleted_count} error/duplicate records",
+            "deleted_count": deleted_count
+        }
+    except Exception as e:
+        logger.error(f"[agent-metrics] Error clearing metrics: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error clearing metrics: {str(e)}")
+
+
 @router.get("/{receipt_id}")
 def get_receipt(receipt_id: str):
     """Get a single pending receipt by ID"""
@@ -751,7 +907,7 @@ def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, ac
         final_txn_type = txn_type_id or parsed_data.get("txn_type_id")
         final_payment = payment_method_id or parsed_data.get("payment_method_id")
         if final_txn_type:
-            expense_data["txn_type_id"] = final_txn_type
+            expense_data["txn_type"] = final_txn_type
         if final_payment:
             expense_data["payment_type"] = final_payment
         expense_data = {k: v for k, v in expense_data.items() if v is not None}
@@ -2700,7 +2856,7 @@ def _create_check_expenses(receipt_id: str, receipt_data: dict, check_flow: dict
         if check_number:
             expense_data["bill_id"] = check_number
         if purchase_txn_type_id:
-            expense_data["txn_type_id"] = purchase_txn_type_id
+            expense_data["txn_type"] = purchase_txn_type_id
         if check_payment_uuid:
             expense_data["payment_type"] = check_payment_uuid
 
@@ -5292,160 +5448,6 @@ def get_unprocessed_counts():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting counts: {str(e)}")
-
-
-# ====== AGENT MANAGER ENDPOINTS ======
-
-@router.get("/agent-stats")
-def get_agent_stats():
-    """Return aggregate stats for the receipt agent."""
-    try:
-        # Get receipts from last 30 days
-        thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).isoformat()
-        all_receipts = supabase.table("pending_receipts") \
-            .select("id, status, parsed_data, project_id, created_at") \
-            .in_("status", ["ready", "linked", "error", "duplicate", "check_review"]) \
-            .gte("created_at", thirty_days_ago) \
-            .order("created_at", desc=True) \
-            .execute()
-
-        data = all_receipts.data or []
-        total = len(data)
-        linked = sum(1 for r in data if r["status"] == "linked")
-        errors = sum(1 for r in data if r["status"] == "error")
-        duplicates = sum(1 for r in data if r["status"] == "duplicate")
-        ready = sum(1 for r in data if r["status"] == "ready")
-
-        # Count manual reviews and OCR failures
-        manual_reviews = 0
-        ocr_failures = 0
-        error_logs = []
-
-        for r in data:
-            parsed = r.get("parsed_data") or {}
-
-            # Check for manual confirmations
-            line_items = parsed.get("line_items", [])
-            if any(item.get("user_confirmed") for item in line_items):
-                manual_reviews += 1
-
-            # Check for OCR failures (missing vendor/amount/date)
-            if not parsed.get("vendor_name") or not parsed.get("amount"):
-                ocr_failures += 1
-
-            # Collect error logs (last 10 errors)
-            if r["status"] == "error" and len(error_logs) < 10:
-                error_logs.append({
-                    "id": r["id"],
-                    "project_id": r.get("project_id"),
-                    "created_at": r.get("created_at"),
-                    "error_type": "Processing Error",
-                    "details": parsed.get("error_message", "Unknown error")
-                })
-
-        confidences = []
-        for r in data:
-            cat = (r.get("parsed_data") or {}).get("categorization") or {}
-            if cat.get("confidence"):
-                confidences.append(cat["confidence"])
-        avg_confidence = round(sum(confidences) / len(confidences)) if confidences else 0
-        success_rate = round(((total - errors) / total) * 100) if total > 0 else 0
-
-        return {
-            "total_processed": total,
-            "expenses_created": linked,
-            "pending_review": ready,
-            "errors": errors,
-            "duplicates_caught": duplicates,
-            "success_rate": success_rate,
-            "avg_confidence": avg_confidence,
-            "manual_reviews": manual_reviews,
-            "ocr_failures": ocr_failures,
-            "error_logs": error_logs,
-        }
-
-    except Exception as e:
-        logger.error(f"[agent-stats] Error getting agent stats: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error getting agent stats: {str(e)}")
-
-
-@router.get("/agent-config")
-def get_agent_config():
-    """Return current agent configuration."""
-    try:
-        result = supabase.table("agent_config").select("*").execute()
-        config = {}
-        for row in (result.data or []):
-            raw_value = row["value"]
-            # Parse JSON values back to their original types
-            try:
-                config[row["key"]] = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
-            except (json.JSONDecodeError, ValueError):
-                # If not valid JSON, keep as-is (backward compat for plain strings)
-                config[row["key"]] = raw_value
-        return config
-    except Exception as e:
-        logger.error(f"[agent-config] Error loading agent config: {e}", exc_info=True)
-        # Table might not exist yet -- return defaults
-        return {
-            "auto_create_expense": True,
-            "min_confidence": 70,
-            "auto_skip_duplicates": False,
-        }
-
-
-@router.patch("/agent-config")
-def update_agent_config(payload: dict):
-    """Update agent configuration (key-value pairs)."""
-    try:
-        now = datetime.utcnow().isoformat()
-        for key, value in payload.items():
-            json_val = json.dumps(value) if not isinstance(value, str) else value
-
-            # Check if key exists (SELECT+UPDATE/INSERT pattern to avoid upsert issues)
-            existing = supabase.table("agent_config") \
-                .select("key") \
-                .eq("key", key) \
-                .execute()
-
-            if existing.data:
-                # Update existing
-                supabase.table("agent_config") \
-                    .update({"value": json_val, "updated_at": now}) \
-                    .eq("key", key) \
-                    .execute()
-            else:
-                # Insert new
-                supabase.table("agent_config") \
-                    .insert({"key": key, "value": json_val, "updated_at": now}) \
-                    .execute()
-
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"[agent-config] Error updating agent config: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error updating agent config: {str(e)}")
-
-
-@router.delete("/agent-metrics")
-def clear_agent_metrics():
-    """Clear error and duplicate records from Andrew metrics."""
-    try:
-        # Delete all receipts with status 'error' or 'duplicate'
-        # This will reset the error and duplicate counters in agent-stats
-        result = supabase.table("pending_receipts") \
-            .delete() \
-            .in_("status", ["error", "duplicate"]) \
-            .execute()
-
-        deleted_count = len(result.data) if result.data else 0
-        return {
-            "ok": True,
-            "message": f"Cleared {deleted_count} error/duplicate records",
-            "deleted_count": deleted_count
-        }
-    except Exception as e:
-        logger.error(f"[agent-metrics] Error clearing metrics: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error clearing metrics: {str(e)}")
 
 
 @router.post("/check-stale")
