@@ -42,6 +42,13 @@ async def get_alert_settings(project_id: Optional[str] = None) -> Dict[str, Any]
     Get alert settings for a project or global defaults.
     Project-specific settings override global settings.
     """
+    defaults = {
+        "warning_threshold": 80,
+        "critical_threshold": 95,
+        "overspend_alert": True,
+        "no_budget_alert": True,
+        "is_enabled": True,
+    }
     try:
         supabase = get_supabase()
 
@@ -50,39 +57,24 @@ async def get_alert_settings(project_id: Optional[str] = None) -> Dict[str, Any]
             result = supabase.table("budget_alert_settings") \
                 .select("*") \
                 .eq("project_id", project_id) \
-                .single() \
                 .execute()
             if result.data:
-                return result.data
+                return result.data[0]
 
         # Fall back to global settings
         result = supabase.table("budget_alert_settings") \
             .select("*") \
             .is_("project_id", "null") \
-            .single() \
             .execute()
 
         if result.data:
-            return result.data
+            return result.data[0]
 
-        # Default settings if nothing in database
-        return {
-            "warning_threshold": 80,
-            "critical_threshold": 95,
-            "overspend_alert": True,
-            "no_budget_alert": True,
-            "is_enabled": True,
-        }
+        return defaults
 
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error getting settings: {e}")
-        return {
-            "warning_threshold": 80,
-            "critical_threshold": 95,
-            "overspend_alert": True,
-            "no_budget_alert": True,
-            "is_enabled": True,
-        }
+        logger.warning(f"[BudgetMonitor] No alert settings found, using defaults: {e}")
+        return defaults
 
 
 async def get_alert_recipients(settings_id: Optional[str] = None) -> List[Dict]:
@@ -91,7 +83,7 @@ async def get_alert_recipients(settings_id: Optional[str] = None) -> List[Dict]:
         supabase = get_supabase()
 
         query = supabase.table("budget_alert_recipients") \
-            .select("*, users(user_id, user_name, user_email)")
+            .select("*")
 
         if settings_id:
             query = query.eq("settings_id", settings_id)
@@ -102,7 +94,7 @@ async def get_alert_recipients(settings_id: Optional[str] = None) -> List[Dict]:
         return result.data or []
 
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error getting recipients: {e}")
+        logger.warning(f"[BudgetMonitor] No alert recipients found: {e}")
         return []
 
 

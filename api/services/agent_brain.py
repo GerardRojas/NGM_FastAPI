@@ -1124,19 +1124,8 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "Attachment has no URL. The file may not have uploaded correctly."}
 
     tag = "[AgentBrain:process_receipt]"
-
-    # Post immediate ack so the user sees a response right away
-    from api.helpers.andrew_messenger import post_andrew_message as _post_ack
-    _post_ack(
-        content=f"Got it! Processing **{file_name}**...",
-        project_id=project_id,
-        metadata={
-            "agent_message": True,
-            "receipt_status": "processing",
-            "processing_started": True,
-        },
-    )
-    print(f"{tag} Posted immediate processing ack for {file_name}")
+    # Ack is now posted immediately in _run_agent_brain (messages.py)
+    # before GPT routing, so users see "Got it!" instantly.
 
     try:
         # 1. Download file bytes from the attachment URL
@@ -1266,7 +1255,19 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         total = validation.get("invoice_total") or sum(
             float(e.get("amount", 0)) for e in expenses
         )
+
+        # Resolve vendor_id from vendor name
         vendor_id = None
+        if vendor and vendor != "Unknown":
+            try:
+                vendors_resp = sb.table("Vendors").select("id, vendor_name").execute()
+                for v in (vendors_resp.data or []):
+                    if v.get("vendor_name") and v["vendor_name"].lower() == vendor.lower():
+                        vendor_id = v["id"]
+                        break
+            except Exception:
+                pass
+
         receipt_date = expenses[0].get("date") if expenses else None
         description = expenses[0].get("description", "") if expenses else ""
         bill_id = expenses[0].get("bill_id") if expenses else None
@@ -1288,6 +1289,48 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                 "warning": cat.get("warning"),
             })
 
+        # 6.5.1 Resolve txn_type_id and payment_method_id from OCR
+        first_item = expenses[0] if expenses else {}
+        try:
+            txn_types_resp = sb.table("txn_types").select("TnxType_id, TnxType_name").execute()
+            txn_types_map = {
+                t["TnxType_name"].lower(): t["TnxType_id"]
+                for t in (txn_types_resp.data or []) if t.get("TnxType_name")
+            }
+        except Exception:
+            txn_types_map = {}
+
+        try:
+            payment_resp = sb.table("paymet_methods").select("id, payment_method_name").execute()
+            payment_map = {
+                p["payment_method_name"].lower(): p["id"]
+                for p in (payment_resp.data or []) if p.get("payment_method_name")
+            }
+        except Exception:
+            payment_resp = type("R", (), {"data": []})()
+            payment_map = {}
+
+        default_txn_type_id = txn_types_map.get("purchase")
+        default_payment_id = (
+            payment_map.get("debit") or
+            payment_map.get("debit card") or
+            payment_map.get("ach debit") or
+            payment_map.get("bank account")
+        )
+        if not default_payment_id and payment_resp.data:
+            default_payment_id = payment_resp.data[0].get("id")
+            print(f"{tag} WARNING: No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
+
+        ocr_txn_type = first_item.get("transaction_type", "Unknown")
+        resolved_txn_type_id = txn_types_map.get(ocr_txn_type.lower()) if ocr_txn_type and ocr_txn_type != "Unknown" else None
+        txn_type_id = resolved_txn_type_id or default_txn_type_id
+
+        ocr_payment = first_item.get("payment_method", "Unknown")
+        resolved_payment_id = payment_map.get(ocr_payment.lower()) if ocr_payment and ocr_payment != "Unknown" else None
+        payment_method_id = resolved_payment_id or default_payment_id
+
+        print(f"{tag} Resolved txn_type_id={txn_type_id}, payment_method_id={payment_method_id} (ocr_payment={ocr_payment}, default={default_payment_id})")
+
         parsed_data = {
             "vendor_name": vendor,
             "vendor_id": vendor_id,
@@ -1298,6 +1341,8 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
             "line_items": line_items,
             "validation": validation,
             "extraction_method": scan_result.get("extraction_method", "unknown"),
+            "txn_type_id": txn_type_id,
+            "payment_method_id": payment_method_id,
         }
 
         # 6.6 Detect low-confidence categories

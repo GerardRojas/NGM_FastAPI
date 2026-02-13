@@ -9,7 +9,7 @@ Usage (from any service):
         agent="daneel",
         source="hint_review",
         extraction_method="pdfplumber",
-        model_used="gpt-5-1",
+        model_used="gpt-5.1",
         scan_mode="heavy",
         file_type="application/pdf",
         processing_ms=342,

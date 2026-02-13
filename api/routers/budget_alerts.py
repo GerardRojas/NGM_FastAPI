@@ -184,12 +184,12 @@ async def get_alert_recipients(
         # Get recipients
         if settings_id:
             result = supabase.table("budget_alert_recipients") \
-                .select("*, users(user_id, user_name, user_email, avatar_color)") \
+                .select("*, users!user_id(user_id, user_name, avatar_color)") \
                 .eq("settings_id", settings_id) \
                 .execute()
         else:
             result = supabase.table("budget_alert_recipients") \
-                .select("*, users(user_id, user_name, user_email, avatar_color)") \
+                .select("*, users!user_id(user_id, user_name, avatar_color)") \
                 .is_("settings_id", "null") \
                 .execute()
 
@@ -693,7 +693,7 @@ async def get_alert_action_history(
     """
     try:
         result = supabase.table("budget_alert_actions") \
-            .select("*, users(user_name, avatar_color)") \
+            .select("*, users!user_id(user_name, avatar_color)") \
             .eq("alert_id", alert_id) \
             .order("created_at", desc=True) \
             .execute()

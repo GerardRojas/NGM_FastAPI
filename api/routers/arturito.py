@@ -827,7 +827,7 @@ async def interpret_intent(request: IntentRequest, current_user: dict = Depends(
             system_prompt += f"\nACCOUNT GROUPS (budget categories): {', '.join(account_groups)}\n"
 
         response = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": request.text[:500]},  # Limit input length
@@ -931,7 +931,7 @@ If you can't interpret the command as a filter action, return:
 {"action": null, "value": null, "message": null}"""
 
         response = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": request.text[:500]}
@@ -1006,7 +1006,7 @@ If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}
         import os
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=30.0)
         response = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Find accounts matching: {query[:200]}"}

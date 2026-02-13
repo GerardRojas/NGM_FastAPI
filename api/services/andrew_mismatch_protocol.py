@@ -300,7 +300,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
             agent="andrew",
             source="mismatch_reconciliation",
             extraction_method=data["_extraction_method"],
-            model_used="gpt-5-2",
+            model_used="gpt-5.2",
             file_type="application/pdf" if is_pdf else (content_type or "unknown"),
             char_count=len(extracted_text) if extracted_text else None,
             success=True,

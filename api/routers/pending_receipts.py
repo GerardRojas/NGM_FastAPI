@@ -53,9 +53,10 @@
 # @step_description: Mark receipt as rejected if invalid
 # =============================================================================
 
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query, BackgroundTasks, Depends
 from pydantic import BaseModel
 from api.supabase_client import supabase
+from api.auth import get_current_user
 from typing import Optional, List, Dict, Any
 import base64
 import hashlib
@@ -83,6 +84,22 @@ router = APIRouter(prefix="/pending-receipts", tags=["Pending Receipts"])
 
 # Storage bucket name
 RECEIPTS_BUCKET = "pending-expenses"
+
+
+def _load_agent_config() -> dict:
+    """Load agent_config with proper JSON parsing (avoid string-truthy bugs)."""
+    try:
+        result = supabase.table("agent_config").select("key, value").execute()
+        cfg = {}
+        for row in (result.data or []):
+            raw = row["value"]
+            try:
+                cfg[row["key"]] = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, ValueError):
+                cfg[row["key"]] = raw
+        return cfg
+    except Exception:
+        return {}
 
 
 # ====== MODELS ======
@@ -147,31 +164,6 @@ class EditCategoriesRequest(BaseModel):
 
 # ====== HELPERS ======
 
-def ensure_bucket_exists():
-    """Ensures the pending-expenses bucket exists, creates if not"""
-    try:
-        # Try to get bucket info
-        supabase.storage.get_bucket(RECEIPTS_BUCKET)
-    except Exception:
-        # Bucket doesn't exist, create it
-        try:
-            supabase.storage.create_bucket(
-                RECEIPTS_BUCKET,
-                options={"public": True}
-            )
-            print(f"[PendingReceipts] Created bucket: {RECEIPTS_BUCKET}")
-        except Exception as e:
-            # Bucket might already exist (race condition) or other error
-            print(f"[PendingReceipts] Bucket creation note: {e}")
-
-
-def generate_storage_path(project_id: str, receipt_id: str, filename: str) -> str:
-    """Generate storage path for receipt file"""
-    # Clean filename
-    safe_filename = "".join(c if c.isalnum() or c in ".-_" else "_" for c in filename)
-    return f"{project_id}/{receipt_id}_{safe_filename}"
-
-
 # ====== ENDPOINTS ======
 
 @router.post("/upload", status_code=201)
@@ -179,7 +171,8 @@ async def upload_receipt(
     file: UploadFile = File(...),
     project_id: str = Form(...),
     uploaded_by: str = Form(...),
-    message_id: Optional[str] = Form(None)
+    message_id: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Upload a receipt file to the pending-expenses bucket.
@@ -263,16 +256,59 @@ async def upload_receipt(
 def get_project_receipts(
     project_id: str,
     status: Optional[str] = Query(None, description="Filter by status"),
+    unprocessed_only: bool = Query(False, description="Only receipts without expenses"),
     limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0)
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Get all pending receipts for a project.
+    Get pending receipts for a project.
 
-    Optional filters:
-    - status: Filter by status (pending, processing, ready, linked, rejected, error)
+    Modes:
+    - unprocessed_only=true: Returns receipts that have no linked expenses
+      (expense_id IS NULL, excludes rejected and processing).
+      Used by the "From Pending" modal in expenses.
+    - status=xxx: Legacy filter by status.
+    - Neither: Returns all receipts for the project.
     """
     try:
+        if unprocessed_only:
+            # Auto-reset orphaned receipts: status='linked' but expense_id=NULL
+            # (happens when all linked expenses are deleted via FK ON DELETE SET NULL)
+            try:
+                supabase.table("pending_receipts") \
+                    .update({"status": "ready", "updated_at": datetime.utcnow().isoformat()}) \
+                    .eq("project_id", project_id) \
+                    .eq("status", "linked") \
+                    .is_("expense_id", "null") \
+                    .execute()
+            except Exception as e:
+                logger.error(f"[PendingReceipts] Auto-reset orphaned receipts error: {e}")
+
+            # Fetch all unprocessed: expense_id IS NULL, exclude rejected/processing
+            query = supabase.table("pending_receipts") \
+                .select("*, users!uploaded_by(user_name, avatar_color)") \
+                .eq("project_id", project_id) \
+                .is_("expense_id", "null") \
+                .not_.in_("status", ["rejected", "processing"]) \
+                .order("created_at", desc=True) \
+                .range(offset, offset + limit - 1)
+
+            result = query.execute()
+            data = result.data or []
+
+            return {
+                "success": True,
+                "data": data,
+                "total": len(data),
+                "pagination": {
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": len(data) == limit
+                }
+            }
+
+        # Legacy mode: filter by status (used by other parts of the app)
         query = supabase.table("pending_receipts") \
             .select("*, users!uploaded_by(user_name, avatar_color)") \
             .eq("project_id", project_id) \
@@ -314,7 +350,7 @@ def get_project_receipts(
 # to prevent FastAPI from matching "/agent-stats" as a receipt_id.
 
 @router.get("/agent-stats")
-def get_agent_stats():
+def get_agent_stats(current_user: dict = Depends(get_current_user)):
     """Return aggregate stats for the receipt agent."""
     try:
         # Get receipts from last 30 days
@@ -387,7 +423,7 @@ def get_agent_stats():
 
 
 @router.get("/agent-config")
-def get_agent_config():
+def get_agent_config(current_user: dict = Depends(get_current_user)):
     """Return current agent configuration."""
     try:
         result = supabase.table("agent_config").select("*").execute()
@@ -412,7 +448,7 @@ def get_agent_config():
 
 
 @router.patch("/agent-config")
-def update_agent_config(payload: dict):
+def update_agent_config(payload: dict, current_user: dict = Depends(get_current_user)):
     """Update agent configuration (key-value pairs)."""
     try:
         now = datetime.utcnow().isoformat()
@@ -444,7 +480,7 @@ def update_agent_config(payload: dict):
 
 
 @router.delete("/agent-metrics")
-def clear_agent_metrics():
+def clear_agent_metrics(current_user: dict = Depends(get_current_user)):
     """Clear error and duplicate records from Andrew metrics."""
     try:
         # Delete all receipts with status 'error' or 'duplicate'
@@ -466,7 +502,7 @@ def clear_agent_metrics():
 
 
 @router.get("/{receipt_id}")
-def get_receipt(receipt_id: str):
+def get_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
     """Get a single pending receipt by ID"""
     try:
         result = supabase.table("pending_receipts") \
@@ -487,7 +523,7 @@ def get_receipt(receipt_id: str):
 
 
 @router.post("/{receipt_id}/process")
-async def process_receipt(receipt_id: str):
+async def process_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
     """
     Process a pending receipt using the shared OCR service (scan_receipt).
     Used by the human bookkeeper from the expenses pending-receipts panel.
@@ -602,7 +638,7 @@ async def process_receipt(receipt_id: str):
                     categorizations = cat_result.get("categorizations", [])
                     cat_metrics = cat_result.get("metrics", {})
             except Exception as cat_err:
-                print(f"[Categorization] Error: {cat_err}")
+                logger.error(f"[Categorization] Error: {cat_err}")
                 pass
 
             # Attach categorization to line items
@@ -645,7 +681,7 @@ async def process_receipt(receipt_id: str):
             # If still no default found, use first available payment method as last resort
             if not default_payment_id and payment_resp.data:
                 default_payment_id = payment_resp.data[0].get("id")
-                print(f"[WARNING] No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
+                logger.warning(f"[WARNING] No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
 
             ocr_txn_type = first_item.get("transaction_type", "Unknown")
             resolved_txn_type_id = txn_types_map.get(ocr_txn_type.lower()) if ocr_txn_type and ocr_txn_type != "Unknown" else None
@@ -655,7 +691,7 @@ async def process_receipt(receipt_id: str):
             resolved_payment_id = payment_map.get(ocr_payment.lower()) if ocr_payment and ocr_payment != "Unknown" else None
             payment_method_id = resolved_payment_id or default_payment_id
 
-            print(f"[Receipt] Resolved payment: OCR='{ocr_payment}' -> ID={payment_method_id} (default={default_payment_id})")
+            logger.info(f"[Receipt] Resolved payment: OCR='{ocr_payment}' -> ID={payment_method_id} (default={default_payment_id})")
 
             # ===== Build parsed_data and update DB =====
             parsed_data = {
@@ -729,7 +765,7 @@ def _check_file_hash_duplicate(file_hash: str, project_id: str, current_receipt_
             .execute()
         return result.data[0] if result.data else None
     except Exception as e:
-        print(f"[Agent] File hash duplicate check error: {e}")
+        logger.error(f"[Agent] File hash duplicate check error: {e}")
         return None
 
 
@@ -753,7 +789,7 @@ def _check_data_duplicate(project_id: str, vendor_name, amount, receipt_date):
             .execute()
         return result.data[0] if result.data else None
     except Exception as e:
-        print(f"[Agent] Data duplicate check error: {e}")
+        logger.error(f"[Agent] Data duplicate check error: {e}")
         return None
 
 
@@ -771,7 +807,7 @@ def _check_expense_duplicate(project_id: str, vendor_id, amount, txn_date):
             .execute()
         return result.data[0] if result.data else None
     except Exception as e:
-        print(f"[Agent] Expense duplicate check error: {e}")
+        logger.error(f"[Agent] Expense duplicate check error: {e}")
         return None
 
 
@@ -789,7 +825,7 @@ def _check_file_hash_split_reuse(file_hash: str, project_id: str, receipt_id: st
             return sorted(result.data, key=lambda x: x.get("created_at", ""), reverse=True)[0]
         return None
     except Exception as e:
-        print(f"[Agent] Split reuse check error: {e}")
+        logger.error(f"[Agent] Split reuse check error: {e}")
         return None
 
 
@@ -809,7 +845,7 @@ def _get_bookkeeping_mentions():
                     mentions.append(f"@{name}")
         return " ".join(mentions) if mentions else ""
     except Exception as e:
-        print(f"[Agent] Error fetching bookkeeping mentions: {e}")
+        logger.error(f"[Agent] Error fetching bookkeeping mentions: {e}")
         return ""
 
 
@@ -838,7 +874,7 @@ def _get_auth_notify_mentions():
                 mentions.append(f"@{name}")
         return " ".join(mentions) if mentions else ""
     except Exception as e:
-        print(f"[Agent] Error fetching auth notify mentions: {e}")
+        logger.error(f"[Agent] Error fetching auth notify mentions: {e}")
         return ""
 
 
@@ -878,15 +914,76 @@ def _get_authorization_message():
             else:
                 return ""
     except Exception as e:
-        print(f"[Agent] Error getting authorization message: {e}")
+        logger.error(f"[Agent] Error getting authorization message: {e}")
         # Fallback to human mentions if error
         auth_mentions = _get_auth_notify_mentions()
         return f"\n\n{auth_mentions}" if auth_mentions else ""
 
 
+def _schedule_daneel_auto_auth(expense_id: str, project_id: str):
+    """Schedule Daneel auto-auth check for a newly created expense (non-blocking)."""
+    try:
+        from api.services.daneel_auto_auth import trigger_auto_auth_check
+        loop = asyncio.get_running_loop()
+        loop.create_task(trigger_auto_auth_check(str(expense_id), str(project_id)))
+    except RuntimeError:
+        pass  # No running event loop (sync endpoint) - skip
+    except Exception as e:
+        logger.error(f"[DaneelTrigger] Failed to schedule auto-auth: {e}")
+
+
+def _schedule_daneel_auto_auth_for_bill(expense_ids: list, bill_id: str, project_id: str,
+                                         vendor_name: str = "", total_amount: float = 0.0):
+    """Schedule bill-level Daneel auto-auth check (non-blocking)."""
+    try:
+        from api.services.daneel_auto_auth import trigger_auto_auth_for_bill
+        loop = asyncio.get_running_loop()
+        loop.create_task(trigger_auto_auth_for_bill(
+            expense_ids=[str(eid) for eid in expense_ids],
+            bill_id=str(bill_id),
+            project_id=str(project_id),
+            vendor_name=vendor_name,
+            total_amount=total_amount,
+        ))
+        logger.info(f"[DaneelTrigger] Scheduled bill-level auth | bill={bill_id} | {len(expense_ids)} expenses")
+    except RuntimeError:
+        pass  # No running event loop
+    except Exception as e:
+        logger.error(f"[DaneelTrigger] Failed to schedule bill-level auto-auth: {e}")
+
+
+def _trigger_bill_or_per_expense_auth(created_expenses: list, project_id: str, vendor_name: str = ""):
+    """Group expenses by bill_id. Bill groups use bill-level auth, no-bill uses per-expense fallback."""
+    bill_groups = {}
+    no_bill = []
+    for exp in created_expenses:
+        bid = (exp.get("bill_id") or "").strip()
+        if bid:
+            bill_groups.setdefault(bid, []).append(exp)
+        else:
+            no_bill.append(exp)
+
+    n_bill = sum(len(g) for g in bill_groups.values())
+    n_per = len(no_bill)
+    logger.info(f"[DaneelTrigger] Grouped {len(created_expenses)} expenses: {n_bill} bill-level ({len(bill_groups)} bills) + {n_per} per-expense")
+
+    for bid, group in bill_groups.items():
+        _schedule_daneel_auto_auth_for_bill(
+            expense_ids=[e.get("expense_id") for e in group if e.get("expense_id")],
+            bill_id=bid,
+            project_id=project_id,
+            vendor_name=vendor_name,
+            total_amount=sum(float(e.get("Amount") or 0) for e in group),
+        )
+    for exp in no_bill:
+        eid = exp.get("expense_id")
+        if eid:
+            _schedule_daneel_auto_auth(eid, project_id)
+
+
 def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, account_id,
                             amount=None, description=None, bill_id=None, txn_date=None,
-                            txn_type_id=None, payment_method_id=None):
+                            txn_type_id=None, payment_method_id=None, skip_auto_auth=False):
     """Create a single expense from receipt data. Returns expense record or None."""
     try:
         expense_data = {
@@ -914,10 +1011,13 @@ def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, ac
 
         result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
         if result.data:
-            return result.data[0]
+            exp = result.data[0]
+            if not skip_auto_auth:
+                _schedule_daneel_auto_auth(exp.get("expense_id"), exp.get("project") or project_id)
+            return exp
         return None
     except Exception as e:
-        print(f"[Agent] Expense creation error: {e}")
+        logger.error(f"[Agent] Expense creation error: {e}")
         return None
 
 
@@ -991,7 +1091,7 @@ def _resolve_project_by_name(query: str):
             if query_lower in p["project_name"].lower():
                 return {"project_id": p["project_id"], "project_name": p["project_name"]}
     except Exception as e:
-        print(f"[ReceiptFlow] Project lookup error: {e}")
+        logger.error(f"[ReceiptFlow] Project lookup error: {e}")
     return None
 
 
@@ -1020,49 +1120,6 @@ def _build_numbered_list(line_items: list, lang: str = "en") -> str:
         conf = item.get("confidence", 0)
         lines.append(f"{i}. {desc} -- ${amt:,.2f} -> {cat} ({conf}%)")
     return "\n".join(lines)
-
-
-def _build_agent_message(parsed_data, categorize_data, warnings, lang="en", expense_created=False):
-    """Build Arturito's summary message for the receipts channel."""
-    vendor = parsed_data.get("vendor_name") or "Unknown"
-    amount = parsed_data.get("amount") or 0
-    date = parsed_data.get("receipt_date") or "Unknown"
-    category = categorize_data.get("account_name") or parsed_data.get("suggested_category") or "Uncategorized"
-    confidence = int(categorize_data.get("confidence", 0))
-    line_items = parsed_data.get("line_items", [])
-    item_count = len(line_items)
-    show_list = item_count > 1 and not expense_created
-
-    if lang == "es":
-        header = f"Escanee este recibo de **{vendor}** -- ${amount:,.2f}"
-        if date != "Unknown":
-            header += f" del {date}"
-        header += "."
-        if show_list:
-            numbered = _build_numbered_list(line_items, lang)
-            body = f"\n{numbered}"
-        else:
-            body = f"Categoria: **{category}** ({confidence}% confianza)"
-        if warnings:
-            body += "\n\nAtencion:\n" + "\n".join(f"- {w}" for w in warnings)
-        if expense_created:
-            body += "\n\nGasto guardado -- listo para autorizacion."
-    else:
-        header = f"I scanned this receipt from **{vendor}** -- ${amount:,.2f}"
-        if date != "Unknown":
-            header += f" on {date}"
-        header += "."
-        if show_list:
-            numbered = _build_numbered_list(line_items, lang)
-            body = f"\n{numbered}"
-        else:
-            body = f"Category: **{category}** ({confidence}% confidence)"
-        if warnings:
-            body += "\n\nHeads up:\n" + "\n".join(f"- {w}" for w in warnings)
-        if expense_created:
-            body += "\n\nExpense saved -- ready for authorization."
-
-    return f"{header}\n{body}"
 
 
 # ====== USER CONTEXT APPLICATION ======
@@ -1144,7 +1201,7 @@ def _apply_user_context(
                     line_items[idx]["confidence"] = 95
                     line_items[idx]["user_confirmed"] = True
                     result["resolved_items"].append(idx)
-                    print(f"[UserContext] Category hint resolved item {idx} -> {matched_acct['name']}")
+                    logger.info(f"[UserContext] Category hint resolved item {idx} -> {matched_acct['name']}")
 
             # Check if ALL low-confidence items were resolved
             unresolved = [
@@ -1153,7 +1210,7 @@ def _apply_user_context(
             ]
             if not unresolved:
                 result["skip_categories"] = True
-                print(f"[UserContext] All {len(low_confidence_items)} low-confidence items resolved by hints")
+                logger.info(f"[UserContext] All {len(low_confidence_items)} low-confidence items resolved by hints")
 
     # --- 2. Project decision ---
     if project_decision == "all_this_project":
@@ -1161,7 +1218,7 @@ def _apply_user_context(
         result["pre_resolved"]["project_decision"] = "all_this_project"
         result["pre_resolved"]["project_id"] = project_id
         result["pre_resolved"]["project_name"] = project_name
-        print(f"[UserContext] Project decision: all for {project_name}")
+        logger.info(f"[UserContext] Project decision: all for {project_name}")
 
     elif project_decision == "split" and split_projects:
         # Resolve project names
@@ -1192,7 +1249,7 @@ def _apply_user_context(
                     })
                 else:
                     all_resolved = False
-                    print(f"[UserContext] Could not resolve project: '{sp_name}'")
+                    logger.warning(f"[UserContext] Could not resolve project: '{sp_name}'")
 
         if all_resolved and resolved_splits:
             # Calculate amounts from portions if not explicitly given
@@ -1209,7 +1266,7 @@ def _apply_user_context(
             result["skip_project_question"] = True
             result["pre_resolved"]["project_decision"] = "split"
             result["pre_resolved"]["split_details"] = resolved_splits
-            print(f"[UserContext] Split resolved: {len(resolved_splits)} projects")
+            logger.info(f"[UserContext] Split resolved: {len(resolved_splits)} projects")
 
     # --- 3. Determine start state ---
     if result["skip_categories"] and result["skip_project_question"]:
@@ -1267,7 +1324,7 @@ def _build_confirm_summary(pre_resolved: dict, line_items: list, parsed_data: di
 # ====== AGENT ENDPOINT ======
 
 @router.post("/{receipt_id}/agent-process")
-async def agent_process_receipt(receipt_id: str):
+async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
     """
     Full automated processing pipeline for material receipts.
 
@@ -1286,7 +1343,7 @@ async def agent_process_receipt(receipt_id: str):
 
     try:
         # ===== STEP 1: Fetch receipt =====
-        print(f"[Agent] === START agent-process for receipt {receipt_id} ===")
+        logger.info(f"[Agent] === START agent-process for receipt {receipt_id} ===")
         receipt = supabase.table("pending_receipts") \
             .select("*") \
             .eq("id", receipt_id) \
@@ -1298,7 +1355,7 @@ async def agent_process_receipt(receipt_id: str):
 
         receipt_data = receipt.data
         project_id = receipt_data.get("project_id")
-        print(f"[Agent] Step 1: Receipt fetched | project={project_id} | file={receipt_data.get('file_name')}")
+        logger.info(f"[Agent] Step 1: Receipt fetched | project={project_id} | file={receipt_data.get('file_name')}")
 
         if receipt_data.get("status") == "linked":
             raise HTTPException(status_code=400, detail="Receipt already linked to an expense")
@@ -1324,10 +1381,10 @@ async def agent_process_receipt(receipt_id: str):
                 "processing_started": True,
             }
         )
-        print(f"[Agent] Sent immediate confirmation message for receipt {receipt_id}")
+        logger.info(f"[Agent] Sent immediate confirmation message for receipt {receipt_id}")
 
         # ===== STEP 2: Download file + duplicate check =====
-        print(f"[Agent] Step 2: Downloading file...")
+        logger.info("[Agent] Step 2: Downloading file...")
         file_url = receipt_data.get("file_url")
         file_type = receipt_data.get("file_type")
         file_hash = receipt_data.get("file_hash")
@@ -1338,7 +1395,7 @@ async def agent_process_receipt(receipt_id: str):
             if resp.status_code != 200:
                 raise Exception("Failed to download receipt file from storage")
             file_content = resp.content
-        print(f"[Agent] Step 2: File downloaded | size={len(file_content)} bytes | type={file_type}")
+        logger.info(f"[Agent] Step 2: File downloaded | size={len(file_content)} bytes | type={file_type}")
 
         # Compute hash if not already stored (backwards compat with old uploads)
         if not file_hash:
@@ -1351,7 +1408,7 @@ async def agent_process_receipt(receipt_id: str):
         # Check if this file was already processed as a split in another project
         split_reuse = _check_file_hash_split_reuse(file_hash, project_id, receipt_id)
         if split_reuse:
-            print(f"[Agent] Step 2: Split reuse detected | original in project {split_reuse.get('project_id')}")
+            logger.info(f"[Agent] Step 2: Split reuse detected | original in project {split_reuse.get('project_id')}")
             original_parsed = split_reuse.get("parsed_data") or {}
             # Strip old flow states from copied data
             original_parsed.pop("receipt_flow", None)
@@ -1423,7 +1480,7 @@ async def agent_process_receipt(receipt_id: str):
         is_likely_check = is_image and "check" in file_name.lower()
 
         if is_likely_check:
-            print(f"[Agent] Step 2.5: LABOR CHECK auto-detected: {file_name}")
+            logger.info(f"[Agent] Step 2.5: LABOR CHECK auto-detected: {file_name}")
 
             payroll_channel_id = _get_payroll_channel_id()
 
@@ -1443,9 +1500,9 @@ async def agent_process_receipt(receipt_id: str):
                 except Exception:
                     pass
 
-                print(f"[CheckFlow] Extracting context from user message: {user_message[:100]}")
+                logger.info(f"[CheckFlow] Extracting context from user message: {user_message[:100]}")
                 check_context = _extract_check_context_sync(user_message, proj_name)
-                print(f"[CheckFlow] Extracted context: {json.dumps(check_context, ensure_ascii=False)[:200]}")
+                logger.info(f"[CheckFlow] Extracted context: {json.dumps(check_context, ensure_ascii=False)[:200]}")
 
             # Auto-create entries from context
             auto_entries = []
@@ -1478,12 +1535,12 @@ async def agent_process_receipt(receipt_id: str):
                         if result.data:
                             return result.data[0]["project_id"]
                     except Exception as e:
-                        print(f"[CheckFlow] Project resolution error for '{project_name}': {e}")
+                        logger.error(f"[CheckFlow] Project resolution error for '{project_name}': {e}")
                     return None
 
                 # Auto-create entries from workers_list
                 if workers_list:
-                    print(f"[CheckFlow] Auto-creating {len(workers_list)} entries from workers_list")
+                    logger.info(f"[CheckFlow] Auto-creating {len(workers_list)} entries from workers_list")
                     for idx, worker in enumerate(workers_list):
                         description = worker.get("description", "")
                         amount = worker.get("amount")
@@ -1517,7 +1574,7 @@ async def agent_process_receipt(receipt_id: str):
 
                 # Auto-create entries from split_projects (when no workers_list)
                 elif split_projects and len(split_projects) > 1:
-                    print(f"[CheckFlow] Auto-creating {len(split_projects)} entries from split_projects")
+                    logger.info(f"[CheckFlow] Auto-creating {len(split_projects)} entries from split_projects")
                     is_split_detected = True
                     for idx, proj_name in enumerate(split_projects):
                         entry_project_id = resolve_project(proj_name)
@@ -1561,12 +1618,6 @@ async def agent_process_receipt(receipt_id: str):
                 "context": check_context,  # Store extracted context
             }
 
-            supabase.table("pending_receipts").update({
-                "status": "check_review",
-                "parsed_data": {"check_flow": check_flow},
-                "updated_at": datetime.utcnow().isoformat()
-            }).eq("id", receipt_id).execute()
-
             # Get project name for context
             proj_name = "Unknown"
             try:
@@ -1588,7 +1639,7 @@ async def agent_process_receipt(receipt_id: str):
                 check_flow["check_number"] = check_number_hint
                 check_flow["state"] = "awaiting_split_decision"
                 context_summary.append(f"Check #{check_number_hint}")
-                print(f"[CheckFlow] Auto-resolved check number from context: {check_number_hint}")
+                logger.info(f"[CheckFlow] Auto-resolved check number from context: {check_number_hint}")
 
             if check_context.get("labor_type_hint"):
                 context_summary.append(f"Labor: {check_context['labor_type_hint']}")
@@ -1751,7 +1802,7 @@ async def agent_process_receipt(receipt_id: str):
             }
 
         # ===== STEP 3: OCR Extraction (Shared Service) =====
-        print(f"[Agent] Step 2: No duplicate found, proceeding to OCR")
+        logger.info("[Agent] Step 2: No duplicate found, proceeding to OCR")
         # Read scan mode from agent_config (default: heavy)
         _scan_mode = "heavy"
         try:
@@ -1760,13 +1811,13 @@ async def agent_process_receipt(receipt_id: str):
                 _scan_mode = _mode_row.data[0]["value"]
         except Exception:
             pass
-        print(f"[Agent] Step 3: Starting OCR extraction (mode={_scan_mode})...")
+        logger.info(f"[Agent] Step 3: Starting OCR extraction (mode={_scan_mode})...")
         try:
             scan_result = _scan_receipt_core(file_content, file_type, model=_scan_mode)
         except ValueError as e:
             if _scan_mode == "fast":
                 # Fast mode failed (no extractable text) -- auto-fallback to heavy
-                print(f"[Agent] Step 3: Fast mode failed ({e}), falling back to heavy...")
+                logger.warning(f"[Agent] Step 3: Fast mode failed ({e}), falling back to heavy...")
                 scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
             else:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -1782,7 +1833,7 @@ async def agent_process_receipt(receipt_id: str):
         if not validation.get("validation_passed", True) and line_items:
             inv_total = validation.get("invoice_total", 0)
             calc_sum = validation.get("calculated_sum", 0)
-            print(f"[Agent] Step 3.5: Validation FAILED | invoice={inv_total} vs calculated={calc_sum} | Triggering correction pass...")
+            logger.warning(f"[Agent] Step 3.5: Validation FAILED | invoice={inv_total} vs calculated={calc_sum} | Triggering correction pass...")
             try:
                 correction_context = {
                     "invoice_total": inv_total,
@@ -1800,15 +1851,15 @@ async def agent_process_receipt(receipt_id: str):
                     line_items = corrected_result.get("expenses", [])
                     validation = corrected_validation
                     corrections = corrected_validation.get("corrections_made", "")
-                    print(f"[Agent] Step 3.5: Correction PASSED | corrections: {corrections}")
+                    logger.info(f"[Agent] Step 3.5: Correction PASSED | corrections: {corrections}")
                 else:
                     # Correction still failed - flag for bookkeeping escalation
                     validation_unresolved = True
                     new_sum = corrected_validation.get("calculated_sum", calc_sum)
-                    print(f"[Agent] Step 3.5: Correction FAILED | still {new_sum} vs {inv_total} | Will escalate to bookkeeping")
+                    logger.warning(f"[Agent] Step 3.5: Correction FAILED | still {new_sum} vs {inv_total} | Will escalate to bookkeeping")
             except Exception as corr_err:
                 validation_unresolved = True
-                print(f"[Agent] Step 3.5: Correction pass error: {corr_err} | Will escalate to bookkeeping")
+                logger.error(f"[Agent] Step 3.5: Correction pass error: {corr_err} | Will escalate to bookkeeping")
 
         # Derive summary fields from line items (backwards compat)
         first_item = line_items[0] if line_items else {}
@@ -1858,7 +1909,7 @@ async def agent_process_receipt(receipt_id: str):
         # If still no default found, use first available payment method as last resort
         if not default_payment_id and payment_resp.data:
             default_payment_id = payment_resp.data[0].get("id")
-            print(f"[Agent] WARNING: No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
+            logger.warning(f"[Agent] No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
 
         ocr_txn_type = first_item.get("transaction_type", "Unknown")
         resolved_txn_type_id = txn_types_map.get(ocr_txn_type.lower()) if ocr_txn_type and ocr_txn_type != "Unknown" else None
@@ -1868,7 +1919,7 @@ async def agent_process_receipt(receipt_id: str):
         resolved_payment_id = payment_map.get(ocr_payment.lower()) if ocr_payment and ocr_payment != "Unknown" else None
         payment_method_id = resolved_payment_id or default_payment_id
 
-        print(f"[Agent] Step 3: Resolved txn_type_id={txn_type_id} (ocr={ocr_txn_type}), payment_method_id={payment_method_id} (ocr={ocr_payment}, default={default_payment_id})")
+        logger.info(f"[Agent] Step 3: Resolved txn_type_id={txn_type_id} (ocr={ocr_txn_type}), payment_method_id={payment_method_id} (ocr={ocr_payment}, default={default_payment_id})")
 
         parsed_data = {
             "vendor_name": vendor_name,
@@ -1882,7 +1933,7 @@ async def agent_process_receipt(receipt_id: str):
             "txn_type_id": txn_type_id,
             "payment_method_id": payment_method_id,
         }
-        print(f"[Agent] Step 3: OCR complete | vendor={vendor_name} | amount={amount} | date={receipt_date} | {len(line_items)} line item(s)")
+        logger.info(f"[Agent] Step 3: OCR complete | vendor={vendor_name} | amount={amount} | date={receipt_date} | {len(line_items)} line item(s)")
 
         # ===== STEP 3.7: Filename hint cross-validation =====
         from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
@@ -1898,7 +1949,7 @@ async def agent_process_receipt(receipt_id: str):
             )
             parsed_data["bill_hint"] = bill_hint
             parsed_data["bill_hint_validation"] = hint_validation
-            print(f"[Agent] Step 3.7: Filename hint | hints={bill_hint} | mismatches={hint_validation.get('mismatches', [])}")
+            logger.info(f"[Agent] Step 3.7: Filename hint | hints={bill_hint} | mismatches={hint_validation.get('mismatches', [])}")
 
         # ===== STEP 3.8: Smart missing info analysis + auto-resolve =====
         from api.services.andrew_smart_layer import (
@@ -1914,12 +1965,12 @@ async def agent_process_receipt(receipt_id: str):
             amount = parsed_data.get("amount", amount)
             receipt_date = parsed_data.get("receipt_date", receipt_date)
             bill_id = parsed_data.get("bill_id", bill_id)
-            print(f"[Agent] Step 3.8: Smart resolved: {list(smart_analysis['resolutions'].keys())}")
+            logger.info(f"[Agent] Step 3.8: Smart resolved: {list(smart_analysis['resolutions'].keys())}")
         if smart_analysis.get("unresolved"):
-            print(f"[Agent] Step 3.8: Still missing: {smart_analysis['unresolved']}")
+            logger.info(f"[Agent] Step 3.8: Still missing: {smart_analysis['unresolved']}")
         if smart_analysis.get("attempts"):
             for attempt in smart_analysis["attempts"]:
-                print(f"[Agent] Step 3.8:   {attempt}")
+                logger.info(f"[Agent] Step 3.8:   {attempt}")
 
         # ===== STEP 4: Warnings =====
         warnings = []
@@ -1936,7 +1987,7 @@ async def agent_process_receipt(receipt_id: str):
             warnings.append("Vendor not found in database")
 
         # ===== STEP 5: Auto-categorize (Shared Service) =====
-        print(f"[Agent] Step 5: Starting auto-categorization (shared service)...")
+        logger.info("[Agent] Step 5: Starting auto-categorization (shared service)...")
         construction_stage = "General Construction"
         try:
             proj_resp = supabase.table("projects") \
@@ -1968,7 +2019,7 @@ async def agent_process_receipt(receipt_id: str):
                 categorizations = cat_result.get("categorizations", [])
                 cat_metrics = cat_result.get("metrics", {})
         except Exception as cat_err:
-            print(f"[Agent] Auto-categorization failed: {cat_err}")
+            logger.error(f"[Agent] Auto-categorization failed: {cat_err}")
 
         # Attach categorization to each line item
         cat_map = {c["rowIndex"]: c for c in categorizations}
@@ -1993,7 +2044,7 @@ async def agent_process_receipt(receipt_id: str):
         final_account_id = categorize_data.get("account_id")
         final_category = categorize_data.get("account_name")
         final_confidence = categorize_data.get("confidence", 0)
-        print(f"[Agent] Step 5: Categorization complete | category={final_category} | confidence={final_confidence}% | {len(categorizations)} item(s) categorized")
+        logger.info(f"[Agent] Step 5: Categorization complete | category={final_category} | confidence={final_confidence}% | {len(categorizations)} item(s) categorized")
 
         # Add categorizer warnings
         if categorize_data.get("warning"):
@@ -2006,13 +2057,7 @@ async def agent_process_receipt(receipt_id: str):
         # NOTE: This threshold check is for BULK PROCESSING only.
         # Manual confirmations (when user approves via @Andrew) ALWAYS bypass this check
         # by setting confidence=100 and user_confirmed=true.
-        agent_cfg = {}
-        try:
-            cfg_result = supabase.table("agent_config").select("key, value").execute()
-            for row in (cfg_result.data or []):
-                agent_cfg[row["key"]] = row["value"]
-        except Exception:
-            pass
+        agent_cfg = _load_agent_config()
 
         # Check if threshold enforcement is enabled (default: false to avoid blocking)
         enforce_threshold = agent_cfg.get("enforce_confidence_threshold", "false")
@@ -2064,11 +2109,11 @@ async def agent_process_receipt(receipt_id: str):
                     })
 
         if low_confidence_items:
-            print(f"[Agent] Step 5.5: {len(low_confidence_items)} item(s) with low confidence - will ask user (enforce_threshold={enforce_threshold})")
+            logger.info(f"[Agent] Step 5.5: {len(low_confidence_items)} item(s) with low confidence - will ask user (enforce_threshold={enforce_threshold})")
 
         # ===== STEP 6: Update receipt with enriched data =====
         if warnings:
-            print(f"[Agent] Step 5: Warnings: {warnings}")
+            logger.info(f"[Agent] Step 5: Warnings: {warnings}")
 
         # Initialize receipt flow - ask about categories first if needed
         if low_confidence_items:
@@ -2117,7 +2162,7 @@ async def agent_process_receipt(receipt_id: str):
             .eq("id", receipt_id) \
             .execute()
 
-        print(f"[Agent] Step 6: Receipt updated in DB | status=ready")
+        logger.info("[Agent] Step 6: Receipt updated in DB | status=ready")
 
         # ===== STEP 7: Post Andrew smart message =====
         # Determine flow state
@@ -2202,7 +2247,7 @@ async def agent_process_receipt(receipt_id: str):
             }
         )
 
-        print(f"[Agent] Step 7: Andrew smart message posted | state={flow_state} | unresolved={smart_analysis.get('unresolved', [])}")
+        logger.info(f"[Agent] Step 7: Andrew smart message posted | state={flow_state} | unresolved={smart_analysis.get('unresolved', [])}")
 
         # ===== STEP 7.5: Bookkeeping escalation for unresolved validation =====
         if validation_unresolved:
@@ -2231,9 +2276,9 @@ async def agent_process_receipt(receipt_id: str):
                     "difference": difference,
                 }
             )
-            print(f"[Agent] Step 7.5: Bookkeeping escalation posted | diff=${difference}")
+            logger.info(f"[Agent] Step 7.5: Bookkeeping escalation posted | diff=${difference}")
 
-        print(f"[Agent] === DONE OCR receipt {receipt_id} | {parsed_data.get('vendor_name')} ${parsed_data.get('amount')} -> {final_category} ({final_confidence}%) | awaiting user response ===")
+        logger.info(f"[Agent] === DONE OCR receipt {receipt_id} | {parsed_data.get('vendor_name')} ${parsed_data.get('amount')} -> {final_category} ({final_confidence}%) | awaiting user response ===")
 
         return {
             "success": True,
@@ -2252,7 +2297,7 @@ async def agent_process_receipt(receipt_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[Agent] === ERROR receipt {receipt_id} | {str(e)} ===")
+        logger.error(f"[Agent] === ERROR receipt {receipt_id} | {str(e)} ===")
         # Update status to error
         try:
             supabase.table("pending_receipts") \
@@ -2319,7 +2364,7 @@ def _resolve_vendor(payee_name: str) -> tuple:
         if best:
             return best["id"], best["vendor_name"]
     except Exception as e:
-        print(f"[CheckFlow] Vendor lookup error: {e}")
+        logger.error(f"[CheckFlow] Vendor lookup error: {e}")
     return None, payee_name
 
 
@@ -2353,7 +2398,7 @@ def _get_check_payment_uuid() -> Optional[str]:
         if resp.data:
             return str(resp.data[0]["id"])
     except Exception as e:
-        print(f"[CheckFlow] Error looking up Check payment method: {e}")
+        logger.error(f"[CheckFlow] Error looking up Check payment method: {e}")
     return None
 
 
@@ -2365,7 +2410,7 @@ def _get_purchase_txn_type_id() -> Optional[str]:
         if resp.data:
             return str(resp.data[0]["TnxType_id"])
     except Exception as e:
-        print(f"[CheckFlow] Error looking up Purchase txn type: {e}")
+        logger.error(f"[CheckFlow] Error looking up Purchase txn type: {e}")
     return None
 
 
@@ -2396,7 +2441,7 @@ def _extract_check_context_sync(user_text: str, project_name: str) -> dict:
         finally:
             loop.close()
     except Exception as e:
-        print(f"[CheckContext] Sync wrapper error: {e}")
+        logger.error(f"[CheckContext] Sync wrapper error: {e}")
         return {}
 
 
@@ -2442,7 +2487,7 @@ def _get_cached_labor_categorization(description: str, stage: str) -> Optional[d
                 "from_cache": True
             }
     except Exception as e:
-        print(f"[LaborCache] Lookup error: {e}")
+        logger.error(f"[LaborCache] Lookup error: {e}")
 
     return None
 
@@ -2461,7 +2506,7 @@ def _save_to_labor_cache(description: str, stage: str, categorization: dict):
             "reasoning": categorization.get("reasoning"),
         }).execute()
     except Exception as e:
-        print(f"[LaborCache] Save error: {e}")
+        logger.error(f"[LaborCache] Save error: {e}")
 
 
 def _get_recent_labor_corrections(project_id: Optional[str], stage: str, limit: int = 5) -> list:
@@ -2481,7 +2526,7 @@ def _get_recent_labor_corrections(project_id: Optional[str], stage: str, limit: 
 
         return result.data or []
     except Exception as e:
-        print(f"[LaborFeedback] Correction fetch error: {e}")
+        logger.error(f"[LaborFeedback] Correction fetch error: {e}")
         return []
 
 
@@ -2524,7 +2569,7 @@ def _save_labor_categorization_metrics(
             "processing_time_ms": metrics.get("processing_time_ms", 0),
         }).execute()
     except Exception as e:
-        print(f"[LaborMetrics] Save error: {e}")
+        logger.error(f"[LaborMetrics] Save error: {e}")
 
 
 def _get_labor_accounts() -> list:
@@ -2537,7 +2582,7 @@ def _get_labor_accounts() -> list:
             if a.get("Name") and "labor" in a["Name"].lower()
         ]
     except Exception as e:
-        print(f"[CheckFlow] Error fetching labor accounts: {e}")
+        logger.error(f"[CheckFlow] Error fetching labor accounts: {e}")
         return []
 
 
@@ -2666,18 +2711,18 @@ Return ONLY valid JSON:
 }}"""
 
         response = ai_client.chat.completions.create(
-            model="gpt-5-1",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": "Construction accounting expert. Return only valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
+            temperature=0.1,
             max_completion_tokens=400,
             response_format={"type": "json_object"}
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        print(f"[LaborGPT] Categorization error: {e}")
+        logger.error(f"[LaborGPT] Categorization error: {e}")
         return {"account_id": None, "account_name": "Uncategorized", "confidence": 0}
 
 
@@ -2864,9 +2909,11 @@ def _create_check_expenses(receipt_id: str, receipt_data: dict, check_flow: dict
         try:
             result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
             if result.data:
-                created_expenses.append(result.data[0])
+                exp = result.data[0]
+                created_expenses.append(exp)
+                _schedule_daneel_auto_auth(exp.get("expense_id"), exp.get("project") or receipt_data.get("project_id"))
         except Exception as e:
-            print(f"[CheckFlow] Error creating expense: {e}")
+            logger.error(f"[CheckFlow] Error creating expense: {e}")
 
     # Link receipt
     if created_expenses:
@@ -2889,7 +2936,7 @@ def _get_payroll_channel_id() -> Optional[str]:
         if result.data and len(result.data) > 0:
             return str(result.data[0]["id"])
     except Exception as e:
-        print(f"[CheckFlow] Error looking up Payroll channel: {e}")
+        logger.error(f"[CheckFlow] Error looking up Payroll channel: {e}")
     return None
 
 
@@ -2971,13 +3018,7 @@ def _categorize_and_finish_check_flow(receipt_id, project_id, check_flow, parsed
     check_flow["entries"] = categorized
 
     # Check confidence vs min_confidence
-    agent_cfg = {}
-    try:
-        cfg_result = supabase.table("agent_config").select("key, value").execute()
-        for row in (cfg_result.data or []):
-            agent_cfg[row["key"]] = row["value"]
-    except Exception:
-        pass
+    agent_cfg = _load_agent_config()
     min_confidence = int(agent_cfg.get("min_confidence", 70))
 
     low_confidence = []
@@ -3541,13 +3582,7 @@ def _handle_date_confirm(receipt_id, project_id, check_flow, parsed_data, action
     check_flow["entries"] = categorized
 
     # === Check confidence vs agent_config.min_confidence ===
-    agent_cfg = {}
-    try:
-        cfg_result = supabase.table("agent_config").select("key, value").execute()
-        for row in (cfg_result.data or []):
-            agent_cfg[row["key"]] = row["value"]
-    except Exception:
-        pass
+    agent_cfg = _load_agent_config()
     min_confidence = int(agent_cfg.get("min_confidence", 70))
 
     low_confidence = []
@@ -3811,7 +3846,7 @@ def _handle_category_confirm(receipt_id, project_id, check_flow, parsed_data, ac
 # ====== CHECK-ACTION ENDPOINT ======
 
 @router.post("/{receipt_id}/check-action")
-async def check_action(receipt_id: str, payload: CheckActionRequest):
+async def check_action(receipt_id: str, payload: CheckActionRequest, current_user: dict = Depends(get_current_user)):
     """
     Handle a user action in the check processing conversation.
     Routes to the appropriate handler based on current state + action.
@@ -3837,7 +3872,7 @@ async def check_action(receipt_id: str, payload: CheckActionRequest):
         current_state = check_flow.get("state")
         action = payload.action
 
-        print(f"[CheckFlow] receipt={receipt_id} | state={current_state} | action={action}")
+        logger.info(f"[CheckFlow] receipt={receipt_id} | state={current_state} | action={action}")
 
         if current_state == "awaiting_check_number":
             return _handle_awaiting_check_number(receipt_id, project_id, check_flow, parsed_data, action, payload.payload)
@@ -3863,14 +3898,14 @@ async def check_action(receipt_id: str, payload: CheckActionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[CheckFlow] Error: {e}")
+        logger.error(f"[CheckFlow] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Check action error: {str(e)}")
 
 
 # ====== DUPLICATE-ACTION ENDPOINT ======
 
 @router.post("/{receipt_id}/duplicate-action")
-async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
+async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest, current_user: dict = Depends(get_current_user)):
     """
     Handle a user response in the duplicate confirmation conversation.
     Actions: confirm_process (yes), skip (no).
@@ -3896,7 +3931,7 @@ async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
         current_state = duplicate_flow.get("state")
         action = payload.action
 
-        print(f"[DuplicateFlow] receipt={receipt_id} | state={current_state} | action={action}")
+        logger.info(f"[DuplicateFlow] receipt={receipt_id} | state={current_state} | action={action}")
 
         if current_state != "awaiting_confirmation":
             raise HTTPException(status_code=400, detail=f"Duplicate flow already resolved (state: {current_state})")
@@ -3957,12 +3992,12 @@ async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[DuplicateFlow] Error: {e}")
+        logger.error(f"[DuplicateFlow] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Duplicate action error: {str(e)}")
 
 
 @router.post("/{receipt_id}/receipt-action")
-async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
+async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current_user: dict = Depends(get_current_user)):
     """
     Handle user action in the receipt split conversation.
     Routes to handler based on receipt_flow.state + action.
@@ -3988,7 +4023,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
         current_state = receipt_flow.get("state")
         action = payload.action
 
-        print(f"[ReceiptFlow] receipt={receipt_id} | state={current_state} | action={action}")
+        logger.info(f"[ReceiptFlow] receipt={receipt_id} | state={current_state} | action={action}")
 
         if action == "cancel":
             receipt_flow["state"] = "cancelled"
@@ -4030,12 +4065,9 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     if idx < len(line_items) and line_items[idx].get("account_id"):
                         line_items[idx]["confidence"] = 100
                         line_items[idx]["user_confirmed"] = True
-                print(f"[ReceiptFlow] Category confirmation: user accepted all suggestions ({len(low_items)} items bumped to 100%)")
+                logger.info(f"[ReceiptFlow] Category confirmation: user accepted all suggestions ({len(low_items)} items bumped to 100%)")
             elif assignments and isinstance(assignments, list):
                 # Structured assignment from interactive account picker (no fuzzy matching needed)
-                print(f"[DEBUG assignments] Received {len(assignments)} assignments from picker")
-                for a in assignments:
-                    print(f"  index={a.get('index')}, account_id={a.get('account_id')}, account_name={a.get('account_name')}")
 
                 # Fetch construction_stage for feedback loop
                 construction_stage = "General"
@@ -4047,7 +4079,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     if proj_resp.data and proj_resp.data.get("project_stage"):
                         construction_stage = proj_resp.data["project_stage"]
                 except Exception as e:
-                    print(f"[ReceiptFlow] Could not fetch project stage: {e}")
+                    logger.error(f"[ReceiptFlow] Could not fetch project stage: {e}")
 
                 updates_applied = 0
                 corrections_logged = 0
@@ -4086,9 +4118,9 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                                         "correction_reason": "User correction from low-confidence modal"
                                     }).execute()
                                     corrections_logged += 1
-                                    print(f"[FeedbackLoop] Logged correction: '{description}' from '{suggested_name}' -> '{account_name}' (stage: {construction_stage})")
+                                    logger.info(f"[FeedbackLoop] Logged correction: '{description}' from '{suggested_name}' -> '{account_name}' (stage: {construction_stage})")
                                 except Exception as e:
-                                    print(f"[FeedbackLoop] Failed to log correction: {e}")
+                                    logger.error(f"[FeedbackLoop] Failed to log correction: {e}")
 
                         # Apply the user's selection
                         line_items[idx]["account_id"] = account_id
@@ -4096,10 +4128,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         line_items[idx]["confidence"] = 100
                         line_items[idx]["user_confirmed"] = True
                         updates_applied += 1
-                        print(f"[ReceiptFlow] Structured assign: item {idx} -> {account_name} ({account_id})")
+                        logger.info(f"[ReceiptFlow] Structured assign: item {idx} -> {account_name} ({account_id})")
 
                 if corrections_logged > 0:
-                    print(f"[FeedbackLoop] Logged {corrections_logged} user corrections for learning")
+                    logger.info(f"[FeedbackLoop] Logged {corrections_logged} user corrections for learning")
 
                 if updates_applied == 0:
                     post_andrew_message(
@@ -4158,9 +4190,9 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         line_items[idx]["confidence"] = 100
                         line_items[idx]["user_confirmed"] = True
                         updates_applied += 1
-                        print(f"[ReceiptFlow] Category update: item {idx} -> {matched_acct['name']}")
+                        logger.info(f"[ReceiptFlow] Category update: item {idx} -> {matched_acct['name']}")
                     else:
-                        print(f"[ReceiptFlow] Category update: no match for '{acct_name}'")
+                        logger.warning(f"[ReceiptFlow] Category update: no match for '{acct_name}'")
 
                 if updates_applied == 0:
                     post_andrew_message(
@@ -4191,7 +4223,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     item["account_id"] = top_level_account
                     item["account_name"] = cat_obj.get("account_name")
                     item["confidence"] = 100  # User reviewed this receipt, so treat as confirmed
-                    print(f"[ReceiptFlow] Applied top-level category to item: {item.get('description', '')[:50]}")
+                    logger.info(f"[ReceiptFlow] Applied top-level category to item: {item.get('description', '')[:50]}")
 
             # Check if user context already resolved the project question
             pre_resolved = receipt_flow.get("pre_resolved", {})
@@ -4213,25 +4245,10 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 receipt_flow["state"] = "awaiting_user_confirm"
                 parsed_data["receipt_flow"] = receipt_flow
 
-                # DEBUG: Log line_items before saving to DB
-                print(f"[DEBUG pre_resolved] Saving to DB - {len(line_items)} line_items:")
-                for idx, item in enumerate(line_items):
-                    print(f"  [{idx}] account_id={item.get('account_id')}, name={item.get('account_name')}, desc={item.get('description', '')[:30]}")
-
                 update_result = supabase.table("pending_receipts").update({
                     "parsed_data": parsed_data,
                     "updated_at": datetime.utcnow().isoformat()
                 }).eq("id", receipt_id).execute()
-
-                print(f"[DEBUG pre_resolved] UPDATE result: {update_result.data is not None}")
-
-                # Verify the update by reading back
-                verify_receipt = supabase.table("pending_receipts").select("parsed_data").eq("id", receipt_id).single().execute()
-                if verify_receipt.data:
-                    verify_items = verify_receipt.data.get("parsed_data", {}).get("line_items", [])
-                    print(f"[DEBUG pre_resolved] VERIFY after UPDATE - {len(verify_items)} line_items in DB:")
-                    for idx, item in enumerate(verify_items[:3]):  # Show first 3
-                        print(f"  [{idx}] account_id={item.get('account_id')}, name={item.get('account_name')}")
 
                 confirm_msg = _build_confirm_summary(pre_resolved, line_items, parsed_data)
                 confirm_msg = "Categories confirmed.\n\n" + confirm_msg
@@ -4247,7 +4264,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "pre_resolved": pre_resolved,
                     }
                 )
-                print(f"[ReceiptFlow] Categories confirmed + pre_resolved -> awaiting_user_confirm")
+                logger.info("[ReceiptFlow] Categories confirmed + pre_resolved -> awaiting_user_confirm")
                 return {"success": True, "state": "awaiting_user_confirm"}
             else:
                 # Normal transition to item selection
@@ -4291,7 +4308,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 "missing_fields": smart.get("unresolved", []),
             }
             interpretation = interpret_reply(text, reply_context)
-            print(f"[ReceiptFlow] Missing info reply interpreted: {interpretation}")
+            logger.info(f"[ReceiptFlow] Missing info reply interpreted: {interpretation}")
 
             # Apply extracted fields
             updated_fields = []
@@ -4411,27 +4428,14 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
             pre_resolved = receipt_flow.get("pre_resolved", {})
             line_items = parsed_data.get("line_items", [])
 
-            print(f"[DEBUG awaiting_user_confirm] action={action}, num_line_items={len(line_items)}")
-            for idx, item in enumerate(line_items):
-                print(f"[DEBUG line_item {idx}] account_id={item.get('account_id')}, account_name={item.get('account_name')}, desc={item.get('description', '')[:30]}")
-
             if action == "confirm":
                 # Create expenses based on pre-resolved decisions
                 # Human clicked Confirm -- no confidence gate needed
 
                 # Check auto_create setting
-                agent_cfg = {}
-                try:
-                    cfg_result = supabase.table("agent_config").select("key, value").execute()
-                    for row in (cfg_result.data or []):
-                        agent_cfg[row["key"]] = row["value"]
-                except Exception:
-                    pass
+                agent_cfg = _load_agent_config()
                 auto_create = agent_cfg.get("auto_create_expense", True)
-                print(f"[DEBUG confirm] auto_create_expense setting = {auto_create}")
-
                 if not auto_create:
-                    print(f"[DEBUG confirm] BLOCKED: auto_create_expense is OFF - skipping expense creation")
                     # Still complete the flow but don't create expenses
                     receipt_flow["state"] = "completed"
                     parsed_data["receipt_flow"] = receipt_flow
@@ -4458,14 +4462,11 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 vendor_id = parsed_data.get("vendor_id")
                 created_expenses = []
 
-                print(f"[DEBUG confirm] decision={decision}, cat_account_id={cat.get('account_id')}")
-
                 if decision == "all_this_project":
                     # Human clicked Confirm -- no confidence gate needed
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
-                            print(f"[DEBUG SKIP] Item has no account_id: {item.get('description', '')[:40]}")
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -4474,6 +4475,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             description=item.get("description"),
                             bill_id=item.get("bill_id"),
                             txn_date=item.get("date"),
+                            skip_auto_auth=True,
                         )
                         if expense:
                             created_expenses.append(expense)
@@ -4526,7 +4528,9 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             "receipt_flow_active": False,
                         }
                     )
-                    print(f"[ReceiptFlow] User confirmed -> {count} expense(s) created")
+                    logger.info(f"[ReceiptFlow] User confirmed -> {count} expense(s) created")
+                    # Trigger bill-level Daneel auth
+                    _trigger_bill_or_per_expense_auth(created_expenses, project_id, parsed_data.get("vendor_name", ""))
                 else:
                     supabase.table("pending_receipts").update({
                         "parsed_data": parsed_data,
@@ -4592,14 +4596,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
             if action == "all_this_project":
                 # Create expenses for ALL line items in this project
-                agent_cfg = {}
-                try:
-                    cfg_result = supabase.table("agent_config").select("key, value").execute()
-                    for row in (cfg_result.data or []):
-                        agent_cfg[row["key"]] = row["value"]
-                except Exception:
-                    pass
-
+                agent_cfg = _load_agent_config()
                 auto_create = agent_cfg.get("auto_create_expense", True)
                 cat = parsed_data.get("categorization", {})
                 vendor_id = parsed_data.get("vendor_id")
@@ -4620,6 +4617,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             description=item.get("description"),
                             bill_id=item.get("bill_id"),
                             txn_date=item.get("date"),
+                            skip_auto_auth=True,
                         )
                         if expense:
                             created_expenses.append(expense)
@@ -4660,7 +4658,9 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             "receipt_flow_active": False,
                         }
                     )
-                    print(f"[ReceiptFlow] All items -> {count} expense(s) created | first_id={expense_id}")
+                    logger.info(f"[ReceiptFlow] All items -> {count} expense(s) created | first_id={expense_id}")
+                    # Trigger bill-level Daneel auth
+                    _trigger_bill_or_per_expense_auth(created_expenses, project_id, parsed_data.get("vendor_name", ""))
                 else:
                     supabase.table("pending_receipts").update({
                         "parsed_data": parsed_data,
@@ -4678,7 +4678,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             "receipt_flow_active": False,
                         }
                     )
-                    print(f"[ReceiptFlow] All items -> skipped expense creation (low confidence)")
+                    logger.warning("[ReceiptFlow] All items -> skipped expense creation (low confidence)")
 
                 return {"success": True, "state": "completed", "expense_id": expense_id}
 
@@ -4773,14 +4773,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                 this_project_indices = [i for i in range(1, num_items + 1) if i not in assigned_indices]
 
                 # Read agent config for expense creation
-                agent_cfg = {}
-                try:
-                    cfg_result = supabase.table("agent_config").select("key, value").execute()
-                    for row in (cfg_result.data or []):
-                        agent_cfg[row["key"]] = row["value"]
-                except Exception:
-                    pass
-
+                agent_cfg = _load_agent_config()
                 auto_create = agent_cfg.get("auto_create_expense", True)
                 cat = parsed_data.get("categorization", {})
                 vendor_id = parsed_data.get("vendor_id")
@@ -4803,6 +4796,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                                 description=item.get("description"),
                                 bill_id=item.get("bill_id"),
                                 txn_date=item.get("date"),
+                                skip_auto_auth=True,
                             )
                             if expense:
                                 created_here.append(expense)
@@ -4824,6 +4818,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                                 description=item.get("description"),
                                 bill_id=item.get("bill_id"),
                                 txn_date=item.get("date"),
+                                skip_auto_auth=True,
                             )
                             if expense:
                                 created_other.append(expense)
@@ -4892,7 +4887,14 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                     }
                 )
 
-                print(f"[ReceiptFlow] Split -> {len(all_created)} expenses across {num_projects} projects")
+                logger.info(f"[ReceiptFlow] Split -> {len(all_created)} expenses across {num_projects} projects")
+                # Trigger bill-level Daneel auth per project
+                if created_here:
+                    _trigger_bill_or_per_expense_auth(created_here, project_id, parsed_data.get("vendor_name", ""))
+                for pa in project_assignments:
+                    pa_expenses = [e for e in all_created if e.get("project") == pa["project_id"]]
+                    if pa_expenses:
+                        _trigger_bill_or_per_expense_auth(pa_expenses, pa["project_id"], parsed_data.get("vendor_name", ""))
                 return {"success": True, "state": "completed", "expense_ids": [e.get("expense_id") for e in all_created]}
 
             else:
@@ -4912,14 +4914,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
 
             if action == "single_project":
                 # Read agent config for confidence check
-                agent_cfg = {}
-                try:
-                    cfg_result = supabase.table("agent_config").select("key, value").execute()
-                    for row in (cfg_result.data or []):
-                        agent_cfg[row["key"]] = row["value"]
-                except Exception:
-                    pass
-
+                agent_cfg = _load_agent_config()
                 auto_create = agent_cfg.get("auto_create_expense", True)
                 cat = parsed_data.get("categorization", {})
                 vendor_id = parsed_data.get("vendor_id")
@@ -4942,6 +4937,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             description=item.get("description"),
                             bill_id=item.get("bill_id"),
                             txn_date=item.get("date"),
+                            skip_auto_auth=True,
                         )
                         if expense:
                             created_expenses.append(expense)
@@ -4984,7 +4980,9 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             "receipt_flow_active": False,
                         }
                     )
-                    print(f"[ReceiptFlow] Single project -> {count} expense(s) created | first_id={expense_id}")
+                    logger.info(f"[ReceiptFlow] Single project -> {count} expense(s) created | first_id={expense_id}")
+                    # Trigger bill-level Daneel auth
+                    _trigger_bill_or_per_expense_auth(created_expenses, project_id, parsed_data.get("vendor_name", ""))
                 else:
                     supabase.table("pending_receipts").update({
                         "parsed_data": parsed_data,
@@ -5002,7 +5000,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                             "receipt_flow_active": False,
                         }
                     )
-                    print(f"[ReceiptFlow] Single project -> skipped expense (confidence={final_confidence})")
+                    logger.warning(f"[ReceiptFlow] Single project -> skipped expense (confidence={cat.get('confidence', 'N/A')})")
 
                 return {"success": True, "state": "completed", "expense_id": expense_id}
 
@@ -5031,7 +5029,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "awaiting_text_input": True,
                     }
                 )
-                print(f"[ReceiptFlow] Split selected -> awaiting_split_details")
+                logger.info("[ReceiptFlow] Split selected -> awaiting_split_details")
                 return {"success": True, "state": "awaiting_split_details"}
 
             else:
@@ -5089,7 +5087,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "awaiting_text_input": True,
                     }
                 )
-                print(f"[ReceiptFlow] Split item added | ${parsed_line['amount']:.2f} {parsed_line['description']} | total=${total:.2f}")
+                logger.info(f"[ReceiptFlow] Split item added | ${parsed_line['amount']:.2f} {parsed_line['description']} | total=${total:.2f}")
                 return {"success": True, "state": "awaiting_split_details", "items": receipt_flow["split_items"]}
 
             elif action == "split_done":
@@ -5163,7 +5161,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
                         "receipt_flow_active": False,
                     }
                 )
-                print(f"[ReceiptFlow] Split done | {count} expenses created | total=${total:.2f}")
+                logger.info(f"[ReceiptFlow] Split done | {count} expenses created | total=${total:.2f}")
                 return {"success": True, "state": "completed", "expense_ids": [e.get("expense_id") for e in created_expenses]}
 
             else:
@@ -5175,12 +5173,12 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ReceiptFlow] Error: {e}")
+        logger.error(f"[ReceiptFlow] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Receipt action error: {str(e)}")
 
 
 @router.post("/{receipt_id}/create-expense")
-def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromReceiptRequest):
+def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromReceiptRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """
     Create an expense from a pending receipt and link them.
 
@@ -5226,6 +5224,11 @@ def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromRecei
 
         expense_id = expense_result.data[0].get("expense_id")
 
+        # Trigger Daneel auto-auth check
+        if expense_id and payload.project_id:
+            from api.services.daneel_auto_auth import trigger_auto_auth_check
+            background_tasks.add_task(trigger_auto_auth_check, expense_id, payload.project_id)
+
         # Link receipt to expense
         supabase.table("pending_receipts") \
             .update({
@@ -5263,7 +5266,7 @@ def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromRecei
 
 
 @router.post("/{receipt_id}/link")
-def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest):
+def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest, current_user: dict = Depends(get_current_user)):
     """
     Link an existing pending receipt to an existing expense.
     """
@@ -5344,7 +5347,7 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest):
 
 
 @router.patch("/{receipt_id}")
-def update_receipt(receipt_id: str, payload: PendingReceiptUpdate):
+def update_receipt(receipt_id: str, payload: PendingReceiptUpdate, current_user: dict = Depends(get_current_user)):
     """Update a pending receipt's status or parsed data"""
     try:
         update_data = payload.model_dump(exclude_none=True)
@@ -5367,7 +5370,7 @@ def update_receipt(receipt_id: str, payload: PendingReceiptUpdate):
 
 
 @router.delete("/{receipt_id}")
-def delete_receipt(receipt_id: str):
+def delete_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
     """
     Delete a pending receipt.
 
@@ -5405,7 +5408,7 @@ def delete_receipt(receipt_id: str):
                 storage_path = file_url.split(bucket_marker, 1)[1].split("?")[0]
                 supabase.storage.from_(bucket).remove([storage_path])
         except Exception as storage_error:
-            print(f"[PendingReceipts] Warning: Could not delete file from storage: {storage_error}")
+            logger.warning(f"[PendingReceipts] Could not delete file from storage: {storage_error}")
 
         # Delete record
         supabase.table("pending_receipts").delete().eq("id", receipt_id).execute()
@@ -5419,7 +5422,7 @@ def delete_receipt(receipt_id: str):
 
 
 @router.get("/unprocessed/count")
-def get_unprocessed_counts():
+def get_unprocessed_counts(current_user: dict = Depends(get_current_user)):
     """
     Get counts of unprocessed receipts across all projects.
 
@@ -5451,7 +5454,7 @@ def get_unprocessed_counts():
 
 
 @router.post("/check-stale")
-async def check_stale_receipts_endpoint():
+async def check_stale_receipts_endpoint(current_user: dict = Depends(get_current_user)):
     """
     Trigger stale receipt check. Sends reminders for receipts waiting
     too long for user action. Call via cron or manually.
@@ -5622,7 +5625,7 @@ async def edit_bill_categories(
 
 
 @router.post("/bill-categories/confirm")
-async def confirm_bill_category_changes(payload: EditCategoriesRequest):
+async def confirm_bill_category_changes(payload: EditCategoriesRequest, current_user: dict = Depends(get_current_user)):
     """
     Process user confirmation of category changes for bill items.
     Updates account_id for each expense.

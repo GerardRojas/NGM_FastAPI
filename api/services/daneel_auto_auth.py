@@ -417,7 +417,7 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
             agent="daneel",
             source="hint_review",
             extraction_method=_extraction_method,
-            model_used="gpt-5-1",
+            model_used="gpt-5.1",
             file_type="application/pdf" if is_pdf else content_type,
             char_count=len(extracted_text) if extracted_text else None,
             success=True,
@@ -1668,6 +1668,308 @@ async def reprocess_pending_info() -> dict:
 
 
 # ============================================================================
+# Bill-level trigger (batch of expenses from same bill)
+# ============================================================================
+
+async def trigger_auto_auth_for_bill(
+    expense_ids: List[str],
+    bill_id: str,
+    project_id: str,
+    vendor_name: str = "",
+    total_amount: float = 0.0,
+):
+    """
+    Bill-level auto-auth: processes all expenses from the same bill in one pass.
+    Posts a "reviewing" message, authorizes each through the rule engine in real-time,
+    then posts a consolidated summary.
+    Called after Andrew creates expenses from a receipt.
+    """
+    tag = "[DaneelBillAuth]"
+    print(f"{tag} START | bill={bill_id} | expenses={len(expense_ids)} | project={project_id}")
+
+    try:
+        # 1. Guard: check kill switch
+        cfg = load_auto_auth_config()
+        if not cfg.get("daneel_auto_auth_enabled"):
+            print(f"{tag} SKIPPED - auto-auth disabled | bill={bill_id}")
+            return
+
+        # 2. Load shared resources ONCE
+        sb = _get_supabase()
+        lookups = _load_lookups(sb)
+
+        bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
+        bills_map = {}
+        receipt_groups = {}
+        for b in (bills_result.data or []):
+            nb = normalize_bill_id(b["bill_id"])
+            bills_map[nb] = b
+            url = (b.get("receipt_url") or "").strip()
+            if url:
+                receipt_groups.setdefault(url, set()).add(nb)
+
+        print(f"{tag} Resources loaded | lookups OK | bills_map={len(bills_map)} entries")
+
+        # 3. Fetch all expenses in one query
+        exp_result = sb.table("expenses_manual_COGS") \
+            .select("*") \
+            .in_("expense_id", expense_ids) \
+            .execute()
+        all_fetched = exp_result.data or []
+        expenses = [e for e in all_fetched if e.get("status") == "pending"]
+        print(f"{tag} Fetched {len(expenses)} pending expenses ({len(all_fetched) - len(expenses)} skipped non-pending)")
+
+        if not expenses:
+            print(f"{tag} No pending expenses to process | bill={bill_id}")
+            return
+
+        # Resolve vendor info
+        first_vendor_id = expenses[0].get("vendor_id")
+        vname = vendor_name or lookups["vendors"].get(first_vendor_id, "Unknown")
+        calc_total = total_amount or sum(float(e.get("Amount") or 0) for e in expenses)
+
+        # 4. Post "reviewing" message
+        post_daneel_message(
+            content=f"Reviewing **{len(expenses)}** expenses from **{vname}** (${calc_total:,.2f})...",
+            project_id=project_id,
+            channel_type="project_general",
+            metadata={"type": "auto_auth_bill_review", "bill_id": bill_id, "count": len(expenses)},
+        )
+        print(f"{tag} Posted reviewing message | bill={bill_id}")
+
+        # 5. Receipt hash check ONCE per bill
+        hash_collision = False
+        norm_bill = normalize_bill_id(bill_id)
+        bill_receipt_url = None
+        if norm_bill in bills_map:
+            bill_receipt_url = bills_map[norm_bill].get("receipt_url")
+        if not bill_receipt_url and expenses:
+            bill_receipt_url = _get_expense_receipt(expenses[0], bills_map)
+
+        if cfg.get("daneel_receipt_hash_check_enabled", True) and bill_receipt_url:
+            bill_hash = get_receipt_hash(bill_receipt_url)
+            if bill_hash:
+                all_proj_result = sb.table("expenses_manual_COGS") \
+                    .select("expense_id, bill_id") \
+                    .eq("project", project_id) \
+                    .execute()
+                for other_exp in (all_proj_result.data or []):
+                    if other_exp.get("expense_id") in expense_ids:
+                        continue
+                    other_bill = normalize_bill_id(other_exp.get("bill_id") or "")
+                    if other_bill == norm_bill:
+                        continue
+                    other_receipt = None
+                    if other_bill and other_bill in bills_map:
+                        other_receipt = bills_map[other_bill].get("receipt_url")
+                    if not other_receipt:
+                        continue
+                    other_hash = get_receipt_hash(other_receipt)
+                    if other_hash and other_hash == bill_hash:
+                        exp_bill_info = bills_map.get(norm_bill, {})
+                        oth_bill_info = bills_map.get(other_bill, {})
+                        if (exp_bill_info.get("status") or "").lower() == "split" or \
+                           (oth_bill_info.get("status") or "").lower() == "split":
+                            continue
+                        if (exp_bill_info.get("status") or "").lower() == "closed" and \
+                           (oth_bill_info.get("status") or "").lower() == "closed":
+                            hash_collision = True
+                            reason_txt = (
+                                f"Receipt hash match: same file on bill #{bill_id} "
+                                f"and bill #{(other_exp.get('bill_id') or '').strip()} (both closed)"
+                            )
+                            print(f"{tag} Receipt hash: COLLISION | bill={bill_id} | {reason_txt}")
+                            escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
+                            msg = (f"{escalation_mentions} " if escalation_mentions else "") + \
+                                  f"All **{len(expenses)}** expenses from **{vname}** flagged: {reason_txt}"
+                            post_daneel_message(
+                                content=msg,
+                                project_id=project_id,
+                                channel_type="project_general",
+                                metadata={"type": "auto_auth_bill_escalation", "bill_id": bill_id},
+                            )
+                            break
+            if not hash_collision:
+                print(f"{tag} Receipt hash: clear | bill={bill_id}")
+        else:
+            print(f"{tag} Receipt hash: skipped (disabled or no receipt URL) | bill={bill_id}")
+
+        if hash_collision:
+            return
+
+        # 6. Load same-vendor expenses ONCE for duplicate checking
+        same_vendor = []
+        if first_vendor_id:
+            sv_result = sb.table("expenses_manual_COGS") \
+                .select("*") \
+                .eq("project", project_id) \
+                .eq("vendor_id", first_vendor_id) \
+                .execute()
+            same_vendor = sv_result.data or []
+        print(f"{tag} Loaded {len(same_vendor)} same-vendor expenses for duplicate check")
+
+        # Resolve mentions for potential messages
+        bookkeeping_mentions = _resolve_mentions(sb, cfg, "daneel_bookkeeping_users", "daneel_bookkeeping_role")
+        escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
+
+        # 7. Process each expense through rule engine
+        authorized_list = []
+        missing_info_list = []
+        escalation_list = []
+        duplicate_list = []
+        decisions = []
+        _hash_cache = {}
+
+        for expense in expenses:
+            exp_id = expense.get("expense_id") or expense.get("id")
+
+            # Health check
+            missing = run_health_check(expense, cfg, bills_map)
+            if missing:
+                print(f"{tag} Health {exp_id[:8]}... -> FAIL: {', '.join(missing)}")
+                missing_info_list.append({"expense": expense, "missing": missing})
+                _track_pending_info(sb, exp_id, project_id, missing)
+                decisions.append(_make_decision_entry(expense, lookups, "missing_info",
+                                                       reason=f"Missing: {', '.join(missing)}",
+                                                       missing_fields=missing))
+                continue
+            print(f"{tag} Health {exp_id[:8]}... -> PASS")
+
+            # Duplicate check
+            dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_hash_cache)
+
+            if dup_result.verdict == "duplicate":
+                print(f"{tag} Dup {exp_id[:8]}... -> DUPLICATE ({dup_result.rule})")
+                duplicate_list.append({"expense": expense, "rule": dup_result.rule, "details": dup_result.details})
+                decisions.append(_make_decision_entry(expense, lookups, "duplicate",
+                                                       rule=dup_result.rule, reason=dup_result.details))
+                continue
+
+            if dup_result.verdict == "need_info":
+                print(f"{tag} Dup {exp_id[:8]}... -> NEED_INFO ({dup_result.details})")
+                need_fields = ["receipt"] if "receipt" in dup_result.rule.lower() else ["bill_id", "receipt"]
+                missing_info_list.append({"expense": expense, "missing": need_fields})
+                _track_pending_info(sb, exp_id, project_id, need_fields)
+                decisions.append(_make_decision_entry(expense, lookups, "need_info",
+                                                       rule=dup_result.rule, reason=dup_result.details))
+                continue
+
+            if dup_result.verdict == "ambiguous":
+                print(f"{tag} Dup {exp_id[:8]}... -> AMBIGUOUS ({dup_result.details})")
+                escalation_list.append({"expense": expense, "reason": dup_result.details})
+                decisions.append(_make_decision_entry(expense, lookups, "escalated",
+                                                       rule=dup_result.rule, reason=dup_result.details))
+                continue
+
+            # All checks passed - authorize in real-time
+            print(f"{tag} Dup {exp_id[:8]}... -> CLEAR ({dup_result.rule})")
+            if authorize_expense(sb, exp_id, project_id, dup_result.rule):
+                authorized_list.append(expense)
+                amt = f"${float(expense.get('Amount') or 0):,.2f}"
+                print(f"{tag} Authorized {exp_id[:8]}... | {vname} {amt}")
+                decisions.append(_make_decision_entry(expense, lookups, "authorized",
+                                                       rule=dup_result.rule, reason=dup_result.details))
+
+        # 8. Post ONE consolidated summary
+        total_auth = sum(float(e.get("Amount") or 0) for e in authorized_list)
+        n_auth = len(authorized_list)
+        n_total = len(expenses)
+        n_missing = len(missing_info_list)
+        n_dup = len(duplicate_list)
+        n_esc = len(escalation_list)
+
+        if n_auth == n_total:
+            # All authorized
+            summary_msg = (
+                f"**Bill #{bill_id} -- Review Complete**\n"
+                f"Authorized all **{n_auth}** expenses from **{vname}** totaling **${total_auth:,.2f}**.\n\n"
+                f"All expenses passed health check and duplicate verification."
+            )
+        elif n_auth > 0:
+            # Mixed results
+            summary_msg = (
+                f"**Bill #{bill_id} -- Review Complete**\n"
+                f"Authorized **{n_auth}/{n_total}** expenses from **{vname}** (${total_auth:,.2f}).\n\n"
+            )
+            flagged_items = []
+            for item in missing_info_list:
+                exp = item["expense"]
+                amt = f"${float(exp.get('Amount') or 0):,.2f}"
+                desc = (exp.get("LineDescription") or "No description")[:50]
+                flagged_items.append(f"- {desc} ({amt}): missing **{', '.join(item['missing'])}**")
+            for item in duplicate_list:
+                exp = item["expense"]
+                amt = f"${float(exp.get('Amount') or 0):,.2f}"
+                desc = (exp.get("LineDescription") or "No description")[:50]
+                flagged_items.append(f"- {desc} ({amt}): duplicate ({item['rule']})")
+            for item in escalation_list:
+                exp = item["expense"]
+                amt = f"${float(exp.get('Amount') or 0):,.2f}"
+                desc = (exp.get("LineDescription") or "No description")[:50]
+                flagged_items.append(f"- {desc} ({amt}): needs review ({item['reason'][:60]})")
+            if flagged_items:
+                summary_msg += f"**{n_total - n_auth}** items need attention:\n" + "\n".join(flagged_items)
+        else:
+            # None authorized
+            summary_msg = (
+                f"**Bill #{bill_id} -- Review Complete**\n"
+                f"0/{n_total} expenses authorized from **{vname}**.\n\n"
+            )
+            flagged_items = []
+            for item in missing_info_list:
+                exp = item["expense"]
+                amt = f"${float(exp.get('Amount') or 0):,.2f}"
+                desc = (exp.get("LineDescription") or "No description")[:50]
+                flagged_items.append(f"- {desc} ({amt}): missing **{', '.join(item['missing'])}**")
+            for item in duplicate_list:
+                exp = item["expense"]
+                amt = f"${float(exp.get('Amount') or 0):,.2f}"
+                desc = (exp.get("LineDescription") or "No description")[:50]
+                flagged_items.append(f"- {desc} ({amt}): duplicate ({item['rule']})")
+            for item in escalation_list:
+                exp = item["expense"]
+                amt = f"${float(exp.get('Amount') or 0):,.2f}"
+                desc = (exp.get("LineDescription") or "No description")[:50]
+                flagged_items.append(f"- {desc} ({amt}): needs review ({item['reason'][:60]})")
+            if flagged_items:
+                summary_msg += "\n".join(flagged_items)
+            if n_missing > 0 and bookkeeping_mentions:
+                summary_msg += f"\n\n{bookkeeping_mentions} Please update missing fields to proceed."
+            if n_esc > 0 and escalation_mentions:
+                summary_msg += f"\n\n{escalation_mentions} Manual review required."
+
+        post_daneel_message(
+            content=summary_msg,
+            project_id=project_id,
+            channel_type="project_general",
+            metadata={
+                "type": "auto_auth_bill_summary",
+                "bill_id": bill_id,
+                "authorized": n_auth,
+                "flagged": n_total - n_auth,
+                "total_amount": total_auth,
+            },
+        )
+
+        # 9. Save audit trail
+        _save_auth_report(sb, "bill_realtime", {
+            "bill_id": bill_id,
+            "authorized": n_auth,
+            "missing_info": n_missing,
+            "duplicates": n_dup,
+            "escalated": n_esc,
+            "total": n_total,
+            "total_amount": total_auth,
+        }, decisions, project_id=project_id)
+
+        print(f"{tag} DONE | bill={bill_id} | auth={n_auth}/{n_total} | missing={n_missing} | dup={n_dup} | escalated={n_esc}")
+
+    except Exception as e:
+        print(f"{tag} ERROR | bill={bill_id} | {repr(e)}")
+        logger.error(f"{tag} trigger_auto_auth_for_bill error: {e}", exc_info=True)
+
+
+# ============================================================================
 # Event trigger (single expense, called as BackgroundTask)
 # ============================================================================
 
@@ -1838,6 +2140,12 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                                                             checks=rt_checks)
                             _save_auth_report(sb, "realtime", {"authorized": 1}, [decision],
                                               project_id=project_id)
+                            post_daneel_message(
+                                content=f"Authorized expense from **{vname}** ({amt}).",
+                                project_id=project_id,
+                                channel_type="project_general",
+                                metadata={"type": "auto_auth_success", "expense_id": expense_id},
+                            )
                         return
 
             # Still ambiguous -- escalate to human
@@ -1866,6 +2174,12 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
             decision = _make_decision_entry(expense, lookups, "authorized",
                                             rule=dup_result.rule, reason=dup_result.details,
                                             checks=rt_checks)
+            post_daneel_message(
+                content=f"Authorized expense from **{vname}** ({amt}).",
+                project_id=project_id,
+                channel_type="project_general",
+                metadata={"type": "auto_auth_success", "expense_id": expense_id},
+            )
 
         # Save realtime decision to report log
         if decision:

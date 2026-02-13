@@ -1,15 +1,9 @@
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, BackgroundTasks
 from pydantic import BaseModel
 from api.supabase_client import supabase
+from api.auth import get_current_user
 from typing import Optional, List
-import base64
-import os
-from openai import OpenAI
 import json
-import io
-from pdf2image import convert_from_bytes
-from PIL import Image
-import pdfplumber
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.receipt_scanner import (
     extract_text_from_pdf as _extract_text_from_pdf,
@@ -100,7 +94,7 @@ def extract_rel_value(row: dict, rel_name: str, field: str):
 # ====== ENDPOINTS ======
 
 @router.post("", status_code=201)
-def create_expense(payload: ExpenseCreate, background_tasks: BackgroundTasks):
+def create_expense(payload: ExpenseCreate, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """
     Crea un nuevo gasto
     """
@@ -142,7 +136,7 @@ def create_expense(payload: ExpenseCreate, background_tasks: BackgroundTasks):
 
 
 @router.post("/batch", status_code=201)
-def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: BackgroundTasks):
+def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """
     Crea múltiples gastos en una sola operación (bulk insert).
     Mucho más eficiente que crear uno por uno.
@@ -188,13 +182,30 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
 
         created_expenses = res.data or []
 
-        # Trigger Daneel auto-auth for each created pending expense
-        from api.services.daneel_auto_auth import trigger_auto_auth_check
+        # Trigger Daneel auto-auth: group by (bill_id, project) for bill-level, fallback per-expense
+        from api.services.daneel_auto_auth import trigger_auto_auth_check, trigger_auto_auth_for_bill
+        bill_groups = {}
+        no_bill = []
         for exp in created_expenses:
-            exp_id = exp.get("expense_id")
+            if exp.get("status", "pending") != "pending":
+                continue
+            bid = (exp.get("bill_id") or "").strip()
             proj_id = exp.get("project")
-            if exp_id and proj_id and exp.get("status", "pending") == "pending":
-                background_tasks.add_task(trigger_auto_auth_check, exp_id, proj_id)
+            if bid and proj_id:
+                bill_groups.setdefault((bid, proj_id), []).append(exp)
+            elif proj_id:
+                no_bill.append(exp)
+
+        for (bid, proj_id), group in bill_groups.items():
+            background_tasks.add_task(
+                trigger_auto_auth_for_bill,
+                expense_ids=[e["expense_id"] for e in group],
+                bill_id=bid,
+                project_id=proj_id,
+                total_amount=sum(float(e.get("Amount") or 0) for e in group),
+            )
+        for exp in no_bill:
+            background_tasks.add_task(trigger_auto_auth_check, exp["expense_id"], exp["project"])
 
         return {
             "message": f"Batch insert completed: {len(created_expenses)} created",
@@ -214,7 +225,7 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
 
 
 @router.patch("/batch")
-def update_expenses_batch(payload: ExpenseBatchUpdate):
+def update_expenses_batch(payload: ExpenseBatchUpdate, current_user: dict = Depends(get_current_user)):
     """
     Actualiza múltiples gastos en una sola operación.
     Cada update se procesa individualmente pero en una sola llamada HTTP.
@@ -275,7 +286,7 @@ def update_expenses_batch(payload: ExpenseBatchUpdate):
 
 
 @router.get("")
-def list_expenses(project: Optional[str] = None, limit: Optional[int] = None):
+def list_expenses(project: Optional[str] = None, limit: Optional[int] = None, current_user: dict = Depends(get_current_user)):
     """
     Lista todos los gastos, opcionalmente filtrados por project.
     Incluye información de tipo de transacción, proyecto, vendor, etc.
@@ -336,7 +347,7 @@ def list_expenses(project: Optional[str] = None, limit: Optional[int] = None):
 
 
 @router.get("/all")
-def list_all_expenses(limit: Optional[int] = 1000):
+def list_all_expenses(limit: Optional[int] = 1000, current_user: dict = Depends(get_current_user)):
     """
     Lista todos los gastos de todos los proyectos.
     Incluye información del proyecto en cada gasto.
@@ -432,7 +443,7 @@ def list_all_expenses(limit: Optional[int] = 1000):
 
 
 @router.get("/meta")
-def get_expenses_meta():
+def get_expenses_meta(current_user: dict = Depends(get_current_user)):
     """
     Devuelve catálogos necesarios para la UI de expenses:
       - txn_types: tipos de transacción
@@ -497,7 +508,7 @@ class DismissDuplicateRequest(BaseModel):
 
 
 @router.get("/dismissed-duplicates")
-def get_dismissed_duplicates(user_id: str):
+def get_dismissed_duplicates(user_id: str, current_user: dict = Depends(get_current_user)):
     """
     Obtiene todos los pares de duplicados descartados por un usuario.
     """
@@ -523,7 +534,7 @@ def get_dismissed_duplicates(user_id: str):
 
 
 @router.post("/dismissed-duplicates", status_code=201)
-def dismiss_duplicate_pair(payload: DismissDuplicateRequest):
+def dismiss_duplicate_pair(payload: DismissDuplicateRequest, current_user: dict = Depends(get_current_user)):
     """
     Marca un par de expenses como "no es duplicado".
     """
@@ -549,7 +560,7 @@ def dismiss_duplicate_pair(payload: DismissDuplicateRequest):
 
 
 @router.delete("/dismissed-duplicates/{dismissal_id}")
-def reactivate_duplicate_alert(dismissal_id: str, user_id: str):
+def reactivate_duplicate_alert(dismissal_id: str, user_id: str, current_user: dict = Depends(get_current_user)):
     """
     Elimina un dismissal para reactivar la alerta de duplicado.
     """
@@ -562,7 +573,7 @@ def reactivate_duplicate_alert(dismissal_id: str, user_id: str):
 
 
 @router.get("/{expense_id}")
-def get_expense(expense_id: str):
+def get_expense(expense_id: str, current_user: dict = Depends(get_current_user)):
     """
     Obtiene un gasto específico por ID.
     Incluye información de transacción, proyecto, vendor, etc.
@@ -609,7 +620,7 @@ def get_expense(expense_id: str):
 
 
 @router.put("/{expense_id}")
-def update_expense(expense_id: str, payload: ExpenseUpdate):
+def update_expense(expense_id: str, payload: ExpenseUpdate, current_user: dict = Depends(get_current_user)):
     """
     Actualiza un gasto existente
     """
@@ -619,8 +630,8 @@ def update_expense(expense_id: str, payload: ExpenseUpdate):
         if not existing.data:
             raise HTTPException(status_code=404, detail="Expense not found")
 
-        # Preparar datos para actualizar (solo campos no nulos)
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        # Preparar datos para actualizar (only fields the client actually sent)
+        data = payload.model_dump(exclude_unset=True)
 
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -646,7 +657,7 @@ def update_expense(expense_id: str, payload: ExpenseUpdate):
 
 
 @router.patch("/{expense_id}")
-def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: BackgroundTasks, user_id: Optional[str] = None, change_reason: Optional[str] = None):
+def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: BackgroundTasks, user_id: Optional[str] = None, change_reason: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """
     Actualiza parcialmente un gasto existente con logging de cambios.
     Solo se actualizan los campos proporcionados en el body.
@@ -675,8 +686,8 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         existing = existing_resp.data
         current_status = existing.get("status") or ("auth" if existing.get("auth_status") else "pending")
 
-        # Preparar datos para actualizar (solo campos proporcionados)
-        data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        # Preparar datos para actualizar (only fields the client actually sent)
+        data = payload.model_dump(exclude_unset=True)
 
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -789,7 +800,7 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
 
 
 @router.delete("/{expense_id}")
-def delete_expense(expense_id: str, user_id: Optional[str] = None, delete_reason: Optional[str] = None):
+def delete_expense(expense_id: str, user_id: Optional[str] = None, delete_reason: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """
     Elimina un gasto con logging si estaba autorizado.
 
@@ -863,7 +874,7 @@ class ExpenseStatusUpdate(BaseModel):
 
 
 @router.patch("/{expense_id}/status")
-def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id: str, background_tasks: BackgroundTasks):
+def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id: str, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """
     Update expense status with audit logging.
 
@@ -971,7 +982,7 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
 
 
 @router.post("/{expense_id}/soft-delete")
-def soft_delete_expense(expense_id: str, user_id: str):
+def soft_delete_expense(expense_id: str, user_id: str, current_user: dict = Depends(get_current_user)):
     """
     Soft-delete: cambia el status a 'review' para que un manager confirme la eliminacion.
     Cualquier usuario puede solicitar soft-delete (no requiere rol de manager).
@@ -1042,7 +1053,7 @@ def soft_delete_expense(expense_id: str, user_id: str):
 
 
 @router.get("/{expense_id}/status-history")
-def get_expense_status_history(expense_id: str):
+def get_expense_status_history(expense_id: str, current_user: dict = Depends(get_current_user)):
     """
     Get status change history for an expense.
 
@@ -1097,7 +1108,7 @@ def get_expense_status_history(expense_id: str):
 
 
 @router.get("/{expense_id}/audit-trail")
-def get_expense_audit_trail(expense_id: str):
+def get_expense_audit_trail(expense_id: str, current_user: dict = Depends(get_current_user)):
     """
     Get complete audit trail for an expense (status changes + field changes).
 
@@ -1213,7 +1224,7 @@ def get_expense_audit_trail(expense_id: str):
 
 
 @router.get("/summary/by-txn-type")
-def get_expenses_summary_by_txn_type(project: Optional[str] = None):
+def get_expenses_summary_by_txn_type(project: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """
     Obtiene un resumen de gastos agrupados por tipo de transacción.
     Opcionalmente filtrado por proyecto.
@@ -1256,7 +1267,7 @@ def get_expenses_summary_by_txn_type(project: Optional[str] = None):
 
 
 @router.get("/summary/by-project")
-def get_expenses_summary_by_project():
+def get_expenses_summary_by_project(current_user: dict = Depends(get_current_user)):
     """
     Obtiene un resumen de gastos agrupados por proyecto.
     """
@@ -1294,7 +1305,7 @@ def get_expenses_summary_by_project():
 
 
 @router.post("/auto-categorize")
-async def auto_categorize_expenses(payload: dict):
+async def auto_categorize_expenses(payload: dict, current_user: dict = Depends(get_current_user)):
     """
     Auto-categorizes expenses using GPT-4 based on construction stage and description.
     Delegates to shared service: services/receipt_scanner.auto_categorize()
@@ -1327,7 +1338,7 @@ async def auto_categorize_expenses(payload: dict):
 
 
 @router.post("/categorization-correction")
-async def save_categorization_correction(payload: dict):
+async def save_categorization_correction(payload: dict, current_user: dict = Depends(get_current_user)):
     """
     Save a user correction to auto-categorization for feedback loop.
     This helps improve future categorizations by learning from user corrections.
@@ -1404,7 +1415,8 @@ extract_text_from_pdf = _extract_text_from_pdf
 async def parse_receipt(
     file: UploadFile = File(...),
     model: str = Form("fast"),
-    correction_context: str = Form(None)
+    correction_context: str = Form(None),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Parsea un recibo/factura usando OpenAI Vision API.
@@ -1480,7 +1492,7 @@ async def parse_receipt(
 
 
 @router.get("/pending-authorization/count")
-def get_pending_authorization_count(user_id: str):
+def get_pending_authorization_count(user_id: str, current_user: dict = Depends(get_current_user)):
     """
     Get count of expenses pending authorization for a user.
 
@@ -1549,7 +1561,7 @@ def get_pending_authorization_count(user_id: str):
 
 
 @router.get("/pending-authorization/summary")
-def get_pending_authorization_summary(user_id: str):
+def get_pending_authorization_summary(user_id: str, current_user: dict = Depends(get_current_user)):
     """
     Get summary of expenses pending authorization for dashboard display.
 
@@ -1644,7 +1656,8 @@ def get_pending_authorization_summary(user_id: str):
 def get_categorization_error_metrics(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    user_id: Optional[str] = None
+    user_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Get metrics on categorization errors based on expenses flagged for review.

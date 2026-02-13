@@ -3893,52 +3893,55 @@ def get_pending_reviews(user_id: str) -> Dict[str, Any]:
                 seen_task_ids.add(task.get("task_id"))
 
         # 2c. Review tasks assigned to this user (created by workflow)
-        review_query = supabase.table("tasks").select("*").eq(
-            "Owner_id", user_id
-        ).not_.is_("parent_task_id", "null").execute()
+        try:
+            review_query = supabase.table("tasks").select("*").eq(
+                "Owner_id", user_id
+            ).eq("task_status", approval_status_id).not_.is_("parent_task_id", "null").execute()
 
-        for task in (review_query.data or []):
-            if task.get("task_id") not in seen_task_ids:
-                # Only include if not already completed
-                task["_review_role"] = "reviewer"
-                all_tasks.append(task)
-                seen_task_ids.add(task.get("task_id"))
+            for task in (review_query.data or []):
+                if task.get("task_id") not in seen_task_ids:
+                    task["_review_role"] = "reviewer"
+                    all_tasks.append(task)
+                    seen_task_ids.add(task.get("task_id"))
+        except Exception as e:
+            print(f"[WORKFLOW] Review query failed: {repr(e)}")
 
-        # 3. Get additional info for each task
+        # 3. Batch-load users and projects for enrichment
+        owner_ids = list({t.get("Owner_id") for t in all_tasks if t.get("Owner_id")})
+        project_ids = list({t.get("project_id") for t in all_tasks if t.get("project_id")})
+        parent_ids = list({t.get("parent_task_id") for t in all_tasks if t.get("parent_task_id")})
+
+        users_map = {}
+        if owner_ids:
+            try:
+                users_resp = supabase.table("users").select("user_id, user_name").in_("user_id", owner_ids).execute()
+                users_map = {u["user_id"]: u["user_name"] for u in (users_resp.data or [])}
+            except Exception:
+                pass
+
+        projects_map = {}
+        if project_ids:
+            try:
+                proj_resp = supabase.table("projects").select("project_id, project_name").in_("project_id", project_ids).execute()
+                projects_map = {p["project_id"]: p["project_name"] for p in (proj_resp.data or [])}
+            except Exception:
+                pass
+
+        parents_map = {}
+        if parent_ids:
+            try:
+                parent_resp = supabase.table("tasks").select("*").in_("task_id", parent_ids).execute()
+                parents_map = {t["task_id"]: t for t in (parent_resp.data or [])}
+            except Exception:
+                pass
+
         enriched_tasks = []
         for task in all_tasks:
-            # Get owner info
-            owner_name = None
-            if task.get("Owner_id"):
-                owner_response = supabase.table("users").select("user_name").eq(
-                    "user_id", task.get("Owner_id")
-                ).execute()
-                if owner_response.data:
-                    owner_name = owner_response.data[0].get("user_name")
-
-            # Get project info
-            project_name = None
-            if task.get("project_id"):
-                project_response = supabase.table("projects").select("project_name").eq(
-                    "project_id", task.get("project_id")
-                ).execute()
-                if project_response.data:
-                    project_name = project_response.data[0].get("project_name")
-
-            # Get original task info if this is a review task
-            original_task = None
-            if task.get("parent_task_id"):
-                original_response = supabase.table("tasks").select("*").eq(
-                    "task_id", task.get("parent_task_id")
-                ).execute()
-                if original_response.data:
-                    original_task = original_response.data[0]
-
             enriched_tasks.append({
                 **task,
-                "owner_name": owner_name,
-                "project_name": project_name,
-                "original_task": original_task,
+                "owner_name": users_map.get(task.get("Owner_id")),
+                "project_name": projects_map.get(task.get("project_id")),
+                "original_task": parents_map.get(task.get("parent_task_id")),
                 "review_role": task.get("_review_role"),
             })
 
@@ -3951,4 +3954,4 @@ def get_pending_reviews(user_id: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"[WORKFLOW] ERROR in GET /pipeline/tasks/pending-reviews/{user_id}: {repr(e)}")
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
+        return {"success": False, "tasks": [], "total": 0}

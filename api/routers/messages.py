@@ -1108,7 +1108,8 @@ def get_my_mentions(
         query = supabase.table("messages") \
             .select("*, users!user_id(user_name, avatar_color, user_photo)") \
             .ilike("content", search_pattern) \
-            .neq("user_id", user_id)  # Don't include self-mentions
+            .neq("user_id", user_id) \
+            .or_("is_deleted.is.null,is_deleted.eq.false")
 
         result = query.order("created_at", desc=True).limit(limit).execute()
 
@@ -1202,6 +1203,15 @@ def mark_mention_read(
     """Mark a mention as read by message_id"""
     try:
         user_id = current_user["user_id"]
+
+        # Verify the message still exists before creating mention record
+        msg_check = supabase.table("messages") \
+            .select("id") \
+            .eq("id", message_id) \
+            .execute()
+        if not msg_check.data:
+            # Message was deleted - nothing to mark as read
+            return {"ok": True}
 
         # Check if record exists
         existing = supabase.table("message_mentions") \

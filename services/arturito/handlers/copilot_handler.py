@@ -110,7 +110,7 @@ Si no puedes interpretar el comando, responde:
     try:
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": "Eres un intérprete preciso de comandos. Respondes SOLO con JSON válido."},
                 {"role": "user", "content": prompt}

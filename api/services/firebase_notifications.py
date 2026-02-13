@@ -350,7 +350,7 @@ async def get_expense_authorizers() -> List[dict]:
 
         # Get users with these roles
         users_result = supabase.table("users") \
-            .select("user_id, user_name, user_email") \
+            .select("user_id, user_name") \
             .in_("user_rol", role_ids) \
             .execute()
 

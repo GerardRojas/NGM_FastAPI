@@ -288,7 +288,7 @@ def _gpt_fuzzy_match(query: str, candidates: List[str]) -> Optional[str]:
         client = OpenAI(api_key=api_key, timeout=10.0)
         candidates_str = "\n".join(f"- {c}" for c in candidates[:40])
         resp = client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5.1",
             messages=[
                 {"role": "system", "content": (
                     "You are a fuzzy-matching helper. The user typed a name that may contain "

@@ -623,6 +623,11 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
     copilot_patterns = [
         # Filtering commands (with imperative forms like "filtrame", "muestrame")
         (r'(mostrar?me|muestrame|muestra|show|ver)\s+(solo\s+)?(los?\s+)?(gastos?|tareas?|proyectos?|usuarios?).*(pendiente|autorizado|completad|activo|progreso)', 'filter'),
+        # English word order: "show pending expenses", "show authorized expenses"
+        (r'(mostrar?me|muestrame|muestra|show|ver)\s+(solo\s+)?(los?\s+)?(pending|pendientes?|authorized?|autorizad[oa]s?|review|revision|completed?|completad[oa]s?)\s+(gastos?|expenses?|tareas?|tasks?)', 'filter'),
+        # "gastos en pending", "expenses in review", "gastos de Home Depot"
+        (r'(gastos?|expenses?)\s+(en|in)\s+(pending|pendiente|authorized?|autorizado|review|revision)', 'filter'),
+        (r'(gastos?|expenses?)\s+(de|from|of)\s+(.+)', 'filter'),
         (r'(filtrar?|filtrame|filtra|filter)\s+(los?\s+)?(gastos?|tareas?|proyectos?|usuarios?)?.*', 'filter'),
         (r'(solo\s+)(pendientes?|autorizados?|completados?|activos?|en\s+progreso)', 'filter'),
         # Sorting commands
@@ -836,7 +841,7 @@ def interpret_with_gpt(text: str, context: Dict[str, Any] = None) -> Dict[str, A
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5-nano",  # Internal tier - fast classification
+            model="gpt-5.1",  # Internal tier - fast classification
             messages=[
                 {"role": "system", "content": NLU_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Mensaje del usuario: {text}{context_info}"}

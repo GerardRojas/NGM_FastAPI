@@ -86,7 +86,7 @@ def _call_gpt(system_prompt: str, user_content: str, max_tokens: int = 500,
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         kwargs = {
-            "model": "gpt-5-mini",
+            "model": "gpt-5.1",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
