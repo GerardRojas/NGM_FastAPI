@@ -202,15 +202,19 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
         if not expenses_data:
             raise HTTPException(status_code=400, detail="No valid expenses to create")
 
-        # Debug: log fields being inserted to catch UUID issues
+        # Debug: log all string values to catch UUID issues
+        uuid_fields = ['project', 'txn_type', 'bill_id', 'vendor_id', 'payment_type', 'account_id', 'created_by', 'LineUID']
         for i, ed in enumerate(expenses_data):
-            empty_fields = {k: repr(v) for k, v in ed.items() if isinstance(v, str) and v.strip() == ''}
-            if empty_fields:
-                print(f"[BATCH-CREATE] WARNING: expense {i} still has empty strings: {empty_fields}")
-            print(f"[BATCH-CREATE] expense {i} fields: {list(ed.keys())}")
+            str_vals = {k: repr(v) for k, v in ed.items() if k in uuid_fields}
+            print(f"[BATCH-CREATE] expense {i} uuid_fields: {str_vals}")
 
         # Inserción bulk - una sola operación a la base de datos
-        res = supabase.table("expenses_manual_COGS").insert(expenses_data).execute()
+        try:
+            res = supabase.table("expenses_manual_COGS").insert(expenses_data).execute()
+        except Exception as insert_err:
+            print(f"[BATCH-CREATE] INSERT FAILED: {insert_err}")
+            print(f"[BATCH-CREATE] Full payload: {expenses_data}")
+            raise
 
         created_expenses = res.data or []
 
