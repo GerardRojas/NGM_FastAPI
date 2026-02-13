@@ -4,6 +4,9 @@
 # ================================
 # Migrado desde Router.gs
 
+import os
+import time
+import json
 from typing import Dict, Any, Callable, Optional, List
 from .handlers import (
     handle_budget_vs_actuals,
@@ -31,6 +34,115 @@ from .handlers import (
 from .permissions import is_action_permitted, get_permission_denial_message, check_role_permission
 from .persona import set_personality_level, get_identity_response
 from .responder import generate_small_talk_response
+
+
+# ================================
+# User-facing capability summary
+# ================================
+
+# Grouped by category for readable display
+_CAPABILITY_GROUPS = {
+    "Reports": [
+        ("bva / budget vs actuals", "Budget vs Actuals report for any project"),
+        ("pnl", "P&L COGS report"),
+        ("budget query", "Ask about a specific budget category (e.g. 'how much on framing?')"),
+    ],
+    "Navigation": [
+        ("go to [page]", "Navigate to any module (expenses, pipeline, projects, etc.)"),
+        ("open [modal]", "Open modals (new expense, new task, etc.)"),
+    ],
+    "Copilot": [
+        ("filter by [column]", "Filter the current page table"),
+        ("sort by [column]", "Sort the current page table"),
+        ("search [term]", "Search on the current page"),
+    ],
+    "Data": [
+        ("list projects / vendors", "Show all projects or vendors"),
+        ("create vendor / project", "Create a new vendor or project"),
+        ("search expenses", "Find expenses by amount, vendor, or category"),
+    ],
+    "Vault": [
+        ("search files", "Find files in the vault"),
+        ("list files", "Browse vault contents"),
+        ("create folder", "Create a new vault folder"),
+    ],
+    "Other": [
+        ("scope of work", "Ask about a project's scope"),
+        ("report bug", "Report an issue"),
+        ("expense reminder", "Send authorization reminders"),
+    ],
+}
+
+
+def _format_capabilities_for_user(current_page: str = None) -> str:
+    """Build a contextual capability list based on the user's current page."""
+    lines = ["Here's what I can help with:\n"]
+
+    # Prioritize relevant groups based on page
+    page = (current_page or "").lower()
+    priority_groups = []
+    if "expense" in page:
+        priority_groups = ["Reports", "Data", "Copilot"]
+    elif "pipeline" in page:
+        priority_groups = ["Copilot", "Navigation", "Data"]
+    elif "vault" in page:
+        priority_groups = ["Vault", "Navigation"]
+    elif "budget" in page:
+        priority_groups = ["Reports", "Data"]
+
+    shown = set()
+    # Show priority groups first
+    for group_name in priority_groups:
+        if group_name in _CAPABILITY_GROUPS:
+            lines.append(f"**{group_name}**")
+            for cmd, desc in _CAPABILITY_GROUPS[group_name]:
+                lines.append(f"  - `{cmd}` - {desc}")
+            shown.add(group_name)
+
+    # Then show remaining groups
+    for group_name, items in _CAPABILITY_GROUPS.items():
+        if group_name not in shown:
+            lines.append(f"**{group_name}**")
+            for cmd, desc in items:
+                lines.append(f"  - `{cmd}` - {desc}")
+
+    lines.append("\nFor receipt processing try @Andrew. For expense authorization try @Daneel.")
+    return "\n".join(lines)
+
+
+# ================================
+# Intent Logging (fire-and-forget)
+# ================================
+
+def _log_intent(context: Dict[str, Any], intent_obj: Dict[str, Any],
+                action_result: str, processing_ms: int = 0,
+                delegated_to: str = None) -> None:
+    """Log an intent to arturito_intent_log. Non-blocking, never fails the main flow."""
+    try:
+        from supabase import create_client
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not key:
+            return
+
+        sb = create_client(url, key)
+        sb.rpc("log_arturito_intent", {
+            "p_user_email": context.get("user_email", ""),
+            "p_user_role": context.get("user_role", ""),
+            "p_space_id": context.get("space_id", ""),
+            "p_current_page": context.get("current_page", ""),
+            "p_raw_text": intent_obj.get("raw_text", "")[:500],
+            "p_intent": intent_obj.get("intent", "UNKNOWN"),
+            "p_confidence": float(intent_obj.get("confidence", 0.0)),
+            "p_source": intent_obj.get("source", "unknown"),
+            "p_entities": json.dumps(intent_obj.get("entities", {})),
+            "p_action_result": action_result,
+            "p_delegated_to": delegated_to,
+            "p_processing_ms": processing_ms,
+        }).execute()
+    except Exception as e:
+        print(f"[Arturito] Intent log error (non-fatal): {e}")
+
 
 # ================================
 # Tabla de Rutas (ROUTES)
@@ -264,6 +376,7 @@ def route(
     Returns:
         Dict con la respuesta formateada para Google Chat
     """
+    _start = time.time()
     ctx = context or {}
     space_id = ctx.get("space_id", "default")
 
@@ -274,10 +387,14 @@ def route(
     confidence = intent_obj.get("confidence", 0.0)
     raw_text = intent_obj.get("raw_text", "")
 
-    # Verificar confianza mínima
+    # Verificar confianza minima
     if confidence < 0.5 and intent not in ["GREETING", "SMALL_TALK"]:
+        current_page = ctx.get("current_page", "")
+        capabilities = _format_capabilities_for_user(current_page)
+        _log_intent(ctx, intent_obj, "low_confidence",
+                     int((time.time() - _start) * 1000))
         return {
-            "text": "🤔 No estoy seguro de entender. ¿Podrías ser más específico?",
+            "text": f"I'm not sure what you need. Could you be more specific?\n\n{capabilities}",
             "action": "low_confidence"
         }
 
@@ -385,8 +502,12 @@ def route(
     route_def = ROUTES.get(intent)
 
     if not route_def:
+        current_page = ctx.get("current_page", "")
+        capabilities = _format_capabilities_for_user(current_page)
+        _log_intent(ctx, intent_obj, "unknown_intent",
+                     int((time.time() - _start) * 1000))
         return {
-            "text": f"🤔 No tengo una acción definida para: {intent}",
+            "text": f"I don't have that capability yet.\n\n{capabilities}",
             "action": "unknown_intent"
         }
 
@@ -403,7 +524,7 @@ def route(
     handler = route_def.get("handler")
     if not handler:
         return {
-            "text": f"⏳ El handler para '{intent}' aún no está implementado.",
+            "text": f"That feature ({intent}) is coming soon but not ready yet.",
             "action": "not_implemented"
         }
 
@@ -418,12 +539,16 @@ def route(
 
         result = handler(request, ctx)
 
-        # El handler retorna un dict con la respuesta
+        # Log success
+        _log_intent(ctx, intent_obj, result.get("action", "success"),
+                     int((time.time() - _start) * 1000))
         return result
 
     except Exception as e:
+        _log_intent(ctx, intent_obj, "handler_error",
+                     int((time.time() - _start) * 1000))
         return {
-            "text": f"⚠️ Error ejecutando {intent}: {str(e)}",
+            "text": f"Error running {intent}: {str(e)}",
             "action": "handler_error",
             "error": str(e)
         }

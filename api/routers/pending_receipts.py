@@ -4502,6 +4502,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                                 vendor_id, primary_account_id,
                                 amount=sp_amount,
                                 description=parsed_data.get("description") or f"Split from {parsed_data.get('vendor_name', 'receipt')}",
+                                skip_auto_auth=True,
                             )
                             if expense:
                                 created_expenses.append(expense)
@@ -4632,7 +4633,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                 elif auto_create and cat.get("account_id"):
                     expense = _create_receipt_expense(
                         project_id, parsed_data, receipt_data,
-                        vendor_id, cat["account_id"]
+                        vendor_id, cat["account_id"],
+                        skip_auto_auth=True,
                     )
                     if expense:
                         created_expenses.append(expense)
@@ -4954,7 +4956,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                     # Fallback: no line items (old data), single expense from summary
                     expense = _create_receipt_expense(
                         project_id, parsed_data, receipt_data,
-                        vendor_id, cat["account_id"]
+                        vendor_id, cat["account_id"],
+                        skip_auto_auth=True,
                     )
                     if expense:
                         created_expenses.append(expense)

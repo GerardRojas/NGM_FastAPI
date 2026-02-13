@@ -1833,17 +1833,21 @@ async def trigger_auto_auth_for_bill(
 
         for expense in expenses:
             exp_id = expense.get("expense_id") or expense.get("id")
+            rt_checks = []
 
             # Health check
             missing = run_health_check(expense, cfg, bills_map)
             if missing:
                 print(f"{tag} Health {exp_id[:8]}... -> FAIL: {', '.join(missing)}")
+                rt_checks.append({"check": "health", "passed": False, "detail": "Missing: " + ", ".join(missing)})
                 missing_info_list.append({"expense": expense, "missing": missing})
                 _track_pending_info(sb, exp_id, project_id, missing)
                 decisions.append(_make_decision_entry(expense, lookups, "missing_info",
                                                        reason=f"Missing: {', '.join(missing)}",
-                                                       missing_fields=missing))
+                                                       missing_fields=missing,
+                                                       checks=rt_checks))
                 continue
+            rt_checks.append({"check": "health", "passed": True, "detail": "All required fields present"})
             print(f"{tag} Health {exp_id[:8]}... -> PASS")
 
             # Duplicate check
@@ -1851,35 +1855,43 @@ async def trigger_auto_auth_for_bill(
 
             if dup_result.verdict == "duplicate":
                 print(f"{tag} Dup {exp_id[:8]}... -> DUPLICATE ({dup_result.rule})")
+                rt_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})
                 duplicate_list.append({"expense": expense, "rule": dup_result.rule, "details": dup_result.details})
                 decisions.append(_make_decision_entry(expense, lookups, "duplicate",
-                                                       rule=dup_result.rule, reason=dup_result.details))
+                                                       rule=dup_result.rule, reason=dup_result.details,
+                                                       checks=rt_checks))
                 continue
 
             if dup_result.verdict == "need_info":
                 print(f"{tag} Dup {exp_id[:8]}... -> NEED_INFO ({dup_result.details})")
+                rt_checks.append({"check": "duplicate", "passed": False, "detail": f"Need info: {dup_result.details}"})
                 need_fields = ["receipt"] if "receipt" in dup_result.rule.lower() else ["bill_id", "receipt"]
                 missing_info_list.append({"expense": expense, "missing": need_fields})
                 _track_pending_info(sb, exp_id, project_id, need_fields)
                 decisions.append(_make_decision_entry(expense, lookups, "need_info",
-                                                       rule=dup_result.rule, reason=dup_result.details))
+                                                       rule=dup_result.rule, reason=dup_result.details,
+                                                       checks=rt_checks))
                 continue
 
             if dup_result.verdict == "ambiguous":
                 print(f"{tag} Dup {exp_id[:8]}... -> AMBIGUOUS ({dup_result.details})")
+                rt_checks.append({"check": "duplicate", "passed": False, "detail": f"Ambiguous: {dup_result.details}"})
                 escalation_list.append({"expense": expense, "reason": dup_result.details})
                 decisions.append(_make_decision_entry(expense, lookups, "escalated",
-                                                       rule=dup_result.rule, reason=dup_result.details))
+                                                       rule=dup_result.rule, reason=dup_result.details,
+                                                       checks=rt_checks))
                 continue
 
             # All checks passed - authorize in real-time
+            rt_checks.append({"check": "duplicate", "passed": True, "detail": f"R1-R9 clear: {dup_result.details}"})
             print(f"{tag} Dup {exp_id[:8]}... -> CLEAR ({dup_result.rule})")
             if authorize_expense(sb, exp_id, project_id, dup_result.rule):
                 authorized_list.append(expense)
                 amt = f"${float(expense.get('Amount') or 0):,.2f}"
                 print(f"{tag} Authorized {exp_id[:8]}... | {vname} {amt}")
                 decisions.append(_make_decision_entry(expense, lookups, "authorized",
-                                                       rule=dup_result.rule, reason=dup_result.details))
+                                                       rule=dup_result.rule, reason=dup_result.details,
+                                                       checks=rt_checks))
 
         # 8. Post ONE consolidated summary
         total_auth = sum(float(e.get("Amount") or 0) for e in authorized_list)
@@ -2015,6 +2027,16 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
         # Load bills (normalized keys)
         bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
         bills_map = {normalize_bill_id(b["bill_id"]): b for b in (bills_result.data or [])}
+
+        # Post ACK message so humans know auto-auth is active
+        vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
+        amt = f"${float(expense.get('Amount') or 0):,.2f}"
+        post_daneel_message(
+            content=f"Reviewing expense from **{vname}** ({amt})...",
+            project_id=project_id,
+            channel_type="project_general",
+            metadata={"type": "auto_auth_check", "expense_id": expense_id},
+        )
 
         # Build checks trail for this expense
         rt_checks = []

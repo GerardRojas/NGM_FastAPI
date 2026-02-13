@@ -20,7 +20,7 @@ import traceback
 from typing import Dict, Any, Optional, Tuple
 from api.services.gpt_client import gpt
 
-from api.services.agent_registry import get_functions, get_function, format_functions_for_llm
+from api.services.agent_registry import get_functions, get_function, format_functions_for_llm, format_capabilities_for_user
 from api.services.agent_personas import (
     get_persona, get_other_agent, get_cross_agent_suggestion, is_bot_user,
 )
@@ -71,8 +71,13 @@ Analyze the user's message and respond with a JSON object (no markdown fences):
 4. If you need more information to proceed:
    {{"action": "clarify", "question": "<what you need to know>"}}
 
-IMPORTANT: Always include a "confidence" field (0.0-1.0) in your JSON response
-indicating how certain you are about your routing decision.
+5. If the user is asking you to do something that is NOT in your capabilities list and is NOT {other_agent}'s domain either:
+   {{"action": "unknown", "response": "<brief explanation of what you understood they want>"}}
+
+IMPORTANT RULES:
+- Always include a "confidence" field (0.0-1.0) in your JSON response.
+- Use "free_chat" ONLY for greetings, casual chat, or questions about yourself.
+- Use "unknown" when the user wants an action/task you cannot perform. Do NOT fabricate answers about data you have not queried.
 
 ## Context
 - Project: {project_name} (ID: {project_id})
@@ -166,6 +171,11 @@ async def invoke_brain(
             )
         elif action == "clarify":
             await _handle_clarify(
+                agent_name, decision,
+                project_id, channel_type, channel_id,
+            )
+        elif action == "unknown":
+            await _handle_unknown(
                 agent_name, decision,
                 project_id, channel_type, channel_id,
             )
@@ -470,6 +480,31 @@ async def _handle_free_chat(
         agent_name, project_id, channel_type, channel_id,
         personalized,
         metadata={"agent_brain": True, "action": "free_chat"},
+    )
+
+
+async def _handle_unknown(
+    agent_name: str,
+    decision: Dict[str, Any],
+    project_id: Optional[str],
+    channel_type: str,
+    channel_id: Optional[str],
+) -> None:
+    """Handle requests outside the agent's capabilities. Show what the agent CAN do."""
+    understood = decision.get("response", "")
+    capabilities = format_capabilities_for_user(agent_name)
+
+    msg = ""
+    if understood:
+        msg = f"I understand you want: {understood}\n\nThat's not something I can do right now.\n\n{capabilities}"
+    else:
+        msg = f"That's not within my current capabilities.\n\n{capabilities}"
+
+    personalized = await _personalize(agent_name, msg)
+    await _post_response(
+        agent_name, project_id, channel_type, channel_id,
+        personalized,
+        metadata={"agent_brain": True, "action": "unknown"},
     )
 
 

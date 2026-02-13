@@ -216,3 +216,22 @@ def format_functions_for_llm(agent_name: str) -> str:
         lines.append(f"- {fn['name']}: {fn['description']}{params_str}")
 
     return "\n".join(lines)
+
+
+def format_capabilities_for_user(agent_name: str) -> str:
+    """
+    Format a user-facing capability summary for when the agent
+    doesn't understand the request. Short, readable, no parameters.
+    """
+    functions = get_functions(agent_name)
+    if not functions:
+        return ""
+
+    other = "Daneel" if agent_name.lower() == "andrew" else "Andrew"
+    lines = [f"Here's what I can help with:"]
+    for fn in functions:
+        # First sentence of description only
+        short = fn["description"].split(". ")[0].rstrip(".")
+        lines.append(f"  - **{fn['name']}**: {short}")
+    lines.append(f"\nFor anything outside this scope, try @{other}.")
+    return "\n".join(lines)

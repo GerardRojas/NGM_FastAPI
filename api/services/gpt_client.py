@@ -63,7 +63,7 @@ def _get_async() -> AsyncOpenAI:
 # ── Mini tier (gpt-5-mini via responses API) ─────────────────────
 
 def mini(instructions: str, input: str, json_mode: bool = False,
-         max_tokens: int = 400) -> Optional[str]:
+         max_tokens: int = 400, timeout: Optional[float] = None) -> Optional[str]:
     """Sync call to gpt-5-mini via responses API.
 
     Args:
@@ -71,6 +71,7 @@ def mini(instructions: str, input: str, json_mode: bool = False,
         input: User message content.
         json_mode: If True, appends JSON-only instruction.
         max_tokens: Max output tokens.
+        timeout: Override default 30s timeout (e.g. 90 for large OCR prompts).
 
     Returns:
         Response text or None on failure.
@@ -81,12 +82,15 @@ def mini(instructions: str, input: str, json_mode: bool = False,
         inst = instructions
         if json_mode:
             inst += "\n\nReturn ONLY valid JSON. No markdown, no explanation, no code fences."
-        r = client.responses.create(
-            model=MINI_MODEL,
-            instructions=inst,
-            input=input,
-            max_output_tokens=max_tokens,
-        )
+        kwargs = {
+            "model": MINI_MODEL,
+            "instructions": inst,
+            "input": input,
+            "max_output_tokens": max_tokens,
+        }
+        if timeout:
+            kwargs["timeout"] = timeout
+        r = client.responses.create(**kwargs)
         text = r.output_text if hasattr(r, "output_text") else ""
         result = text.strip() if text and text.strip() else None
         ms = int((time.monotonic() - t0) * 1000)
@@ -99,7 +103,8 @@ def mini(instructions: str, input: str, json_mode: bool = False,
 
 
 async def mini_async(instructions: str, input: str, json_mode: bool = False,
-                     max_tokens: int = 400) -> Optional[str]:
+                     max_tokens: int = 400,
+                     timeout: Optional[float] = None) -> Optional[str]:
     """Async call to gpt-5-mini via responses API."""
     t0 = time.monotonic()
     try:
@@ -107,12 +112,15 @@ async def mini_async(instructions: str, input: str, json_mode: bool = False,
         inst = instructions
         if json_mode:
             inst += "\n\nReturn ONLY valid JSON. No markdown, no explanation, no code fences."
-        r = await client.responses.create(
-            model=MINI_MODEL,
-            instructions=inst,
-            input=input,
-            max_output_tokens=max_tokens,
-        )
+        kwargs = {
+            "model": MINI_MODEL,
+            "instructions": inst,
+            "input": input,
+            "max_output_tokens": max_tokens,
+        }
+        if timeout:
+            kwargs["timeout"] = timeout
+        r = await client.responses.create(**kwargs)
         text = r.output_text if hasattr(r, "output_text") else ""
         result = text.strip() if text and text.strip() else None
         ms = int((time.monotonic() - t0) * 1000)

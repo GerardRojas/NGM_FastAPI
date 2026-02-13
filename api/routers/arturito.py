@@ -432,7 +432,7 @@ async def update_permission(update: PermissionUpdate, current_user: dict = Depen
     if current_user.get("role") not in allowed_roles:
         raise HTTPException(status_code=403, detail="Only CEO/COO can modify Arturito permissions")
 
-    from services.arturito.permissions import ARTURITO_PERMISSIONS
+    from services.arturito.permissions import ARTURITO_PERMISSIONS, save_permission_to_db
 
     intent = update.intent.upper()
 
@@ -442,12 +442,13 @@ async def update_permission(update: PermissionUpdate, current_user: dict = Depen
             detail=f"Permission '{intent}' not found"
         )
 
-    # Actualizar el permiso en memoria
+    # Update in-memory AND persist to DB
     ARTURITO_PERMISSIONS[intent]["enabled"] = update.enabled
+    save_permission_to_db(intent, update.enabled)
 
     return {
         "success": True,
-        "message": f"Permission '{intent}' updated",
+        "message": f"Permission '{intent}' updated and saved to database",
         "intent": intent,
         "enabled": update.enabled,
     }
@@ -462,35 +463,13 @@ async def reset_permissions(current_user: dict = Depends(get_current_user)):
     allowed_roles = ["CEO", "COO", "KD COO"]
     if current_user.get("role") not in allowed_roles:
         raise HTTPException(status_code=403, detail="Only CEO/COO can reset Arturito permissions")
-    from services.arturito.permissions import ARTURITO_PERMISSIONS
+    from services.arturito.permissions import reset_permissions_to_defaults
 
-    # Valores por defecto
-    defaults = {
-        "LIST_PROJECTS": True,
-        "LIST_VENDORS": True,
-        "BUDGET_VS_ACTUALS": True,
-        "CONSULTA_ESPECIFICA": True,
-        "SCOPE_OF_WORK": True,
-        "SEARCH_EXPENSES": True,
-        "CREATE_VENDOR": True,
-        "CREATE_PROJECT": True,
-        "DELETE_VENDOR": False,
-        "DELETE_PROJECT": False,
-        "UPDATE_VENDOR": False,
-        "UPDATE_PROJECT": False,
-        "EXPENSE_REMINDER": True,
-        "REPORT_BUG": True,
-        "NGM_ACTION": True,
-        "COPILOT": True,
-    }
-
-    for intent, enabled in defaults.items():
-        if intent in ARTURITO_PERMISSIONS:
-            ARTURITO_PERMISSIONS[intent]["enabled"] = enabled
+    success = reset_permissions_to_defaults()
 
     return {
-        "success": True,
-        "message": "Permissions reset to defaults",
+        "success": success,
+        "message": "Permissions reset to defaults and saved to database" if success else "Permissions reset in-memory (DB save failed)",
     }
 
 

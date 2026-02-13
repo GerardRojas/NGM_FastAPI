@@ -766,6 +766,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
                 input=prompt,
                 json_mode=True,
                 max_tokens=8000,
+                timeout=90,
             )
             if not result_text:
                 raise RuntimeError("GPT mini returned empty for text mode OCR")
@@ -780,6 +781,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context):
                 temperature=0.1,
                 max_tokens=8000,
                 json_mode=True,
+                timeout=90,
             )
             if not result_text:
                 raise RuntimeError("GPT heavy returned empty for text mode OCR")
@@ -898,6 +900,35 @@ def _get_cached_categorization(description: str, stage: str) -> Optional[dict]:
     return None
 
 
+def _get_vendor_affinity(vendor_id: str) -> Optional[dict]:
+    """
+    Check if vendor has a strong account affinity (>= 90% ratio, >= 5 uses).
+    Returns the dominant account or None.
+    """
+    if not vendor_id:
+        return None
+    try:
+        result = supabase.rpc("get_vendor_affinity", {
+            "p_vendor_id": vendor_id,
+            "p_min_count": 5,
+            "p_min_ratio": 0.90,
+        }).execute()
+
+        if result.data and len(result.data) > 0:
+            row = result.data[0]
+            return {
+                "account_id": row["account_id"],
+                "account_name": row["account_name"],
+                "confidence": 95,
+                "reasoning": f"Vendor affinity: {row['hit_count']} of {int(row['hit_count'] / max(row['ratio'], 0.01))} expenses ({int(row['ratio'] * 100)}%) assigned to this account",
+                "from_vendor_affinity": True,
+            }
+    except Exception as e:
+        print(f"[VendorAffinity] Lookup error: {e}")
+
+    return None
+
+
 def _save_to_cache(description: str, stage: str, categorization: dict):
     """Save a categorization result to cache."""
     try:
@@ -984,7 +1015,8 @@ def auto_categorize(
     expenses: list,
     project_id: Optional[str] = None,
     receipt_id: Optional[str] = None,
-    min_confidence: int = 60
+    min_confidence: int = 60,
+    vendor_id: Optional[str] = None,
 ) -> dict:
     """
     Core auto-categorization logic with caching and feedback loop.
@@ -1039,7 +1071,30 @@ def auto_categorize(
             cache_misses += 1
             expenses_needing_gpt.append(exp)
 
-    # Step 2: If all cached, return early
+    # Step 1.5: Vendor affinity shortcut for uncached items
+    # If the vendor has a strong historical preference (>= 90%, >= 5 uses),
+    # assign that account directly without calling GPT.
+    affinity_hits = 0
+    if vendor_id and expenses_needing_gpt:
+        affinity = _get_vendor_affinity(vendor_id)
+        if affinity:
+            still_need_gpt = []
+            for exp in expenses_needing_gpt:
+                categorizations.append({
+                    "rowIndex": exp["rowIndex"],
+                    "account_id": affinity["account_id"],
+                    "account_name": affinity["account_name"],
+                    "confidence": affinity["confidence"],
+                    "reasoning": affinity["reasoning"],
+                    "warning": None,
+                })
+                # Also save to description cache for future lookups
+                _save_to_cache(exp["description"], stage, affinity)
+                affinity_hits += 1
+            expenses_needing_gpt = still_need_gpt
+            print(f"[VendorAffinity] Applied affinity for vendor {vendor_id}: {affinity_hits} items -> {affinity['account_name']}")
+
+    # Step 2: If all resolved (cache + affinity), return early
     if not expenses_needing_gpt:
         elapsed_ms = int((time.time() - start_time) * 1000)
         return {
@@ -1047,6 +1102,7 @@ def auto_categorize(
             "metrics": {
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
+                "affinity_hits": affinity_hits,
                 "total_items": len(expenses),
                 "processing_time_ms": elapsed_ms
             }
@@ -1216,8 +1272,12 @@ IMPORTANT:
     # Step 6: Call GPT (mini tier w/ fallback to heavy if low confidence)
     from api.services.gpt_client import gpt
     system_inst = "You are a construction accounting expert. You always return valid JSON with accurate account categorizations."
+    # Dynamic timeout: 30s base + 3s per item (e.g. 20 items = 90s)
+    n_items = len(expenses_needing_gpt)
+    gpt_timeout = max(30.0, 30.0 + n_items * 3.0)
+    print(f"[SCAN-RECEIPT] auto-categorize: {n_items} items, timeout={gpt_timeout}s")
     gpt_start = time.time()
-    raw_response = gpt.mini(system_inst, prompt, json_mode=True, max_tokens=8000)
+    raw_response = gpt.mini(system_inst, prompt, json_mode=True, max_tokens=8000, timeout=gpt_timeout)
     tier_used = "mini"
 
     # Confidence fallback: if any categorization < min_confidence%, retry with heavy
@@ -1233,7 +1293,7 @@ IMPORTANT:
         except Exception:
             pass
     if not raw_response:
-        raw_response = gpt.heavy(system_inst, prompt, temperature=0.1, max_tokens=8000, json_mode=True)
+        raw_response = gpt.heavy(system_inst, prompt, temperature=0.1, max_tokens=8000, json_mode=True, timeout=gpt_timeout)
         tier_used = "heavy"
 
     gpt_elapsed = int((time.time() - gpt_start) * 1000)

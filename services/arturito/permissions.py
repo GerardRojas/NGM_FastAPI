@@ -4,11 +4,17 @@
 # ================================
 # Configuración centralizada de qué acciones puede ejecutar Arturito
 # Incluye permisos basados en roles de usuario
+# Permissions persist to agent_config table via arturito_perm_<INTENT> keys
 
+import os
+import json
 from typing import Dict, Any, List, Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Prefix used for storing Arturito permissions in agent_config table
+_PERM_KEY_PREFIX = "arturito_perm_"
 
 
 # ================================
@@ -443,3 +449,130 @@ def get_permissions_by_category() -> Dict[str, List[Dict[str, Any]]]:
         })
 
     return by_category
+
+
+# ================================
+# Database Persistence
+# ================================
+# Permissions are stored in the agent_config table with keys like
+# "arturito_perm_LIST_PROJECTS" = "true" or "false".
+# Defaults come from ARTURITO_PERMISSIONS dict above.
+
+_db_loaded = False
+
+
+def _get_supabase():
+    """Get Supabase client for permission persistence."""
+    try:
+        from supabase import create_client
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if url and key:
+            return create_client(url, key)
+    except Exception as e:
+        logger.warning(f"[Permissions] Supabase unavailable: {e}")
+    return None
+
+
+def load_permissions_from_db():
+    """
+    Load permission overrides from agent_config table.
+    Merges DB values into the in-memory ARTURITO_PERMISSIONS dict.
+    Only loads once per process (cached via _db_loaded flag).
+    """
+    global _db_loaded
+    if _db_loaded:
+        return
+
+    sb = _get_supabase()
+    if not sb:
+        _db_loaded = True
+        return
+
+    try:
+        result = sb.table("agent_config") \
+            .select("key, value") \
+            .like("key", f"{_PERM_KEY_PREFIX}%") \
+            .execute()
+
+        if result.data:
+            for row in result.data:
+                intent = row["key"].replace(_PERM_KEY_PREFIX, "")
+                if intent in ARTURITO_PERMISSIONS:
+                    ARTURITO_PERMISSIONS[intent]["enabled"] = row["value"].lower() == "true"
+
+            logger.info(f"[Permissions] Loaded {len(result.data)} permission overrides from DB")
+    except Exception as e:
+        logger.warning(f"[Permissions] Could not load from DB (using defaults): {e}")
+
+    _db_loaded = True
+
+
+def save_permission_to_db(intent: str, enabled: bool) -> bool:
+    """
+    Persist a single permission change to agent_config table.
+    Uses upsert pattern: SELECT then UPDATE or INSERT.
+
+    Returns True on success.
+    """
+    sb = _get_supabase()
+    if not sb:
+        return False
+
+    key = f"{_PERM_KEY_PREFIX}{intent}"
+    value = "true" if enabled else "false"
+
+    try:
+        # Check if exists
+        existing = sb.table("agent_config") \
+            .select("key") \
+            .eq("key", key) \
+            .execute()
+
+        if existing.data and len(existing.data) > 0:
+            sb.table("agent_config").update({"value": value}).eq("key", key).execute()
+        else:
+            sb.table("agent_config").insert({
+                "key": key,
+                "value": value,
+                "description": f"Arturito permission: {intent}",
+            }).execute()
+
+        # Also update in-memory
+        if intent in ARTURITO_PERMISSIONS:
+            ARTURITO_PERMISSIONS[intent]["enabled"] = enabled
+
+        return True
+    except Exception as e:
+        logger.error(f"[Permissions] Save to DB failed for {intent}: {e}")
+        return False
+
+
+def reset_permissions_to_defaults() -> bool:
+    """
+    Reset all permissions to hardcoded defaults and persist to DB.
+    """
+    # Define defaults (same as initial ARTURITO_PERMISSIONS values)
+    defaults = {
+        "LIST_PROJECTS": True, "LIST_VENDORS": True,
+        "BUDGET_VS_ACTUALS": True, "CONSULTA_ESPECIFICA": True,
+        "SCOPE_OF_WORK": True, "SEARCH_EXPENSES": True,
+        "CREATE_VENDOR": True, "CREATE_PROJECT": True,
+        "DELETE_VENDOR": False, "DELETE_PROJECT": False,
+        "UPDATE_VENDOR": False, "UPDATE_PROJECT": False,
+        "EXPENSE_REMINDER": True, "REPORT_BUG": True,
+        "NGM_ACTION": True, "COPILOT": True,
+    }
+
+    success = True
+    for intent, enabled in defaults.items():
+        if intent in ARTURITO_PERMISSIONS:
+            ARTURITO_PERMISSIONS[intent]["enabled"] = enabled
+        if not save_permission_to_db(intent, enabled):
+            success = False
+
+    return success
+
+
+# Auto-load on module import
+load_permissions_from_db()
