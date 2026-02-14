@@ -741,7 +741,17 @@ def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
         if not receipts_result.data:
             return {}
 
-        # Step 2: Build map of file_hash -> receipt_url
+        # Step 1.5: Detect processing/pending receipts early
+        status_map = {}
+        for row in receipts_result.data:
+            h = row.get("file_hash")
+            s = row.get("status")
+            if h and s == "processing":
+                status_map[h] = "processing"
+            elif h and s in ("pending", "error", "check_review") and h not in status_map:
+                status_map[h] = "pending"
+
+        # Step 2: Build map of file_hash -> receipt_url (for ready/linked receipts)
         hash_to_url = {}
         for row in receipts_result.data:
             h = row.get("file_hash")
@@ -751,7 +761,7 @@ def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
                 hash_to_url[h] = url
 
         if not hash_to_url:
-            return {}
+            return status_map
 
         # Step 3: Get bills for these receipt URLs
         receipt_urls = list(set(hash_to_url.values()))

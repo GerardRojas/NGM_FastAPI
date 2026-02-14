@@ -161,6 +161,12 @@ class EditCategoriesRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+class VaultBatchRequest(BaseModel):
+    """Batch process receipts from vault's Receipts folder"""
+    vault_file_ids: List[str]
+    project_id: str
+
+
 # ====== HELPERS ======
 
 # ====== ENDPOINTS ======
@@ -499,6 +505,209 @@ def clear_agent_metrics(current_user: dict = Depends(get_current_user)):
         logger.error(f"[agent-metrics] Error clearing metrics: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error clearing metrics: {str(e)}")
 
+
+# ====== VAULT BATCH PROCESSING ======
+# NOTE: These static routes MUST be defined before /{receipt_id} dynamic routes
+
+ALLOWED_RECEIPT_MIMES = {
+    "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif",
+    "application/pdf",
+}
+
+
+@router.post("/process-from-vault")
+async def process_from_vault(
+    payload: VaultBatchRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Bridge vault files to Andrew's receipt processing pipeline.
+    Creates pending_receipt entries from vault files, then processes each
+    in background with tiered OCR (fast-beta -> fast -> heavy).
+    """
+    from api.services.vault_service import get_download_url
+
+    batch_id = str(uuid.uuid4())
+    results = []
+    queued_receipt_ids = []
+
+    for vault_file_id in payload.vault_file_ids:
+        try:
+            # 1. Fetch vault file record
+            vf_resp = supabase.table("vault_files") \
+                .select("id, name, file_hash, bucket_path, mime_type, size_bytes, is_folder, is_deleted") \
+                .eq("id", vault_file_id) \
+                .execute()
+            vault_file = vf_resp.data[0] if vf_resp.data else None
+
+            if not vault_file:
+                results.append({"vault_file_id": vault_file_id, "status": "error", "message": "File not found"})
+                continue
+
+            if vault_file.get("is_folder") or vault_file.get("is_deleted"):
+                results.append({"vault_file_id": vault_file_id, "status": "skipped", "message": "Folder or deleted"})
+                continue
+
+            # 2. Validate mime type
+            mime = vault_file.get("mime_type", "")
+            if mime not in ALLOWED_RECEIPT_MIMES:
+                results.append({"vault_file_id": vault_file_id, "status": "skipped",
+                                "message": f"Unsupported type: {mime}"})
+                continue
+
+            # 3. Check if already processed
+            file_hash = vault_file.get("file_hash")
+            if file_hash:
+                existing = supabase.table("pending_receipts") \
+                    .select("id, status") \
+                    .eq("file_hash", file_hash) \
+                    .eq("project_id", payload.project_id) \
+                    .in_("status", ["processing", "ready", "linked"]) \
+                    .execute()
+                if existing.data:
+                    results.append({"vault_file_id": vault_file_id, "status": "skipped",
+                                    "message": f"Already processed ({existing.data[0]['status']})"})
+                    continue
+
+            # 4. Get download URL
+            download_url = get_download_url(vault_file_id)
+
+            # 5. Create pending_receipt entry
+            receipt_id = str(uuid.uuid4())
+            receipt_data = {
+                "id": receipt_id,
+                "project_id": payload.project_id,
+                "file_name": vault_file.get("name"),
+                "file_url": download_url,
+                "file_type": mime,
+                "file_size": vault_file.get("size_bytes", 0),
+                "file_hash": file_hash,
+                "thumbnail_url": f"{download_url}?width=200&height=200&resize=contain" if mime.startswith("image/") else None,
+                "status": "pending",
+                "uploaded_by": current_user.get("user_id", current_user.get("uid")),
+                "vault_file_id": vault_file_id,
+                "batch_id": batch_id,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            supabase.table("pending_receipts").insert(receipt_data).execute()
+
+            queued_receipt_ids.append(receipt_id)
+            results.append({"vault_file_id": vault_file_id, "receipt_id": receipt_id, "status": "queued",
+                            "file_name": vault_file.get("name")})
+
+        except Exception as e:
+            logger.error(f"[VaultBatch] Error queueing vault file {vault_file_id}: {e}")
+            results.append({"vault_file_id": vault_file_id, "status": "error", "message": str(e)})
+
+    # Queue background processing
+    if queued_receipt_ids:
+        background_tasks.add_task(
+            _process_vault_batch,
+            batch_id,
+            queued_receipt_ids,
+            payload.project_id,
+        )
+
+    return {
+        "batch_id": batch_id,
+        "total": len(payload.vault_file_ids),
+        "queued": len(queued_receipt_ids),
+        "results": results,
+    }
+
+
+async def _process_vault_batch(batch_id: str, receipt_ids: list, project_id: str):
+    """Process a batch of vault receipts sequentially through Andrew's pipeline."""
+    total = len(receipt_ids)
+    logger.info(f"[VaultBatch] START batch={batch_id} | {total} receipt(s) | mode=auto")
+
+    post_andrew_message(
+        content=f"Processing **{total}** receipt(s) from Vault...",
+        project_id=project_id,
+        metadata={
+            "agent_message": True,
+            "vault_batch_id": batch_id,
+            "vault_batch_total": total,
+            "vault_batch_started": True,
+        }
+    )
+
+    success_count = 0
+    error_count = 0
+
+    for i, receipt_id in enumerate(receipt_ids):
+        try:
+            logger.info(f"[VaultBatch] Processing {i+1}/{total} | receipt={receipt_id}")
+            await _agent_process_receipt_core(receipt_id, scan_mode="auto")
+            success_count += 1
+        except Exception as e:
+            error_count += 1
+            logger.error(f"[VaultBatch] Error processing receipt {receipt_id}: {e}")
+            try:
+                supabase.table("pending_receipts").update({
+                    "status": "error",
+                    "processing_error": str(e),
+                    "updated_at": datetime.utcnow().isoformat(),
+                }).eq("id", receipt_id).execute()
+            except Exception:
+                pass
+
+    # Post batch summary
+    summary = f"Vault batch complete: **{success_count}** processed"
+    if error_count > 0:
+        summary += f", **{error_count}** failed"
+    summary += f" ({total} total). Expenses are ready for review in the table."
+
+    post_andrew_message(
+        content=summary,
+        project_id=project_id,
+        metadata={
+            "agent_message": True,
+            "vault_batch_id": batch_id,
+            "vault_batch_complete": True,
+            "vault_batch_success": success_count,
+            "vault_batch_errors": error_count,
+        }
+    )
+
+    logger.info(f"[VaultBatch] DONE batch={batch_id} | success={success_count} errors={error_count}")
+
+
+@router.get("/vault-batch-status")
+async def vault_batch_status(
+    batch_id: str = Query(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get processing status for a vault batch."""
+    result = supabase.table("pending_receipts") \
+        .select("id, file_name, status, processing_error, vault_file_id, file_hash") \
+        .eq("batch_id", batch_id) \
+        .execute()
+
+    receipts = result.data or []
+    statuses = {"pending": 0, "processing": 0, "ready": 0, "linked": 0, "error": 0}
+    for r in receipts:
+        s = r.get("status", "pending")
+        if s in statuses:
+            statuses[s] += 1
+        elif s == "check_review":
+            statuses["ready"] += 1
+
+    terminal = {"ready", "linked", "error", "rejected", "check_review"}
+    complete = all(r.get("status") in terminal for r in receipts) if receipts else False
+
+    return {
+        "batch_id": batch_id,
+        "total": len(receipts),
+        "statuses": statuses,
+        "receipts": receipts,
+        "complete": complete,
+    }
+
+
+# ====== DYNAMIC RECEIPT ROUTES ======
 
 @router.get("/{receipt_id}")
 def get_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
@@ -1325,20 +1534,13 @@ def _build_confirm_summary(pre_resolved: dict, line_items: list, parsed_data: di
 
 # ====== AGENT ENDPOINT ======
 
-@router.post("/{receipt_id}/agent-process")
-async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
+async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
     """
-    Full automated processing pipeline for material receipts.
+    Core processing pipeline for material receipts.
+    Extracted so it can be called from both the endpoint and background batch jobs.
 
-    Pipeline:
-    1. Fetch receipt, download file
-    2. Split reuse detection / check detection
-    3. OCR extraction (OpenAI Vision)
-    4. Auto-categorize (GPT with construction stage context)
-    5. Update receipt with enriched data + receipt_flow
-    6. Post Andrew summary + project question (awaiting user response)
-
-    Expense creation happens in the receipt-action endpoint after user responds.
+    scan_mode: None = read from agent_config (legacy), "auto" = tiered escalation,
+               "fast-beta", "fast", "heavy" = force specific mode.
     """
     receipt_data = None
     project_id = None
@@ -1805,26 +2007,70 @@ async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(ge
 
         # ===== STEP 3: OCR Extraction (Shared Service) =====
         logger.info("[Agent] Step 2: No duplicate found, proceeding to OCR")
-        # Read scan mode from agent_config (default: heavy)
-        _scan_mode = "heavy"
-        try:
-            _mode_row = supabase.table("agent_config").select("value").eq("key", "andrew_scan_mode").execute()
-            if _mode_row.data and _mode_row.data[0].get("value") in ("fast", "heavy"):
-                _scan_mode = _mode_row.data[0]["value"]
-        except Exception:
-            pass
-        logger.info(f"[Agent] Step 3: Starting OCR extraction (mode={_scan_mode})...")
+        is_image_file = (file_type or "").startswith("image/")
+
+        # Determine scan mode based on parameter or config
+        if scan_mode == "auto":
+            # Tiered: images -> heavy (vision required), PDFs -> fast-beta first
+            _scan_mode = "heavy" if is_image_file else "fast-beta"
+        elif scan_mode in ("fast-beta", "fast", "heavy"):
+            _scan_mode = scan_mode
+        else:
+            # Legacy: read from agent_config (default: heavy)
+            _scan_mode = "heavy"
+            try:
+                _mode_row = supabase.table("agent_config").select("value").eq("key", "andrew_scan_mode").execute()
+                if _mode_row.data and _mode_row.data[0].get("value") in ("fast", "fast-beta", "heavy"):
+                    _scan_mode = _mode_row.data[0]["value"]
+            except Exception:
+                pass
+
+        logger.info(f"[Agent] Step 3: Starting OCR extraction (mode={_scan_mode}, requested={scan_mode})...")
+
+        # Tiered OCR with error-based escalation
         try:
             scan_result = _scan_receipt_core(file_content, file_type, model=_scan_mode)
         except ValueError as e:
-            if _scan_mode == "fast":
-                # Fast mode failed (no extractable text) -- auto-fallback to heavy
-                logger.warning(f"[Agent] Step 3: Fast mode failed ({e}), falling back to heavy...")
+            if _scan_mode == "fast-beta":
+                logger.warning(f"[Agent] Step 3: fast-beta failed ({e}), escalating to fast...")
+                try:
+                    scan_result = _scan_receipt_core(file_content, file_type, model="fast")
+                    _scan_mode = "fast"
+                except ValueError as e2:
+                    logger.warning(f"[Agent] Step 3: fast failed ({e2}), escalating to heavy...")
+                    scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
+                    _scan_mode = "heavy"
+            elif _scan_mode == "fast":
+                logger.warning(f"[Agent] Step 3: fast failed ({e}), escalating to heavy...")
                 scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
+                _scan_mode = "heavy"
             else:
                 raise HTTPException(status_code=400, detail=str(e))
         except RuntimeError as e:
             raise Exception(f"OCR extraction failed: {str(e)}")
+
+        # Confidence-based escalation: if fast-beta/fast returned no items or failed validation
+        if scan_mode == "auto" and _scan_mode in ("fast-beta", "fast"):
+            _items_count = len(scan_result.get("expenses", []))
+            _val_check = scan_result.get("validation", {})
+            if _items_count == 0 or not _val_check.get("validation_passed", True):
+                _next = "fast" if _scan_mode == "fast-beta" else "heavy"
+                logger.info(f"[Agent] Step 3: Confidence escalation {_scan_mode} -> {_next} (items={_items_count}, valid={_val_check.get('validation_passed')})")
+                try:
+                    scan_result = _scan_receipt_core(file_content, file_type, model=_next)
+                    _scan_mode = _next
+                    # Second escalation if still failing at fast
+                    if _scan_mode == "fast":
+                        _ic2 = len(scan_result.get("expenses", []))
+                        _vc2 = scan_result.get("validation", {})
+                        if _ic2 == 0 or not _vc2.get("validation_passed", True):
+                            logger.info("[Agent] Step 3: Second escalation fast -> heavy")
+                            scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
+                            _scan_mode = "heavy"
+                except Exception:
+                    if _scan_mode != "heavy":
+                        scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
+                        _scan_mode = "heavy"
 
         line_items = scan_result.get("expenses", [])
         validation = scan_result.get("validation", {})
@@ -2334,6 +2580,12 @@ async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(ge
             )
 
         raise HTTPException(status_code=500, detail=f"Agent processing error: {str(e)}")
+
+
+@router.post("/{receipt_id}/agent-process")
+async def agent_process_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
+    """Endpoint wrapper for agent processing (provides auth via Depends)."""
+    return await _agent_process_receipt_core(receipt_id)
 
 
 # ====== CHECK FLOW HELPERS ======

@@ -79,6 +79,9 @@ from api.routers.ocr_metrics import router as ocr_metrics_router
 from api.routers.revit import router as revit_router
 from api.routers.revit_ocr import router as revit_ocr_router
 
+# ========= CATEGORIZATION ML: TF-IDF + k-NN expense classification ==========
+from api.routers.categorization_ml import router as categorization_ml_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -207,6 +210,9 @@ app.include_router(revit_router)
 
 # Revit OCR (GPT-4o Vision floor plan analysis for Project Builder)
 app.include_router(revit_ocr_router)
+
+# Categorization ML (TF-IDF + k-NN expense classification, zero-GPT-cost)
+app.include_router(categorization_ml_router)
 
 # ========================================
 # Root & Healthcheck
