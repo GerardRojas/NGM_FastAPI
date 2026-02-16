@@ -283,10 +283,13 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
 
 
 @router.patch("/batch")
-def update_expenses_batch(payload: ExpenseBatchUpdate, current_user: dict = Depends(get_current_user)):
+def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """
     Actualiza múltiples gastos en una sola operación.
     Cada update se procesa individualmente pero en una sola llamada HTTP.
+
+    Query params:
+        - user_id: UUID of user making changes (for audit log)
 
     Returns:
         - updated: lista de gastos actualizados exitosamente
@@ -296,6 +299,7 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, current_user: dict = Depe
     try:
         updated = []
         failed = []
+        status_logs = []
 
         for item in payload.updates:
             try:
@@ -310,6 +314,27 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, current_user: dict = Depe
                         "error": "No fields to update"
                     })
                     continue
+
+                # Log status change if status is being updated (e.g. auto-review)
+                new_status = update_data.get("status")
+                if new_status and user_id:
+                    try:
+                        existing = supabase.table("expenses_manual_COGS").select("status, auth_status").eq(
+                            "expense_id", item.expense_id
+                        ).single().execute()
+                        if existing.data:
+                            old_status = existing.data.get("status") or ("auth" if existing.data.get("auth_status") else "pending")
+                            if old_status != new_status:
+                                status_logs.append({
+                                    "expense_id": item.expense_id,
+                                    "old_status": old_status,
+                                    "new_status": new_status,
+                                    "changed_by": user_id,
+                                    "reason": update_data.get("status_reason") or "Field modification (batch edit)",
+                                    "metadata": {"via_batch": True}
+                                })
+                    except Exception:
+                        pass  # Non-critical: don't block update if logging fails
 
                 # Actualizar el gasto
                 res = supabase.table("expenses_manual_COGS").update(update_data).eq(
@@ -329,6 +354,13 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, current_user: dict = Depe
                     "expense_id": item.expense_id,
                     "error": str(e)
                 })
+
+        # Batch insert status change logs (non-blocking)
+        if status_logs:
+            try:
+                supabase.table("expense_status_log").insert(status_logs).execute()
+            except Exception as log_err:
+                print(f"[BATCH] Status log insert failed: {log_err}")
 
         return {
             "message": f"Batch update completed: {len(updated)} updated, {len(failed)} failed",

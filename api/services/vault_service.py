@@ -733,7 +733,7 @@ def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
         # Step 1: Get pending_receipts that match the hashes
         receipts_result = (
             supabase.table("pending_receipts")
-            .select("file_hash, receipt_url, status")
+            .select("file_hash, file_url, status")
             .in_("file_hash", file_hashes)
             .execute()
         )
@@ -755,7 +755,7 @@ def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
         hash_to_url = {}
         for row in receipts_result.data:
             h = row.get("file_hash")
-            url = row.get("receipt_url")
+            url = row.get("file_url")
             s = row.get("status")
             if h and url and s in ("ready", "linked"):
                 hash_to_url[h] = url
