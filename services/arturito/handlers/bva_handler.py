@@ -306,7 +306,8 @@ def _gpt_ask_missing_entity(
     raw_text: str,
     missing: str,
     hint: str,
-    space_id: str = "default"
+    space_id: str = "default",
+    report_type: str = "budget"
 ) -> str:
     """
     Uses GPT + persona to generate a natural follow-up question
@@ -317,6 +318,7 @@ def _gpt_ask_missing_entity(
         missing: What's missing ("project" or "category")
         hint: Extra context like available project names
         space_id: For personality level lookup
+        report_type: Type of report ("budget" for BVA, "P&L COGS" for PNL)
     """
     from services.arturito.persona import get_persona_prompt
 
@@ -338,7 +340,7 @@ def _gpt_ask_missing_entity(
         persona = get_persona_prompt(space_id)
         result = gpt.mini(
             f"{persona}\n\n"
-            f"The user asked a budget question but didn't specify the {missing}. "
+            f"The user asked for a {report_type} report but didn't specify the {missing}. "
             f"Generate a SHORT follow-up question asking for the {missing}. "
             f"Reply in the SAME LANGUAGE the user wrote in. "
             f"Keep it to 1-2 sentences max. "

@@ -78,7 +78,7 @@ def handle_pnl_cogs(
             data = {
                 "projects": [{"id": p.get("project_id"), "name": p.get("project_name")} for p in recent_projects]
             }
-        text = _gpt_ask_missing_entity(raw_text, "project", hint, space_id)
+        text = _gpt_ask_missing_entity(raw_text, "project", hint, space_id, report_type="P&L COGS")
         result = {
             "ok": False,
             "text": text,
