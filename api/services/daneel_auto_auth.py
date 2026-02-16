@@ -14,6 +14,7 @@
 import logging
 import re
 import os
+import time
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1044,6 +1045,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
     process_all=True: process ALL pending expenses (backlog).
     project_id: if provided, only process expenses for this project.
     """
+    t0 = time.monotonic()
     cfg = load_auto_auth_config()
 
     # Per-project manual runs bypass the global auto-auth toggle
@@ -1052,6 +1054,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
 
     sb = _get_supabase()
     lookups = _load_lookups(sb)
+    logger.info("[DaneelAutoAuth] Starting run | process_all=%s project_id=%s", process_all, project_id)
 
     last_run = cfg.get("daneel_auto_auth_last_run")
     now = datetime.now(timezone.utc).isoformat()
@@ -1070,7 +1073,9 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
     pending = result.data or []
     if not pending:
         _save_config_key("daneel_auto_auth_last_run", now)
+        logger.info("[DaneelAutoAuth] No pending expenses found")
         return {"status": "ok", "message": "No new pending expenses", "authorized": 0}
+    logger.info("[DaneelAutoAuth] Found %d pending expenses across projects", len(pending))
 
     # Load all bills metadata (normalized keys for case-insensitive lookup)
     bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
@@ -1560,6 +1565,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
     if not project_id:
         _save_config_key("daneel_auto_auth_last_run", now)
 
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
     summary = {
         "status": "ok",
         "authorized": total_authorized,
@@ -1569,7 +1575,8 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
         "expenses_processed": len(pending),
         "missing_detail": missing_detail[:20],  # cap for response size
     }
-    logger.info(f"[DaneelAutoAuth] Run complete: {summary}")
+    logger.info("[DaneelAutoAuth] Run complete in %dms | processed=%d authorized=%d missing=%d duplicates=%d escalated=%d",
+                 elapsed_ms, len(pending), total_authorized, total_missing, total_duplicates, total_escalated)
 
     # Save auth report
     if all_decisions:

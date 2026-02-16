@@ -874,12 +874,12 @@ def detect_vendor_format(text: str) -> Optional[str]:
 # ── Home Depot vendor parser ─────────────────────────────────
 
 _HD_ITEM_RE = re.compile(
-    r'^R(\d{2})\s+'                    # R## reference
+    r'^([RV])(\d{2})\s+'               # R## or V## reference
     r'(\d{4}-\d{3}-\d{3})\s+'         # SKU (####-###-###)
     r'(\d+\.\d{2})\s+'                # Quantity
     r'([A-Z]{2})\s+'                   # Unit of measure
-    r'(.+?)\s+'                        # Description (lazy up to Y $)
-    r'Y\s+'                            # Tax indicator
+    r'(.+?)\s+'                        # Description (lazy up to tax indicator $)
+    r'[YN]\s+'                         # Tax indicator (Y=taxable, N=non-taxable)
     r'\$(\d[\d,.]*\.\d{2})\s+'         # Unit price
     r'\$(\d[\d,.]*\.\d{2})\*?\s*$',    # Extension (line total)
     re.IGNORECASE,
@@ -900,9 +900,9 @@ def _parse_home_depot(text: str) -> dict:
         'items_sum': 0, 'vendor_detected': 'home_depot',
     }
 
-    # Bill ID: "No. H####-######"
+    # Bill ID: "No. H####-######" or "No. H####-#######" (6-7 digits)
     for line in lines:
-        m = re.search(r'\bNo\.\s*(H\d{4}-\d{6})', line)
+        m = re.search(r'\bNo\.\s*(H\d{4}-\d{6,7})', line)
         if m:
             meta['bill_id'] = m.group(1)
             break
@@ -917,16 +917,18 @@ def _parse_home_depot(text: str) -> dict:
     # Payment hints
     meta['payment_hints'] = _extract_payment_hints(text)
 
-    # Line items: R## pattern with multi-line description support
+    # Line items: R##/V## pattern with multi-line description support
     for idx, line in enumerate(lines):
         m = _HD_ITEM_RE.match(line.strip())
         if not m:
             continue
 
-        qty = float(m.group(3))
-        um = m.group(4)
-        desc_raw = m.group(5).strip().rstrip('/').strip()
-        extension = _parse_amt(m.group(7))
+        prefix = m.group(1)   # R or V
+        ref_num = m.group(2)  # ## number
+        qty = float(m.group(4))
+        um = m.group(5)
+        desc_raw = m.group(6).strip().rstrip('/').strip()
+        extension = _parse_amt(m.group(8))
 
         # Append continuation lines (description wraps to next line, ends with /)
         for next_idx in range(idx + 1, min(idx + 3, len(lines))):
@@ -948,11 +950,13 @@ def _parse_home_depot(text: str) -> dict:
         meta['line_items'].append({
             'description': item_desc,
             'amount': extension,
-            'sku': m.group(2),
-            'ref': f'R{m.group(1)}',
+            'sku': m.group(3),
+            'ref': f'{prefix}{ref_num}',
         })
 
-    # Totals: MERCHANDISE TOTAL, SALES TAX, TOTAL
+    # Totals: MERCHANDISE TOTAL, SALES TAX, ORDER TOTAL / TOTAL
+    # Multi-section invoices may have multiple MERCHANDISE TOTAL lines (sum them)
+    subtotal_parts = []
     for line in lines:
         stripped = line.strip()
         upper = stripped.upper()
@@ -960,16 +964,19 @@ def _parse_home_depot(text: str) -> dict:
         if 'MERCHANDISE TOTAL' in upper:
             amts = _find_amounts(line)
             if amts:
-                meta['subtotal'] = amts[-1]
+                subtotal_parts.append(amts[-1])
         elif re.match(r'^SALES\s+TAX', upper):
             amts = _find_amounts(line)
             if amts:
                 meta['tax_amount'] = amts[-1]
                 meta['tax_label'] = 'SALES TAX'
-        elif re.match(r'^TOTAL\s', upper) and 'MERCHANDISE' not in upper and 'CHARGES' not in upper:
+        elif re.search(r'(?:^|\bORDER\s+)TOTAL\b', upper) and 'MERCHANDISE' not in upper and 'CHARGES' not in upper:
             amts = _find_amounts(line)
             if amts and amts[-1] > 0:
                 meta['grand_total'] = amts[-1]
+
+    if subtotal_parts:
+        meta['subtotal'] = round(sum(subtotal_parts), 2)
 
     meta['items_sum'] = round(sum(i['amount'] for i in meta['line_items']), 2)
     meta['confidence'] = _compute_confidence(meta)

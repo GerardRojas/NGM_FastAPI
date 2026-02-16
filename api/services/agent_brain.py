@@ -16,6 +16,7 @@ import re
 import json
 import time
 import asyncio
+import logging
 import traceback
 from typing import Dict, Any, Optional, Tuple
 from api.services.gpt_client import gpt
@@ -24,6 +25,8 @@ from api.services.agent_registry import get_functions, get_function, format_func
 from api.services.agent_personas import (
     get_persona, get_other_agent, get_cross_agent_suggestion, is_bot_user,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Rate limiting (in-memory, per-process)
@@ -90,6 +93,32 @@ IMPORTANT RULES:
 Respond with ONLY the JSON object. No explanation, no markdown.
 """
 
+# Minimum routing confidence to execute an action directly.
+# Below this, the brain will try a context-enriched re-route before dispatching.
+REROUTE_CONFIDENCE_THRESHOLD = 0.6
+
+REROUTE_CONTEXT_PROMPT = """\
+The user's CURRENT message was unclear on its own (initial routing confidence: {initial_confidence:.0%}).
+However, the conversation history may provide the missing context.
+
+## Recent conversation (most recent last)
+{conversation_context}
+
+## Current user message
+"{user_text}"
+
+Given the conversation history above, re-analyze the user's current message.
+The user may be:
+- Answering a previous question from you (the agent)
+- Referring to something mentioned earlier in the conversation
+- Providing follow-up details for a prior request
+
+If the conversation context clarifies the user's intent, route with higher confidence.
+If it's still unclear, use "clarify" and ask a specific question.
+
+{original_prompt}
+"""
+
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -116,20 +145,22 @@ async def invoke_brain(
 
     # Loop prevention layer 1: bot user check
     if is_bot_user(user_id):
-        print(f"{tag} Ignoring message from bot user {user_id}")
+        logger.info("%s Ignoring message from bot user %s", tag, user_id)
         return
 
     # Rate limit
     if not _check_cooldown(user_id, agent_name):
-        print(f"{tag} Cooldown active for user {user_id}")
+        logger.info("%s Cooldown active for user %s", tag, user_id)
         return
 
     persona = get_persona(agent_name)
     if not persona:
-        print(f"{tag} Unknown agent: {agent_name}")
+        logger.warning("%s Unknown agent: %s", tag, agent_name)
         return
 
     try:
+        t0 = time.monotonic()
+
         # 1. Build context
         context = await _build_brain_context(
             agent_name, project_id, channel_type, channel_id
@@ -145,6 +176,8 @@ async def invoke_brain(
             attachments=attachments,
         )
 
+        route_ms = int((time.monotonic() - t0) * 1000)
+
         if not decision:
             await _post_response(
                 agent_name, project_id, channel_type, channel_id,
@@ -154,6 +187,40 @@ async def invoke_brain(
             return
 
         action = decision.get("action", "free_chat")
+        confidence = decision.get("confidence", 0)
+        fn_name = decision.get("function", "")
+        logger.info("%s Routed in %dms | action=%s confidence=%.2f fn=%s | text: '%s'",
+                     tag, route_ms, action, confidence, fn_name, user_text[:80])
+
+        # 2b. Re-route with enriched context if confidence is low
+        #     Skip re-route for free_chat/clarify (already conversational)
+        if (confidence < REROUTE_CONFIDENCE_THRESHOLD
+                and action not in ("free_chat", "clarify")):
+            logger.info("%s Low confidence (%.2f < %.2f), attempting context re-route",
+                         tag, confidence, REROUTE_CONFIDENCE_THRESHOLD)
+            decision = await _reroute_with_context(
+                agent_name, persona, user_text, user_name,
+                context, decision, attachments,
+            )
+            # Refresh action/confidence from (possibly updated) decision
+            action = decision.get("action", "free_chat")
+            confidence = decision.get("confidence", 0)
+            fn_name = decision.get("function", "")
+
+            # If still low after re-route, force clarify
+            if (confidence < REROUTE_CONFIDENCE_THRESHOLD
+                    and action not in ("free_chat", "clarify")):
+                logger.info("%s Still low after re-route (%.2f), forcing clarify", tag, confidence)
+                decision = {
+                    "action": "clarify",
+                    "question": (
+                        f"I'm not fully sure what you need. "
+                        f"Could you give me a bit more detail?"
+                    ),
+                    "confidence": confidence,
+                    "_forced_clarify": True,
+                }
+                action = "clarify"
 
         # 3. Dispatch
         if action == "function_call":
@@ -186,7 +253,7 @@ async def invoke_brain(
             )
 
     except Exception as e:
-        print(f"{tag} Brain error: {e}\n{traceback.format_exc()}")
+        logger.error("%s Brain error: %s\n%s", tag, e, traceback.format_exc())
         await _post_response(
             agent_name, project_id, channel_type, channel_id,
             "Something went wrong on my end. Try again in a moment.",
@@ -226,13 +293,13 @@ async def _build_brain_context(
         except Exception:
             pass
 
-    # Recent messages in this channel (last 5)
+    # Recent messages in this channel (last 10)
     try:
         query = sb.table("messages") \
             .select("content, user_id, created_at") \
             .eq("channel_type", channel_type) \
             .order("created_at", desc=True) \
-            .limit(5)
+            .limit(10)
 
         if channel_id:
             query = query.eq("channel_id", channel_id)
@@ -352,11 +419,11 @@ async def _route(
                 parsed = _parse_routing_json(raw)
                 confidence = float(parsed.get("confidence", 0))
                 if confidence >= min_confidence:
-                    print(f"[AgentBrain:{agent_name}] mini routing confident ({confidence:.2f})")
+                    logger.info("[AgentBrain:%s] mini routing confident (%.2f)", agent_name, confidence)
                     return parsed
-                print(f"[AgentBrain:{agent_name}] mini confidence {confidence:.2f} < {min_confidence}, escalating to heavy")
+                logger.info("[AgentBrain:%s] mini confidence %.2f < %.2f, escalating to heavy", agent_name, confidence, min_confidence)
             except (json.JSONDecodeError, ValueError):
-                print(f"[AgentBrain:{agent_name}] mini JSON parse failed, escalating to heavy")
+                logger.warning("[AgentBrain:%s] mini JSON parse failed, escalating to heavy", agent_name)
 
         # Step 2: Fallback to gpt-5.2 (heavy, reliable)
         raw = await gpt.heavy_async(system_prompt, user_text, temperature=0.1,
@@ -365,14 +432,110 @@ async def _route(
             try:
                 return _parse_routing_json(raw)
             except json.JSONDecodeError:
-                print(f"[AgentBrain:{agent_name}] heavy JSON parse also failed: {raw[:200]}")
+                logger.warning("[AgentBrain:%s] heavy JSON parse also failed: %s", agent_name, raw[:200])
                 return {"action": "free_chat", "response": raw}
 
         return None
 
     except Exception as e:
-        print(f"[AgentBrain:{agent_name}] Routing GPT error: {e}")
+        logger.error("[AgentBrain:%s] Routing GPT error: %s", agent_name, e)
         return None
+
+
+async def _reroute_with_context(
+    agent_name: str,
+    persona: Dict[str, Any],
+    user_text: str,
+    user_name: str,
+    context: Dict[str, Any],
+    initial_decision: Dict[str, Any],
+    attachments: Optional[list] = None,
+) -> Dict[str, Any]:
+    """
+    Re-route with enriched conversation context when initial confidence is low.
+
+    Builds a prompt that explicitly tells GPT to use the conversation history
+    to disambiguate the user's intent. Returns the better decision (higher
+    confidence) between the initial and re-routed result.
+    """
+    tag = f"[AgentBrain:{agent_name}]"
+    initial_conf = float(initial_decision.get("confidence", 0))
+
+    # Build a richer conversation context (chronological, with role labels)
+    conv_lines = context.get("recent_messages", [])
+    if not conv_lines:
+        logger.info("%s Re-route skipped: no conversation history", tag)
+        return initial_decision
+
+    conversation_context = "\n".join(conv_lines)
+
+    other_agent = get_other_agent(agent_name)
+    attachments_ctx = ""
+    if attachments:
+        att_lines = [f"  - {a.get('name', 'unknown')} ({a.get('type', 'unknown')})" for a in attachments]
+        attachments_ctx = (
+            "\n- Attachments:\n" + "\n".join(att_lines) + "\n"
+            "  IMPORTANT: The user attached file(s). If they are receipts/invoices "
+            "(PDF, image), use the process_receipt function."
+        )
+
+    original_prompt = BRAIN_ROUTING_PROMPT.format(
+        brain_summary=persona["brain_summary"],
+        function_menu=format_functions_for_llm(agent_name),
+        other_agent=other_agent or "N/A",
+        project_name=context["project_name"],
+        project_id=context["project_id"],
+        user_name=user_name,
+        channel_type="receipts" if "receipt" in (context.get("channel_type") or "") else "general",
+        attachments_context=attachments_ctx,
+        recent_messages="(see conversation context above)",
+    )
+
+    enriched_prompt = REROUTE_CONTEXT_PROMPT.format(
+        initial_confidence=initial_conf,
+        conversation_context=conversation_context,
+        user_text=user_text,
+        original_prompt=original_prompt,
+    )
+
+    try:
+        t0 = time.monotonic()
+        # Use heavy model directly for re-route (we already tried mini)
+        raw = await gpt.heavy_async(
+            enriched_prompt, user_text,
+            temperature=0.1, max_tokens=300, json_mode=True,
+        )
+        reroute_ms = int((time.monotonic() - t0) * 1000)
+
+        if not raw:
+            logger.info("%s Re-route returned empty in %dms, keeping initial", tag, reroute_ms)
+            return initial_decision
+
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        rerouted = json.loads(cleaned)
+        new_conf = float(rerouted.get("confidence", 0))
+
+        logger.info(
+            "%s Re-routed in %dms | initial=%.2f -> rerouted=%.2f | action=%s fn=%s",
+            tag, reroute_ms, initial_conf, new_conf,
+            rerouted.get("action", "?"), rerouted.get("function", ""),
+        )
+
+        # Use the re-routed result if it's more confident
+        if new_conf > initial_conf:
+            rerouted["_rerouted"] = True
+            rerouted["_initial_confidence"] = initial_conf
+            return rerouted
+
+        return initial_decision
+
+    except Exception as e:
+        logger.warning("%s Re-route failed: %s", tag, e)
+        return initial_decision
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +591,10 @@ async def _execute_function_call(
             params["_user_text"] = user_text
 
         # Execute the handler
+        t_fn = time.monotonic()
         result = await _call_handler(agent_name, fn_def, params)
+        fn_ms = int((time.monotonic() - t_fn) * 1000)
+        logger.info("%s Function %s completed in %dms", tag, fn_name, fn_ms)
 
         # Format result into readable text
         result_text = _format_result(agent_name, fn_name, result)
@@ -446,7 +612,7 @@ async def _execute_function_call(
             )
 
     except Exception as e:
-        print(f"{tag} Function {fn_name} failed: {e}\n{traceback.format_exc()}")
+        logger.error("%s Function %s failed: %s\n%s", tag, fn_name, e, traceback.format_exc())
         error_msg = f"I ran into a problem executing {fn_name}: {str(e)[:100]}"
         await _post_response(
             agent_name, project_id, channel_type, channel_id,
@@ -1065,11 +1231,11 @@ async def _extract_user_context(
             raw = re.sub(r"\s*```$", "", raw)
 
         result = json.loads(raw)
-        print(f"[UserContext] Extracted: {json.dumps(result, ensure_ascii=False)[:200]}")
+        logger.info("[UserContext] Extracted: %s", json.dumps(result, ensure_ascii=False)[:200])
         return result
 
     except Exception as e:
-        print(f"[UserContext] Extraction failed (non-blocking): {e}")
+        logger.warning("[UserContext] Extraction failed (non-blocking): %s", e)
         return {}
 
 
@@ -1102,11 +1268,11 @@ async def _extract_check_context(
             raw = re.sub(r"\s*```$", "", raw)
 
         result = json.loads(raw)
-        print(f"[CheckContext] Extracted: {json.dumps(result, ensure_ascii=False)[:250]}")
+        logger.info("[CheckContext] Extracted: %s", json.dumps(result, ensure_ascii=False)[:250])
         return result
 
     except Exception as e:
-        print(f"[CheckContext] Extraction failed (non-blocking): {e}")
+        logger.warning("[CheckContext] Extraction failed (non-blocking): %s", e)
         return {}
 
 
@@ -1157,7 +1323,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         # 1. Download file bytes from the attachment URL
-        print(f"{tag} Downloading {file_name} from {file_url[:80]}...")
+        logger.info("%s Downloading %s from %s...", tag, file_name, file_url[:80])
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(file_url)
             resp.raise_for_status()
@@ -1194,7 +1360,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         receipt_id = str(uuid4())
         from api.services.vault_service import save_to_project_folder
 
-        print(f"{tag} Saving to vault Receipts folder for project {project_id[:8]}...")
+        logger.info("%s Saving to vault Receipts folder for project %s...", tag, project_id[:8])
         vault_result = save_to_project_folder(
             project_id=project_id,
             folder_name="Receipts",
@@ -1238,11 +1404,11 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
             receipt_data["thumbnail_url"] = f"{public_url}?width=200&height=200&resize=contain"
 
         sb.table("pending_receipts").insert(receipt_data).execute()
-        print(f"{tag} Created pending_receipt {receipt_id}")
+        logger.info("%s Created pending_receipt %s", tag, receipt_id)
 
         # 5. Run OCR scan
         from services.receipt_scanner import scan_receipt
-        print(f"{tag} Running OCR scan...")
+        logger.info("%s Running OCR scan...", tag)
         scan_result = scan_receipt(
             file_content=file_content,
             file_type=file_type,
@@ -1285,9 +1451,9 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                 cat_result = auto_categorize(construction_stage, cat_input, project_id=project_id, min_confidence=_min_conf)
                 categorize_data = cat_result.get("categorizations", [])
                 metrics = cat_result.get("metrics", {})
-                print(f"{tag} Categorized {len(categorize_data)} items (cache hits: {metrics.get('cache_hits', 0)}/{metrics.get('total_items', 0)})")
+                logger.info("%s Categorized %d items (cache hits: %d/%d)", tag, len(categorize_data), metrics.get('cache_hits', 0), metrics.get('total_items', 0))
             except Exception as cat_err:
-                print(f"{tag} Categorization failed (non-blocking): {cat_err}")
+                logger.warning("%s Categorization failed (non-blocking): %s", tag, cat_err)
 
         # 6.5 Build line_items with categorization (like agent-process)
         vendor = expenses[0].get("vendor", "Unknown") if expenses else "Unknown"
@@ -1358,7 +1524,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         )
         if not default_payment_id and payment_resp.data:
             default_payment_id = payment_resp.data[0].get("id")
-            print(f"{tag} WARNING: No 'debit' payment method found, using fallback: {payment_resp.data[0].get('payment_method_name')}")
+            logger.warning("%s No 'debit' payment method found, using fallback: %s", tag, payment_resp.data[0].get('payment_method_name'))
 
         ocr_txn_type = first_item.get("transaction_type", "Unknown")
         resolved_txn_type_id = txn_types_map.get(ocr_txn_type.lower()) if ocr_txn_type and ocr_txn_type != "Unknown" else None
@@ -1368,7 +1534,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         resolved_payment_id = payment_map.get(ocr_payment.lower()) if ocr_payment and ocr_payment != "Unknown" else None
         payment_method_id = resolved_payment_id or default_payment_id
 
-        print(f"{tag} Resolved txn_type_id={txn_type_id}, payment_method_id={payment_method_id} (ocr_payment={ocr_payment}, default={default_payment_id})")
+        logger.info("%s Resolved txn_type_id=%s, payment_method_id=%s (ocr_payment=%s)", tag, txn_type_id, payment_method_id, ocr_payment)
 
         parsed_data = {
             "vendor_name": vendor,
@@ -1417,7 +1583,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                 })
 
         if low_confidence_items:
-            print(f"{tag} {len(low_confidence_items)} item(s) with low confidence")
+            logger.info("%s %d item(s) with low confidence", tag, len(low_confidence_items))
 
         # 7. Extract user context from message text
         user_text = params.get("_user_text", "")
@@ -1523,7 +1689,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                     "pre_resolved": pre_resolved,
                 }
             )
-            print(f"{tag} Posted confirm summary (user context resolved all steps)")
+            logger.info("%s Posted confirm summary (user context resolved all steps)", tag)
 
         elif flow_state == "awaiting_category_confirmation":
             # Build category question message
@@ -1565,7 +1731,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                     "low_confidence_items": low_confidence_items,
                 }
             )
-            print(f"{tag} Posted category question ({len(low_confidence_items)} items)")
+            logger.info("%s Posted category question (%d items)", tag, len(low_confidence_items))
 
         else:
             # Normal flow: awaiting_item_selection
@@ -1600,7 +1766,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                     "receipt_flow_active": True,
                 }
             )
-            print(f"{tag} Posted project question (normal flow)")
+            logger.info("%s Posted project question (normal flow)", tag)
 
         # Return status for brain formatting (messages already posted above)
         return {
@@ -1618,7 +1784,7 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        print(f"{tag} Error: {e}\n{traceback.format_exc()}")
+        logger.error("%s Error: %s\n%s", tag, e, traceback.format_exc())
         return {"error": f"Failed to process receipt: {str(e)[:150]}"}
 
 
@@ -1787,7 +1953,7 @@ async def _personalize(agent_name: str, raw_text: str) -> str:
         return raw_text
     result = await gpt.mini_async(persona["conversation_prompt"], raw_text, max_tokens=500)
     if not result:
-        print(f"[AgentBrain:{agent_name}] Personality pass returned empty, using raw")
+        logger.info("[AgentBrain:%s] Personality pass returned empty, using raw", agent_name)
         return raw_text
     return result
 
@@ -1800,7 +1966,7 @@ async def _generate_conversation(
     """Generate a full conversational response (for free chat when router didn't provide one)."""
     result = await gpt.mini_async(persona["conversation_prompt"], user_text, max_tokens=300)
     if not result:
-        print(f"[AgentBrain:{agent_name}] Conversation generation failed")
+        logger.warning("[AgentBrain:%s] Conversation generation failed", agent_name)
         return "I'm having a moment. Try again."
     return result
 
@@ -1841,7 +2007,7 @@ async def _post_response(
                 metadata=meta,
             )
         else:
-            print(f"[AgentBrain:daneel] Cannot post without project_id")
+            logger.warning("[AgentBrain:daneel] Cannot post without project_id")
 
 
 # ---------------------------------------------------------------------------
@@ -1876,10 +2042,10 @@ async def resolve_bill_reference(text: str, project_id: Optional[str]) -> Option
             return result.data[0]["bill_id"]
         elif result.data and len(result.data) > 1:
             # Multiple matches -- return the first one but log ambiguity
-            print(f"[AgentBrain] Ambiguous bill reference '{partial_id}': {len(result.data)} matches")
+            logger.info("[AgentBrain] Ambiguous bill reference '%s': %d matches", partial_id, len(result.data))
             return result.data[0]["bill_id"]
 
     except Exception as e:
-        print(f"[AgentBrain] Bill resolution error: {e}")
+        logger.warning("[AgentBrain] Bill resolution error: %s", e)
 
     return None

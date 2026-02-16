@@ -7,9 +7,13 @@
 import re
 import json
 import os
+import time
+import logging
 from typing import Dict, Any, Optional
 from api.services.gpt_client import gpt
 from .persona import get_persona_prompt
+
+logger = logging.getLogger(__name__)
 
 # ================================
 # Tipos de Intent soportados
@@ -166,7 +170,7 @@ def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
     # ---- Step 4: Signal detected but extraction failed ----
     # Regex detected a budget question but couldn't parse entities.
     # Log for diagnostics; GPT will handle via normal fallback.
-    print(f"[NLU] Budget signal detected but entity extraction failed: '{t}'")
+    logger.info("[NLU] Budget signal detected but entity extraction failed: '%s'", t[:80])
     return None
 
 
@@ -860,14 +864,17 @@ def interpret_with_gpt(text: str, context: Dict[str, Any] = None) -> Dict[str, A
             context_info = f"\n\nContexto: El usuario está en el espacio '{context['space_name']}'"
 
     try:
-        raw_response = gpt.mini(
+        t0 = time.monotonic()
+        raw_response = gpt.with_fallback(
             NLU_SYSTEM_PROMPT,
             f"Mensaje del usuario: {text}{context_info}",
-            json_mode=True,
+            min_confidence=0.85,
             max_tokens=200,
         )
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
 
         if not raw_response:
+            logger.warning("[NLU] GPT returned empty response after %dms | text: '%s'", elapsed_ms, text[:80])
             return {
                 "intent": "UNKNOWN",
                 "entities": {},
@@ -884,12 +891,15 @@ def interpret_with_gpt(text: str, context: Dict[str, Any] = None) -> Dict[str, A
         # Parsear JSON
         parsed = json.loads(cleaned)
 
-        return {
+        result = {
             "intent": parsed.get("intent", "UNKNOWN").upper(),
             "entities": parsed.get("entities", {}),
             "confidence": parsed.get("confidence", 0.7),
             "source": "gpt"
         }
+        logger.info("[NLU] GPT path | intent=%s confidence=%.2f %dms | text: '%s'",
+                     result["intent"], result["confidence"], elapsed_ms, text[:80])
+        return result
 
     except json.JSONDecodeError as e:
         return {
@@ -933,9 +943,12 @@ def interpret_message(text: str, context: Dict[str, Any] = None) -> Dict[str, An
     local_result = interpret_local(clean_text)
     if local_result:
         local_result["raw_text"] = clean_text
+        logger.info("[NLU] REGEX path | intent=%s confidence=%.2f | text: '%s'",
+                     local_result["intent"], local_result["confidence"], clean_text[:80])
         return local_result
 
-    # 2. Delegar a GPT
+    # 2. Delegar a GPT (mini -> heavy fallback)
+    logger.info("[NLU] No regex match, delegating to GPT | text: '%s'", clean_text[:80])
     gpt_result = interpret_with_gpt(clean_text, context)
     gpt_result["raw_text"] = clean_text
 

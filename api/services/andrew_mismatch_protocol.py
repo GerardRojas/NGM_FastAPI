@@ -22,6 +22,7 @@ import logging
 import os
 import json
 import re
+import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
@@ -198,6 +199,7 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
     Tries pdfplumber text extraction first for PDFs, falls back to GPT-4o Vision.
     Returns parsed dict or None on failure.
     """
+    t0 = time.monotonic()
     downloaded = _download_receipt(receipt_url)
     if not downloaded:
         return None
@@ -288,11 +290,13 @@ def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
                     f"vs total=${ocr_total:,.2f} / subtotal=${ocr_subtotal:,.2f} -- inconsistent"
                 )
 
+        extract_ms = int((time.monotonic() - t0) * 1000)
         logger.info(
-            f"[AndrewMismatch] Extracted {len(line_items)} line items via "
-            f"{'pdfplumber+gpt' if extracted_text else 'vision'}, "
-            f"subtotal=${ocr_subtotal:,.2f} tax=${ocr_tax:,.2f} total=${ocr_total:,.2f} "
-            f"(confidence={data.get('confidence', confidence)}%)"
+            "[AndrewMismatch] Extracted %d line items via %s in %dms | "
+            "subtotal=$%.2f tax=$%.2f total=$%.2f (confidence=%d%%)",
+            len(line_items), 'pdfplumber+gpt' if extracted_text else 'vision',
+            extract_ms, ocr_subtotal, ocr_tax, ocr_total,
+            data.get('confidence', confidence)
         )
         log_ocr_metric(
             agent="andrew",
@@ -716,12 +720,14 @@ def run_mismatch_reconciliation(
     Returns:
         Summary dict with reconciliation results.
     """
+    t0 = time.monotonic()
     cfg = _load_mismatch_config()
 
     if not cfg.get("andrew_mismatch_enabled", True):
         return {"status": "disabled", "message": "Andrew mismatch protocol is disabled"}
 
     from api.supabase_client import supabase as sb
+    logger.info("[AndrewMismatch] Starting reconciliation | bill=%s project=%s source=%s", bill_id, project_id, source)
 
     # 1. Get the bill and its receipt URL
     bill_result = sb.table("bills") \
@@ -844,5 +850,8 @@ def run_mismatch_reconciliation(
     except Exception:
         pass
 
-    logger.info(f"[AndrewMismatch] Reconciliation complete: {summary}")
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    logger.info("[AndrewMismatch] Reconciliation complete in %dms | matched=%d mismatches=%d missing=%d extra=%d confidence=%d%%",
+                 elapsed_ms, summary["matched"], summary["amount_mismatches"],
+                 summary["missing_in_db"], summary["extra_in_db"], summary["confidence"])
     return summary
