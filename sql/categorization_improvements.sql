@@ -187,18 +187,21 @@ ALTER TABLE categorization_corrections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE categorization_metrics ENABLE ROW LEVEL SECURITY;
 
 -- Service role has full access (backend operations)
+DROP POLICY IF EXISTS "Service role full access on cache" ON categorization_cache;
 CREATE POLICY "Service role full access on cache"
 ON categorization_cache FOR ALL
 TO service_role
 USING (true)
 WITH CHECK (true);
 
+DROP POLICY IF EXISTS "Service role full access on corrections" ON categorization_corrections;
 CREATE POLICY "Service role full access on corrections"
 ON categorization_corrections FOR ALL
 TO service_role
 USING (true)
 WITH CHECK (true);
 
+DROP POLICY IF EXISTS "Service role full access on metrics" ON categorization_metrics;
 CREATE POLICY "Service role full access on metrics"
 ON categorization_metrics FOR ALL
 TO service_role
@@ -206,6 +209,7 @@ USING (true)
 WITH CHECK (true);
 
 -- Authenticated users can read their project's corrections
+DROP POLICY IF EXISTS "Users can read project corrections" ON categorization_corrections;
 CREATE POLICY "Users can read project corrections"
 ON categorization_corrections FOR SELECT
 TO authenticated
@@ -250,7 +254,8 @@ BEGIN
         SELECT project INTO proj_id FROM "expenses_manual_COGS" WHERE expense_id = NEW.expense_id;
 
         IF proj_id IS NOT NULL THEN
-            SELECT project_stage INTO stage FROM projects WHERE project_id = proj_id;
+            -- project_stage column does not exist in projects table; default to 'General'
+            stage := 'General';
 
             -- Get account names (using "Name" with capital N)
             SELECT "Name" INTO orig_account_name FROM accounts WHERE account_id = OLD.account_id;

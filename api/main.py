@@ -1,6 +1,10 @@
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+import gc
+import time
+import asyncio
+import logging
 
 # ========================================
 # Cargar .env desde la raíz del proyecto
@@ -81,6 +85,9 @@ from api.routers.revit_ocr import router as revit_ocr_router
 
 # ========= CATEGORIZATION ML: TF-IDF + k-NN expense classification ==========
 from api.routers.categorization_ml import router as categorization_ml_router
+
+# ========= REPORTING: PDF report generation & Vault storage ==========
+from api.routers.reporting import router as reporting_router
 
 
 # ========================================
@@ -213,6 +220,119 @@ app.include_router(revit_ocr_router)
 
 # Categorization ML (TF-IDF + k-NN expense classification, zero-GPT-cost)
 app.include_router(categorization_ml_router)
+
+# Reporting (PDF report generation, Vault storage)
+app.include_router(reporting_router)
+
+_mem_logger = logging.getLogger("memory")
+
+# ========================================
+# Memory Management: periodic GC + cache cleanup
+# ========================================
+
+@app.on_event("startup")
+async def _start_memory_manager():
+    """Periodic garbage collection and cache cleanup to prevent memory leaks."""
+
+    async def _memory_loop():
+        while True:
+            await asyncio.sleep(300)  # every 5 min
+            try:
+                # Force garbage collection
+                collected = gc.collect()
+
+                # Clean stale caches across modules
+                _purge_stale_caches()
+
+                if collected > 100:
+                    _mem_logger.info("[MEM-GC] Collected %d objects", collected)
+            except Exception as e:
+                _mem_logger.warning("[MEM-GC] Error: %s", e)
+
+    asyncio.create_task(_memory_loop())
+
+
+def _purge_stale_caches():
+    """Sweep in-memory caches that lack their own TTL cleanup."""
+    now = time.time()
+
+    # --- agent_brain: _cooldowns (purge entries older than 60s) ---
+    try:
+        from api.services.agent_brain import _cooldowns
+        stale = [k for k, ts in _cooldowns.items() if now - ts > 60]
+        for k in stale:
+            del _cooldowns[k]
+    except Exception:
+        pass
+
+    # --- messages: _unread_cache (purge entries past their 30s TTL) ---
+    try:
+        from api.routers.messages import _unread_cache, _UNREAD_CACHE_TTL
+        stale = [k for k, v in _unread_cache.items() if now - v["ts"] > _UNREAD_CACHE_TTL]
+        for k in stale:
+            del _unread_cache[k]
+    except Exception:
+        pass
+
+    # --- arturito assistants: _thread_cache (cap at 500 entries, LRU-ish) ---
+    try:
+        from services.arturito.assistants import _thread_cache
+        if len(_thread_cache) > 500:
+            # Keep the most recent 250 (dict is insertion-ordered in Python 3.7+)
+            keys = list(_thread_cache.keys())
+            for k in keys[: len(keys) - 250]:
+                del _thread_cache[k]
+    except Exception:
+        pass
+
+
+
+# ========================================
+# Debug: Memory monitoring endpoint
+# ========================================
+
+@app.get("/debug/memory", include_in_schema=False)
+async def debug_memory():
+    """Return current memory usage and cache sizes for leak monitoring."""
+    import psutil, os as _os
+    proc = psutil.Process(_os.getpid())
+    mem = proc.memory_info()
+
+    cache_sizes = {}
+    try:
+        from api.services.agent_brain import _cooldowns, _user_name_cache
+        cache_sizes["agent_brain._cooldowns"] = len(_cooldowns)
+        cache_sizes["agent_brain._user_name_cache"] = len(_user_name_cache)
+    except Exception:
+        pass
+    try:
+        from api.routers.messages import _unread_cache
+        cache_sizes["messages._unread_cache"] = len(_unread_cache)
+    except Exception:
+        pass
+    try:
+        from services.arturito.assistants import _thread_cache
+        cache_sizes["arturito._thread_cache"] = len(_thread_cache)
+    except Exception:
+        pass
+    try:
+        from api.services.categorization_ml import get_ml_service
+        ml = get_ml_service()
+        cache_sizes["ml.is_trained"] = ml.is_trained
+        cache_sizes["ml.training_size"] = ml.training_size
+        cache_sizes["ml.last_trained_at"] = (
+            ml.last_trained_at.isoformat() if ml.last_trained_at else None
+        )
+    except Exception:
+        pass
+
+    return {
+        "rss_mb": round(mem.rss / 1024 / 1024, 1),
+        "vms_mb": round(mem.vms / 1024 / 1024, 1),
+        "gc_counts": gc.get_count(),
+        "cache_sizes": cache_sizes,
+    }
+
 
 # ========================================
 # Root & Healthcheck

@@ -19,8 +19,9 @@ from .persona import get_persona_prompt, get_personality_level, BOT_NAME
 # Cache for assistant ID (created once, reused)
 _assistant_cache: Dict[str, str] = {}  # personality_level -> assistant_id
 
-# Cache for threads (session_id -> thread_id)
+# Cache for threads (session_id -> thread_id) — capped to prevent unbounded growth
 _thread_cache: Dict[str, str] = {}
+_THREAD_CACHE_MAX = 500
 
 # Model to use
 MODEL = "gpt-5-mini"
@@ -117,6 +118,11 @@ def get_or_create_thread(session_id: str) -> Tuple[Optional[str], Optional[str]]
 
     try:
         thread = client.beta.threads.create()
+        # Cap cache size: evict oldest entries when limit reached
+        if len(_thread_cache) >= _THREAD_CACHE_MAX:
+            keys = list(_thread_cache.keys())
+            for k in keys[: len(keys) // 2]:
+                del _thread_cache[k]
         _thread_cache[session_id] = thread.id
         return thread.id, None
     except Exception as e:

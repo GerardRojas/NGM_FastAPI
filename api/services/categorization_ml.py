@@ -14,6 +14,7 @@
 #   results = ml.predict_batch([{"description": "Lumber 2x4"}, ...])
 # ============================================================================
 
+import gc
 import hashlib
 import logging
 import re
@@ -149,7 +150,16 @@ class CategorizationMLService:
                         "message": msg,
                     }
 
-                # ── Step 5: Build TF-IDF matrix ──────────────────────
+                # ── Step 5: Free old models before allocating new ones ─
+                if self.vectorizer is not None:
+                    del self.vectorizer
+                if self.nn_model is not None:
+                    del self.nn_model
+                if self.training_data is not None:
+                    del self.training_data
+                gc.collect()
+
+                # ── Step 6: Build TF-IDF matrix ──────────────────────
                 self.vectorizer = TfidfVectorizer(
                     max_features=MAX_FEATURES,
                     ngram_range=(1, 2),
@@ -158,7 +168,7 @@ class CategorizationMLService:
                 )
                 tfidf_matrix = self.vectorizer.fit_transform(df["processed"])
 
-                # ── Step 6: Fit k-NN model ───────────────────────────
+                # ── Step 7: Fit k-NN model ───────────────────────────
                 self.nn_model = NearestNeighbors(
                     n_neighbors=min(DEFAULT_N_NEIGHBORS, len(df)),
                     metric="cosine",
@@ -166,7 +176,7 @@ class CategorizationMLService:
                 )
                 self.nn_model.fit(tfidf_matrix)
 
-                # ── Step 7: Store training metadata ──────────────────
+                # ── Step 8: Store training metadata ──────────────────
                 self.training_data = df[
                     ["description", "account_id", "account_name", "confidence"]
                 ].reset_index(drop=True)
@@ -177,6 +187,11 @@ class CategorizationMLService:
 
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
                 unique_accounts = df["account_id"].nunique()
+
+                # Free temporary training artifacts to reduce memory pressure
+                del df, tfidf_matrix
+                gc.collect()
+
                 logger.info(
                     "[ML-CAT] Training complete: %d rows, %d features, "
                     "%d accounts, %dms",

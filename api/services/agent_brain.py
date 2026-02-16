@@ -29,10 +29,11 @@ from api.services.agent_personas import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Rate limiting (in-memory, per-process)
+# Rate limiting (in-memory, per-process) — capped to prevent unbounded growth
 # ---------------------------------------------------------------------------
 _cooldowns: Dict[str, float] = {}
 COOLDOWN_SECONDS = 5
+_COOLDOWN_MAX_SIZE = 2000
 
 
 def _check_cooldown(user_id: str, agent_name: str) -> bool:
@@ -43,6 +44,11 @@ def _check_cooldown(user_id: str, agent_name: str) -> bool:
     if now - last < COOLDOWN_SECONDS:
         return False
     _cooldowns[key] = now
+    # Periodic purge: remove expired entries when dict gets large
+    if len(_cooldowns) > _COOLDOWN_MAX_SIZE:
+        stale = [k for k, ts in _cooldowns.items() if now - ts > 60]
+        for k in stale:
+            del _cooldowns[k]
     return True
 
 
@@ -325,10 +331,11 @@ async def _build_brain_context(
 
 
 _user_name_cache: Dict[str, str] = {}
+_USER_NAME_CACHE_MAX = 500
 
 
 def _resolve_user_name(sb, user_id: str) -> str:
-    """Resolve user_id to user_name with caching."""
+    """Resolve user_id to user_name with caching (capped at 500 entries)."""
     if user_id in _user_name_cache:
         return _user_name_cache[user_id]
 
@@ -348,6 +355,12 @@ def _resolve_user_name(sb, user_id: str) -> str:
         name = result.data.get("user_name", "User") if result.data else "User"
     except Exception:
         name = "User"
+
+    # Cap cache size: evict oldest half when limit reached
+    if len(_user_name_cache) >= _USER_NAME_CACHE_MAX:
+        keys = list(_user_name_cache.keys())
+        for k in keys[: len(keys) // 2]:
+            del _user_name_cache[k]
 
     _user_name_cache[user_id] = name
     return name

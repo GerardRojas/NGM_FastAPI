@@ -259,7 +259,8 @@ BEGIN
             SELECT project INTO proj_id FROM "expenses_manual_COGS" WHERE expense_id = NEW.expense_id;
 
             IF proj_id IS NOT NULL THEN
-                SELECT project_stage INTO stage FROM projects WHERE project_id = proj_id;
+                -- project_stage column does not exist in projects table; default to 'General'
+                stage := 'General';
 
                 -- Insert correction record
                 INSERT INTO labor_categorization_corrections (

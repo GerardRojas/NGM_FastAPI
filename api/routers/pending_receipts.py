@@ -817,17 +817,8 @@ async def process_receipt(receipt_id: str, current_user: dict = Depends(get_curr
 
             # ===== Auto-categorize via shared service =====
             project_id = receipt_data.get("project_id")
+            # TODO: add project_stage column to projects table for stage-aware categorization
             construction_stage = "General Construction"
-            if project_id:
-                try:
-                    proj = supabase.table("projects") \
-                        .select("project_stage") \
-                        .eq("project_id", project_id) \
-                        .single().execute()
-                    if proj.data and proj.data.get("project_stage"):
-                        construction_stage = proj.data["project_stage"]
-                except Exception:
-                    pass
 
             categorizations = []
             cat_metrics = {}
@@ -2236,17 +2227,8 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
 
         # ===== STEP 5: Auto-categorize (Shared Service) =====
         logger.info("[Agent] Step 5: Starting auto-categorization (shared service)...")
+        # TODO: add project_stage column to projects table for stage-aware categorization
         construction_stage = "General Construction"
-        try:
-            proj_resp = supabase.table("projects") \
-                .select("project_name, project_stage") \
-                .eq("project_id", project_id) \
-                .single() \
-                .execute()
-            if proj_resp.data and proj_resp.data.get("project_stage"):
-                construction_stage = proj_resp.data["project_stage"]
-        except Exception:
-            pass
 
         # Categorize each line item via shared service
         cat_expenses = [
@@ -2691,14 +2673,8 @@ def _extract_check_context_sync(user_text: str, project_name: str) -> dict:
     try:
         from api.services.agent_brain import _extract_check_context
 
-        # Run async function in new event loop (same pattern as agent_brain notifications)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(_extract_check_context(user_text, project_name))
-            return result or {}
-        finally:
-            loop.close()
+        result = asyncio.run(_extract_check_context(user_text, project_name))
+        return result or {}
     except Exception as e:
         logger.error(f"[CheckContext] Sync wrapper error: {e}")
         return {}
@@ -3251,13 +3227,8 @@ def _categorize_and_finish_check_flow(receipt_id, project_id, check_flow, parsed
     """Categorize check entries and transition to review/confirm state."""
     # Get construction stage from origin project
     stage_project_id = check_flow.get("origin_project_id", project_id)
+    # TODO: add project_stage column to projects table for stage-aware categorization
     construction_stage = "General Construction"
-    try:
-        proj = supabase.table("projects").select("project_stage").eq("project_id", stage_project_id).single().execute()
-        if proj.data and proj.data.get("project_stage"):
-            construction_stage = proj.data["project_stage"]
-    except Exception:
-        pass
 
     # Load agent config BEFORE categorization so GPT fallback uses DB threshold
     agent_cfg = _load_agent_config()
@@ -3819,13 +3790,8 @@ def _handle_date_confirm(receipt_id, project_id, check_flow, parsed_data, action
 
     # === Run labor-only categorization ===
     stage_project_id = check_flow.get("origin_project_id", project_id)
+    # TODO: add project_stage column to projects table for stage-aware categorization
     construction_stage = "General Construction"
-    try:
-        proj = supabase.table("projects").select("project_stage").eq("project_id", stage_project_id).single().execute()
-        if proj.data and proj.data.get("project_stage"):
-            construction_stage = proj.data["project_stage"]
-    except Exception:
-        pass
 
     # Load agent config BEFORE categorization so GPT fallback uses DB threshold
     agent_cfg = _load_agent_config()
@@ -4329,17 +4295,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
             elif assignments and isinstance(assignments, list):
                 # Structured assignment from interactive account picker (no fuzzy matching needed)
 
-                # Fetch construction_stage for feedback loop
+                # TODO: add project_stage column to projects table for stage-aware categorization
                 construction_stage = "General"
-                try:
-                    proj_resp = supabase.table("projects") \
-                        .select("project_stage") \
-                        .eq("project_id", project_id) \
-                        .single().execute()
-                    if proj_resp.data and proj_resp.data.get("project_stage"):
-                        construction_stage = proj_resp.data["project_stage"]
-                except Exception as e:
-                    logger.error(f"[ReceiptFlow] Could not fetch project stage: {e}")
 
                 updates_applied = 0
                 corrections_logged = 0

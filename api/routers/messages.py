@@ -29,8 +29,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/messages", tags=["messages"])
 
 # In-memory cache for unread-counts (per user_id): {user_id: {"data": {...}, "ts": float}}
+# Cleanup: stale entries purged by _purge_stale_caches() in main.py every 5 min
 _unread_cache: Dict[str, dict] = {}
 _UNREAD_CACHE_TTL = 30  # seconds
+_UNREAD_CACHE_MAX = 300  # max entries to prevent unbounded growth
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -273,20 +275,15 @@ def _run_message_notifications(content, sender_user_id, sender_name,
                                project_id, channel_id):
     """Sync wrapper to safely run async message notifications from a background task."""
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(send_message_notifications(
-                content=content,
-                sender_user_id=sender_user_id,
-                sender_name=sender_name,
-                sender_avatar_color=sender_avatar_color,
-                channel_type=channel_type,
-                project_id=project_id,
-                channel_id=channel_id
-            ))
-        finally:
-            loop.close()
+        asyncio.run(send_message_notifications(
+            content=content,
+            sender_user_id=sender_user_id,
+            sender_name=sender_name,
+            sender_avatar_color=sender_avatar_color,
+            channel_type=channel_type,
+            project_id=project_id,
+            channel_id=channel_id
+        ))
     except Exception as e:
         print(f"[Messages] Message notification error: {e}")
 
@@ -382,22 +379,17 @@ def _run_agent_brain(
                         print(f"[Messages] Immediate ack failed (non-blocking): {e}")
                     break
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            from api.services.agent_brain import invoke_brain
-            loop.run_until_complete(invoke_brain(
-                agent_name=agent_name,
-                user_text=user_text,
-                user_id=user_id,
-                user_name=user_name,
-                project_id=project_id,
-                channel_type=channel_type,
-                channel_id=channel_id,
-                attachments=attachments,
-            ))
-        finally:
-            loop.close()
+        from api.services.agent_brain import invoke_brain
+        asyncio.run(invoke_brain(
+            agent_name=agent_name,
+            user_text=user_text,
+            user_id=user_id,
+            user_name=user_name,
+            project_id=project_id,
+            channel_type=channel_type,
+            channel_id=channel_id,
+            attachments=attachments,
+        ))
     except Exception as e:
         print(f"[Messages] Agent brain error ({agent_name}): {e}")
 
@@ -852,7 +844,17 @@ def get_unread_counts(
         for row in (result.data or []):
             counts[row["channel_key"]] = row["unread_count"]
 
-        # Store in cache
+        # Store in cache (cap size to prevent unbounded growth)
+        if len(_unread_cache) >= _UNREAD_CACHE_MAX:
+            now = time.time()
+            stale = [k for k, v in _unread_cache.items() if now - v["ts"] > _UNREAD_CACHE_TTL]
+            for k in stale:
+                del _unread_cache[k]
+            # If still over limit after TTL purge, drop oldest half
+            if len(_unread_cache) >= _UNREAD_CACHE_MAX:
+                keys = list(_unread_cache.keys())
+                for k in keys[: len(keys) // 2]:
+                    del _unread_cache[k]
         _unread_cache[user_id] = {"data": counts, "ts": time.time()}
 
         return {"unread_counts": counts}
