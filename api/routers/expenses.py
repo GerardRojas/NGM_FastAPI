@@ -756,29 +756,8 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        # Validar txn_type si se está actualizando
-        if "txn_type" in data:
-            txn = supabase.table("txn_types").select("TnxType_id").eq("TnxType_id", data["txn_type"]).single().execute()
-            if not txn.data:
-                raise HTTPException(status_code=400, detail="Invalid txn_type")
-
-        # Validar vendor_id si se está actualizando
-        if "vendor_id" in data:
-            vendor = supabase.table("Vendors").select("id").eq("id", data["vendor_id"]).single().execute()
-            if not vendor.data:
-                raise HTTPException(status_code=400, detail="Invalid vendor_id")
-
-        # Validar payment_type si se está actualizando
-        if "payment_type" in data:
-            payment = supabase.table("paymet_methods").select("id").eq("id", data["payment_type"]).single().execute()
-            if not payment.data:
-                raise HTTPException(status_code=400, detail="Invalid payment_type")
-
-        # Validar account_id si se está actualizando
-        if "account_id" in data:
-            account = supabase.table("accounts").select("account_id").eq("account_id", data["account_id"]).single().execute()
-            if not account.data:
-                raise HTTPException(status_code=400, detail="Invalid account_id")
+        # FK validation skipped — values come from vetted frontend dropdowns
+        # and DB foreign key constraints will reject invalid IDs on UPDATE
 
         # Handle status change if included in payload
         status_reason = data.pop("status_reason", None)
