@@ -1317,6 +1317,8 @@ def get_expenses_summary_by_txn_type(project: Optional[str] = None, current_user
         if project:
             query = query.eq("project", project)
 
+        query = query.eq("auth_status", True).neq("status", "review")
+
         resp = query.execute()
         raw_expenses = resp.data or []
 
@@ -1354,7 +1356,7 @@ def get_expenses_summary_by_project(current_user: dict = Depends(get_current_use
     Obtiene un resumen de gastos agrupados por proyecto.
     """
     try:
-        resp = supabase.table("expenses_manual_COGS").select("project, Amount").execute()
+        resp = supabase.table("expenses_manual_COGS").select("project, Amount").eq("auth_status", True).neq("status", "review").execute()
         raw_expenses = resp.data or []
 
         # Obtener todos los proyectos
