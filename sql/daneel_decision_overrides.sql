@@ -97,7 +97,7 @@ BEGIN
             OLD.expense_id,
             OLD.project,
             OLD.vendor_id,
-            (SELECT vendor FROM "expenses_manual_COGS" WHERE expense_id = OLD.expense_id LIMIT 1),
+            (SELECT vendor_name FROM "Vendors" WHERE id = OLD.vendor_id LIMIT 1),
             OLD."Amount",
             COALESCE(v_decision_obj->>'decision', 'authorized'),
             v_decision_obj->>'rule',
