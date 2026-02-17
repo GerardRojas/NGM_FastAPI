@@ -148,6 +148,7 @@ async def get_project_actuals(project_id: str) -> Dict[str, float]:
             .select("account_name, Amount, amount") \
             .eq("project", project_id) \
             .eq("auth_status", True) \
+            .neq("status", "review") \
             .execute()
 
         actuals = {}
