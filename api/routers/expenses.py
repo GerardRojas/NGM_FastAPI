@@ -341,6 +341,10 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                     except Exception:
                         pass  # Non-critical: don't block update if logging fails
 
+                # Set updated_by so DB triggers know who made the change
+                if user_id:
+                    update_data["updated_by"] = user_id
+
                 # Actualizar el gasto
                 res = supabase.table("expenses_manual_COGS").update(update_data).eq(
                     "expense_id", item.expense_id
@@ -741,6 +745,11 @@ def update_expense(expense_id: str, payload: ExpenseUpdate, current_user: dict =
             if not txn.data:
                 raise HTTPException(status_code=400, detail="Invalid txn_type")
 
+        # Set updated_by so DB triggers (log_category_correction, etc.) know who made the change
+        uid = current_user.get("user_id") if current_user else None
+        if uid:
+            data["updated_by"] = uid
+
         # Actualizar
         res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
 
@@ -855,6 +864,10 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
                 "metadata": {"via_patch": True}
             }
             supabase.table("expense_status_log").insert(log_data).execute()
+
+        # Set updated_by so DB triggers (log_category_correction, etc.) know who made the change
+        if user_id:
+            data["updated_by"] = user_id
 
         # Actualizar
         res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
