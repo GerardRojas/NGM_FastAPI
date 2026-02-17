@@ -308,6 +308,11 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                 # Safety net: remove any remaining empty strings (prevents UUID parse errors)
                 update_data = {k: v for k, v in update_data.items() if not (isinstance(v, str) and v.strip() == '')}
 
+                # When de-authorizing (status→review), ensure auth_by is cleared.
+                # exclude_none=True drops auth_by=None, so re-add it explicitly.
+                if update_data.get('status') == 'review' and update_data.get('auth_status') is False:
+                    update_data['auth_by'] = None
+
                 if not update_data:
                     failed.append({
                         "expense_id": item.expense_id,
@@ -792,7 +797,9 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         # and DB foreign key constraints will reject invalid IDs on UPDATE
 
         # Handle status change if included in payload
-        status_reason = data.pop("status_reason", None)
+        # Keep status_reason in data dict so it's stored in the expenses table
+        # (used by frontend for soft-delete strikethrough styling)
+        status_reason = data.get("status_reason")
         new_status = data.get("status")
         status_changed = False
 

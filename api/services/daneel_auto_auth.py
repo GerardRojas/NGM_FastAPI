@@ -844,14 +844,13 @@ def _resolve_pending_info(sb, expense_id: str):
 def _save_auth_report(sb, report_type: str, summary: dict, decisions: list,
                       project_id: Optional[str] = None, project_name: Optional[str] = None):
     """Save an auth report with per-expense decisions."""
-    import json as _json
     try:
         sb.table("daneel_auth_reports").insert({
             "report_type": report_type,
             "project_id": project_id,
             "project_name": project_name,
-            "summary": _json.dumps(summary),
-            "decisions": _json.dumps(decisions),
+            "summary": summary,
+            "decisions": decisions,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception as e:

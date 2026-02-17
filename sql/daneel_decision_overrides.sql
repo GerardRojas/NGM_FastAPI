@@ -72,8 +72,17 @@ BEGIN
         ORDER BY created_at DESC
         LIMIT 1;
 
+        -- Handle double-encoded JSON (stored as string instead of array)
+        IF v_decisions IS NOT NULL AND jsonb_typeof(v_decisions) = 'string' THEN
+            BEGIN
+                v_decisions := (v_decisions #>> '{}')::jsonb;
+            EXCEPTION WHEN OTHERS THEN
+                v_decisions := NULL;
+            END;
+        END IF;
+
         -- Find this expense in the decisions array
-        IF v_decisions IS NOT NULL THEN
+        IF v_decisions IS NOT NULL AND jsonb_typeof(v_decisions) = 'array' THEN
             SELECT elem INTO v_decision_obj
             FROM jsonb_array_elements(v_decisions) AS elem
             WHERE elem->>'expense_id' = OLD.expense_id::TEXT
