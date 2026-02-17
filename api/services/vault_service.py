@@ -232,7 +232,7 @@ def get_folder_tree(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     query = (
         supabase.table("vault_files")
-        .select("id, name, parent_id, project_id, created_at")
+        .select("id, name, is_folder, parent_id, project_id, created_at")
         .eq("is_folder", True)
         .eq("is_deleted", False)
     )

@@ -1964,3 +1964,112 @@ def get_pnl_data(project: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====== MIGRATION: Extract Bill DocNumbers ======
+
+@router.post("/bills/extract-doc-numbers/{realm_id}")
+async def extract_bill_doc_numbers(
+    realm_id: str,
+    project: Optional[str] = None,
+    qbo_customer_id: Optional[str] = None
+):
+    """
+    One-time endpoint: fetches all Bills from QBO API and extracts DocNumber
+    for each Bill. Stores the mapping in qbo_bill_doc_mapping table so
+    SQL migration functions can re-link bills.
+
+    Parameters:
+    - realm_id: QuickBooks company realm ID
+    - project: NGM project UUID (uses qbo_project_mapping to find QB customer IDs)
+    - qbo_customer_id: Direct QB customer ID filter
+    """
+    try:
+        bills = await fetch_all_bills(realm_id)
+
+        # Resolve QB customer IDs for the project
+        qbo_ids = set()
+        if project:
+            mapping_resp = supabase.table("qbo_project_mapping") \
+                .select("qbo_customer_id") \
+                .eq("ngm_project_id", project) \
+                .execute()
+            qbo_ids = {m["qbo_customer_id"] for m in (mapping_resp.data or [])}
+        elif qbo_customer_id:
+            qbo_ids = {qbo_customer_id}
+
+        results = []
+        for bill in bills:
+            bill_id = str(bill.get("Id", ""))
+            if not bill_id:
+                continue
+
+            # Collect all customer IDs referenced in this bill (header + lines)
+            bill_customer_ids = set()
+            if bill.get("CustomerRef"):
+                bill_customer_ids.add(str(bill["CustomerRef"].get("value", "")))
+
+            for line in bill.get("Line", []):
+                detail = line.get("AccountBasedExpenseLineDetail") or \
+                         line.get("ItemBasedExpenseLineDetail") or {}
+                if detail.get("CustomerRef"):
+                    bill_customer_ids.add(str(detail["CustomerRef"].get("value", "")))
+
+            # Filter by project if specified
+            if qbo_ids and not (bill_customer_ids & qbo_ids):
+                continue
+
+            vendor_name = ""
+            vendor_ref_id = ""
+            if bill.get("VendorRef"):
+                vendor_name = bill["VendorRef"].get("name", "")
+                vendor_ref_id = str(bill["VendorRef"].get("value", ""))
+
+            detail = {
+                "qbo_bill_id": bill_id,
+                "doc_number": bill.get("DocNumber"),
+                "vendor_name": vendor_name,
+                "vendor_ref_id": vendor_ref_id,
+                "total_amount": bill.get("TotalAmt"),
+                "txn_date": bill.get("TxnDate"),
+                "linked_txns": bill.get("LinkedTxn", []),
+                "balance": bill.get("Balance"),
+                "line_count": len([
+                    l for l in bill.get("Line", [])
+                    if l.get("DetailType") != "SubTotalLineDetail"
+                ])
+            }
+            results.append(detail)
+
+        # Store in mapping table for SQL migration
+        if results:
+            rows = []
+            for r in results:
+                rows.append({
+                    "qbo_bill_id": r["qbo_bill_id"],
+                    "doc_number": r["doc_number"],
+                    "vendor_name": r["vendor_name"],
+                    "vendor_ref_id": r["vendor_ref_id"],
+                    "total_amount": r["total_amount"],
+                    "txn_date": r["txn_date"],
+                    "linked_txns_json": str(r["linked_txns"]) if r["linked_txns"] else None
+                })
+
+            # Upsert in batches
+            batch_size = 200
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i + batch_size]
+                supabase.table("qbo_bill_doc_mapping").upsert(
+                    batch,
+                    on_conflict="qbo_bill_id"
+                ).execute()
+
+        return {
+            "message": f"Extracted DocNumbers for {len(results)} bills",
+            "total_bills_in_qbo": len(bills),
+            "bills_for_project": len(results),
+            "bills": results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
