@@ -95,7 +95,7 @@ BEGIN
             new_status, override_by
         ) VALUES (
             OLD.expense_id,
-            OLD.project_id,
+            OLD.project,
             OLD.vendor_id,
             (SELECT vendor FROM "expenses_manual_COGS" WHERE expense_id = OLD.expense_id LIMIT 1),
             OLD."Amount",
