@@ -3,7 +3,7 @@ services:
     name: ngm-api
     env: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    startCommand: gunicorn api.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:10000 --max-requests 1000 --max-requests-jitter 50
     envVars:
       - key: PYTHON_VERSION
         value: 3.13.4
