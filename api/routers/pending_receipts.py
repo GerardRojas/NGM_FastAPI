@@ -72,7 +72,6 @@ import time
 import asyncio
 
 logger = logging.getLogger(__name__)
-from pdf2image import convert_from_bytes
 from api.helpers.andrew_messenger import post_andrew_message, ANDREW_BOT_USER_ID
 from services.receipt_scanner import (
     scan_receipt as _scan_receipt_core,
@@ -109,7 +108,8 @@ def _load_agent_config() -> dict:
             except (json.JSONDecodeError, ValueError):
                 cfg[row["key"]] = raw
         return cfg
-    except Exception:
+    except Exception as e:
+        logger.warning("[AgentConfig] Failed to load agent_config: %s", e)
         return {}
 
 
@@ -822,8 +822,11 @@ async def process_receipt(receipt_id: str, current_user: dict = Depends(get_curr
                         scan_result = corrected
                         line_items = corrected.get("expenses", [])
                         validation = corrected.get("validation", {})
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
+
+            # file_content no longer needed — free before vendor/categorize/DB phase
+            del file_content
 
             # Derive summary from line items
             first_item = line_items[0] if line_items else {}
@@ -858,12 +861,13 @@ async def process_receipt(receipt_id: str, current_user: dict = Depends(get_curr
             _min_conf = int(_cfg.get("min_confidence", 60))
             try:
                 if cat_expenses:
-                    cat_result = _auto_categorize_core(
+                    cat_result = await asyncio.to_thread(
+                        _auto_categorize_core,
                         stage=construction_stage,
                         expenses=cat_expenses,
                         project_id=project_id,
                         receipt_id=receipt_id,
-                        min_confidence=_min_conf
+                        min_confidence=_min_conf,
                     )
                     categorizations = cat_result.get("categorizations", [])
                     cat_metrics = cat_result.get("metrics", {})
@@ -1574,14 +1578,14 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
             .execute()
 
         if not receipt.data:
-            raise HTTPException(status_code=404, detail="Receipt not found")
+            raise ValueError("Receipt not found")
 
         receipt_data = receipt.data
         project_id = receipt_data.get("project_id")
         logger.info(f"[Agent] Step 1: Receipt fetched | project={project_id} | file={receipt_data.get('file_name')}")
 
         if receipt_data.get("status") == "linked":
-            raise HTTPException(status_code=400, detail="Receipt already linked to an expense")
+            raise ValueError("Receipt already linked to an expense")
 
         # Update status to processing
         supabase.table("pending_receipts") \
@@ -1666,8 +1670,8 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
                     .eq("project_id", project_id).single().execute()
                 if proj_resp.data and proj_resp.data.get("project_name"):
                     project_name = proj_resp.data["project_name"]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
             vendor_name = original_parsed.get("vendor_name", "Unknown")
             amount = original_parsed.get("amount", 0)
@@ -1720,8 +1724,8 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
                         .select("project_name").eq("project_id", project_id).single().execute()
                     if proj.data:
                         proj_name = proj.data.get("project_name", "Unknown")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
                 logger.info(f"[CheckFlow] Extracting context from user message: {user_message[:100]}")
                 from api.services.agent_brain import _extract_check_context
@@ -1849,8 +1853,8 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
                     .select("project_name").eq("project_id", project_id).single().execute()
                 if proj.data:
                     proj_name = proj.data.get("project_name", "Unknown")
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
             file_url = receipt_data.get("file_url", "")
             file_link = f"[{file_name}]({file_url})" if file_url else file_name
@@ -2042,8 +2046,8 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
                 _mode_row = supabase.table("agent_config").select("value").eq("key", "andrew_scan_mode").execute()
                 if _mode_row.data and _mode_row.data[0].get("value") in ("fast", "fast-beta", "heavy"):
                     _scan_mode = _mode_row.data[0]["value"]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
         logger.info(f"[Agent] Step 3: Starting OCR extraction (mode={_scan_mode}, requested={scan_mode})...")
 
@@ -2065,7 +2069,7 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
                 scan_result = _scan_receipt_core(file_content, file_type, model="heavy")
                 _scan_mode = "heavy"
             else:
-                raise HTTPException(status_code=400, detail=str(e))
+                raise ValueError(f"OCR extraction failed: {str(e)}")
         except RuntimeError as e:
             raise Exception(f"OCR extraction failed: {str(e)}")
 
@@ -2128,6 +2132,12 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
             except Exception as corr_err:
                 validation_unresolved = True
                 logger.error(f"[Agent] Step 3.5: Correction pass error: {corr_err} | Will escalate to bookkeeping")
+
+        # file_content no longer needed — free before DB/message operations
+        try:
+            del file_content
+        except NameError:
+            pass
 
         # Derive summary fields from line items (backwards compat)
         first_item = line_items[0] if line_items else {}
@@ -2273,12 +2283,13 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
         cat_metrics = {}
         try:
             if cat_expenses:
-                cat_result = _auto_categorize_core(
+                cat_result = await asyncio.to_thread(
+                    _auto_categorize_core,
                     stage=construction_stage,
                     expenses=cat_expenses,
                     project_id=project_id,
                     receipt_id=receipt_id,
-                    min_confidence=_min_conf
+                    min_confidence=_min_conf,
                 )
                 categorizations = cat_result.get("categorizations", [])
                 cat_metrics = cat_result.get("metrics", {})
@@ -2655,8 +2666,8 @@ def _resolve_project(project_name: str, fallback_project_id: str) -> tuple:
                 best, best_len = p, len(p_name)
         if best:
             return best["project_id"], best["project_name"]
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
     return fallback_project_id, project_name
 
 
@@ -4463,8 +4474,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                     .eq("project_id", project_id).single().execute()
                 if proj_resp.data:
                     project_name = proj_resp.data.get("project_name", project_name)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
             if pre_resolved.get("project_decision"):
                 # User context already answered the project question -- skip to confirmation
@@ -4549,8 +4560,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         if (v.get("vendor_name") or "").lower() == interpretation["vendor_name"].lower():
                             parsed_data["vendor_id"] = v["id"]
                             break
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
                 updated_fields.append("vendor")
 
             if interpretation.get("receipt_date"):
@@ -4632,8 +4643,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         .eq("project_id", project_id).single().execute()
                     if proj_resp.data:
                         project_name = proj_resp.data.get("project_name", project_name)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
                 ack_msg = f"Got it -- updated {', '.join(updated_fields)}. Is this entire bill for **{project_name}**?"
                 post_andrew_message(
@@ -4690,9 +4701,11 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
 
                 if decision == "all_this_project":
                     # Human clicked Confirm -- no confidence gate needed
+                    skipped_items = 0
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
+                            skipped_items += 1
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -4705,6 +4718,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         )
                         if expense:
                             created_expenses.append(expense)
+                    if skipped_items:
+                        logger.warning(f"[ReceiptFlow] {skipped_items}/{len(line_items)} items skipped (no account_id) for receipt {receipt_id}")
 
                 elif decision == "split":
                     split_details = pre_resolved.get("split_details", [])
@@ -4794,8 +4809,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         .eq("project_id", project_id).single().execute()
                     if proj_resp.data and proj_resp.data.get("project_name"):
                         project_name = proj_resp.data["project_name"]
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
                 post_andrew_message(
                     content=f"No problem -- is this entire bill for **{project_name}**?",
@@ -4818,8 +4833,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                     .eq("project_id", project_id).single().execute()
                 if proj_resp.data and proj_resp.data.get("project_name"):
                     project_name = proj_resp.data["project_name"]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
             if action == "all_this_project":
                 # Create expenses for ALL line items in this project
@@ -4833,9 +4848,11 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
 
                 if auto_create and line_items:
                     # Human clicked "All for this project" -- skip confidence gate
+                    skipped_items = 0
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
+                            skipped_items += 1
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -4848,6 +4865,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         )
                         if expense:
                             created_expenses.append(expense)
+                    if skipped_items:
+                        logger.warning(f"[CheckFlow] {skipped_items}/{len(line_items)} items skipped (no account_id) for receipt {receipt_id}")
                 elif auto_create and cat.get("account_id"):
                     expense = _create_receipt_expense(
                         project_id, parsed_data, receipt_data,
@@ -5137,8 +5156,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                     .eq("project_id", project_id).single().execute()
                 if proj_resp.data and proj_resp.data.get("project_name"):
                     project_name = proj_resp.data["project_name"]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
             if action == "single_project":
                 # Read agent config for confidence check
@@ -5154,9 +5173,11 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                 created_expenses = []
 
                 if should_create and line_items:
+                    skipped_items = 0
                     for item in line_items:
                         item_account_id = item.get("account_id") or cat.get("account_id")
                         if not item_account_id:
+                            skipped_items += 1
                             continue
                         expense = _create_receipt_expense(
                             project_id, parsed_data, receipt_data,
@@ -5169,6 +5190,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         )
                         if expense:
                             created_expenses.append(expense)
+                    if skipped_items:
+                        logger.warning(f"[ReceiptFlow] {skipped_items}/{len(line_items)} items skipped (no account_id) for receipt {receipt_id}")
 
                 elif should_create and cat.get("account_id"):
                     # Fallback: no line items (old data), single expense from summary
@@ -5371,8 +5394,8 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         .eq("project_id", project_id).single().execute()
                     if proj_resp.data and proj_resp.data.get("project_name"):
                         project_name = proj_resp.data["project_name"]
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
                 total = receipt_flow["total_for_project"]
                 count = len(created_expenses)

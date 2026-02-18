@@ -3,7 +3,9 @@ from pydantic import BaseModel, field_validator
 from api.supabase_client import supabase
 from api.auth import get_current_user
 from typing import Optional, List
+import asyncio
 import json
+import logging
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.receipt_scanner import (
@@ -13,6 +15,17 @@ from services.receipt_scanner import (
 )
 
 router = APIRouter(prefix="/expenses", tags=["Expenses"])
+logger = logging.getLogger(__name__)
+
+_PAGE_SIZE = 1000
+
+
+def _bg_insert(table_name: str, data, label: str = ""):
+    """Background task helper: insert with error logging instead of silent failure."""
+    try:
+        supabase.table(table_name).insert(data).execute()
+    except Exception as exc:
+        logger.error("[BG %s] Insert into %s failed: %s", label, table_name, exc)
 
 
 # ====== MODELOS ======
@@ -472,15 +485,23 @@ def list_all_expenses(limit: Optional[int] = 1000, current_user: dict = Depends(
     PERFORMANCE: Metadata queries ejecutadas en paralelo con ThreadPoolExecutor
     """
     try:
-        # Obtener los gastos primero (necesitamos esto antes de enriquecer)
-        query = supabase.table("expenses_manual_COGS").select("*")
-        query = query.order("TxnDate", desc=True)
-
-        if limit is not None:
-            query = query.limit(limit)
-
-        resp = query.execute()
-        raw_expenses = resp.data or []
+        # Paginated fetch to avoid Supabase 1000-row silent truncation
+        raw_expenses = []
+        offset = 0
+        max_rows = limit or 10000
+        while offset < max_rows:
+            page_end = min(offset + _PAGE_SIZE, max_rows) - 1
+            resp = (
+                supabase.table("expenses_manual_COGS").select("*")
+                .order("TxnDate", desc=True)
+                .range(offset, page_end)
+                .execute()
+            )
+            batch = resp.data or []
+            raw_expenses.extend(batch)
+            if len(batch) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
 
         if not raw_expenses:
             return {"data": []}
@@ -866,9 +887,7 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
 
             # Insert change logs in background (non-blocking)
             if change_logs:
-                background_tasks.add_task(
-                    lambda logs=change_logs: supabase.table("expense_change_log").insert(logs).execute()
-                )
+                background_tasks.add_task(_bg_insert, "expense_change_log", change_logs, "CHANGE_LOG")
 
         # Log status change in background (non-blocking)
         if status_changed and user_id:
@@ -880,9 +899,7 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
                 "reason": status_reason or change_reason or "Field modification",
                 "metadata": {"via_patch": True}
             }
-            background_tasks.add_task(
-                lambda ld=log_data: supabase.table("expense_status_log").insert(ld).execute()
-            )
+            background_tasks.add_task(_bg_insert, "expense_status_log", log_data, "STATUS_LOG")
 
         # Set updated_by so DB triggers (log_category_correction, etc.) know who made the change
         if user_id:
@@ -1055,7 +1072,7 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
                 )
 
         # Update expense status
-        update_data = {"status": payload.status}
+        update_data = {"status": payload.status, "updated_by": user_id}
 
         # Also update legacy auth_status for backwards compatibility
         if payload.status == 'auth':
@@ -1136,7 +1153,8 @@ def soft_delete_expense(expense_id: str, user_id: str, current_user: dict = Depe
             "status": "review",
             "status_reason": "Deletion requested",
             "auth_status": False,
-            "auth_by": None
+            "auth_by": None,
+            "updated_by": user_id
         }
 
         supabase.table("expenses_manual_COGS").update(update_data).eq(
@@ -1351,15 +1369,19 @@ def get_expenses_summary_by_txn_type(project: Optional[str] = None, current_user
     Opcionalmente filtrado por proyecto.
     """
     try:
-        query = supabase.table("expenses_manual_COGS").select("txn_type, Amount")
-
-        if project:
-            query = query.eq("project", project)
-
-        query = query.eq("auth_status", True).neq("status", "review")
-
-        resp = query.execute()
-        raw_expenses = resp.data or []
+        # Paginated fetch to avoid Supabase 1000-row silent truncation
+        raw_expenses = []
+        offset = 0
+        while True:
+            q = supabase.table("expenses_manual_COGS").select("txn_type, Amount")
+            if project:
+                q = q.eq("project", project)
+            q = q.eq("auth_status", True).neq("status", "review")
+            batch = (q.range(offset, offset + _PAGE_SIZE - 1).execute()).data or []
+            raw_expenses.extend(batch)
+            if len(batch) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
 
         # Obtener todos los tipos de transacción
         txn_types_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
@@ -1395,8 +1417,20 @@ def get_expenses_summary_by_project(current_user: dict = Depends(get_current_use
     Obtiene un resumen de gastos agrupados por proyecto.
     """
     try:
-        resp = supabase.table("expenses_manual_COGS").select("project, Amount").eq("auth_status", True).neq("status", "review").execute()
-        raw_expenses = resp.data or []
+        # Paginated fetch to avoid Supabase 1000-row silent truncation
+        raw_expenses = []
+        offset = 0
+        while True:
+            batch = (
+                supabase.table("expenses_manual_COGS").select("project, Amount")
+                .eq("auth_status", True).neq("status", "review")
+                .range(offset, offset + _PAGE_SIZE - 1)
+                .execute()
+            ).data or []
+            raw_expenses.extend(batch)
+            if len(batch) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
 
         # Obtener todos los proyectos
         projects_resp = supabase.table("projects").select("project_id, project_name").execute()
@@ -1451,7 +1485,10 @@ async def auto_categorize_expenses(payload: dict, current_user: dict = Depends(g
         except Exception:
             pass
 
-        result = _auto_categorize_core(stage=stage, expenses=expenses, project_id=project_id, min_confidence=_min_conf)
+        result = await asyncio.to_thread(
+            _auto_categorize_core,
+            stage=stage, expenses=expenses, project_id=project_id, min_confidence=_min_conf,
+        )
 
         return {
             "success": True,
@@ -1768,13 +1805,21 @@ def get_pending_authorization_summary(user_id: str, current_user: dict = Depends
                 "role": role_name
             }
 
-        # Get pending expenses with project info
-        query = supabase.table("expenses_manual_COGS").select(
-            "expense_id, project, Amount, status"
-        ).eq("status", "pending")
-
-        result = query.execute()
-        expenses = result.data or []
+        # Paginated fetch to avoid Supabase 1000-row silent truncation
+        expenses = []
+        offset = 0
+        while True:
+            batch = (
+                supabase.table("expenses_manual_COGS")
+                .select("expense_id, project, Amount, status")
+                .eq("status", "pending")
+                .range(offset, offset + _PAGE_SIZE - 1)
+                .execute()
+            ).data or []
+            expenses.extend(batch)
+            if len(batch) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
 
         # Get project names
         projects_resp = supabase.table("projects").select("project_id, project_name").execute()

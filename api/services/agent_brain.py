@@ -45,6 +45,12 @@ def _check_cooldown(user_id: str, agent_name: str) -> bool:
     for k in stale:
         del _cooldowns[k]
 
+    # Hard-cap eviction: drop oldest half if over limit
+    if len(_cooldowns) > _COOLDOWN_MAX_SIZE:
+        sorted_keys = sorted(_cooldowns, key=_cooldowns.get)
+        for k in sorted_keys[:len(sorted_keys) // 2]:
+            del _cooldowns[k]
+
     key = f"{user_id}:{agent_name}"
     last = _cooldowns.get(key, 0)
     if now - last < COOLDOWN_SECONDS:
@@ -297,8 +303,8 @@ async def _build_brain_context(
                 .execute()
             if result.data:
                 context["project_name"] = result.data["project_name"]
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("Suppressed: %s", _exc)
 
     # Recent messages in this channel (last 10)
     try:
@@ -325,8 +331,8 @@ async def _build_brain_context(
                 content = (m.get("content") or "")[:200]
                 formatted.append(f"[{name}]: {content}")
             context["recent_messages"] = formatted
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
 
     return context
 
@@ -360,7 +366,8 @@ def _resolve_user_name(sb, user_id: str) -> str:
             .single() \
             .execute()
         name = result.data.get("user_name", "User") if result.data else "User"
-    except Exception:
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
         name = "User"
 
     # Evict if at capacity: first purge TTL-expired, then oldest half if needed
@@ -860,8 +867,8 @@ async def _builtin_explain_categorization(params: Dict[str, Any]) -> Dict[str, A
                     .execute()
                 if acc.data:
                     account_name = acc.data["Name"]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
         vendor_name = "Unknown"
         if exp.get("vendor_id"):
@@ -873,8 +880,8 @@ async def _builtin_explain_categorization(params: Dict[str, Any]) -> Dict[str, A
                     .execute()
                 if v.data:
                     vendor_name = v.data["vendor_name"]
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
         return {
             "expense_id": expense_id,
@@ -936,8 +943,8 @@ async def _builtin_check_budget(params: Dict[str, Any]) -> Dict[str, Any]:
                         .execute()
                     if acc.data:
                         name = acc.data["Name"]
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
             account_breakdown.append({"account": name, "spent": round(total, 2)})
 
         remaining = round(budget - total_spent, 2)
@@ -1383,8 +1390,8 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                         f"(ID: {existing['id'][:8]}...). No duplicate created."
                     ),
                 }
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("Suppressed: %s", _exc)
 
         # 3. Save to project vault (Receipts folder)
         receipt_id = str(uuid4())
@@ -1470,15 +1477,18 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                     _cfg_r = sb.table("agent_config").select("key, value").execute()
                     for row in (_cfg_r.data or []):
                         _cfg[row["key"]] = row["value"]
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
                 _min_conf = int(_cfg.get("min_confidence", 60))
 
                 cat_input = [
                     {"rowIndex": i, "description": e.get("description", "")}
                     for i, e in enumerate(expenses)
                 ]
-                cat_result = auto_categorize(construction_stage, cat_input, project_id=project_id, min_confidence=_min_conf)
+                cat_result = await asyncio.to_thread(
+                    auto_categorize, construction_stage, cat_input,
+                    project_id=project_id, min_confidence=_min_conf,
+                )
                 categorize_data = cat_result.get("categorizations", [])
                 metrics = cat_result.get("metrics", {})
                 logger.info("%s Categorized %d items (cache hits: %d/%d)", tag, len(categorize_data), metrics.get('cache_hits', 0), metrics.get('total_items', 0))
@@ -1500,8 +1510,8 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                     if v.get("vendor_name") and v["vendor_name"].lower() == vendor.lower():
                         vendor_id = v["id"]
                         break
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
         receipt_date = expenses[0].get("date") if expenses else None
         description = expenses[0].get("description", "") if expenses else ""
@@ -1532,7 +1542,8 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                 t["TnxType_name"].lower(): t["TnxType_id"]
                 for t in (txn_types_resp.data or []) if t.get("TnxType_name")
             }
-        except Exception:
+        except Exception as _exc:
+            logger.debug("Suppressed: %s", _exc)
             txn_types_map = {}
 
         try:
@@ -1541,7 +1552,8 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
                 p["payment_method_name"].lower(): p["id"]
                 for p in (payment_resp.data or []) if p.get("payment_method_name")
             }
-        except Exception:
+        except Exception as _exc:
+            logger.debug("Suppressed: %s", _exc)
             payment_resp = type("R", (), {"data": []})()
             payment_map = {}
 
@@ -1586,8 +1598,8 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
             cfg_result = sb.table("agent_config").select("key, value").execute()
             for row in (cfg_result.data or []):
                 agent_cfg[row["key"]] = row["value"]
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("Suppressed: %s", _exc)
         min_confidence = int(agent_cfg.get("min_confidence", 70))
 
         low_confidence_items = []
