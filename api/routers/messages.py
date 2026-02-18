@@ -12,7 +12,6 @@
 
 import re
 import time
-import asyncio
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
@@ -270,24 +269,6 @@ def get_channel_member_ids(channel_id: str, exclude_user_id: str = None) -> List
         return []
 
 
-def _run_message_notifications(content, sender_user_id, sender_name,
-                               sender_avatar_color, channel_type,
-                               project_id, channel_id):
-    """Sync wrapper to safely run async message notifications from a background task."""
-    try:
-        asyncio.run(send_message_notifications(
-            content=content,
-            sender_user_id=sender_user_id,
-            sender_name=sender_name,
-            sender_avatar_color=sender_avatar_color,
-            channel_type=channel_type,
-            project_id=project_id,
-            channel_id=channel_id
-        ))
-    except Exception as e:
-        print(f"[Messages] Message notification error: {e}")
-
-
 # ---------------------------------------------------------------------------
 # Agent Brain: @mention detection and dispatch
 # ---------------------------------------------------------------------------
@@ -343,7 +324,7 @@ _RECEIPT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp", "i
 _RECEIPT_EXTS = (".pdf", ".jpg", ".jpeg", ".png", ".webp")
 
 
-def _run_agent_brain(
+async def _run_agent_brain(
     agent_name: str,
     user_text: str,
     user_id: str,
@@ -353,7 +334,7 @@ def _run_agent_brain(
     channel_id: str | None,
     attachments: list | None = None,
 ) -> None:
-    """Sync wrapper to run the async agent brain from a BackgroundTask."""
+    """Run the async agent brain from a BackgroundTask."""
     try:
         # Immediate ack for Andrew + file attachments (before GPT routing)
         if agent_name == "andrew" and attachments:
@@ -380,7 +361,7 @@ def _run_agent_brain(
                     break
 
         from api.services.agent_brain import invoke_brain
-        asyncio.run(invoke_brain(
+        await invoke_brain(
             agent_name=agent_name,
             user_text=user_text,
             user_id=user_id,
@@ -389,7 +370,7 @@ def _run_agent_brain(
             channel_type=channel_type,
             channel_id=channel_id,
             attachments=attachments,
-        ))
+        )
     except Exception as e:
         print(f"[Messages] Agent brain error ({agent_name}): {e}")
 
@@ -591,14 +572,14 @@ def create_message(
         # Send push notifications for @mentions + DM/group (in background)
         try:
             background_tasks.add_task(
-                _run_message_notifications,
-                payload.content,
-                user_id,
-                sender_name,
-                sender_avatar_color,
-                payload.channel_type,
-                payload.project_id,
-                payload.channel_id
+                send_message_notifications,
+                content=payload.content,
+                sender_user_id=user_id,
+                sender_name=sender_name,
+                sender_avatar_color=sender_avatar_color,
+                channel_type=payload.channel_type,
+                project_id=payload.project_id,
+                channel_id=payload.channel_id
             )
         except Exception as bg_err:
             print(f"[Messages] Background task setup error (non-blocking): {bg_err}")
@@ -713,14 +694,14 @@ def create_thread_reply(
         # Send push notifications for @mentions + DM/group (in background)
         try:
             background_tasks.add_task(
-                _run_message_notifications,
-                payload.content,
-                user_id,
-                sender_name,
-                sender_avatar_color,
-                parent_data["channel_type"],
-                parent_data.get("project_id"),
-                parent_data.get("channel_id")
+                send_message_notifications,
+                content=payload.content,
+                sender_user_id=user_id,
+                sender_name=sender_name,
+                sender_avatar_color=sender_avatar_color,
+                channel_type=parent_data["channel_type"],
+                project_id=parent_data.get("project_id"),
+                channel_id=parent_data.get("channel_id")
             )
         except Exception:
             pass

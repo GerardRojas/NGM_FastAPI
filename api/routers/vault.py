@@ -5,9 +5,10 @@
 # File storage management with folders, versioning, chunked uploads,
 # search and duplicate detection.
 
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query, Depends
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query, Depends, Request
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+import gc
 import logging
 
 from api.auth import get_current_user
@@ -33,6 +34,19 @@ from api.services.vault_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _check_content_length(request: Request, max_bytes: int = MAX_UPLOAD_BYTES):
+    """Reject oversized uploads early using the Content-Length header (before reading the body)."""
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload too large. Maximum upload size is {max_bytes // (1024*1024)} MB.",
+        )
+
 
 router = APIRouter(prefix="/vault", tags=["Vault"])
 
@@ -132,6 +146,7 @@ async def api_get_file(
 
 @router.post("/upload", status_code=201)
 async def api_upload_file(
+    request: Request,
     file: UploadFile = File(...),
     parent_id: Optional[str] = Form(None),
     project_id: Optional[str] = Form(None),
@@ -141,13 +156,17 @@ async def api_upload_file(
     Upload a single file (up to ~50MB via this endpoint).
     For larger files, use the chunked upload endpoints.
     """
+    # Reject oversized payloads before reading the body into memory
+    _check_content_length(request, MAX_UPLOAD_BYTES)
+
+    file_content = None
     try:
         file_content = await file.read()
 
-        # Soft limit at 50MB for single upload
-        if len(file_content) > 50 * 1024 * 1024:
+        # Hard limit at 50MB for single upload
+        if len(file_content) > MAX_UPLOAD_BYTES:
             raise HTTPException(
-                status_code=400,
+                status_code=413,
                 detail="File too large for single upload. Use chunked upload for files over 50MB.",
             )
 
@@ -165,6 +184,9 @@ async def api_upload_file(
     except Exception as e:
         logger.error("[Vault] Upload error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        del file_content
+        gc.collect()
 
 
 # ====== CHUNKED UPLOAD ======
@@ -178,6 +200,7 @@ async def api_upload_chunk(
     current_user: dict = Depends(get_current_user),
 ):
     """Store a single chunk for a chunked upload."""
+    chunk_data = None
     try:
         chunk_data = await file.read()
         result = store_chunk(upload_id, chunk_index, chunk_data)
@@ -186,6 +209,8 @@ async def api_upload_chunk(
     except Exception as e:
         logger.error("[Vault] Chunk upload error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        del chunk_data
 
 
 @router.post("/upload-complete", status_code=201)
@@ -234,12 +259,16 @@ async def api_list_versions(
 
 @router.post("/files/{file_id}/versions", status_code=201)
 async def api_create_version(
+    request: Request,
     file_id: str,
     file: UploadFile = File(...),
     comment: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user),
 ):
     """Upload a new version of an existing file."""
+    _check_content_length(request, MAX_UPLOAD_BYTES)
+
+    file_content = None
     try:
         file_content = await file.read()
         result = create_version(
@@ -256,6 +285,9 @@ async def api_create_version(
     except Exception as e:
         logger.error("[Vault] Create version error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        del file_content
+        gc.collect()
 
 
 @router.post("/files/{file_id}/restore/{version_id}")

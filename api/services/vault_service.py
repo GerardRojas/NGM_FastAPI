@@ -5,6 +5,7 @@
 # Handles file/folder CRUD, versioning, chunked uploads,
 # search, and duplicate detection for the Vault module.
 
+import gc
 import hashlib
 import logging
 import os
@@ -310,6 +311,7 @@ def upload_file(
     file_id = str(uuid.uuid4())
     ext = _get_extension(filename)
     file_hash = _compute_hash(file_content)
+    size_bytes = len(file_content)
     bucket_path = _storage_path(project_id, file_id, 1, ext,
                                 parent_id=parent_id, filename=filename)
 
@@ -319,6 +321,7 @@ def upload_file(
         file=file_content,
         file_options={"content-type": content_type, "upsert": "true"},
     )
+    # Note: file_content is owned by the caller; caller is responsible for cleanup.
 
     public_url = supabase.storage.from_(VAULT_BUCKET).get_public_url(bucket_path)
 
@@ -331,7 +334,7 @@ def upload_file(
         "project_id": project_id,
         "bucket_path": bucket_path,
         "mime_type": content_type,
-        "size_bytes": len(file_content),
+        "size_bytes": size_bytes,
         "file_hash": file_hash,
         "uploaded_by": user_id,
     }
@@ -342,7 +345,7 @@ def upload_file(
         "file_id": file_id,
         "version_number": 1,
         "bucket_path": bucket_path,
-        "size_bytes": len(file_content),
+        "size_bytes": size_bytes,
         "uploaded_by": user_id,
         "comment": "Initial upload",
     }
@@ -383,7 +386,7 @@ def assemble_chunks(
 
     upload_dir = os.path.join(CHUNK_TEMP_DIR, upload_id)
 
-    # Assemble all chunks
+    # Assemble all chunks into a bytearray
     assembled = bytearray()
     for i in range(total_chunks):
         chunk_path = os.path.join(upload_dir, f"chunk_{i:06d}")
@@ -392,19 +395,28 @@ def assemble_chunks(
         with open(chunk_path, "rb") as f:
             assembled.extend(f.read())
 
+    # Convert to bytes and free the bytearray immediately
     file_content = bytes(assembled)
+    del assembled
+
     file_id = str(uuid.uuid4())
     ext = _get_extension(filename)
     file_hash = _compute_hash(file_content)
+    size_bytes = len(file_content)
     bucket_path = _storage_path(project_id, file_id, 1, ext,
                                 parent_id=parent_id, filename=filename)
 
     # Upload assembled file to Supabase Storage
-    supabase.storage.from_(VAULT_BUCKET).upload(
-        path=bucket_path,
-        file=file_content,
-        file_options={"content-type": content_type, "upsert": "true"},
-    )
+    try:
+        supabase.storage.from_(VAULT_BUCKET).upload(
+            path=bucket_path,
+            file=file_content,
+            file_options={"content-type": content_type, "upsert": "true"},
+        )
+    finally:
+        # Free the large buffer as soon as the upload completes (or fails)
+        del file_content
+        gc.collect()
 
     public_url = supabase.storage.from_(VAULT_BUCKET).get_public_url(bucket_path)
 
@@ -417,7 +429,7 @@ def assemble_chunks(
         "project_id": project_id,
         "bucket_path": bucket_path,
         "mime_type": content_type,
-        "size_bytes": len(file_content),
+        "size_bytes": size_bytes,
         "file_hash": file_hash,
         "uploaded_by": user_id,
     }
@@ -428,7 +440,7 @@ def assemble_chunks(
         "file_id": file_id,
         "version_number": 1,
         "bucket_path": bucket_path,
-        "size_bytes": len(file_content),
+        "size_bytes": size_bytes,
         "uploaded_by": user_id,
         "comment": "Initial upload",
     }
@@ -483,6 +495,7 @@ def create_version(
 
     ext = _get_extension(filename)
     file_hash = _compute_hash(file_content)
+    size_bytes = len(file_content)
     bucket_path = _storage_path(file_rec.get("project_id"), file_id, next_version, ext,
                                 parent_id=file_rec.get("parent_id"), filename=filename)
 
@@ -492,13 +505,14 @@ def create_version(
         file=file_content,
         file_options={"content-type": content_type, "upsert": "true"},
     )
+    # Note: file_content is owned by the caller; caller is responsible for cleanup.
 
     # Create version record
     version_row = {
         "file_id": file_id,
         "version_number": next_version,
         "bucket_path": bucket_path,
-        "size_bytes": len(file_content),
+        "size_bytes": size_bytes,
         "uploaded_by": user_id,
         "comment": comment,
     }
@@ -507,7 +521,7 @@ def create_version(
     # Update file record with latest version info
     supabase.table("vault_files").update({
         "bucket_path": bucket_path,
-        "size_bytes": len(file_content),
+        "size_bytes": size_bytes,
         "file_hash": file_hash,
         "mime_type": content_type,
     }).eq("id", file_id).execute()
@@ -535,6 +549,7 @@ def restore_version(file_id: str, version_id: str, user_id: str) -> Dict[str, An
 
     file_rec = get_file(file_id)
     if not file_rec:
+        del old_data
         raise ValueError(f"File {file_id} not found")
 
     # Create a new version with the old content
@@ -547,11 +562,15 @@ def restore_version(file_id: str, version_id: str, user_id: str) -> Dict[str, An
         parent_id=file_rec.get("parent_id"), filename=file_rec.get("name", ""),
     )
 
-    supabase.storage.from_(VAULT_BUCKET).upload(
-        path=bucket_path,
-        file=old_data,
-        file_options={"content-type": file_rec.get("mime_type", "application/octet-stream"), "upsert": "true"},
-    )
+    try:
+        supabase.storage.from_(VAULT_BUCKET).upload(
+            path=bucket_path,
+            file=old_data,
+            file_options={"content-type": file_rec.get("mime_type", "application/octet-stream"), "upsert": "true"},
+        )
+    finally:
+        del old_data
+        gc.collect()
 
     version_row = {
         "file_id": file_id,
@@ -646,14 +665,18 @@ def duplicate_file(file_id: str, user_id: str) -> Dict[str, Any]:
     base_name, ext = os.path.splitext(file_rec["name"])
     copy_name = f"{base_name} (copy){ext}"
 
-    return upload_file(
-        file_content=file_content,
-        filename=copy_name,
-        content_type=file_rec.get("mime_type", "application/octet-stream"),
-        parent_id=file_rec.get("parent_id"),
-        project_id=file_rec.get("project_id"),
-        user_id=user_id,
-    )
+    try:
+        return upload_file(
+            file_content=file_content,
+            filename=copy_name,
+            content_type=file_rec.get("mime_type", "application/octet-stream"),
+            parent_id=file_rec.get("parent_id"),
+            project_id=file_rec.get("project_id"),
+            user_id=user_id,
+        )
+    finally:
+        del file_content
+        gc.collect()
 
 
 # ============================================

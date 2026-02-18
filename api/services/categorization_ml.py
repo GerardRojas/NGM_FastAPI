@@ -37,6 +37,7 @@ DEFAULT_MIN_CONFIDENCE = 90.0
 DEFAULT_N_NEIGHBORS = 5
 MAX_FEATURES = 5000
 BATCH_FETCH_SIZE = 1000  # rows per Supabase fetch page
+MAX_TRAINING_ROWS = 2000  # cap to limit memory usage during training
 
 
 # ── Text Preprocessing ──────────────────────────────────────────
@@ -256,6 +257,16 @@ class CategorizationMLService:
                 break
 
             all_rows.extend(resp.data)
+
+            # Stop early if we've reached the training-row cap
+            if len(all_rows) >= MAX_TRAINING_ROWS:
+                all_rows = all_rows[:MAX_TRAINING_ROWS]
+                logger.info(
+                    "[ML-CAT] Reached MAX_TRAINING_ROWS (%d), stopping fetch",
+                    MAX_TRAINING_ROWS,
+                )
+                break
+
             if len(resp.data) < BATCH_FETCH_SIZE:
                 break
             offset += BATCH_FETCH_SIZE

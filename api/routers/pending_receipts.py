@@ -53,12 +53,13 @@
 # @step_description: Mark receipt as rejected if invalid
 # =============================================================================
 
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query, BackgroundTasks, Depends, Request
 from pydantic import BaseModel
 from api.supabase_client import supabase
 from api.auth import get_current_user
 from typing import Optional, List, Dict, Any
 import base64
+import gc
 import hashlib
 import logging
 import os
@@ -83,6 +84,17 @@ router = APIRouter(prefix="/pending-receipts", tags=["Pending Receipts"])
 
 # Storage bucket name
 RECEIPTS_BUCKET = "pending-expenses"
+MAX_RECEIPT_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _check_content_length(request: Request, max_bytes: int = MAX_RECEIPT_BYTES):
+    """Reject oversized uploads early using the Content-Length header."""
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload too large. Maximum upload size is {max_bytes // (1024*1024)} MB.",
+        )
 
 
 def _load_agent_config() -> dict:
@@ -173,6 +185,7 @@ class VaultBatchRequest(BaseModel):
 
 @router.post("/upload", status_code=201)
 async def upload_receipt(
+    request: Request,
     file: UploadFile = File(...),
     project_id: str = Form(...),
     uploaded_by: str = Form(...),
@@ -189,6 +202,10 @@ async def upload_receipt(
 
     Returns the created pending receipt record.
     """
+    # Reject oversized payloads before reading the body into memory
+    _check_content_length(request, MAX_RECEIPT_BYTES)
+
+    file_content = None
     try:
         # Validate file type
         allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif", "application/pdf"]
@@ -202,17 +219,24 @@ async def upload_receipt(
         file_content = await file.read()
 
         # Validate size (max 20MB)
-        if len(file_content) > 20 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Maximum size is 20MB.")
+        if len(file_content) > MAX_RECEIPT_BYTES:
+            raise HTTPException(status_code=413, detail="File too large. Maximum size is 20MB.")
 
         # Compute file hash for duplicate detection
         file_hash = hashlib.sha256(file_content).hexdigest()
+        file_size = len(file_content)
 
         # Generate unique ID for this receipt
         receipt_id = str(uuid.uuid4())
 
         # Upload to Vault (primary storage)
         vault_result = save_to_project_folder(project_id, "Receipts", file_content, file.filename, file.content_type)
+
+        # Free the large buffer immediately after upload
+        del file_content
+        file_content = None
+        gc.collect()
+
         if not vault_result or not vault_result.get("public_url"):
             raise HTTPException(status_code=500, detail="Failed to upload file to vault")
 
@@ -231,7 +255,7 @@ async def upload_receipt(
             "file_name": file.filename,
             "file_url": file_url,
             "file_type": file.content_type,
-            "file_size": len(file_content),
+            "file_size": file_size,
             "file_hash": file_hash,
             "thumbnail_url": thumbnail_url,
             "status": "pending",
@@ -255,6 +279,10 @@ async def upload_receipt(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading receipt: {str(e)}")
+    finally:
+        if file_content is not None:
+            del file_content
+            gc.collect()
 
 
 @router.get("/project/{project_id}")
@@ -1696,7 +1724,8 @@ async def _agent_process_receipt_core(receipt_id: str, scan_mode: str = None):
                     pass
 
                 logger.info(f"[CheckFlow] Extracting context from user message: {user_message[:100]}")
-                check_context = _extract_check_context_sync(user_message, proj_name)
+                from api.services.agent_brain import _extract_check_context
+                check_context = await _extract_check_context(user_message, proj_name) or {}
                 logger.info(f"[CheckFlow] Extracted context: {json.dumps(check_context, ensure_ascii=False)[:200]}")
 
             # Auto-create entries from context
@@ -2658,26 +2687,6 @@ def _get_purchase_txn_type_id() -> Optional[str]:
 # ================================================================
 # CHECK CONTEXT EXTRACTION - SMART CHECK FLOW
 # ================================================================
-
-def _extract_check_context_sync(user_text: str, project_name: str) -> dict:
-    """
-    Synchronous wrapper for _extract_check_context (async).
-    Extracts labor type, projects, and worker info from user's message.
-
-    Examples:
-        "pago de drywall para trasher" → {labor_type_hint: "Drywall Labor", split_projects: [{"name": "trasher"}]}
-        "check for framing, split $800 Main St and $600 Oak" → {labor_type_hint: "Framing Labor", split_projects: [...]}
-
-    Returns empty dict on failure (graceful fallback).
-    """
-    try:
-        from api.services.agent_brain import _extract_check_context
-
-        result = asyncio.run(_extract_check_context(user_text, project_name))
-        return result or {}
-    except Exception as e:
-        logger.error(f"[CheckContext] Sync wrapper error: {e}")
-        return {}
 
 
 # ================================================================
