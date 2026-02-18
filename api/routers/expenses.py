@@ -849,11 +849,13 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
                             "change_reason": change_reason or status_reason or "Manual correction"
                         })
 
-            # Insert change logs
+            # Insert change logs in background (non-blocking)
             if change_logs:
-                supabase.table("expense_change_log").insert(change_logs).execute()
+                background_tasks.add_task(
+                    lambda logs=change_logs: supabase.table("expense_change_log").insert(logs).execute()
+                )
 
-        # Log status change in expense_status_log
+        # Log status change in background (non-blocking)
         if status_changed and user_id:
             log_data = {
                 "expense_id": expense_id,
@@ -863,7 +865,9 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
                 "reason": status_reason or change_reason or "Field modification",
                 "metadata": {"via_patch": True}
             }
-            supabase.table("expense_status_log").insert(log_data).execute()
+            background_tasks.add_task(
+                lambda ld=log_data: supabase.table("expense_status_log").insert(ld).execute()
+            )
 
         # Set updated_by so DB triggers (log_category_correction, etc.) know who made the change
         if user_id:
@@ -880,6 +884,13 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
             if project_id:
                 from api.services.daneel_auto_auth import trigger_auto_auth_check
                 background_tasks.add_task(trigger_auto_auth_check, expense_id, project_id)
+
+        # Trigger budget check when expense is authorized via main PATCH
+        if status_changed and new_status == 'auth':
+            project_id = updated_exp.get("project") or existing.get("project")
+            if project_id:
+                from api.services.budget_monitor import trigger_project_budget_check
+                background_tasks.add_task(trigger_project_budget_check, project_id)
 
         return {
             "message": "Expense updated successfully",
