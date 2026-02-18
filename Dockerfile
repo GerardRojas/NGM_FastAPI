@@ -24,4 +24,4 @@ COPY . .
 EXPOSE 10000
 
 # Comando para iniciar la aplicación
-CMD ["gunicorn", "api.main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:10000", "--max-requests", "1000", "--max-requests-jitter", "50"]
+CMD gunicorn api.main:app -w ${GUNICORN_WORKERS:-2} -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:10000 --max-requests 1000 --max-requests-jitter 50
