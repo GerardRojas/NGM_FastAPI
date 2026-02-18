@@ -5,6 +5,7 @@ import gc
 import time
 import asyncio
 import logging
+from typing import Optional
 
 # ========================================
 # Cargar .env desde la raíz del proyecto
@@ -230,9 +231,13 @@ _mem_logger = logging.getLogger("memory")
 # Memory Management: periodic GC + cache cleanup
 # ========================================
 
+_memory_task: Optional[asyncio.Task] = None
+
+
 @app.on_event("startup")
 async def _start_memory_manager():
     """Periodic garbage collection and cache cleanup to prevent memory leaks."""
+    global _memory_task
 
     async def _memory_loop():
         while True:
@@ -249,7 +254,15 @@ async def _start_memory_manager():
             except Exception as e:
                 _mem_logger.warning("[MEM-GC] Error: %s", e)
 
-    asyncio.create_task(_memory_loop())
+    _memory_task = asyncio.create_task(_memory_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_memory_manager():
+    """Cancel the memory management loop on shutdown."""
+    global _memory_task
+    if _memory_task and not _memory_task.done():
+        _memory_task.cancel()
 
 
 def _purge_stale_caches():

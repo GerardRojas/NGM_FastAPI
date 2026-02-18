@@ -29,12 +29,18 @@ _THREAD_TTL = 7200  # 2 hours
 MODEL = "gpt-5-mini"
 
 
+_openai_client: Optional[OpenAI] = None
+
+
 def _get_client() -> Optional[OpenAI]:
-    """Get OpenAI client if API key is configured"""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+    """Get OpenAI client (lazy singleton — reused across all calls)."""
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
 
 
 # ================================

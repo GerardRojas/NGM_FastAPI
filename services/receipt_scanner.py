@@ -180,8 +180,10 @@ def _convert_pdf_to_images(file_content: bytes):
     for img in images:
         buffer = io.BytesIO()
         img.save(buffer, format='PNG')
-        buffer.seek(0)
         base64_images.append(base64.b64encode(buffer.getvalue()).decode('utf-8'))
+        buffer.close()
+        img.close()
+    del images
 
     return base64_images
 
