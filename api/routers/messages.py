@@ -211,7 +211,7 @@ def extract_mentioned_user_ids(content: str, sender_user_id: str) -> List[str]:
 
         return user_ids
     except Exception as e:
-        print(f"[Messages] Error extracting mentions: {e}")
+        logger.error("[Messages] Error extracting mentions: %s", e)
         return []
 
 
@@ -265,7 +265,7 @@ def get_channel_member_ids(channel_id: str, exclude_user_id: str = None) -> List
 
         return member_ids
     except Exception as e:
-        print(f"[Messages] Error getting channel members: {e}")
+        logger.error("[Messages] Error getting channel members: %s", e)
         return []
 
 
@@ -306,7 +306,7 @@ def _detect_agent_mentions(
             continue
         seen.add(agent_key)
 
-        print(f"[Messages] Agent mention detected: @{name} by user {user_name}")
+        logger.info("[Messages] Agent mention detected: @%s by user %s", name, user_name)
         background_tasks.add_task(
             _run_agent_brain,
             agent_key,
@@ -355,9 +355,9 @@ async def _run_agent_brain(
                                 "processing_started": True,
                             },
                         )
-                        print(f"[Messages] Immediate ack posted for {att.get('name')}")
+                        logger.info("[Messages] Immediate ack posted for %s", att.get('name'))
                     except Exception as e:
-                        print(f"[Messages] Immediate ack failed (non-blocking): {e}")
+                        logger.warning("[Messages] Immediate ack failed (non-blocking): %s", e)
                     break
 
         from api.services.agent_brain import invoke_brain
@@ -372,7 +372,7 @@ async def _run_agent_brain(
             attachments=attachments,
         )
     except Exception as e:
-        print(f"[Messages] Agent brain error ({agent_name}): {e}")
+        logger.error("[Messages] Agent brain error (%s): %s", agent_name, e)
 
 
 async def send_message_notifications(
@@ -546,7 +546,7 @@ def create_message(
                     if att_result.data:
                         saved_attachments.append(att_result.data[0])
                 except Exception as att_err:
-                    print(f"[Messages] Attachment insert error (non-blocking): {att_err}")
+                    logger.warning("[Messages] Attachment insert error (non-blocking): %s", att_err)
 
         # Get user info for response
         response = normalize_message(msg)
@@ -567,7 +567,7 @@ def create_message(
                 sender_name = user_row.get("user_name", "Someone")
                 sender_avatar_color = user_row.get("avatar_color")
         except Exception as user_err:
-            print(f"[Messages] User lookup error (non-blocking): {user_err}")
+            logger.warning("[Messages] User lookup error (non-blocking): %s", user_err)
 
         # Send push notifications for @mentions + DM/group (in background)
         try:
@@ -582,7 +582,7 @@ def create_message(
                 channel_id=payload.channel_id
             )
         except Exception as bg_err:
-            print(f"[Messages] Background task setup error (non-blocking): {bg_err}")
+            logger.warning("[Messages] Background task setup error (non-blocking): %s", bg_err)
 
         # --- Agent Brain: detect @Andrew / @Daneel mentions ---
         try:
@@ -598,7 +598,7 @@ def create_message(
                     payload.attachments,
                 )
         except Exception as brain_err:
-            print(f"[Messages] Agent brain setup error (non-blocking): {brain_err}")
+            logger.warning("[Messages] Agent brain setup error (non-blocking): %s", brain_err)
 
         return {"message": response}
 

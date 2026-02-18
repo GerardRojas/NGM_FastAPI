@@ -1,17 +1,16 @@
 # api/routers/team.py
 from __future__ import annotations
 
+import asyncio
 from fastapi import APIRouter, Query, HTTPException
 from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field
-from passlib.context import CryptContext
 
 from api.supabase_client import supabase
+from utils.auth import hash_password
 
 router = APIRouter(prefix="/team", tags=["team"])
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 SELECT_CLAUSE = """
   user_id,
@@ -122,32 +121,34 @@ class RoleUpdate(BaseModel):
 
 
 @router.get("/meta")
-def team_meta() -> Dict[str, Any]:
+async def team_meta() -> Dict[str, Any]:
     """
     Para poblar dropdowns en el frontend.
+    Runs all 4 lookups in parallel (~4x faster than sequential).
     """
     try:
-        roles = supabase.table("rols").select("rol_id, rol_name").order("rol_name").execute().data or []
-        seniorities = (
-            supabase.table("users_seniority").select("id, user_seniority_name").order("user_seniority_name").execute().data
-            or []
-        )
-        statuses = (
-            supabase.table("users_status").select("id, user_status_name").order("user_status_name").execute().data
-            or []
-        )
-        departments = (
-            supabase.table("task_departments").select("department_id, department_name").order("department_name").execute().data
-            or []
+        roles_res, sen_res, status_res, dept_res = await asyncio.gather(
+            asyncio.to_thread(
+                lambda: supabase.table("rols").select("rol_id, rol_name").order("rol_name").execute()
+            ),
+            asyncio.to_thread(
+                lambda: supabase.table("users_seniority").select("id, user_seniority_name").order("user_seniority_name").execute()
+            ),
+            asyncio.to_thread(
+                lambda: supabase.table("users_status").select("id, user_status_name").order("user_status_name").execute()
+            ),
+            asyncio.to_thread(
+                lambda: supabase.table("task_departments").select("department_id, department_name").order("department_name").execute()
+            ),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Supabase meta query failed: {e}")
 
     return {
-        "roles": [{"id": r["rol_id"], "name": r["rol_name"]} for r in roles],
-        "seniorities": [{"id": s["id"], "name": s["user_seniority_name"]} for s in seniorities],
-        "statuses": [{"id": s["id"], "name": s["user_status_name"]} for s in statuses],
-        "departments": [{"id": d["department_id"], "name": d["department_name"]} for d in departments],
+        "roles": [{"id": r["rol_id"], "name": r["rol_name"]} for r in (roles_res.data or [])],
+        "seniorities": [{"id": s["id"], "name": s["user_seniority_name"]} for s in (sen_res.data or [])],
+        "statuses": [{"id": s["id"], "name": s["user_status_name"]} for s in (status_res.data or [])],
+        "departments": [{"id": d["department_id"], "name": d["department_name"]} for d in (dept_res.data or [])],
     }
 
 
@@ -264,7 +265,7 @@ def create_user(payload: UserCreate) -> Dict[str, Any]:
 
     # hash password if provided
     if data.get("password"):
-        insert_obj["password_hash"] = pwd_context.hash(data["password"])
+        insert_obj["password_hash"] = hash_password(data["password"])
 
     # remove None (so DB defaults apply)
     insert_obj = {k: v for k, v in insert_obj.items() if v is not None}
@@ -313,7 +314,7 @@ def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
 
     # password
     if "password" in data and data["password"]:
-        update_obj["password_hash"] = pwd_context.hash(data["password"])
+        update_obj["password_hash"] = hash_password(data["password"])
 
     if not update_obj:
         return fetch_user_by_id(user_id)

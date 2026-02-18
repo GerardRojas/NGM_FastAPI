@@ -1,11 +1,14 @@
 """
 Router para gestion de Materials (Base de datos de materiales para estimator)
 """
+import logging
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
 import os
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 
@@ -324,6 +327,15 @@ async def delete_material(material_id: str):
 
         if not existing.data:
             raise HTTPException(status_code=404, detail="Material not found")
+
+        # Referential integrity check: ensure no concepts reference this material
+        refs = supabase.table("concept_materials").select("id", count="exact").eq("material_id", material_id).execute()
+        ref_count = refs.count or 0
+        if ref_count > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Material is referenced by {ref_count} concept(s). Remove material from concepts before deleting."
+            )
 
         supabase.table("materials").delete().eq('"ID"', material_id).execute()
 

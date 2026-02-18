@@ -12,6 +12,9 @@ from datetime import datetime
 import re
 import json
 import time
+import logging
+
+logger_art = logging.getLogger(__name__)
 
 from api.auth import get_current_user
 from api.services.gpt_client import gpt
@@ -142,7 +145,7 @@ async def receive_message(message: ChatMessage):
         )
 
     except Exception as e:
-        print(f"[ARTURITO] /message error: {e}")
+        logger_art.error("[ARTURITO] /message error: %s", e)
         return BotResponse(
             text="Ocurrio un error procesando tu mensaje.",
             action="error",
@@ -170,7 +173,7 @@ async def receive_slash_command(command: SlashCommand):
         )
 
     except Exception as e:
-        print(f"[ARTURITO] /slash error: {e}")
+        logger_art.error("[ARTURITO] /slash error: %s", e)
         return BotResponse(
             text=f"Error ejecutando /{command.command}",
             action="error",
@@ -266,7 +269,7 @@ async def web_chat(message: WebChatMessage):
             )
 
             if error:
-                print(f"[ARTURITO] Assistants API error: {error}")
+                logger_art.warning("[ARTURITO] Assistants API error: %s", error)
             return BotResponse(
                 text=response_text,
                 action="chat_response",
@@ -277,7 +280,7 @@ async def web_chat(message: WebChatMessage):
         response = route(intent_result, context)
 
         if response.get("error"):
-            print(f"[ARTURITO] Route handler error: {response.get('error')}")
+            logger_art.warning("[ARTURITO] Route handler error: %s", response.get('error'))
 
         return BotResponse(
             text=response.get("text", ""),
@@ -287,7 +290,7 @@ async def web_chat(message: WebChatMessage):
         )
 
     except Exception as e:
-        print(f"[ARTURITO] /web-chat error: {e}")
+        logger_art.error("[ARTURITO] /web-chat error: %s", e)
         return BotResponse(
             text="Ocurrio un error procesando tu mensaje. Por favor intenta de nuevo.",
             action="error",
@@ -394,7 +397,7 @@ async def google_chat_webhook(payload: Dict[str, Any]):
         return {"text": ""}
 
     except Exception as e:
-        print(f"[ARTURITO] /webhook error: {e}")
+        logger_art.error("[ARTURITO] /webhook error: %s", e)
         return {"text": "Ocurrio un error procesando tu mensaje."}
 
 
@@ -641,7 +644,7 @@ def _get_cached_entities():
             ))
             g_cache["ts"] = now
         except Exception as e:
-            print(f"[ARTURITO] Entity cache refresh error: {e}")
+            logger_art.warning("[ARTURITO] Entity cache refresh error: %s", e)
 
     return p_cache["data"], v_cache["data"], g_cache["data"]
 
@@ -811,7 +814,7 @@ async def interpret_intent(request: IntentRequest, current_user: dict = Depends(
         )
 
     except Exception as e:
-        print(f"[ARTURITO] interpret-intent error: {e}")
+        logger_art.error("[ARTURITO] interpret-intent error: %s", e)
         return IntentResponse(type="chat")
 
 
@@ -910,7 +913,7 @@ If you can't interpret the command as a filter action, return:
         return FilterInterpretResponse(understood=False)
 
     except Exception as e:
-        print(f"[ARTURITO] Filter interpretation error: {e}")
+        logger_art.error("[ARTURITO] Filter interpretation error: %s", e)
         return FilterInterpretResponse(understood=False)
 
 
@@ -988,7 +991,7 @@ If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}
         return []
 
     except Exception as e:
-        print(f"[ARTURITO] Semantic search error: {e}")
+        logger_art.error("[ARTURITO] Semantic search error: %s", e)
         return []
 
 
@@ -1062,17 +1065,17 @@ async def search_accounts(query: str, limit: int = 5):
 
         # Phase 2: If no good match found (best score < 70), try GPT semantic search
         if not scored_accounts or scored_accounts[0]["score"] < 70:
-            print(f"[ARTURITO] Fuzzy match weak (best: {scored_accounts[0]['score'] if scored_accounts else 0}), trying GPT semantic search...")
+            logger_art.info("[ARTURITO] Fuzzy match weak (best: %s), trying GPT semantic search...", scored_accounts[0]['score'] if scored_accounts else 0)
 
             semantic_matches = await semantic_account_search(query, accounts)
             if semantic_matches:
-                print(f"[ARTURITO] GPT found {len(semantic_matches)} semantic matches")
+                logger_art.info("[ARTURITO] GPT found %d semantic matches", len(semantic_matches))
                 return {"matches": semantic_matches[:limit], "method": "semantic"}
 
         return {"matches": scored_accounts[:limit], "method": "fuzzy"}
 
     except Exception as e:
-        print(f"[ARTURITO] Account search error: {e}")
+        logger_art.error("[ARTURITO] Account search error: %s", e)
         return {"matches": []}
 
 

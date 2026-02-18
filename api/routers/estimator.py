@@ -22,6 +22,7 @@
 #
 # Note: Legacy estimates/templates may have .csv snapshots - backward compatible
 
+import logging
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from datetime import datetime
@@ -32,6 +33,8 @@ from fastapi import APIRouter, HTTPException, Body
 from pydantic import BaseModel
 
 from api.supabase_client import supabase
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/estimator", tags=["estimator"])
 
@@ -47,8 +50,8 @@ BASE_DIR = Path(__file__).resolve().parents[2]   # .../NGM_API
 TEMPLATES_DIR = BASE_DIR / "templates"
 NGM_FILE_PATH = TEMPLATES_DIR / "estimate.ngm"
 
-print(f"[ESTIMATOR] BASE_DIR      = {BASE_DIR}")
-print(f"[ESTIMATOR] TEMPLATES_DIR = {TEMPLATES_DIR}")
+logger.info("[ESTIMATOR] BASE_DIR      = %s", BASE_DIR)
+logger.info("[ESTIMATOR] TEMPLATES_DIR = %s", TEMPLATES_DIR)
 
 
 # ============================================
@@ -89,16 +92,17 @@ def ensure_bucket_exists(bucket_name: str, public: bool = True) -> bool:
     try:
         supabase.storage.get_bucket(bucket_name)
         return True
-    except Exception:
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
         try:
             supabase.storage.create_bucket(
                 bucket_name,
                 options={"public": public}
             )
-            print(f"[ESTIMATOR] Created bucket: {bucket_name}")
+            logger.info("[ESTIMATOR] Created bucket: %s", bucket_name)
             return True
         except Exception as e:
-            print(f"[ESTIMATOR] Bucket creation note for {bucket_name}: {e}")
+            logger.warning("[ESTIMATOR] Bucket creation note for %s: %s", bucket_name, e)
             # Might already exist due to race condition
             return True
 
@@ -157,8 +161,8 @@ async def get_buckets_status():
             status["estimates"]["exists"] = True
             files = supabase.storage.from_(ESTIMATES_BUCKET).list()
             status["estimates"]["file_count"] = len(files) if files else 0
-        except:
-            pass
+        except Exception as _exc:
+            logger.debug("Suppressed: %s", _exc)
 
         # Check templates bucket
         try:
@@ -166,8 +170,8 @@ async def get_buckets_status():
             status["templates"]["exists"] = True
             files = supabase.storage.from_(TEMPLATES_BUCKET).list()
             status["templates"]["file_count"] = len(files) if files else 0
-        except:
-            pass
+        except Exception as _exc:
+            logger.debug("Suppressed: %s", _exc)
 
         return status
     except Exception as e:

@@ -73,7 +73,7 @@ async def get_alert_settings(project_id: Optional[str] = None) -> Dict[str, Any]
         return defaults
 
     except Exception as e:
-        logger.warning(f"[BudgetMonitor] No alert settings found, using defaults: {e}")
+        logger.warning("[BudgetMonitor] No alert settings found, using defaults: %s", e)
         return defaults
 
 
@@ -94,7 +94,7 @@ async def get_alert_recipients(settings_id: Optional[str] = None) -> List[Dict]:
         return result.data or []
 
     except Exception as e:
-        logger.warning(f"[BudgetMonitor] No alert recipients found: {e}")
+        logger.warning("[BudgetMonitor] No alert recipients found: %s", e)
         return []
 
 
@@ -107,7 +107,7 @@ async def get_active_projects() -> List[Dict]:
             .execute()
         return result.data or []
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error getting projects: {e}")
+        logger.error("[BudgetMonitor] Error getting projects: %s", e)
         return []
 
 
@@ -133,7 +133,7 @@ async def get_project_budgets(project_id: str) -> Dict[str, float]:
         return budgets
 
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error getting budgets for {project_id}: {e}")
+        logger.error("[BudgetMonitor] Error getting budgets for %s: %s", project_id, e)
         return {}
 
 
@@ -144,7 +144,7 @@ async def get_project_actuals(project_id: str) -> Dict[str, float]:
     """
     try:
         supabase = get_supabase()
-        result = supabase.table("expenses") \
+        result = supabase.table("expenses_manual_COGS") \
             .select("account_name, Amount, amount") \
             .eq("project", project_id) \
             .eq("auth_status", True) \
@@ -160,7 +160,7 @@ async def get_project_actuals(project_id: str) -> Dict[str, float]:
         return actuals
 
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error getting actuals for {project_id}: {e}")
+        logger.error("[BudgetMonitor] Error getting actuals for %s: %s", project_id, e)
         return {}
 
 
@@ -286,7 +286,7 @@ async def is_alert_already_sent(dedup_key: str) -> bool:
             .execute()
         return len(result.data or []) > 0
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error checking dedup: {e}")
+        logger.error("[BudgetMonitor] Error checking dedup: %s", e)
         return False
 
 
@@ -321,7 +321,7 @@ async def save_alert_log(alert: Dict, recipients: List[str]) -> Optional[str]:
     except Exception as e:
         # May fail on duplicate dedup_key - that's OK
         if "duplicate" not in str(e).lower():
-            logger.error(f"[BudgetMonitor] Error saving alert log: {e}")
+            logger.error("[BudgetMonitor] Error saving alert log: %s", e)
         return None
 
 
@@ -367,7 +367,7 @@ async def create_dashboard_notification(
         supabase.table("dashboard_notifications").insert(notification).execute()
 
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error creating dashboard notification: {e}")
+        logger.error("[BudgetMonitor] Error creating dashboard notification: %s", e)
 
 
 async def send_push_notification_for_alert(user_id: str, alert: Dict):
@@ -397,7 +397,7 @@ async def send_push_notification_for_alert(user_id: str, alert: Dict):
         )
 
     except Exception as e:
-        logger.error(f"[BudgetMonitor] Error sending push notification: {e}")
+        logger.error("[BudgetMonitor] Error sending push notification: %s", e)
 
 
 async def notify_recipients(alert: Dict, recipients: List[Dict]):
@@ -541,7 +541,7 @@ async def check_project_budgets(
             # Save to log
             await save_alert_log(alert, notified)
             alerts_sent += 1
-            logger.info(f"[BudgetMonitor] Alert sent: {alert['title']} to {len(notified)} users")
+            logger.info("[BudgetMonitor] Alert sent: %s to %s users", alert['title'], len(notified))
 
             # Post to project accounting channel as Daneel
             post_alert_to_channel(alert)
@@ -576,7 +576,7 @@ async def run_budget_check() -> Dict[str, Any]:
 
     # Get all projects
     projects = await get_active_projects()
-    logger.info(f"[BudgetMonitor] Checking {len(projects)} projects...")
+    logger.info("[BudgetMonitor] Checking %s projects...", len(projects))
 
     total_alerts = 0
 
@@ -604,7 +604,7 @@ async def run_budget_check() -> Dict[str, Any]:
         total_alerts += alerts
 
     elapsed = (datetime.now() - start_time).total_seconds()
-    logger.info(f"[BudgetMonitor] Check complete. {total_alerts} alerts sent in {elapsed:.2f}s")
+    logger.info("[BudgetMonitor] Check complete. %s alerts sent in %.2fs", total_alerts, elapsed)
 
     return {
         "status": "completed",
@@ -635,7 +635,7 @@ async def trigger_project_budget_check(project_id: str):
             .execute()
 
         if not proj.data:
-            logger.warning(f"[BudgetMonitor] Project not found: {project_id}")
+            logger.warning("[BudgetMonitor] Project not found: %s", project_id)
             return
 
         project_name = proj.data.get("project_name", "Unknown")
@@ -663,11 +663,11 @@ async def trigger_project_budget_check(project_id: str):
         )
 
         if alerts > 0:
-            logger.info(f"[BudgetMonitor] Event trigger: {alerts} alerts for {project_name}")
+            logger.info("[BudgetMonitor] Event trigger: %s alerts for %s", alerts, project_name)
 
     except Exception as e:
         # Never let budget monitoring break expense operations
-        logger.error(f"[BudgetMonitor] Event trigger error for {project_id}: {e}")
+        logger.error("[BudgetMonitor] Event trigger error for %s: %s", project_id, e)
 
 
 # ============================================================================
@@ -689,6 +689,6 @@ if __name__ == "__main__":
 
     # Run the check
     result = asyncio.run(run_budget_check())
-    print(f"\nBudget Check Result: {result}")
+    logger.info("Budget Check Result: %s", result)
 
     sys.exit(0 if result.get("status") == "completed" else 1)

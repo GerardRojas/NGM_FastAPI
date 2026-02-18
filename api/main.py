@@ -117,7 +117,7 @@ app.add_middleware(
         "http://127.0.0.1:8000",
     ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -365,7 +365,14 @@ async def root():
 
 @app.get("/health", include_in_schema=False)
 async def health():
-    return {"status": "ok"}
+    try:
+        from api.supabase_client import supabase
+        result = supabase.table("users").select("user_id").limit(1).execute()
+        db_ok = result.data is not None
+    except Exception:
+        db_ok = False
+    status = "ok" if db_ok else "degraded"
+    return {"status": status, "database": db_ok}
 
 @app.get("/departments")
 async def get_departments():

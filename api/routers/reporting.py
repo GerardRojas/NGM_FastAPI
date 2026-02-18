@@ -3,9 +3,12 @@
 # Reporting endpoints — generate PDFs and save to Vault
 # ================================
 
+import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from api.supabase_client import supabase
 
@@ -48,7 +51,8 @@ async def generate_pnl_report(body: PnlReportRequest):
         proj_resp = supabase.table("projects").select(
             "project_id, project_name"
         ).eq("project_id", body.project_id).single().execute()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
         proj_resp = None
 
     if not proj_resp or not proj_resp.data:

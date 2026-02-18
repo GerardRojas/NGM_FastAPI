@@ -15,6 +15,7 @@ from api.services.ocr_metrics import log_ocr_metric, ocr_timer
 from typing import Optional
 import base64
 import hashlib
+import logging
 import io
 import json
 import os
@@ -24,6 +25,8 @@ import time
 
 import pdfplumber
 from pdf2image import convert_from_bytes
+
+logger = logging.getLogger(__name__)
 
 
 # ====== PDF TEXT EXTRACTION ======
@@ -40,38 +43,38 @@ def extract_text_from_pdf(file_content: bytes, min_chars: int = 100) -> tuple:
         (success: bool, text_or_error: str)
     """
     try:
-        print("[PDF-TEXT] Intentando extraer texto con pdfplumber...")
+        logger.info("[PDF-TEXT] Intentando extraer texto con pdfplumber...")
 
         with pdfplumber.open(io.BytesIO(file_content)) as pdf:
             all_text = []
             total_pages = len(pdf.pages)
-            print(f"[PDF-TEXT] PDF tiene {total_pages} pagina(s)")
+            logger.info(f"[PDF-TEXT] PDF tiene {total_pages} pagina(s)")
 
             for i, page in enumerate(pdf.pages):
                 page_text = page.extract_text() or ""
                 all_text.append(page_text)
                 char_count = len(page_text.strip())
-                print(f"[PDF-TEXT] Pagina {i+1}: {char_count} caracteres extraidos")
+                logger.info(f"[PDF-TEXT] Pagina {i+1}: {char_count} caracteres extraidos")
 
             combined_text = "\n\n--- PAGE BREAK ---\n\n".join(all_text)
             total_chars = len(combined_text.strip())
 
-            print(f"[PDF-TEXT] Total caracteres extraidos: {total_chars}")
+            logger.info(f"[PDF-TEXT] Total caracteres extraidos: {total_chars}")
 
             if total_chars < min_chars:
-                print(f"[PDF-TEXT] FALLBACK: Texto insuficiente ({total_chars} < {min_chars})")
+                logger.warning(f"[PDF-TEXT] FALLBACK: Texto insuficiente ({total_chars} < {min_chars})")
                 return False, f"Texto insuficiente: {total_chars} caracteres"
 
             meaningful_text = combined_text.replace(" ", "").replace("\n", "").replace("\t", "")
             if len(meaningful_text) < min_chars:
-                print(f"[PDF-TEXT] FALLBACK: Texto no significativo ({len(meaningful_text)} chars utiles)")
+                logger.warning(f"[PDF-TEXT] FALLBACK: Texto no significativo ({len(meaningful_text)} chars utiles)")
                 return False, "Texto no significativo (solo espacios/newlines)"
 
-            print(f"[PDF-TEXT] EXITO: Texto extraido correctamente ({total_chars} chars)")
+            logger.info(f"[PDF-TEXT] EXITO: Texto extraido correctamente ({total_chars} chars)")
             return True, combined_text
 
     except Exception as e:
-        print(f"[PDF-TEXT] ERROR: {str(e)}")
+        logger.error(f"[PDF-TEXT] ERROR: {str(e)}")
         return False, f"Error pdfplumber: {str(e)}"
 
 
@@ -110,7 +113,7 @@ def _redistribute_tax_items(parsed_data: dict) -> dict:
 
     # Calculate total tax to redistribute
     tax_total = sum(float(t.get("amount", 0)) for t in tax_items)
-    print(f"[SCAN-RECEIPT] TAX SAFETY NET: Found {len(tax_items)} tax line item(s) "
+    logger.info(f"[SCAN-RECEIPT] TAX SAFETY NET: Found {len(tax_items)} tax line item(s) "
           f"totaling ${tax_total:.2f} - redistributing across {len(real_items)} items")
 
     # Calculate subtotal of real items
@@ -158,7 +161,7 @@ def _redistribute_tax_items(parsed_data: dict) -> dict:
     parsed_data["validation"] = validation
 
     parsed_data["expenses"] = real_items
-    print(f"[SCAN-RECEIPT] TAX SAFETY NET: Redistributed. New sum=${new_sum:.2f}")
+    logger.info(f"[SCAN-RECEIPT] TAX SAFETY NET: Redistributed. New sum=${new_sum:.2f}")
     return parsed_data
 
 
@@ -288,7 +291,7 @@ def _fetch_lookup_data():
     result = (vendors_list, txn_types_list, payment_methods_list)
     _lookup_cache["data"] = result
     _lookup_cache["ts"] = now
-    print(f"[SCAN-RECEIPT] Lookup cache refreshed: {len(vendors_list)} vendors, {len(txn_types_list)} txn types, {len(payment_methods_list)} payment methods")
+    logger.info(f"[SCAN-RECEIPT] Lookup cache refreshed: {len(vendors_list)} vendors, {len(txn_types_list)} txn types, {len(payment_methods_list)} payment methods")
     return result
 
 
@@ -791,7 +794,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
     if correction_context:
         openai_model = HEAVY_MODEL
         model = "heavy"
-        print(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
+        logger.warning(f"[SCAN-RECEIPT] CORRECTION MODE: invoice_total={correction_context.get('invoice_total')}, "
               f"calculated_sum={correction_context.get('calculated_sum')}, "
               f"items={len(correction_context.get('items', []))}")
     elif model in ("fast-beta", "super-fast"):
@@ -801,7 +804,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
     else:
         openai_model = HEAVY_MODEL  # fast default
 
-    print(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
+    logger.info(f"[SCAN-RECEIPT] Using model: {openai_model} (requested: {model})")
 
     # Fetch lookup data
     vendors_list, txn_types_list, payment_methods_list = _fetch_lookup_data()
@@ -816,31 +819,31 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
     # HEAVY MODE: Always use Vision OCR (skip pdfplumber for max accuracy)
     if model == "heavy":
         if file_type == "application/pdf":
-            print(f"[SCAN-RECEIPT] HEAVY MODE: PDF detectado, usando Vision OCR (saltando pdfplumber)...")
+            logger.info(f"[SCAN-RECEIPT] HEAVY MODE: PDF detectado, usando Vision OCR (saltando pdfplumber)...")
             extraction_method = "vision_direct"
             try:
                 base64_images = _convert_pdf_to_images(file_content)
                 media_type = "image/png"
-                print(f"[SCAN-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
+                logger.info(f"[SCAN-RECEIPT] PDF convertido a {len(base64_images)} imagen(es) para Vision")
             except Exception as pdf_error:
                 raise ValueError(f"Error processing PDF: {str(pdf_error)}")
         else:
             # Images always use Vision in heavy mode
             extraction_method = "vision_direct"
             base64_images = [base64.b64encode(file_content).decode('utf-8')]
-            print(f"[SCAN-RECEIPT] HEAVY MODE: Imagen lista para Vision")
+            logger.info(f"[SCAN-RECEIPT] HEAVY MODE: Imagen lista para Vision")
 
     # FAST / FAST-BETA / SUPER-FAST MODE: Only pdfplumber (no Vision fallback)
     elif file_type == "application/pdf":
         mode_label = {"super-fast": "SUPER-FAST", "fast-beta": "FAST-BETA"}.get(model, "FAST")
-        print(f"[SCAN-RECEIPT] {mode_label} MODE: PDF detectado, intentando pdfplumber...")
+        logger.info(f"[SCAN-RECEIPT] {mode_label} MODE: PDF detectado, intentando pdfplumber...")
         text_success, text_result = extract_text_from_pdf(file_content)
 
         if text_success:
             use_text_mode = True
             extraction_method = "pdfplumber"
             extracted_text = text_result
-            print(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
+            logger.info(f"[SCAN-RECEIPT] EXITO pdfplumber - {len(extracted_text)} caracteres")
         else:
             raise ValueError(
                 f"{mode_label} mode: PDF has no extractable text ({text_result}). "
@@ -852,6 +855,9 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             "Use heavy mode for images and scanned documents."
         )
 
+    # file_content no longer needed — free it before the long processing phase
+    del file_content
+
     # ── SUPER-FAST: regex-only path (no GPT at all) ──
     if model == "super-fast" and use_text_mode:
         from services.receipt_regex import (
@@ -861,7 +867,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
 
         cleaned_text = clean_receipt_text(extracted_text)
         chars_removed = len(extracted_text) - len(cleaned_text)
-        print(f"[SCAN-RECEIPT] SUPER-FAST Pass 1: {len(extracted_text)} -> {len(cleaned_text)} chars "
+        logger.info(f"[SCAN-RECEIPT] SUPER-FAST Pass 1: {len(extracted_text)} -> {len(cleaned_text)} chars "
               f"({chars_removed} noise removed)")
 
         regex_meta, scoring = extract_best(cleaned_text, filename=filename)
@@ -870,7 +876,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
         items_ok = conf.get('items_match_subtotal') or conf.get('items_match_grand') or conf.get('items_plus_tax_match')
         best_score = scoring.get('vendor_score') or scoring['general_score']
 
-        print(f"[SCAN-RECEIPT] SUPER-FAST Pass 2: vendor={scoring['vendor_detected']}, "
+        logger.info(f"[SCAN-RECEIPT] SUPER-FAST Pass 2: vendor={scoring['vendor_detected']}, "
               f"winner={scoring['winner']}, score={best_score}/100, "
               f"grand_total={regex_meta['grand_total']}, items={n_items}, "
               f"items_sum={regex_meta['items_sum']}, cross={conf['cross_validated']}")
@@ -882,7 +888,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             )
             parsed_data = _redistribute_tax_items(parsed_data)
 
-            print(f"[SCAN-RECEIPT] SUPER-FAST COMPLETADO - metodo: regex, items: {len(parsed_data['expenses'])}, score: {best_score}/100")
+            logger.info(f"[SCAN-RECEIPT] SUPER-FAST COMPLETADO - metodo: regex, items: {len(parsed_data['expenses'])}, score: {best_score}/100")
 
             log_ocr_metric(
                 agent="receipt_scanner",
@@ -922,7 +928,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
         # Pass 1: Clean noise
         cleaned_text = clean_receipt_text(extracted_text)
         chars_removed = len(extracted_text) - len(cleaned_text)
-        print(f"[SCAN-RECEIPT] FAST-BETA Pass 1: {len(extracted_text)} -> {len(cleaned_text)} chars "
+        logger.info(f"[SCAN-RECEIPT] FAST-BETA Pass 1: {len(extracted_text)} -> {len(cleaned_text)} chars "
               f"({chars_removed} noise removed)")
 
         # Pass 2: Best extraction (general + vendor-specific layers + scoring)
@@ -931,14 +937,14 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
         n_items = len(regex_meta['line_items'])
         items_ok = conf.get('items_match_subtotal') or conf.get('items_match_grand') or conf.get('items_plus_tax_match')
 
-        print(f"[SCAN-RECEIPT] FAST-BETA Pass 2: vendor={scoring['vendor_detected']}, "
+        logger.info(f"[SCAN-RECEIPT] FAST-BETA Pass 2: vendor={scoring['vendor_detected']}, "
               f"winner={scoring['winner']}, score={scoring.get('vendor_score') or scoring['general_score']}/100, "
               f"grand_total={regex_meta['grand_total']}, items={n_items}, "
               f"items_sum={regex_meta['items_sum']}, cross={conf['cross_validated']}")
 
         if conf['grand_total'] == 'high' and n_items > 0 and items_ok:
             # HIGH confidence → build result without GPT
-            print(f"[SCAN-RECEIPT] FAST-BETA REGEX: High confidence! Skipping GPT entirely.")
+            logger.info(f"[SCAN-RECEIPT] FAST-BETA REGEX: High confidence! Skipping GPT entirely.")
             parsed_data = assemble_scan_result(
                 regex_meta, vendors_list, txn_types_list, payment_methods_list,
                 original_text=extracted_text,
@@ -948,7 +954,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             parsed_data = _redistribute_tax_items(parsed_data)
 
             extraction_method = "regex"
-            print(f"[SCAN-RECEIPT] COMPLETADO - metodo: regex, items: {len(parsed_data['expenses'])}")
+            logger.info(f"[SCAN-RECEIPT] COMPLETADO - metodo: regex, items: {len(parsed_data['expenses'])}")
 
             # Log metric
             log_ocr_metric(
@@ -973,7 +979,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             }
 
         # LOW confidence → fall back to GPT but with cleaned text (smaller input)
-        print(f"[SCAN-RECEIPT] FAST-BETA REGEX: Low confidence, falling back to GPT mini "
+        logger.info(f"[SCAN-RECEIPT] FAST-BETA REGEX: Low confidence, falling back to GPT mini "
               f"(using cleaned text: {len(cleaned_text)} chars)")
         extracted_text = cleaned_text
 
@@ -985,7 +991,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
     elif use_text_mode:
         # Text modes (fast, fast-beta) use the slim prompt
         prompt = _build_text_prompt_slim(vendors_list, txn_types_list, payment_methods_list, extracted_text)
-        print(f"[SCAN-RECEIPT] Slim prompt: {len(prompt)} chars")
+        logger.info(f"[SCAN-RECEIPT] Slim prompt: {len(prompt)} chars")
     else:
         page_count_hint = ""
         if len(base64_images) > 1:
@@ -996,7 +1002,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
     if use_text_mode:
         if model == "fast-beta":
             # FAST-BETA: pdfplumber text -> gpt-5-mini via responses API
-            print(f"[SCAN-RECEIPT] FAST-BETA: Enviando texto a gpt-5-mini ({len(extracted_text)} chars)...")
+            logger.info(f"[SCAN-RECEIPT] FAST-BETA: Enviando texto a gpt-5-mini ({len(extracted_text)} chars)...")
             result_text = gpt.mini(
                 instructions="You extract structured expense data from receipts. Return ONLY valid JSON.",
                 input=prompt,
@@ -1007,10 +1013,10 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             if not result_text:
                 raise RuntimeError("GPT mini returned empty for text mode OCR")
             openai_model = MINI_MODEL
-            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5-mini (texto)")
+            logger.info(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5-mini (texto)")
         elif not correction_context and model != "heavy":
             # FAST: pdfplumber text -> gpt-5.2 via chat.completions
-            print(f"[SCAN-RECEIPT] FAST: Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
+            logger.info(f"[SCAN-RECEIPT] FAST: Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
             result_text = gpt.heavy(
                 system="You extract structured expense data from receipts.",
                 user=prompt,
@@ -1022,10 +1028,10 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             if not result_text:
                 raise RuntimeError("GPT heavy returned empty for text mode OCR")
             openai_model = HEAVY_MODEL
-            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
+            logger.info(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
         else:
             # Correction/heavy text mode: gpt-5.2
-            print(f"[SCAN-RECEIPT] Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
+            logger.info(f"[SCAN-RECEIPT] Enviando texto a gpt-5.2 ({len(extracted_text)} chars)...")
             result_text = gpt.heavy(
                 system="You extract structured data from receipts.",
                 user=prompt,
@@ -1035,10 +1041,10 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
             )
             if not result_text:
                 raise RuntimeError("GPT heavy returned empty for correction/text mode")
-            print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
+            logger.info(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (texto)")
     else:
         # Vision mode: always gpt-5.2
-        print(f"[SCAN-RECEIPT] Enviando {len(base64_images)} imagen(es) a gpt-5.2 Vision...")
+        logger.info(f"[SCAN-RECEIPT] Enviando {len(base64_images)} imagen(es) a gpt-5.2 Vision...")
         vision_user = [{"type": "image_url", "image_url": {
             "url": f"data:{media_type};base64,{b64}", "detail": "high"
         }} for b64 in base64_images]
@@ -1051,7 +1057,8 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
         )
         if not result_text:
             raise RuntimeError("GPT heavy returned empty for Vision OCR")
-        print(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (vision)")
+        logger.info(f"[SCAN-RECEIPT] Respuesta recibida de gpt-5.2 (vision)")
+        del base64_images, vision_user  # free 30-50MB per multi-page scan
 
     # Parse response
     parsed_data = _parse_json_response(result_text)
@@ -1067,7 +1074,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
     # Safety net: catch and redistribute any tax line items GPT created
     parsed_data = _redistribute_tax_items(parsed_data)
 
-    print(f"[SCAN-RECEIPT] COMPLETADO - metodo: {extraction_method}, items: {len(parsed_data['expenses'])}")
+    logger.info(f"[SCAN-RECEIPT] COMPLETADO - metodo: {extraction_method}, items: {len(parsed_data['expenses'])}")
 
     # Log OCR metric
     tax_summary = parsed_data.get("tax_summary")
@@ -1095,10 +1102,7 @@ def _scan_receipt_inner(file_content, file_type, model, correction_context, file
     }
 
 
-def _generate_description_hash(description: str) -> str:
-    """Generate MD5 hash of normalized description for cache lookups."""
-    normalized = description.lower().strip()
-    return hashlib.md5(normalized.encode('utf-8')).hexdigest()
+from utils.hashing import generate_description_hash as _generate_description_hash
 
 
 def _get_cached_categorization(description: str, stage: str) -> Optional[dict]:
@@ -1120,8 +1124,9 @@ def _get_cached_categorization(description: str, stage: str) -> Optional[dict]:
         if result.data and len(result.data) > 0:
             cache_entry = result.data[0]
             # Update hit count and last_used_at
+            current_hit = cache_entry.get("hit_count", 0) or 0
             supabase.table("categorization_cache").update({
-                "hit_count": supabase.rpc("increment", {"x": 1, "row_id": cache_entry["cache_id"]}),
+                "hit_count": current_hit + 1,
                 "last_used_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }).eq("cache_id", cache_entry["cache_id"]).execute()
 
@@ -1134,7 +1139,7 @@ def _get_cached_categorization(description: str, stage: str) -> Optional[dict]:
                 "from_cache": True
             }
     except Exception as e:
-        print(f"[Cache] Lookup error: {e}")
+        logger.warning(f"[Cache] Lookup error: {e}")
 
     return None
 
@@ -1163,7 +1168,7 @@ def _get_vendor_affinity(vendor_id: str) -> Optional[dict]:
                 "from_vendor_affinity": True,
             }
     except Exception as e:
-        print(f"[VendorAffinity] Lookup error: {e}")
+        logger.warning(f"[VendorAffinity] Lookup error: {e}")
 
     return None
 
@@ -1183,7 +1188,7 @@ def _save_to_cache(description: str, stage: str, categorization: dict):
             "warning": categorization.get("warning"),
         }).execute()
     except Exception as e:
-        print(f"[Cache] Save error: {e}")
+        logger.warning(f"[Cache] Save error: {e}")
 
 
 def _get_recent_corrections(project_id: Optional[str], stage: str, limit: int = 5) -> list:
@@ -1203,7 +1208,7 @@ def _get_recent_corrections(project_id: Optional[str], stage: str, limit: int = 
 
         return result.data or []
     except Exception as e:
-        print(f"[Feedback] Correction fetch error: {e}")
+        logger.warning(f"[Feedback] Correction fetch error: {e}")
         return []
 
 
@@ -1246,177 +1251,17 @@ def _save_categorization_metrics(
             "processing_time_ms": metrics.get("processing_time_ms", 0),
         }).execute()
     except Exception as e:
-        print(f"[Metrics] Save error: {e}")
+        logger.warning(f"[Metrics] Save error: {e}")
 
 
-def auto_categorize(
-    stage: str,
-    expenses: list,
-    project_id: Optional[str] = None,
-    receipt_id: Optional[str] = None,
-    min_confidence: int = 60,
-    vendor_id: Optional[str] = None,
-) -> dict:
-    """
-    Core auto-categorization logic with caching and feedback loop.
+# ── Chunk-level GPT helper (used by auto_categorize) ──────────────
+_GPT_CHUNK_SIZE = 10  # items per parallel GPT call
 
-    Args:
-        stage: Construction stage (e.g. "Framing", "Rough Plumbing")
-        expenses: List of {"rowIndex": int, "description": str}
-        project_id: Optional project ID for feedback loop context
-        receipt_id: Optional receipt ID for metrics tracking
 
-    Returns:
-        {
-            "categorizations": [...],
-            "metrics": {
-                "cache_hits": int,
-                "cache_misses": int,
-                "total_items": int,
-                "processing_time_ms": int
-            }
-        }
-
-    Raises:
-        ValueError: If stage or expenses empty
-        RuntimeError: OpenAI failure, missing accounts
-    """
-    start_time = time.time()
-
-    if not stage or not expenses:
-        raise ValueError("Missing stage or expenses")
-
-    # Metrics tracking
-    cache_hits = 0
-    cache_misses = 0
-    gpt_elapsed = 0
-    categorizations = []
-    expenses_needing_gpt = []
-
-    # Step 1: Check cache for each expense
-    for exp in expenses:
-        cached = _get_cached_categorization(exp["description"], stage)
-        if cached:
-            cache_hits += 1
-            categorizations.append({
-                "rowIndex": exp["rowIndex"],
-                "account_id": cached["account_id"],
-                "account_name": cached["account_name"],
-                "confidence": cached["confidence"],
-                "reasoning": cached.get("reasoning", "") + " [from cache]",
-                "warning": cached.get("warning"),
-            })
-        else:
-            cache_misses += 1
-            expenses_needing_gpt.append(exp)
-
-    # Step 1.5: Vendor affinity shortcut for uncached items
-    # If the vendor has a strong historical preference (>= 90%, >= 5 uses),
-    # assign that account directly without calling GPT.
-    affinity_hits = 0
-    if vendor_id and expenses_needing_gpt:
-        affinity = _get_vendor_affinity(vendor_id)
-        if affinity:
-            still_need_gpt = []
-            for exp in expenses_needing_gpt:
-                categorizations.append({
-                    "rowIndex": exp["rowIndex"],
-                    "account_id": affinity["account_id"],
-                    "account_name": affinity["account_name"],
-                    "confidence": affinity["confidence"],
-                    "reasoning": affinity["reasoning"],
-                    "warning": None,
-                })
-                # Also save to description cache for future lookups
-                _save_to_cache(exp["description"], stage, affinity)
-                affinity_hits += 1
-            expenses_needing_gpt = still_need_gpt
-            print(f"[VendorAffinity] Applied affinity for vendor {vendor_id}: {affinity_hits} items -> {affinity['account_name']}")
-
-    # Step 1.75: ML classification for remaining uncached items
-    # TF-IDF + k-NN trained on historical expenses (zero GPT cost, ~1-5ms)
-    ml_hits = 0
-    if expenses_needing_gpt:
-        try:
-            from api.services.categorization_ml import get_ml_service
-            ml_service = get_ml_service()
-            ml_service.ensure_trained(supabase)
-
-            if ml_service.is_trained:
-                ml_results = ml_service.predict_batch(
-                    expenses_needing_gpt,
-                    construction_stage=stage,
-                    min_confidence=90.0,
-                )
-                still_need_gpt = []
-                for exp, ml_result in zip(expenses_needing_gpt, ml_results):
-                    if ml_result:
-                        ml_hits += 1
-                        categorizations.append({
-                            "rowIndex": exp["rowIndex"],
-                            "account_id": ml_result["account_id"],
-                            "account_name": ml_result["account_name"],
-                            "confidence": ml_result["confidence"],
-                            "reasoning": f"ML classification (confidence {ml_result['confidence']}%)",
-                            "warning": None,
-                            "source": "ml",
-                        })
-                        # Save to cache so next identical item is instant
-                        _save_to_cache(exp["description"], stage, ml_result)
-                    else:
-                        still_need_gpt.append(exp)
-                expenses_needing_gpt = still_need_gpt
-                print(f"[ML-CAT] Classified {ml_hits}/{ml_hits + len(expenses_needing_gpt)} items via ML")
-        except Exception as e:
-            print(f"[ML-CAT] ML tier error (falling through to GPT): {e}")
-
-    # Step 2: If all resolved (cache + affinity + ML), return early
-    if not expenses_needing_gpt:
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        return {
-            "categorizations": categorizations,
-            "metrics": {
-                "cache_hits": cache_hits,
-                "cache_misses": cache_misses,
-                "affinity_hits": affinity_hits,
-                "ml_hits": ml_hits,
-                "total_items": len(expenses),
-                "processing_time_ms": elapsed_ms
-            }
-        }
-
-    # Step 3: Fetch accounts
-    accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum").execute()
-    accounts = accounts_resp.data or []
-    if not accounts:
-        raise RuntimeError("No accounts found in database")
-
-    # Build accounts list (exclude Labor accounts)
-    accounts_list = []
-    for acc in accounts:
-        acc_name = acc.get("Name", "")
-        if "Labor" in acc_name:
-            continue
-        accounts_list.append({
-            "account_id": acc.get("account_id"),
-            "name": acc_name,
-            "number": acc.get("AcctNum")
-        })
-
-    # Step 4: Get recent corrections for feedback loop
-    corrections = _get_recent_corrections(project_id, stage, limit=5)
-    corrections_context = ""
-    if corrections:
-        corrections_list = []
-        for c in corrections:
-            corrections_list.append(
-                f"- '{c['description']}' was corrected from "
-                f"'{c['original_account']}' to '{c['corrected_account']}'"
-            )
-        corrections_context = "\n\nRECENT CORRECTIONS (learn from these):\n" + "\n".join(corrections_list)
-
-    # Step 5: Build enhanced prompt with examples
-    prompt = f"""You are an expert construction accountant specializing in categorizing expenses.
+def _build_categorize_prompt(stage: str, expenses_chunk: list,
+                             accounts_list: list, corrections_context: str) -> str:
+    """Build the GPT prompt for a chunk of expenses."""
+    return f"""You are an expert construction accountant specializing in categorizing expenses.
 
 CONSTRUCTION STAGE: {stage}
 
@@ -1424,7 +1269,7 @@ AVAILABLE ACCOUNTS:
 {json.dumps(accounts_list, indent=2)}
 
 EXPENSE DESCRIPTIONS TO CATEGORIZE:
-{json.dumps([{"rowIndex": e["rowIndex"], "description": e["description"]} for e in expenses_needing_gpt], indent=2)}
+{json.dumps([{"rowIndex": e["rowIndex"], "description": e["description"]} for e in expenses_chunk], indent=2)}
 
 EXAMPLES OF GOOD CATEGORIZATIONS:
 
@@ -1546,59 +1391,329 @@ IMPORTANT:
 - Be conservative with confidence - better to under-estimate
 - DO NOT include any text before or after the JSON"""
 
-    # Step 6: Call GPT (mini tier w/ fallback to heavy if low confidence)
+
+def _categorize_chunk_via_gpt(
+    stage: str,
+    expenses_chunk: list,
+    accounts_list: list,
+    corrections_context: str,
+    min_confidence: int,
+) -> list:
+    """
+    Categorize a chunk of expenses via GPT (mini→heavy fallback).
+    Returns list of validated categorization dicts.
+    Raises RuntimeError on total failure.
+    """
     from api.services.gpt_client import gpt
+
+    prompt = _build_categorize_prompt(stage, expenses_chunk, accounts_list, corrections_context)
     system_inst = "You are a construction accounting expert. You always return valid JSON with accurate account categorizations."
-    # Dynamic timeout: 30s base + 3s per item (e.g. 20 items = 90s)
-    n_items = len(expenses_needing_gpt)
-    gpt_timeout = max(30.0, 30.0 + n_items * 3.0)
-    print(f"[SCAN-RECEIPT] auto-categorize: {n_items} items, timeout={gpt_timeout}s")
-    gpt_start = time.time()
-    raw_response = gpt.mini(system_inst, prompt, json_mode=True, max_tokens=8000, timeout=gpt_timeout)
+
+    n = len(expenses_chunk)
+    gpt_timeout = max(30.0, 30.0 + n * 3.0)
+
+    raw_response = gpt.mini(system_inst, prompt, json_mode=True, max_tokens=4000, timeout=gpt_timeout)
     tier_used = "mini"
 
-    # Confidence fallback: if any categorization < min_confidence%, retry with heavy
+    # Confidence fallback: retry with heavy if any categorization < min_confidence%
     if raw_response:
         try:
             _check = _parse_json_response(raw_response)
             _cats = _check.get("categorizations", [])
             if _cats:
-                _min_conf = min(int(c.get("confidence", 0)) for c in _cats)
-                if _min_conf < min_confidence:
-                    print(f"[SCAN-RECEIPT] auto-categorize: min confidence {_min_conf}% < {min_confidence}%, escalating to heavy")
+                _min_c = min(int(c.get("confidence", 0)) for c in _cats)
+                if _min_c < min_confidence:
+                    logger.info(f"[GPT-CHUNK] min confidence {_min_c}% < {min_confidence}%, escalating to heavy")
                     raw_response = None
         except Exception:
             pass
     if not raw_response:
-        raw_response = gpt.heavy(system_inst, prompt, temperature=0.1, max_tokens=8000, json_mode=True, timeout=gpt_timeout)
+        raw_response = gpt.heavy(system_inst, prompt, temperature=0.1, max_tokens=4000, json_mode=True, timeout=gpt_timeout)
         tier_used = "heavy"
 
-    gpt_elapsed = int((time.time() - gpt_start) * 1000)
-    print(f"[SCAN-RECEIPT] auto-categorize via {tier_used} ({gpt_elapsed}ms)")
-
-    # Parse response
     if not raw_response:
-        raise RuntimeError("GPT returned empty response for auto-categorization")
-    parsed_data = _parse_json_response(raw_response)
+        raise RuntimeError(f"GPT returned empty response for chunk of {n} items")
 
-    # Validate
+    parsed_data = _parse_json_response(raw_response)
     if "categorizations" not in parsed_data or not isinstance(parsed_data["categorizations"], list):
         raise RuntimeError("OpenAI response missing 'categorizations' array")
 
-    gpt_categorizations = parsed_data["categorizations"]
-
-    for cat in gpt_categorizations:
-        required_fields = ["rowIndex", "account_id", "account_name", "confidence"]
-        if not all(field in cat for field in required_fields):
+    cats = parsed_data["categorizations"]
+    for cat in cats:
+        required = ["rowIndex", "account_id", "account_name", "confidence"]
+        if not all(f in cat for f in required):
             raise RuntimeError(f"Categorization missing required fields: {cat}")
         if not (0 <= cat["confidence"] <= 100):
             cat["confidence"] = max(0, min(100, cat["confidence"]))
 
-    # Step 7: Save new categorizations to cache
-    for i, cat in enumerate(gpt_categorizations):
-        exp = expenses_needing_gpt[i]
-        _save_to_cache(exp["description"], stage, cat)
+    logger.info(f"[GPT-CHUNK] {n} items via {tier_used}")
+    return cats
+
+
+def auto_categorize(
+    stage: str,
+    expenses: list,
+    project_id: Optional[str] = None,
+    receipt_id: Optional[str] = None,
+    min_confidence: int = 60,
+    vendor_id: Optional[str] = None,
+) -> dict:
+    """
+    Core auto-categorization logic with caching and feedback loop.
+
+    Args:
+        stage: Construction stage (e.g. "Framing", "Rough Plumbing")
+        expenses: List of {"rowIndex": int, "description": str}
+        project_id: Optional project ID for feedback loop context
+        receipt_id: Optional receipt ID for metrics tracking
+
+    Returns:
+        {
+            "categorizations": [...],
+            "metrics": {
+                "cache_hits": int,
+                "cache_misses": int,
+                "total_items": int,
+                "processing_time_ms": int
+            }
+        }
+
+    Raises:
+        ValueError: If stage or expenses empty
+        RuntimeError: OpenAI failure, missing accounts
+    """
+    start_time = time.time()
+
+    if not stage or not expenses:
+        raise ValueError("Missing stage or expenses")
+
+    # Metrics tracking
+    cache_hits = 0
+    cache_misses = 0
+    gpt_elapsed = 0
+    categorizations = []
+    expenses_needing_gpt = []
+
+    # Step 1: Batch cache lookup (1 query instead of N)
+    hash_map = {}  # hash -> list of expenses with that hash
+    for exp in expenses:
+        h = _generate_description_hash(exp["description"])
+        hash_map.setdefault(h, []).append(exp)
+
+    all_hashes = list(hash_map.keys())
+    cached_rows = {}  # hash -> cache row
+    if all_hashes:
+        try:
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 30 * 24 * 60 * 60))
+            # Supabase .in_() supports up to ~300 items safely
+            for chunk_start in range(0, len(all_hashes), 200):
+                chunk = all_hashes[chunk_start:chunk_start + 200]
+                resp = supabase.table("categorization_cache") \
+                    .select("description_hash, account_id, account_name, confidence, reasoning, warning, cache_id") \
+                    .in_("description_hash", chunk) \
+                    .eq("construction_stage", stage) \
+                    .gte("created_at", cutoff) \
+                    .order("created_at", desc=True) \
+                    .execute()
+                for row in (resp.data or []):
+                    h = row["description_hash"]
+                    if h not in cached_rows:  # keep newest (already ordered desc)
+                        cached_rows[h] = row
+        except Exception as e:
+            logger.warning(f"[Cache] Batch lookup error (falling back to uncached): {e}")
+
+    # Separate cached vs uncached + bulk update hit counts
+    hit_cache_ids = []
+    for exp in expenses:
+        h = _generate_description_hash(exp["description"])
+        row = cached_rows.get(h)
+        if row:
+            cache_hits += 1
+            hit_cache_ids.append(row["cache_id"])
+            categorizations.append({
+                "rowIndex": exp["rowIndex"],
+                "account_id": row["account_id"],
+                "account_name": row["account_name"],
+                "confidence": row["confidence"],
+                "reasoning": (row.get("reasoning") or "") + " [from cache]",
+                "warning": row.get("warning"),
+            })
+        else:
+            cache_misses += 1
+            expenses_needing_gpt.append(exp)
+
+    # Step 1.5: Vendor affinity shortcut for uncached items
+    # If the vendor has a strong historical preference (>= 90%, >= 5 uses),
+    # assign that account directly without calling GPT.
+    affinity_hits = 0
+    if vendor_id and expenses_needing_gpt:
+        affinity = _get_vendor_affinity(vendor_id)
+        if affinity:
+            still_need_gpt = []
+            for exp in expenses_needing_gpt:
+                categorizations.append({
+                    "rowIndex": exp["rowIndex"],
+                    "account_id": affinity["account_id"],
+                    "account_name": affinity["account_name"],
+                    "confidence": affinity["confidence"],
+                    "reasoning": affinity["reasoning"],
+                    "warning": None,
+                })
+                # Also save to description cache for future lookups
+                _save_to_cache(exp["description"], stage, affinity)
+                affinity_hits += 1
+            expenses_needing_gpt = still_need_gpt
+            logger.info(f"[VendorAffinity] Applied affinity for vendor {vendor_id}: {affinity_hits} items -> {affinity['account_name']}")
+
+    # Step 1.75: ML classification for remaining uncached items
+    # TF-IDF + k-NN trained on historical expenses (zero GPT cost, ~1-5ms)
+    ml_hits = 0
+    if expenses_needing_gpt:
+        try:
+            from api.services.categorization_ml import get_ml_service
+            ml_service = get_ml_service()
+            ml_service.ensure_trained(supabase)
+
+            if ml_service.is_trained:
+                ml_results = ml_service.predict_batch(
+                    expenses_needing_gpt,
+                    construction_stage=stage,
+                    min_confidence=90.0,
+                )
+                still_need_gpt = []
+                for exp, ml_result in zip(expenses_needing_gpt, ml_results):
+                    if ml_result:
+                        ml_hits += 1
+                        categorizations.append({
+                            "rowIndex": exp["rowIndex"],
+                            "account_id": ml_result["account_id"],
+                            "account_name": ml_result["account_name"],
+                            "confidence": ml_result["confidence"],
+                            "reasoning": f"ML classification (confidence {ml_result['confidence']}%)",
+                            "warning": None,
+                            "source": "ml",
+                        })
+                        # Save to cache so next identical item is instant
+                        _save_to_cache(exp["description"], stage, ml_result)
+                    else:
+                        still_need_gpt.append(exp)
+                expenses_needing_gpt = still_need_gpt
+                logger.info(f"[ML-CAT] Classified {ml_hits}/{ml_hits + len(expenses_needing_gpt)} items via ML")
+        except Exception as e:
+            logger.warning(f"[ML-CAT] ML tier error (falling through to GPT): {e}")
+
+    # Step 2: If all resolved (cache + affinity + ML), return early
+    if not expenses_needing_gpt:
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        return {
+            "categorizations": categorizations,
+            "metrics": {
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "affinity_hits": affinity_hits,
+                "ml_hits": ml_hits,
+                "total_items": len(expenses),
+                "processing_time_ms": elapsed_ms
+            }
+        }
+
+    # Step 3+4: Fetch accounts and corrections in parallel (independent queries)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_accounts = pool.submit(
+            lambda: supabase.table("accounts").select("account_id, Name, AcctNum").execute()
+        )
+        f_corrections = pool.submit(_get_recent_corrections, project_id, stage, 5)
+        accounts_resp = f_accounts.result()
+        corrections = f_corrections.result()
+
+    accounts = accounts_resp.data or []
+    if not accounts:
+        raise RuntimeError("No accounts found in database")
+
+    # Build accounts list (exclude Labor accounts)
+    accounts_list = []
+    for acc in accounts:
+        acc_name = acc.get("Name", "")
+        if "Labor" in acc_name:
+            continue
+        accounts_list.append({
+            "account_id": acc.get("account_id"),
+            "name": acc_name,
+            "number": acc.get("AcctNum")
+        })
+
+    corrections_context = ""
+    if corrections:
+        corrections_list = []
+        for c in corrections:
+            corrections_list.append(
+                f"- '{c['description']}' was corrected from "
+                f"'{c['original_account']}' to '{c['corrected_account']}'"
+            )
+        corrections_context = "\n\nRECENT CORRECTIONS (learn from these):\n" + "\n".join(corrections_list)
+
+    # Step 5+6: Call GPT (chunked + parallel for large batches)
+    n_items = len(expenses_needing_gpt)
+    gpt_start = time.time()
+
+    if n_items <= _GPT_CHUNK_SIZE:
+        # Small batch: single call (same as before)
+        logger.info(f"[SCAN-RECEIPT] auto-categorize: {n_items} items (single call)")
+        gpt_categorizations = _categorize_chunk_via_gpt(
+            stage, expenses_needing_gpt, accounts_list, corrections_context, min_confidence,
+        )
+    else:
+        # Large batch: split into chunks and call GPT in parallel
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        chunks = [expenses_needing_gpt[i:i + _GPT_CHUNK_SIZE]
+                  for i in range(0, n_items, _GPT_CHUNK_SIZE)]
+        n_chunks = len(chunks)
+        logger.info(f"[SCAN-RECEIPT] auto-categorize: {n_items} items -> {n_chunks} parallel chunks of ~{_GPT_CHUNK_SIZE}")
+
+        gpt_categorizations = []
+        with ThreadPoolExecutor(max_workers=min(n_chunks, 4)) as pool:
+            futures = {
+                pool.submit(
+                    _categorize_chunk_via_gpt,
+                    stage, chunk, accounts_list, corrections_context, min_confidence,
+                ): idx
+                for idx, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                chunk_idx = futures[future]
+                try:
+                    gpt_categorizations.extend(future.result())
+                except Exception as e:
+                    logger.error(f"[SCAN-RECEIPT] chunk {chunk_idx} failed: {e}")
+                    raise RuntimeError(f"GPT chunk {chunk_idx} failed: {e}")
+
+    gpt_elapsed = int((time.time() - gpt_start) * 1000)
+    logger.info(f"[SCAN-RECEIPT] auto-categorize GPT total: {gpt_elapsed}ms")
+
+    # Step 7: Batch-save new categorizations to cache (1 insert instead of N)
+    # Use rowIndex to map back to expense descriptions (order-independent for parallel chunks)
+    exp_by_row = {e["rowIndex"]: e for e in expenses_needing_gpt}
+    cache_rows = []
+    for cat in gpt_categorizations:
+        exp = exp_by_row.get(cat["rowIndex"])
+        if exp:
+            cache_rows.append({
+                "description_hash": _generate_description_hash(exp["description"]),
+                "description_raw": exp["description"],
+                "construction_stage": stage,
+                "account_id": cat["account_id"],
+                "account_name": cat["account_name"],
+                "confidence": cat["confidence"],
+                "reasoning": cat.get("reasoning"),
+                "warning": cat.get("warning"),
+            })
         categorizations.append(cat)
+    if cache_rows:
+        try:
+            supabase.table("categorization_cache").insert(cache_rows).execute()
+        except Exception as e:
+            logger.warning(f"[Cache] Batch save error: {e}")
 
     # Step 8: Sort by rowIndex to maintain order
     categorizations.sort(key=lambda x: x["rowIndex"])

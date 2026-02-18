@@ -742,5 +742,6 @@ def _get_bookkeeping_mentions_safe() -> str:
                 if name:
                     mentions.append(f"@{name}")
         return " ".join(mentions) if mentions else ""
-    except Exception:
+    except Exception as _exc:
+        logger.debug("Suppressed bookkeeping mentions resolve: %s", _exc)
         return ""

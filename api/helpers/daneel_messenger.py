@@ -6,9 +6,12 @@
 # Messages are inserted directly into the messages table;
 # Supabase Realtime delivers them to connected frontends automatically.
 
+import logging
 from api.supabase_client import supabase
 from typing import Optional, Dict, Any
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 DANEEL_BOT_USER_ID = "00000000-0000-0000-0000-000000000002"
 
@@ -28,7 +31,7 @@ def _ensure_bot_user_exists():
             .execute()
 
         if not result.data or len(result.data) == 0:
-            print("[DaneelMessenger] Daneel user not found, creating...")
+            logger.info("[DaneelMessenger] Daneel user not found, creating...")
             dummy_hash = "$2b$12$DaneelNoLoginDaneelNoLogDN2.2.2.2.2.2.2.2.2.2.2.2.2.2"
 
             supabase.table("users").insert({
@@ -37,14 +40,14 @@ def _ensure_bot_user_exists():
                 "avatar_color": 210,
                 "password_hash": dummy_hash,
             }).execute()
-            print("[DaneelMessenger] Daneel user created successfully")
+            logger.info("[DaneelMessenger] Daneel user created successfully")
         else:
-            print("[DaneelMessenger] Daneel user already exists")
+            logger.info("[DaneelMessenger] Daneel user already exists")
 
         _bot_user_verified = True
     except Exception as e:
-        print(f"[DaneelMessenger] Error ensuring bot user exists: {e}")
-        _bot_user_verified = True
+        logger.error("[DaneelMessenger] Error ensuring bot user exists: %s", e)
+        # Do NOT mark as verified on failure — allow retry on next call
 
 
 def post_daneel_message(
@@ -77,18 +80,18 @@ def post_daneel_message(
             "created_at": datetime.utcnow().isoformat(),
         }
 
-        print(f"[DaneelMessenger] Inserting message | project={project_id} | type={channel_type}")
+        logger.info("[DaneelMessenger] Inserting message | project=%s | type=%s", project_id, channel_type)
         result = supabase.table("messages").insert(message_data).execute()
 
         if result.data and len(result.data) > 0:
             msg_id = result.data[0].get("id", "?")
-            print(f"[DaneelMessenger] Message posted OK | id={msg_id} | project={project_id}")
+            logger.info("[DaneelMessenger] Message posted OK | id=%s | project=%s", msg_id, project_id)
             return result.data[0]
 
-        print(f"[DaneelMessenger] Insert returned no data | project={project_id}")
+        logger.warning("[DaneelMessenger] Insert returned no data | project=%s", project_id)
         return None
 
     except Exception as e:
         # Never let bot message failures break the main pipeline
-        print(f"[DaneelMessenger] ERROR posting message: {e}")
+        logger.error("[DaneelMessenger] ERROR posting message: %s", e)
         return None

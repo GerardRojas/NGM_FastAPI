@@ -4,9 +4,12 @@
 # Same as BVA but without budget columns — only authorized actuals by account
 # ================================
 
+import logging
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import io
+
+logger = logging.getLogger(__name__)
 
 from api.supabase_client import supabase
 from api.services.vault_service import save_to_project_folder
@@ -32,7 +35,7 @@ try:
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
-    print("[PNL] WARNING: reportlab not installed. PDF generation disabled.")
+    logger.warning("[PNL] reportlab not installed. PDF generation disabled.")
 
 
 REPORTS_BUCKET = "bva-reports"
@@ -157,7 +160,7 @@ Accounts: {len(report_data['rows'])}"""
         }
 
     except Exception as e:
-        print(f"[PNL] Error generating report: {e}")
+        logger.error("[PNL] Error generating report: %s", e)
         return {
             "ok": False,
             "text": "Error generating the report. Please try again.",
@@ -265,7 +268,7 @@ def generate_and_upload_pnl_pdf(
         return upload_to_storage(pdf_bytes, filename)
 
     except Exception as e:
-        print(f"[PNL] Error generating/uploading PDF: {e}")
+        logger.error("[PNL] Error generating/uploading PDF: %s", e)
         return None
 
 

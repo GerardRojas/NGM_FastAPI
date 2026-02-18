@@ -65,13 +65,7 @@ def _preprocess_text(text: str) -> str:
     return t
 
 
-def _generate_description_hash(description: str) -> str:
-    """Generate MD5 hash of normalized description for cache lookups.
-
-    Matches the hashing in receipt_scanner.py so cache joins work.
-    """
-    normalized = description.lower().strip()
-    return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+from utils.hashing import generate_description_hash as _generate_description_hash
 
 
 # ── Core Service ─────────────────────────────────────────────────

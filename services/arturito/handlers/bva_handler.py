@@ -4,11 +4,14 @@
 # ================================
 # Genera reportes BVA en PDF y los sube a Supabase Storage
 
+import logging
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import io
 import os
 import re
+
+logger = logging.getLogger(__name__)
 
 from api.services.gpt_client import gpt
 from api.supabase_client import supabase
@@ -25,7 +28,7 @@ try:
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
-    print("[BVA] WARNING: reportlab not installed. PDF generation disabled.")
+    logger.warning("[BVA] reportlab not installed. PDF generation disabled.")
 
 
 # Bucket de Supabase Storage para reportes
@@ -161,7 +164,7 @@ Actual: ${totals['actual']:,.2f}
         }
 
     except Exception as e:
-        print(f"[BVA] Error generating report: {e}")
+        logger.error("[BVA] Error generating report: %s", e)
         return {
             "ok": False,
             "text": "Error generando el reporte. Intenta de nuevo.",
@@ -194,7 +197,7 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
         if result.data:
             return result.data[0]
     except Exception as e:
-        print(f"[BVA] resolve_project step 1 (ID lookup) skipped: {e}")
+        logger.info("[BVA] resolve_project step 1 (ID lookup) skipped: %s", e)
 
     # 2. Buscar por nombre directo (case-insensitive, parcial)
     try:
@@ -203,7 +206,7 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
             matches = sorted(result.data, key=lambda x: len(x.get("project_name", "")))
             return matches[0]
     except Exception as e:
-        print(f"[BVA] resolve_project step 2 (ilike) error: {e}")
+        logger.warning("[BVA] resolve_project step 2 (ilike) error: %s", e)
 
     # 3. Busqueda fuzzy por palabras (substring + typo tolerance)
     try:
@@ -268,7 +271,7 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
 
         return None
     except Exception as e:
-        print(f"[BVA] resolve_project step 3/4 (fuzzy/GPT) error: {e}")
+        logger.warning("[BVA] resolve_project step 3/4 (fuzzy/GPT) error: %s", e)
         return None
 
 
@@ -298,7 +301,7 @@ def _gpt_fuzzy_match(query: str, candidates: List[str]) -> Optional[str]:
             return None
         return answer
     except Exception as e:
-        print(f"[BVA] GPT fuzzy match error: {e}")
+        logger.warning("[BVA] GPT fuzzy match error: %s", e)
         return None
 
 
@@ -350,7 +353,7 @@ def _gpt_ask_missing_entity(
         )
         return result if result else _fallback(missing, hint)
     except Exception as e:
-        print(f"[BVA] GPT ask missing entity error: {e}")
+        logger.warning("[BVA] GPT ask missing entity error: %s", e)
         return _fallback(missing, hint)
 
 
@@ -363,8 +366,8 @@ def fetch_recent_projects(limit: int = 8) -> List[Dict[str, Any]]:
             .limit(limit) \
             .execute()
         return result.data or []
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
     # Fallback: sin ordenamiento si created_at no existe
     try:
         result = supabase.table("projects") \
@@ -373,7 +376,7 @@ def fetch_recent_projects(limit: int = 8) -> List[Dict[str, Any]]:
             .execute()
         return result.data or []
     except Exception as e:
-        print(f"[BVA] Error fetching recent projects: {e}")
+        logger.error("[BVA] Error fetching recent projects: %s", e)
         return []
 
 
@@ -383,7 +386,7 @@ def fetch_budgets(project_id: str) -> List[Dict[str, Any]]:
         result = supabase.table("budgets_qbo").select("*").eq("ngm_project_id", project_id).eq("active", True).execute()
         return result.data or []
     except Exception as e:
-        print(f"[BVA] Error fetching budgets: {e}")
+        logger.error("[BVA] Error fetching budgets: %s", e)
         return []
 
 
@@ -411,7 +414,7 @@ def fetch_expenses(project_id: str) -> List[Dict[str, Any]]:
             offset += page_size
         return all_expenses
     except Exception as e:
-        print(f"[BVA] Error fetching expenses: {e}")
+        logger.error("[BVA] Error fetching expenses: %s", e)
         return []
 
 
@@ -421,7 +424,7 @@ def fetch_accounts() -> List[Dict[str, Any]]:
         result = supabase.table("accounts").select("*").execute()
         return result.data or []
     except Exception as e:
-        print(f"[BVA] Error fetching accounts: {e}")
+        logger.error("[BVA] Error fetching accounts: %s", e)
         return []
 
 
@@ -526,7 +529,7 @@ def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any], proj
         return upload_to_storage(pdf_bytes, filename)
 
     except Exception as e:
-        print(f"[BVA] Error generating/uploading PDF: {e}")
+        logger.error("[BVA] Error generating/uploading PDF: %s", e)
         return None
 
 
@@ -714,7 +717,7 @@ def upload_to_storage(file_bytes: bytes, filename: str) -> Optional[str]:
 
         # Si el bucket no existe, intentar crearlo
         if "not found" in error_msg.lower() or "bucket" in error_msg.lower():
-            print(f"[BVA] Bucket '{REPORTS_BUCKET}' may not exist. Attempting to create...")
+            logger.info("[BVA] Bucket '%s' may not exist. Attempting to create...", REPORTS_BUCKET)
             try:
                 # Crear bucket público
                 supabase.storage.create_bucket(REPORTS_BUCKET, options={"public": True})
@@ -729,10 +732,10 @@ def upload_to_storage(file_bytes: bytes, filename: str) -> Optional[str]:
                 return supabase.storage.from_(REPORTS_BUCKET).get_public_url(filename)
 
             except Exception as create_err:
-                print(f"[BVA] Error creating bucket: {create_err}")
+                logger.error("[BVA] Error creating bucket: %s", create_err)
                 return None
 
-        print(f"[BVA] Error uploading to storage: {e}")
+        logger.error("[BVA] Error uploading to storage: %s", e)
         return None
 
 
@@ -929,7 +932,7 @@ def handle_consulta_especifica(
         }
 
     except Exception as e:
-        print(f"[BVA] Error in consulta especifica: {e}")
+        logger.error("[BVA] Error in consulta especifica: %s", e)
         return {
             "ok": False,
             "text": "Error querying data. Please try again.",

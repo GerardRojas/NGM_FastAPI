@@ -60,8 +60,8 @@ def _load_mismatch_config() -> dict:
             if isinstance(val, str):
                 try:
                     val = json.loads(val)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed JSON parse: %s", _exc)
             cfg[row["key"]] = val
         return cfg
     except Exception as e:
@@ -792,8 +792,8 @@ def run_mismatch_reconciliation(
         try:
             vr = sb.table("Vendors").select("id, vendor_name").in_("id", list(vendor_ids)).execute()
             vendor_names = {v["id"]: v["vendor_name"] for v in (vr.data or [])}
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug("Suppressed vendor lookup: %s", _exc)
 
     # 7. Build and post the reconciliation message
     msg = _build_reconciliation_message(bill_id, result, corrections, vendor_names)

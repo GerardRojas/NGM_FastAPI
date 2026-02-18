@@ -6,9 +6,12 @@
 # Messages are inserted directly into the messages table;
 # Supabase Realtime delivers them to connected frontends automatically.
 
+import logging
 from api.supabase_client import supabase
 from typing import Optional, Dict, Any
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 ANDREW_BOT_USER_ID = "00000000-0000-0000-0000-000000000003"
 
@@ -28,7 +31,7 @@ def _ensure_bot_user_exists():
             .execute()
 
         if not result.data or len(result.data) == 0:
-            print("[AndrewMessenger] Andrew user not found, creating...")
+            logger.info("[AndrewMessenger] Andrew user not found, creating...")
             dummy_hash = "$2b$12$AndrewNoLoginAndrewNoLogAN3.3.3.3.3.3.3.3.3.3.3.3.3.3"
 
             supabase.table("users").insert({
@@ -37,14 +40,14 @@ def _ensure_bot_user_exists():
                 "avatar_color": 35,
                 "password_hash": dummy_hash,
             }).execute()
-            print("[AndrewMessenger] Andrew user created successfully")
+            logger.info("[AndrewMessenger] Andrew user created successfully")
         else:
-            print("[AndrewMessenger] Andrew user already exists")
+            logger.info("[AndrewMessenger] Andrew user already exists")
 
         _bot_user_verified = True
     except Exception as e:
-        print(f"[AndrewMessenger] Error ensuring bot user exists: {e}")
-        _bot_user_verified = True
+        logger.error("[AndrewMessenger] Error ensuring bot user exists: %s", e)
+        # Do NOT mark as verified on failure — allow retry on next call
 
 
 def post_andrew_message(
@@ -86,22 +89,22 @@ def post_andrew_message(
         elif project_id:
             message_data["project_id"] = project_id
         else:
-            print("[AndrewMessenger] WARNING: No project_id or channel_id provided")
+            logger.warning("[AndrewMessenger] WARNING: No project_id or channel_id provided")
             return None
 
         target = f"channel={channel_id}" if channel_id else f"project={project_id}"
-        print(f"[AndrewMessenger] Inserting message | {target} | type={channel_type}")
+        logger.info("[AndrewMessenger] Inserting message | %s | type=%s", target, channel_type)
         result = supabase.table("messages").insert(message_data).execute()
 
         if result.data and len(result.data) > 0:
             msg_id = result.data[0].get("id", "?")
-            print(f"[AndrewMessenger] Message posted OK | id={msg_id} | {target}")
+            logger.info("[AndrewMessenger] Message posted OK | id=%s | %s", msg_id, target)
             return result.data[0]
 
-        print(f"[AndrewMessenger] Insert returned no data | {target}")
+        logger.warning("[AndrewMessenger] Insert returned no data | %s", target)
         return None
 
     except Exception as e:
         # Never let bot message failures break the main pipeline
-        print(f"[AndrewMessenger] ERROR posting message: {e}")
+        logger.error("[AndrewMessenger] ERROR posting message: %s", e)
         return None

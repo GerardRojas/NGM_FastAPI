@@ -3,12 +3,15 @@ QuickBooks Online OAuth2 Service
 Handles authentication, token management, and API calls to QBO
 """
 
+import logging
 import os
 import base64
 import httpx
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from api.supabase_client import supabase
+
+logger = logging.getLogger(__name__)
 
 
 # ====== CONFIGURATION ======
@@ -295,8 +298,8 @@ async def get_company_name(access_token: str, realm_id: str) -> str:
             if response.status_code == 200:
                 data = response.json()
                 return data.get("CompanyInfo", {}).get("CompanyName", "Unknown Company")
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("Suppressed company name fetch: %s", _exc)
 
     return "Unknown Company"
 
@@ -486,7 +489,7 @@ def get_connection_status() -> Dict[str, Any]:
         result = supabase.table("qbo_tokens").select("*").execute()
 
         # Debug: log what we got
-        print(f"[QBO] get_connection_status - result.data: {result.data}")
+        logger.debug("[QBO] get_connection_status - result.data: %s", result.data)
 
         connections = []
         for token in (result.data or []):
@@ -521,7 +524,7 @@ def get_connection_status() -> Dict[str, Any]:
                     "last_updated": token.get("updated_at")
                 })
             except Exception as token_error:
-                print(f"[QBO] Error processing token: {token_error}")
+                logger.warning("[QBO] Error processing token: %s", token_error)
                 # Include the token with error info
                 connections.append({
                     "realm_id": token.get("realm_id"),
@@ -540,7 +543,7 @@ def get_connection_status() -> Dict[str, Any]:
             "environment": QBO_ENVIRONMENT
         }
     except Exception as e:
-        print(f"[QBO] Error in get_connection_status: {e}")
+        logger.error("[QBO] Error in get_connection_status: %s", e)
         # Return empty status instead of crashing
         return {
             "connected": False,

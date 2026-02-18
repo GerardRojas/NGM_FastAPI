@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 from typing import Dict, Any, List, Optional
+import logging
 import traceback
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, field_validator
 from api.supabase_client import supabase
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
@@ -70,8 +73,8 @@ def get_pipeline_projects() -> Dict[str, Any]:
         response = supabase.table("projects").select("project_id, project_name").order("project_name").execute()
         return {"data": response.data or []}
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/projects: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/projects: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -82,8 +85,8 @@ def get_pipeline_companies() -> Dict[str, Any]:
         response = supabase.table("companies").select("id, name").order("name").execute()
         return {"data": response.data or []}
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/companies: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/companies: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -94,8 +97,8 @@ def get_pipeline_task_departments() -> Dict[str, Any]:
         response = supabase.table("task_departments").select("department_id, department_name").order("department_name").execute()
         return {"data": response.data or []}
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/task-departments: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/task-departments: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -106,8 +109,8 @@ def get_pipeline_task_types() -> Dict[str, Any]:
         response = supabase.table("task_types").select("type_id, type_name").order("type_name").execute()
         return {"data": response.data or []}
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/task-types: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/task-types: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -118,8 +121,8 @@ def get_pipeline_task_priorities() -> Dict[str, Any]:
         response = supabase.table("tasks_priority").select("priority_id, priority").order("priority").execute()
         return {"data": response.data or []}
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/task-priorities: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/task-priorities: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -130,8 +133,8 @@ def get_pipeline_users() -> Dict[str, Any]:
         response = supabase.table("users").select("user_id, user_name").order("user_name").execute()
         return {"data": response.data or []}
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/users: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/users: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -143,23 +146,23 @@ def get_pipeline_grouped() -> Dict[str, Any]:
     Devuelve las tareas agrupadas por task_status.
     Usa múltiples queries al cliente Supabase para obtener los datos relacionados.
     """
-    print("[PIPELINE] GET /pipeline/grouped called")
+    logger.info("[PIPELINE] GET /pipeline/grouped called")
 
     try:
         # 1. Obtener todos los statuses
-        print("[PIPELINE] Fetching statuses...")
+        logger.info("[PIPELINE] Fetching statuses...")
         statuses_response = supabase.table("tasks_status").select("task_status_id, task_status").order("task_status").execute()
         statuses = statuses_response.data or []
-        print(f"[PIPELINE] Found {len(statuses)} statuses")
+        logger.info(f"[PIPELINE] Found {len(statuses)} statuses")
 
         # 2. Obtener todas las tareas
-        print("[PIPELINE] Fetching tasks...")
+        logger.info("[PIPELINE] Fetching tasks...")
         tasks_response = supabase.table("tasks").select("*").order("created_at", desc=True).execute()
         tasks = tasks_response.data or []
-        print(f"[PIPELINE] Found {len(tasks)} tasks")
+        logger.info(f"[PIPELINE] Found {len(tasks)} tasks")
 
         # 3. Obtener datos relacionados para enriquecer las tareas
-        print("[PIPELINE] Fetching related data...")
+        logger.info("[PIPELINE] Fetching related data...")
 
         # Users (para owner, collaborator, manager) - incluye avatar_color y user_photo para avatares
         users_response = supabase.table("users").select("user_id, user_name, avatar_color, user_photo").execute()
@@ -184,7 +187,7 @@ def get_pipeline_grouped() -> Dict[str, Any]:
         # Status map for names
         status_map = {s["task_status_id"]: s["task_status"] for s in statuses}
 
-        print("[PIPELINE] Processing tasks...")
+        logger.info("[PIPELINE] Processing tasks...")
 
         # 4. Agrupar tareas por status
         groups_map: Dict[str, Dict[str, Any]] = {}
@@ -311,13 +314,13 @@ def get_pipeline_grouped() -> Dict[str, Any]:
             groups.append(remaining_group)
 
         total_tasks = sum(len(g.get("tasks", [])) for g in groups)
-        print(f"[PIPELINE] Returning {len(groups)} groups with {total_tasks} total tasks")
+        logger.info(f"[PIPELINE] Returning {len(groups)} groups with {total_tasks} total tasks")
 
         return {"groups": groups}
 
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/grouped: {repr(e)}")
-        print(f"[PIPELINE] Traceback: {traceback.format_exc()}")
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/grouped: {repr(e)}")
+        logger.debug(f"[PIPELINE] Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -368,8 +371,8 @@ def create_task(payload: TaskCreate) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[PIPELINE] ERROR in POST /pipeline/tasks: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in POST /pipeline/tasks: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -465,8 +468,8 @@ def patch_task(task_id: str, payload: TaskUpdate) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[PIPELINE] ERROR in PATCH /pipeline/tasks/{task_id}: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in PATCH /pipeline/tasks/{task_id}: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -488,8 +491,8 @@ def delete_task(task_id: str) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[PIPELINE] ERROR in DELETE /pipeline/tasks/{task_id}: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in DELETE /pipeline/tasks/{task_id}: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -508,7 +511,7 @@ def get_my_tasks(user_id: str) -> Dict[str, Any]:
     Solo devuelve tareas que NO estan en status "Done".
     Incluye informacion del proyecto y prioridad.
     """
-    print(f"[PIPELINE] GET /pipeline/tasks/my-tasks/{user_id}")
+    logger.info(f"[PIPELINE] GET /pipeline/tasks/my-tasks/{user_id}")
 
     try:
         # 1. Obtener el status_id de "Done" para excluirlo
@@ -590,7 +593,7 @@ def get_my_tasks(user_id: str) -> Dict[str, Any]:
         all_tasks.sort(key=lambda t: t.get("created_at") or "", reverse=True)
         tasks = all_tasks
 
-        print(f"[PIPELINE] Found {len(tasks)} tasks for user {user_id} (owner + collaborator + manager)")
+        logger.info(f"[PIPELINE] Found {len(tasks)} tasks for user {user_id} (owner + collaborator + manager)")
 
         if not tasks:
             return {"tasks": []}
@@ -655,8 +658,8 @@ def get_my_tasks(user_id: str) -> Dict[str, Any]:
         return {"tasks": enriched_tasks}
 
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /pipeline/tasks/my-tasks/{user_id}: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/tasks/my-tasks/{user_id}: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -669,7 +672,7 @@ def start_task(task_id: str) -> Dict[str, Any]:
         - task: La tarea actualizada
         - status_changed: True si el status cambió
     """
-    print(f"[PIPELINE] POST /pipeline/tasks/{task_id}/start")
+    logger.info(f"[PIPELINE] POST /pipeline/tasks/{task_id}/start")
 
     try:
         # 1. Verificar que la tarea existe
@@ -727,7 +730,7 @@ def start_task(task_id: str) -> Dict[str, Any]:
                 metadata={"time_start": now}
             )
         except Exception as log_error:
-            print(f"[PIPELINE] Warning: Could not log start event: {log_error}")
+            logger.warning(f"[PIPELINE] Warning: Could not log start event: {log_error}")
 
         return {
             "success": True,
@@ -739,8 +742,8 @@ def start_task(task_id: str) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[PIPELINE] ERROR in POST /pipeline/tasks/{task_id}/start: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in POST /pipeline/tasks/{task_id}/start: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -764,7 +767,7 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
         - task: La tarea actualizada
         - reviewer_task_created: True si se creó tarea para el autorizador
     """
-    print(f"[PIPELINE] POST /pipeline/tasks/{task_id}/send-to-review")
+    logger.info(f"[PIPELINE] POST /pipeline/tasks/{task_id}/send-to-review")
 
     try:
         from datetime import datetime
@@ -834,7 +837,7 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
                     "review_task_id": reviewer_task_id
                 }).eq("task_id", task_id).execute()
         except Exception as e:
-            print(f"[PIPELINE] Warning: Could not create reviewer task: {e}")
+            logger.warning(f"[PIPELINE] Warning: Could not create reviewer task: {e}")
 
         # 5. Calcular tiempo trabajado
         time_start = task.get("time_start")
@@ -848,8 +851,8 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
                 elapsed_seconds = diff.total_seconds()
                 hours = elapsed_seconds / 3600
                 elapsed_time = f"{hours:.2f} hours"
-            except:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
         # 6. Log the workflow event
         try:
@@ -869,7 +872,7 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
                 }
             )
         except Exception as log_error:
-            print(f"[PIPELINE] Warning: Could not log review submission: {log_error}")
+            logger.warning(f"[PIPELINE] Warning: Could not log review submission: {log_error}")
 
         return {
             "success": True,
@@ -883,8 +886,8 @@ def send_task_to_review(task_id: str, payload: SendToReviewRequest) -> Dict[str,
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[PIPELINE] ERROR in POST /pipeline/tasks/{task_id}/send-to-review: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[PIPELINE] ERROR in POST /pipeline/tasks/{task_id}/send-to-review: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -957,7 +960,7 @@ def _create_reviewer_task(original_task: dict, submission_notes: str, original_t
                 reviewer_id = users_response.data[0]["user_id"]
 
     if not reviewer_id:
-        print("[PIPELINE] No reviewer found for task")
+        logger.info("[PIPELINE] No reviewer found for task")
         return None
 
     # Obtener el status "Not Started"
@@ -991,7 +994,7 @@ def _create_reviewer_task(original_task: dict, submission_notes: str, original_t
 
     if response.data:
         new_task_id = response.data[0].get("task_id")
-        print(f"[PIPELINE] Created reviewer task: {new_task_id}")
+        logger.info(f"[PIPELINE] Created reviewer task: {new_task_id}")
         return new_task_id
 
     return None
@@ -1017,7 +1020,7 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
     - pending_invoices: Crea tareas para facturas pendientes por enviar
     - overdue_tasks: Crea alertas para tareas vencidas
     """
-    print(f"[AUTOMATIONS] Running automations: {payload.automations}")
+    logger.info(f"[AUTOMATIONS] Running automations: {payload.automations}")
 
     tasks_created = 0
     tasks_updated = 0
@@ -1039,10 +1042,10 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
                 tasks_updated += updated
             elif automation_id == "pending_invoices":
                 # TODO: Implementar logica para facturas pendientes
-                print(f"[AUTOMATIONS] pending_invoices: Not implemented yet")
+                logger.info(f"[AUTOMATIONS] pending_invoices: Not implemented yet")
             elif automation_id == "overdue_tasks":
                 # TODO: Implementar logica para tareas vencidas
-                print(f"[AUTOMATIONS] overdue_tasks: Not implemented yet")
+                logger.info(f"[AUTOMATIONS] overdue_tasks: Not implemented yet")
             else:
                 errors.append(f"Unknown automation: {automation_id}")
 
@@ -1054,8 +1057,8 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Automation error: {e}") from e
 
 
@@ -1118,7 +1121,7 @@ def _run_pending_expenses_automation() -> tuple:
     Returns:
         tuple: (tasks_created, tasks_updated)
     """
-    print("[AUTOMATIONS] Running pending_expenses_auth...")
+    logger.info("[AUTOMATIONS] Running pending_expenses_auth...")
 
     tasks_created = 0
     tasks_updated = 0
@@ -1131,7 +1134,7 @@ def _run_pending_expenses_automation() -> tuple:
         ).or_("auth_status.is.null,auth_status.eq.false").execute()
 
         expenses = expenses_response.data or []
-        print(f"[AUTOMATIONS] Found {len(expenses)} pending expenses")
+        logger.info(f"[AUTOMATIONS] Found {len(expenses)} pending expenses")
 
         if not expenses:
             return (0, 0)
@@ -1149,7 +1152,7 @@ def _run_pending_expenses_automation() -> tuple:
             by_project[project_id]["count"] += 1
             by_project[project_id]["total"] += float(exp.get("Amount") or 0)
 
-        print(f"[AUTOMATIONS] Projects with pending expenses: {len(by_project)}")
+        logger.info(f"[AUTOMATIONS] Projects with pending expenses: {len(by_project)}")
 
         if not by_project:
             return (0, 0)
@@ -1179,9 +1182,9 @@ def _run_pending_expenses_automation() -> tuple:
 
         if dept_response.data:
             bookkeeping_dept_id = dept_response.data[0]["department_id"]
-            print(f"[AUTOMATIONS] Found bookkeeping department: {bookkeeping_dept_id}")
+            logger.info(f"[AUTOMATIONS] Found bookkeeping department: {bookkeeping_dept_id}")
         else:
-            print("[AUTOMATIONS] WARNING: Bookkeeping department not found")
+            logger.warning("[AUTOMATIONS] WARNING: Bookkeeping department not found")
 
         # 5. Encontrar un manager para autorizacion (Accounting Manager o CEO/COO)
         expense_manager_id = None
@@ -1199,7 +1202,7 @@ def _run_pending_expenses_automation() -> tuple:
 
             if users_response.data:
                 expense_manager_id = users_response.data[0]["user_id"]
-                print(f"[AUTOMATIONS] Found Accounting Manager: {expense_manager_id}")
+                logger.info(f"[AUTOMATIONS] Found Accounting Manager: {expense_manager_id}")
 
         # Si no hay Accounting Manager, buscar CEO/COO
         if not expense_manager_id:
@@ -1215,10 +1218,10 @@ def _run_pending_expenses_automation() -> tuple:
 
                 if users_response.data:
                     expense_manager_id = users_response.data[0]["user_id"]
-                    print(f"[AUTOMATIONS] Found CEO/COO as manager: {expense_manager_id}")
+                    logger.info(f"[AUTOMATIONS] Found CEO/COO as manager: {expense_manager_id}")
 
         if not expense_manager_id:
-            print("[AUTOMATIONS] WARNING: No manager found for expense authorization")
+            logger.warning("[AUTOMATIONS] WARNING: No manager found for expense authorization")
 
         # 6. Obtener configuracion de la automatizacion
         settings_response = supabase.table("automation_settings").select(
@@ -1273,7 +1276,7 @@ def _run_pending_expenses_automation() -> tuple:
                 }).eq("task_id", existing_task["task_id"]).execute()
 
                 tasks_updated += 1
-                print(f"[AUTOMATIONS] Updated task for project: {project_name}")
+                logger.info(f"[AUTOMATIONS] Updated task for project: {project_name}")
             else:
                 # Crear nueva tarea
                 new_task_data = {
@@ -1291,7 +1294,7 @@ def _run_pending_expenses_automation() -> tuple:
 
                 supabase.table("tasks").insert(new_task_data).execute()
                 tasks_created += 1
-                print(f"[AUTOMATIONS] Created task for project: {project_name}")
+                logger.info(f"[AUTOMATIONS] Created task for project: {project_name}")
 
         # 6. Opcional: Limpiar tareas automatizadas de proyectos que ya no tienen gastos pendientes
         # (esto evita que queden tareas obsoletas)
@@ -1301,13 +1304,13 @@ def _run_pending_expenses_automation() -> tuple:
                 supabase.table("tasks").delete().eq(
                     "task_id", existing_task["task_id"]
                 ).execute()
-                print(f"[AUTOMATIONS] Removed obsolete task for project: {existing_project_id}")
+                logger.info(f"[AUTOMATIONS] Removed obsolete task for project: {existing_project_id}")
 
         return (tasks_created, tasks_updated)
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in pending_expenses_auth: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in pending_expenses_auth: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise
 
 
@@ -1364,7 +1367,7 @@ def _run_pending_expenses_categorize_automation() -> tuple:
     Returns:
         tuple: (tasks_created, tasks_updated)
     """
-    print("[AUTOMATIONS] Running pending_expenses_categorize...")
+    logger.info("[AUTOMATIONS] Running pending_expenses_categorize...")
 
     tasks_created = 0
     tasks_updated = 0
@@ -1377,7 +1380,7 @@ def _run_pending_expenses_categorize_automation() -> tuple:
         ).or_("expense_category.is.null,expense_category.eq.").execute()
 
         expenses = expenses_response.data or []
-        print(f"[AUTOMATIONS] Found {len(expenses)} uncategorized expenses")
+        logger.info(f"[AUTOMATIONS] Found {len(expenses)} uncategorized expenses")
 
         if not expenses:
             return (0, 0)
@@ -1395,7 +1398,7 @@ def _run_pending_expenses_categorize_automation() -> tuple:
             by_project[project_id]["count"] += 1
             by_project[project_id]["total"] += float(exp.get("Amount") or 0)
 
-        print(f"[AUTOMATIONS] Projects with uncategorized expenses: {len(by_project)}")
+        logger.info(f"[AUTOMATIONS] Projects with uncategorized expenses: {len(by_project)}")
 
         if not by_project:
             return (0, 0)
@@ -1497,8 +1500,8 @@ def _run_pending_expenses_categorize_automation() -> tuple:
         return (tasks_created, tasks_updated)
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in pending_expenses_categorize: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in pending_expenses_categorize: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise
 
 
@@ -1557,7 +1560,7 @@ def _run_pending_health_check_automation() -> tuple:
     Returns:
         tuple: (tasks_created, tasks_updated)
     """
-    print("[AUTOMATIONS] Running pending_health_check...")
+    logger.info("[AUTOMATIONS] Running pending_health_check...")
 
     tasks_created = 0
     tasks_updated = 0
@@ -1572,7 +1575,7 @@ def _run_pending_health_check_automation() -> tuple:
         ).eq("is_active", True).execute()
 
         projects = projects_response.data or []
-        print(f"[AUTOMATIONS] Found {len(projects)} active projects")
+        logger.info(f"[AUTOMATIONS] Found {len(projects)} active projects")
 
         if not projects:
             return (0, 0)
@@ -1630,8 +1633,8 @@ def _run_pending_health_check_automation() -> tuple:
                     task_date = datetime.fromisoformat(created_at.replace("Z", "+00:00").replace("+00:00", ""))
                     if task_date > thirty_days_ago:
                         recent_health_checks.add(project_id)
-                except:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
         # 6. Determinar proyectos que necesitan health check
         projects_needing_check: Dict[str, Dict] = {}
@@ -1669,7 +1672,7 @@ def _run_pending_health_check_automation() -> tuple:
                     "budget": budget,
                 }
 
-        print(f"[AUTOMATIONS] Projects needing health check: {len(projects_needing_check)}")
+        logger.info(f"[AUTOMATIONS] Projects needing health check: {len(projects_needing_check)}")
 
         # 7. Crear o actualizar tareas
         for project_id, data in projects_needing_check.items():
@@ -1732,8 +1735,8 @@ def _run_pending_health_check_automation() -> tuple:
         return (tasks_created, tasks_updated)
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in pending_health_check: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in pending_health_check: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise
 
 
@@ -1761,7 +1764,7 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
         hours_per_day: Horas de trabajo por día (default 8)
         days_per_week: Días de trabajo por semana (default 6)
     """
-    print(f"[MY-WORK] GET /pipeline/my-work/{user_id}")
+    logger.info(f"[MY-WORK] GET /pipeline/my-work/{user_id}")
 
     try:
         from datetime import datetime, timedelta
@@ -1788,7 +1791,7 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
         tasks_response = query.order("deadline", desc=False).execute()
         tasks = tasks_response.data or []
 
-        print(f"[MY-WORK] Found {len(tasks)} tasks for user")
+        logger.info(f"[MY-WORK] Found {len(tasks)} tasks for user")
 
         if not tasks:
             return {
@@ -1872,8 +1875,8 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
                     elif deadline_date <= week_from_now:
                         is_due_soon = True
                         due_soon_count += 1
-                except:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
             enriched_tasks.append({
                 "task_id": task.get("task_id"),
@@ -1946,8 +1949,8 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
         }
 
     except Exception as e:
-        print(f"[MY-WORK] ERROR: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[MY-WORK] ERROR: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -1960,7 +1963,7 @@ def get_team_workload_overview(hours_per_day: float = 8.0, days_per_week: int = 
     Returns:
         Lista de usuarios con su carga de trabajo actual.
     """
-    print("[MY-WORK] GET /pipeline/my-work/team-overview")
+    logger.info("[MY-WORK] GET /pipeline/my-work/team-overview")
 
     try:
         from datetime import datetime, timedelta
@@ -2024,8 +2027,8 @@ def get_team_workload_overview(hours_per_day: float = 8.0, days_per_week: int = 
                     deadline_date = datetime.fromisoformat(deadline_str.replace("Z", "")).date()
                     if deadline_date < today:
                         user_workload[owner_id]["overdue_count"] += 1
-                except:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
         # 5. Calcular status para cada usuario
         team_data = []
@@ -2063,8 +2066,8 @@ def get_team_workload_overview(hours_per_day: float = 8.0, days_per_week: int = 
         }
 
     except Exception as e:
-        print(f"[MY-WORK] ERROR in team-overview: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[MY-WORK] ERROR in team-overview: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2109,8 +2112,8 @@ def get_automations_status() -> Dict[str, Any]:
         }
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in GET /automations/status: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in GET /automations/status: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2130,10 +2133,10 @@ def ensure_attachments_bucket():
                 TASK_ATTACHMENTS_BUCKET,
                 options={"public": True}
             )
-            print(f"[PIPELINE] Created bucket: {TASK_ATTACHMENTS_BUCKET}")
+            logger.info(f"[PIPELINE] Created bucket: {TASK_ATTACHMENTS_BUCKET}")
             return True
         except Exception as e:
-            print(f"[PIPELINE] Bucket creation note: {e}")
+            logger.info(f"[PIPELINE] Bucket creation note: {e}")
             return False
 
 
@@ -2151,7 +2154,7 @@ def init_attachments_bucket():
             "message": "Bucket ready" if success else "Bucket may already exist"
         }
     except Exception as e:
-        print(f"[PIPELINE] ERROR in GET /attachments/init: {repr(e)}")
+        logger.error(f"[PIPELINE] ERROR in GET /attachments/init: {repr(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2210,7 +2213,7 @@ def get_automation_settings() -> Dict[str, Any]:
     - default_manager: Default reviewer/manager (with name)
     - default_department: Department for tasks
     """
-    print("[AUTOMATIONS] GET /automations/settings")
+    logger.info("[AUTOMATIONS] GET /automations/settings")
 
     try:
         # Get automation settings
@@ -2261,8 +2264,8 @@ def get_automation_settings() -> Dict[str, Any]:
         return {"settings": enriched}
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in GET /automations/settings: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in GET /automations/settings: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2282,7 +2285,7 @@ def update_automation_settings(
     - default_priority: Set priority level (1-5)
     - config: Additional JSON configuration
     """
-    print(f"[AUTOMATIONS] PUT /automations/settings/{automation_type}")
+    logger.info(f"[AUTOMATIONS] PUT /automations/settings/{automation_type}")
 
     try:
         # Check if automation type exists
@@ -2319,8 +2322,8 @@ def update_automation_settings(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in PUT /automations/settings: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in PUT /automations/settings: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2336,7 +2339,7 @@ def get_automation_overrides(
     - automation_type: Filter by automation type
     - project_id: Filter by project
     """
-    print("[AUTOMATIONS] GET /automations/overrides")
+    logger.info("[AUTOMATIONS] GET /automations/overrides")
 
     try:
         query = supabase.table("automation_owner_overrides").select("*")
@@ -2387,8 +2390,8 @@ def get_automation_overrides(
         return {"overrides": overrides}
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in GET /automations/overrides: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in GET /automations/overrides: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2400,7 +2403,7 @@ def create_or_update_automation_override(payload: AutomationOverrideCreate) -> D
     If an override for the automation_type + project_id combination exists, it updates.
     Otherwise, it creates a new override.
     """
-    print(f"[AUTOMATIONS] POST /automations/overrides - {payload.automation_type}")
+    logger.info(f"[AUTOMATIONS] POST /automations/overrides - {payload.automation_type}")
 
     try:
         # Check if override already exists
@@ -2447,15 +2450,15 @@ def create_or_update_automation_override(payload: AutomationOverrideCreate) -> D
             }
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in POST /automations/overrides: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in POST /automations/overrides: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
 @router.delete("/automations/overrides/{override_id}")
 def delete_automation_override(override_id: str) -> Dict[str, Any]:
     """Delete an automation owner override."""
-    print(f"[AUTOMATIONS] DELETE /automations/overrides/{override_id}")
+    logger.info(f"[AUTOMATIONS] DELETE /automations/overrides/{override_id}")
 
     try:
         # Check if exists
@@ -2476,8 +2479,8 @@ def delete_automation_override(override_id: str) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in DELETE /automations/overrides: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in DELETE /automations/overrides: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2493,7 +2496,7 @@ def get_automation_tasks_grouped() -> Dict[str, Any]:
     - Each cluster contains tasks for different projects
     - Includes completion status and counts
     """
-    print("[AUTOMATIONS] GET /automations/tasks")
+    logger.info("[AUTOMATIONS] GET /automations/tasks")
 
     try:
         # Get tasks that are automated
@@ -2595,8 +2598,8 @@ def get_automation_tasks_grouped() -> Dict[str, Any]:
         return {"clusters": clusters}
 
     except Exception as e:
-        print(f"[AUTOMATIONS] ERROR in GET /automations/tasks: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[AUTOMATIONS] ERROR in GET /automations/tasks: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2625,7 +2628,7 @@ def get_user_workload(user_id: str) -> Dict[str, Any]:
     - Next available slot
     - Burnout risk indicators
     """
-    print(f"[WORKLOAD] GET /workload/user/{user_id}")
+    logger.info(f"[WORKLOAD] GET /workload/user/{user_id}")
 
     try:
         from datetime import datetime, timedelta
@@ -2719,8 +2722,8 @@ def get_user_workload(user_id: str) -> Dict[str, Any]:
                     elif deadline_date <= today + timedelta(days=7):
                         is_due_soon = True
                         due_soon_count += 1
-                except:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed: %s", _exc)
 
             status_id = task.get("task_status")
             status_name = status_name_map.get(status_id, "")
@@ -2818,8 +2821,8 @@ def get_user_workload(user_id: str) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[WORKLOAD] ERROR: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKLOAD] ERROR: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2829,7 +2832,7 @@ def get_team_workload() -> Dict[str, Any]:
     Get workload overview for all team members.
     Useful for coordination to identify bottlenecks and balance work.
     """
-    print("[WORKLOAD] GET /workload/team")
+    logger.info("[WORKLOAD] GET /workload/team")
 
     try:
         from datetime import datetime, timedelta
@@ -2899,8 +2902,8 @@ def get_team_workload() -> Dict[str, Any]:
                         deadline_date = datetime.fromisoformat(deadline_str.replace("Z", "")).date()
                         if deadline_date < today:
                             overdue_count += 1
-                    except:
-                        pass
+                    except Exception as _exc:
+                        logger.debug("Suppressed: %s", _exc)
 
             utilization = (total_hours / effective_capacity * 100) if effective_capacity > 0 else 0
 
@@ -2938,8 +2941,8 @@ def get_team_workload() -> Dict[str, Any]:
         return {"team": team_data}
 
     except Exception as e:
-        print(f"[WORKLOAD] ERROR: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKLOAD] ERROR: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2948,7 +2951,7 @@ def update_user_capacity(user_id: str, data: UserCapacityUpdate) -> Dict[str, An
     """
     Update user capacity settings.
     """
-    print(f"[WORKLOAD] PUT /workload/capacity/{user_id}")
+    logger.info(f"[WORKLOAD] PUT /workload/capacity/{user_id}")
 
     try:
         # Check if settings exist
@@ -2986,8 +2989,8 @@ def update_user_capacity(user_id: str, data: UserCapacityUpdate) -> Dict[str, An
         return {"success": True, "data": response.data[0] if response.data else None}
 
     except Exception as e:
-        print(f"[WORKLOAD] ERROR: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKLOAD] ERROR: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -2997,7 +3000,7 @@ def schedule_task(data: ScheduleTaskRequest) -> Dict[str, Any]:
     Schedule a task based on owner's workload.
     Creates auto-dependencies if owner is busy.
     """
-    print(f"[WORKLOAD] POST /workload/schedule-task - task_id: {data.task_id}")
+    logger.info(f"[WORKLOAD] POST /workload/schedule-task - task_id: {data.task_id}")
 
     try:
         from datetime import datetime, timedelta
@@ -3136,8 +3139,8 @@ def schedule_task(data: ScheduleTaskRequest) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[WORKLOAD] ERROR: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKLOAD] ERROR: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -3147,7 +3150,7 @@ def recalculate_user_schedule(user_id: str) -> Dict[str, Any]:
     Recalculate all scheduled dates for a user's tasks.
     Called after task completion or priority changes.
     """
-    print(f"[WORKLOAD] POST /workload/recalculate/{user_id}")
+    logger.info(f"[WORKLOAD] POST /workload/recalculate/{user_id}")
 
     try:
         from datetime import datetime, timedelta
@@ -3251,8 +3254,8 @@ def recalculate_user_schedule(user_id: str) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        print(f"[WORKLOAD] ERROR: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKLOAD] ERROR: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -3262,7 +3265,7 @@ def get_next_available_slot(user_id: str, estimated_hours: float = 2.0) -> Dict[
     Get the next available time slot for a user.
     Useful for showing when a new task could realistically start.
     """
-    print(f"[WORKLOAD] GET /workload/next-available/{user_id}")
+    logger.info(f"[WORKLOAD] GET /workload/next-available/{user_id}")
 
     try:
         from datetime import datetime, timedelta
@@ -3333,8 +3336,8 @@ def get_next_available_slot(user_id: str, estimated_hours: float = 2.0) -> Dict[
         }
 
     except Exception as e:
-        print(f"[WORKLOAD] ERROR in next-available: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKLOAD] ERROR in next-available: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 
 
@@ -3390,11 +3393,11 @@ def _log_workflow_event(
 
         if response.data:
             log_id = response.data[0].get("log_id")
-            print(f"[WORKFLOW LOG] Created log {log_id} for task {task_id}: {event_type}")
+            logger.info(f"[WORKFLOW LOG] Created log {log_id} for task {task_id}: {event_type}")
             return log_id
         return None
     except Exception as e:
-        print(f"[WORKFLOW LOG] Warning: Could not create log: {e}")
+        logger.warning(f"[WORKFLOW LOG] Warning: Could not create log: {e}")
         return None
 
 
@@ -3429,7 +3432,7 @@ def approve_task(task_id: str, payload: TaskApproveRequest) -> Dict[str, Any]:
         - task: The approved task
         - review_task_completed: True if review task was marked done
     """
-    print(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/approve")
+    logger.info(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/approve")
 
     try:
         from datetime import datetime
@@ -3495,7 +3498,7 @@ def approve_task(task_id: str, payload: TaskApproveRequest) -> Dict[str, Any]:
                 ).execute()
                 review_task_completed = True
             except Exception as e:
-                print(f"[WORKFLOW] Warning: Could not complete review task: {e}")
+                logger.warning(f"[WORKFLOW] Warning: Could not complete review task: {e}")
 
         # 5. Log the approval event
         _log_workflow_event(
@@ -3520,8 +3523,8 @@ def approve_task(task_id: str, payload: TaskApproveRequest) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/approve: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/approve: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -3539,7 +3542,7 @@ def reject_task(task_id: str, payload: TaskRejectRequest) -> Dict[str, Any]:
         - task: The rejected task (now back with owner)
         - rejection_count: Total times this task was rejected
     """
-    print(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/reject")
+    logger.info(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/reject")
 
     try:
         from datetime import datetime
@@ -3624,7 +3627,7 @@ def reject_task(task_id: str, payload: TaskRejectRequest) -> Dict[str, Any]:
                     "task_id", review_task_id
                 ).execute()
             except Exception as e:
-                print(f"[WORKFLOW] Warning: Could not complete review task: {e}")
+                logger.warning(f"[WORKFLOW] Warning: Could not complete review task: {e}")
 
         # 6. Log the rejection event
         _log_workflow_event(
@@ -3653,8 +3656,8 @@ def reject_task(task_id: str, payload: TaskRejectRequest) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/reject: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/reject: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -3668,7 +3671,7 @@ def convert_to_coordination(task_id: str) -> Dict[str, Any]:
         - coordination_task: The new coordination task
         - original_task: The original task (marked as converted)
     """
-    print(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/convert-to-coordination")
+    logger.info(f"[WORKFLOW] POST /pipeline/tasks/{task_id}/convert-to-coordination")
 
     try:
         from datetime import datetime
@@ -3778,8 +3781,8 @@ def convert_to_coordination(task_id: str) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/convert-to-coordination: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKFLOW] ERROR in POST /pipeline/tasks/{task_id}/convert-to-coordination: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -3792,7 +3795,7 @@ def get_task_workflow_history(task_id: str) -> Dict[str, Any]:
         - history: List of workflow events in chronological order
         - task: Current task data
     """
-    print(f"[WORKFLOW] GET /pipeline/tasks/{task_id}/workflow-history")
+    logger.info(f"[WORKFLOW] GET /pipeline/tasks/{task_id}/workflow-history")
 
     try:
         # 1. Get task info
@@ -3836,8 +3839,8 @@ def get_task_workflow_history(task_id: str) -> Dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[WORKFLOW] ERROR in GET /pipeline/tasks/{task_id}/workflow-history: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKFLOW] ERROR in GET /pipeline/tasks/{task_id}/workflow-history: {repr(e)}")
+        logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
@@ -3854,7 +3857,7 @@ def get_pending_reviews(user_id: str) -> Dict[str, Any]:
     Returns:
         - tasks: List of tasks awaiting this user's review
     """
-    print(f"[WORKFLOW] GET /pipeline/tasks/pending-reviews/{user_id}")
+    logger.info(f"[WORKFLOW] GET /pipeline/tasks/pending-reviews/{user_id}")
 
     try:
         # 1. Get "Awaiting Approval" status ID
@@ -3904,7 +3907,7 @@ def get_pending_reviews(user_id: str) -> Dict[str, Any]:
                     all_tasks.append(task)
                     seen_task_ids.add(task.get("task_id"))
         except Exception as e:
-            print(f"[WORKFLOW] Review query failed: {repr(e)}")
+            logger.info(f"[WORKFLOW] Review query failed: {repr(e)}")
 
         # 3. Batch-load users and projects for enrichment
         owner_ids = list({t.get("Owner_id") for t in all_tasks if t.get("Owner_id")})
@@ -3952,6 +3955,6 @@ def get_pending_reviews(user_id: str) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        print(f"[WORKFLOW] ERROR in GET /pipeline/tasks/pending-reviews/{user_id}: {repr(e)}")
-        print(traceback.format_exc())
+        logger.error(f"[WORKFLOW] ERROR in GET /pipeline/tasks/pending-reviews/{user_id}: {repr(e)}")
+        logger.debug(traceback.format_exc())
         return {"success": False, "tasks": [], "total": 0}

@@ -1,11 +1,14 @@
 """
 Router para gestion de Concepts (Conceptos compuestos de materiales)
 """
+import logging
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
 import os
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/concepts", tags=["concepts"])
 
@@ -660,5 +663,5 @@ async def recalculate_concept_cost(concept_id: str):
 
         return total
     except Exception as e:
-        print(f"Error recalculating concept cost: {e}")
+        logger.error("Error recalculating concept cost: %s", e)
         return 0
