@@ -32,7 +32,7 @@ router = APIRouter(prefix="/messages", tags=["messages"])
 # Cleanup: stale entries purged by _purge_stale_caches() in main.py every 5 min
 _unread_cache: Dict[str, dict] = {}
 _UNREAD_CACHE_TTL = 30  # seconds
-_UNREAD_CACHE_MAX = 300  # max entries to prevent unbounded growth
+_UNREAD_CACHE_MAX = 100  # max entries to prevent unbounded growth
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -844,18 +844,17 @@ def get_unread_counts(
         for row in (result.data or []):
             counts[row["channel_key"]] = row["unread_count"]
 
-        # Store in cache (cap size to prevent unbounded growth)
+        # Purge stale entries on every write (cheap: TTL is 30s, most will be expired)
+        now = time.time()
+        stale = [k for k, v in _unread_cache.items() if now - v["ts"] > _UNREAD_CACHE_TTL]
+        for k in stale:
+            del _unread_cache[k]
+        # Hard cap: if still over limit, drop oldest half
         if len(_unread_cache) >= _UNREAD_CACHE_MAX:
-            now = time.time()
-            stale = [k for k, v in _unread_cache.items() if now - v["ts"] > _UNREAD_CACHE_TTL]
-            for k in stale:
+            sorted_keys = sorted(_unread_cache, key=lambda k: _unread_cache[k]["ts"])
+            for k in sorted_keys[: len(sorted_keys) // 2]:
                 del _unread_cache[k]
-            # If still over limit after TTL purge, drop oldest half
-            if len(_unread_cache) >= _UNREAD_CACHE_MAX:
-                keys = list(_unread_cache.keys())
-                for k in keys[: len(keys) // 2]:
-                    del _unread_cache[k]
-        _unread_cache[user_id] = {"data": counts, "ts": time.time()}
+        _unread_cache[user_id] = {"data": counts, "ts": now}
 
         return {"unread_counts": counts}
 

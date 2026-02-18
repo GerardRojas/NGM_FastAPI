@@ -265,6 +265,16 @@ def _purge_stale_caches():
     except Exception:
         pass
 
+    # --- agent_brain: _user_name_cache (purge entries past 1h TTL, keep bots) ---
+    try:
+        from api.services.agent_brain import _user_name_cache, _USER_NAME_TTL
+        stale = [k for k, v in _user_name_cache.items()
+                 if v["ts"] != 0 and (now - v["ts"]) >= _USER_NAME_TTL]
+        for k in stale:
+            del _user_name_cache[k]
+    except Exception:
+        pass
+
     # --- messages: _unread_cache (purge entries past their 30s TTL) ---
     try:
         from api.routers.messages import _unread_cache, _UNREAD_CACHE_TTL
@@ -274,14 +284,12 @@ def _purge_stale_caches():
     except Exception:
         pass
 
-    # --- arturito assistants: _thread_cache (cap at 500 entries, LRU-ish) ---
+    # --- arturito assistants: _thread_cache (purge entries past 2h TTL) ---
     try:
-        from services.arturito.assistants import _thread_cache
-        if len(_thread_cache) > 500:
-            # Keep the most recent 250 (dict is insertion-ordered in Python 3.7+)
-            keys = list(_thread_cache.keys())
-            for k in keys[: len(keys) - 250]:
-                del _thread_cache[k]
+        from services.arturito.assistants import _thread_cache, _THREAD_TTL
+        stale = [k for k, v in _thread_cache.items() if now - v["ts"] >= _THREAD_TTL]
+        for k in stale:
+            del _thread_cache[k]
     except Exception:
         pass
 

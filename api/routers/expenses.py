@@ -394,20 +394,35 @@ def list_expenses(project: Optional[str] = None, limit: Optional[int] = None, cu
     Si no se especifica limit, devuelve todos los gastos.
     """
     try:
-        # Obtener los gastos
-        query = supabase.table("expenses_manual_COGS").select("*")
+        # Obtener los gastos — paginar para superar límite de 1000 de Supabase
+        raw_expenses: list = []
+        page_size = 1000
+        offset = 0
+        effective_limit = limit  # None = sin límite = traer todos
 
-        if project:
-            query = query.eq("project", project)
+        while True:
+            query = supabase.table("expenses_manual_COGS").select("*")
+            if project:
+                query = query.eq("project", project)
+            query = query.order("TxnDate", desc=True)
 
-        query = query.order("TxnDate", desc=True)
+            # Calcular cuántos traer en esta página
+            if effective_limit is not None:
+                remaining = effective_limit - len(raw_expenses)
+                fetch_size = min(page_size, remaining)
+            else:
+                fetch_size = page_size
 
-        # Solo aplicar límite si se especifica
-        if limit is not None:
-            query = query.limit(limit)
+            query = query.range(offset, offset + fetch_size - 1)
+            resp = query.execute()
+            batch = resp.data or []
+            raw_expenses.extend(batch)
 
-        resp = query.execute()
-        raw_expenses = resp.data or []
+            if len(batch) < fetch_size:
+                break
+            if effective_limit is not None and len(raw_expenses) >= effective_limit:
+                break
+            offset += fetch_size
 
         # Obtener tipos de transacción
         txn_types_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()

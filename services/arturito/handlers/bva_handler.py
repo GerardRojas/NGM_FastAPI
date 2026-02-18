@@ -388,17 +388,28 @@ def fetch_budgets(project_id: str) -> List[Dict[str, Any]]:
 
 
 def fetch_expenses(project_id: str) -> List[Dict[str, Any]]:
-    """Obtiene expenses autorizados del proyecto desde expenses_manual_COGS"""
+    """Obtiene expenses autorizados del proyecto desde expenses_manual_COGS.
+    Pagina en bloques de 1000 para superar el límite default de Supabase."""
     try:
-        result = (
-            supabase.table("expenses_manual_COGS")
-            .select("*")
-            .eq("project", project_id)
-            .eq("auth_status", True)
-            .neq("status", "review")
-            .execute()
-        )
-        return result.data or []
+        all_expenses: List[Dict[str, Any]] = []
+        page_size = 1000
+        offset = 0
+        while True:
+            result = (
+                supabase.table("expenses_manual_COGS")
+                .select("*")
+                .eq("project", project_id)
+                .eq("auth_status", True)
+                .neq("status", "review")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = result.data or []
+            all_expenses.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return all_expenses
     except Exception as e:
         print(f"[BVA] Error fetching expenses: {e}")
         return []

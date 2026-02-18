@@ -33,22 +33,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _cooldowns: Dict[str, float] = {}
 COOLDOWN_SECONDS = 5
-_COOLDOWN_MAX_SIZE = 2000
+_COOLDOWN_MAX_SIZE = 200
 
 
 def _check_cooldown(user_id: str, agent_name: str) -> bool:
     """Return True if the user can invoke this agent (cooldown expired)."""
-    key = f"{user_id}:{agent_name}"
     now = time.time()
+
+    # Always purge stale entries (>60s) to keep dict compact
+    stale = [k for k, ts in _cooldowns.items() if now - ts > 60]
+    for k in stale:
+        del _cooldowns[k]
+
+    key = f"{user_id}:{agent_name}"
     last = _cooldowns.get(key, 0)
     if now - last < COOLDOWN_SECONDS:
         return False
     _cooldowns[key] = now
-    # Periodic purge: remove expired entries when dict gets large
-    if len(_cooldowns) > _COOLDOWN_MAX_SIZE:
-        stale = [k for k, ts in _cooldowns.items() if now - ts > 60]
-        for k in stale:
-            del _cooldowns[k]
     return True
 
 
@@ -330,20 +331,26 @@ async def _build_brain_context(
     return context
 
 
-_user_name_cache: Dict[str, str] = {}
-_USER_NAME_CACHE_MAX = 500
+_user_name_cache: Dict[str, Dict[str, Any]] = {}  # {user_id: {"name": str, "ts": float}}
+_USER_NAME_CACHE_MAX = 200
+_USER_NAME_TTL = 3600  # 1 hour
 
 
 def _resolve_user_name(sb, user_id: str) -> str:
-    """Resolve user_id to user_name with caching (capped at 500 entries)."""
-    if user_id in _user_name_cache:
-        return _user_name_cache[user_id]
+    """Resolve user_id to user_name with TTL caching (1h, capped at 200)."""
+    cached = _user_name_cache.get(user_id)
+    if cached is not None:
+        # Bot entries never expire (ts == 0 means permanent)
+        if cached["ts"] == 0 or (time.time() - cached["ts"]) < _USER_NAME_TTL:
+            return cached["name"]
+        # TTL expired - remove stale entry and re-fetch below
+        del _user_name_cache[user_id]
 
-    # Check bot IDs
+    # Check bot IDs - store permanently (ts=0)
     from api.services.agent_personas import BOT_USER_IDS, AGENT_PERSONAS
     if user_id in BOT_USER_IDS:
         name = AGENT_PERSONAS[BOT_USER_IDS[user_id]]["name"]
-        _user_name_cache[user_id] = name
+        _user_name_cache[user_id] = {"name": name, "ts": 0}
         return name
 
     try:
@@ -356,13 +363,23 @@ def _resolve_user_name(sb, user_id: str) -> str:
     except Exception:
         name = "User"
 
-    # Cap cache size: evict oldest half when limit reached
+    # Evict if at capacity: first purge TTL-expired, then oldest half if needed
     if len(_user_name_cache) >= _USER_NAME_CACHE_MAX:
-        keys = list(_user_name_cache.keys())
-        for k in keys[: len(keys) // 2]:
+        now = time.time()
+        expired = [k for k, v in _user_name_cache.items()
+                   if v["ts"] != 0 and (now - v["ts"]) >= _USER_NAME_TTL]
+        for k in expired:
             del _user_name_cache[k]
+        # Still over limit - evict oldest half (by ts, skip permanent bot entries)
+        if len(_user_name_cache) >= _USER_NAME_CACHE_MAX:
+            evictable = sorted(
+                ((k, v["ts"]) for k, v in _user_name_cache.items() if v["ts"] != 0),
+                key=lambda x: x[1],
+            )
+            for k, _ in evictable[: len(evictable) // 2]:
+                del _user_name_cache[k]
 
-    _user_name_cache[user_id] = name
+    _user_name_cache[user_id] = {"name": name, "ts": time.time()}
     return name
 
 

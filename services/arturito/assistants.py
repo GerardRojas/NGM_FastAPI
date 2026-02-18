@@ -5,7 +5,7 @@
 # Manages Arturito assistant and conversation threads
 # More efficient than sending full history each time
 
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from openai import OpenAI
 import os
 import time
@@ -19,9 +19,11 @@ from .persona import get_persona_prompt, get_personality_level, BOT_NAME
 # Cache for assistant ID (created once, reused)
 _assistant_cache: Dict[str, str] = {}  # personality_level -> assistant_id
 
-# Cache for threads (session_id -> thread_id) — capped to prevent unbounded growth
-_thread_cache: Dict[str, str] = {}
-_THREAD_CACHE_MAX = 500
+# Cache for threads (session_id -> {"thread_id": str, "ts": float})
+# Entries expire after _THREAD_TTL seconds to prevent unbounded growth.
+_thread_cache: Dict[str, Dict[str, Any]] = {}
+_THREAD_CACHE_MAX = 150
+_THREAD_TTL = 7200  # 2 hours
 
 # Model to use
 MODEL = "gpt-5-mini"
@@ -100,6 +102,19 @@ def update_assistant_instructions(assistant_id: str, personality_level: int) -> 
 
 
 # ================================
+# THREAD CACHE HELPERS
+# ================================
+
+def _sweep_stale_threads() -> None:
+    """Remove cache entries whose TTL has expired."""
+    now = time.time()
+    stale = [sid for sid, entry in _thread_cache.items()
+             if now - entry["ts"] >= _THREAD_TTL]
+    for sid in stale:
+        del _thread_cache[sid]
+
+
+# ================================
 # THREAD MANAGEMENT
 # ================================
 
@@ -108,9 +123,15 @@ def get_or_create_thread(session_id: str) -> Tuple[Optional[str], Optional[str]]
     Get or create a thread for the given session.
     Returns (thread_id, error_message)
     """
-    # Check cache first
-    if session_id in _thread_cache:
-        return _thread_cache[session_id], None
+    now = time.time()
+
+    # Check cache first (with TTL validation)
+    entry = _thread_cache.get(session_id)
+    if entry is not None:
+        if now - entry["ts"] < _THREAD_TTL:
+            return entry["thread_id"], None
+        # Expired — remove stale entry
+        del _thread_cache[session_id]
 
     client = _get_client()
     if not client:
@@ -118,25 +139,40 @@ def get_or_create_thread(session_id: str) -> Tuple[Optional[str], Optional[str]]
 
     try:
         thread = client.beta.threads.create()
-        # Cap cache size: evict oldest entries when limit reached
+
+        # Sweep expired entries then cap size
+        _sweep_stale_threads()
         if len(_thread_cache) >= _THREAD_CACHE_MAX:
-            keys = list(_thread_cache.keys())
-            for k in keys[: len(keys) // 2]:
+            # Evict oldest half by timestamp
+            sorted_keys = sorted(_thread_cache, key=lambda k: _thread_cache[k]["ts"])
+            for k in sorted_keys[: len(sorted_keys) // 2]:
                 del _thread_cache[k]
-        _thread_cache[session_id] = thread.id
+
+        _thread_cache[session_id] = {"thread_id": thread.id, "ts": now}
         return thread.id, None
     except Exception as e:
         return None, f"Error creating thread: {str(e)}"
 
 
 def get_thread_id(session_id: str) -> Optional[str]:
-    """Get cached thread ID for a session"""
-    return _thread_cache.get(session_id)
+    """Get cached thread ID for a session (returns None if expired)."""
+    entry = _thread_cache.get(session_id)
+    if entry is None:
+        return None
+    if time.time() - entry["ts"] >= _THREAD_TTL:
+        del _thread_cache[session_id]
+        return None
+    return entry["thread_id"]
 
 
 def set_thread_id(session_id: str, thread_id: str):
-    """Store thread ID for a session (useful when client provides it)"""
-    _thread_cache[session_id] = thread_id
+    """Store thread ID for a session (useful when client provides it)."""
+    _sweep_stale_threads()
+    if session_id not in _thread_cache and len(_thread_cache) >= _THREAD_CACHE_MAX:
+        sorted_keys = sorted(_thread_cache, key=lambda k: _thread_cache[k]["ts"])
+        for k in sorted_keys[: len(sorted_keys) // 2]:
+            del _thread_cache[k]
+    _thread_cache[session_id] = {"thread_id": thread_id, "ts": time.time()}
 
 
 def clear_thread(session_id: str) -> Tuple[Optional[str], Optional[str]]:

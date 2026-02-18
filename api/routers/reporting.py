@@ -76,7 +76,7 @@ async def generate_pnl_report(body: PnlReportRequest):
         end = parse_date(body.end_date) if body.end_date else None
 
         def in_range(expense):
-            date_str = expense.get("Date") or expense.get("date") or ""
+            date_str = expense.get("TxnDate") or expense.get("Date") or expense.get("date") or ""
             exp_date = parse_date(str(date_str)[:10]) if date_str else None
             if not exp_date:
                 return True
