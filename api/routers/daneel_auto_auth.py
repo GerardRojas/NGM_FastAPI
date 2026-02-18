@@ -8,8 +8,11 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
+import logging
 
 from api.supabase_client import supabase
+
+logger = logging.getLogger("daneel.auto_auth")
 
 router = APIRouter(prefix="/daneel", tags=["daneel"])
 
@@ -42,6 +45,14 @@ class AutoAuthConfigUpdate(BaseModel):
 # TRIGGER ENDPOINTS
 # ================================
 
+async def _safe_run(coro_func, **kwargs):
+    """Wrapper to catch and log errors in background auto-auth runs."""
+    try:
+        await coro_func(**kwargs)
+    except Exception:
+        logger.exception("Background auto-auth run failed")
+
+
 @router.post("/auto-auth/run")
 async def run_auto_auth(
     background_tasks: BackgroundTasks,
@@ -51,28 +62,31 @@ async def run_auto_auth(
     Manually trigger a full auto-authorization run.
     Processes all new pending expenses since last run.
     Optionally filter by project_id.
+    Runs in background to avoid Render's 30s proxy timeout.
+    Results are saved to daneel_auth_reports.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
-    try:
-        result = await _run(project_id=project_id)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Auto-auth run failed: {str(e)}")
+    background_tasks.add_task(_safe_run, _run, project_id=project_id)
+    return {
+        "status": "started",
+        "message": "Auto-auth run started in background. Check /daneel/auto-auth/reports for results.",
+    }
 
 
 @router.post("/auto-auth/run-backlog")
-async def run_auto_auth_backlog():
+async def run_auto_auth_backlog(background_tasks: BackgroundTasks):
     """
     One-time run: process ALL pending expenses regardless of creation date.
     Use this to clear the historical backlog.
+    Runs in background to avoid Render's 30s proxy timeout.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
-    try:
-        result = await _run(process_all=True)
-        result["mode"] = "backlog"
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Backlog run failed: {str(e)}")
+    background_tasks.add_task(_safe_run, _run, process_all=True)
+    return {
+        "status": "started",
+        "mode": "backlog",
+        "message": "Backlog run started in background. Check /daneel/auto-auth/reports for results.",
+    }
 
 
 @router.post("/auto-auth/reprocess")

@@ -85,8 +85,8 @@ def load_auto_auth_config() -> dict:
                 try:
                     import json
                     val = json.loads(val)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug("Suppressed JSON parse: %s", _exc)
             cfg[row["key"]] = val
         return cfg
     except Exception as e:
@@ -209,16 +209,19 @@ def _get_bill_siblings(norm_bill: str, bills_map: dict, receipt_groups: dict) ->
 # Receipt hash (lightweight -- HTTP HEAD only, no file download)
 # ============================================================================
 
-def get_receipt_hash(receipt_url: Optional[str]) -> Optional[str]:
+def get_receipt_hash(receipt_url: Optional[str], client: Optional[httpx.Client] = None) -> Optional[str]:
     """
     Get a lightweight fingerprint for a receipt file via HTTP HEAD.
     Uses ETag or Content-Length as proxy.  Returns None if unavailable.
+    Pass a shared ``client`` to reuse TCP connections across calls.
     """
     if not receipt_url:
         return None
     try:
-        with httpx.Client(timeout=5.0) as client:
-            resp = client.head(receipt_url, follow_redirects=True)
+        _own_client = client is None
+        _client = client or httpx.Client(timeout=5.0)
+        try:
+            resp = _client.head(receipt_url, follow_redirects=True)
             etag = resp.headers.get("etag")
             if etag:
                 return f"etag:{etag}"
@@ -226,6 +229,9 @@ def get_receipt_hash(receipt_url: Optional[str]) -> Optional[str]:
             ct = resp.headers.get("content-type", "")
             if cl:
                 return f"cl:{cl}:{ct}"
+        finally:
+            if _own_client:
+                _client.close()
     except Exception as e:
         logger.warning(f"[DaneelAutoAuth] HEAD failed for {receipt_url}: {e}")
     return None
@@ -348,12 +354,16 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
                     buf.seek(0)
                     b64_image = base64.b64encode(buf.getvalue()).decode('utf-8')
                     media_type = "image/png"
+                    buf.close()
+                    del buf, images  # free PIL + BytesIO before GPT call
                 except Exception as e:
                     logger.warning(f"[DaneelAutoAuth] Vision: PDF convert error: {e}")
                     return None
             else:
                 b64_image = base64.b64encode(file_content).decode('utf-8')
                 media_type = content_type if content_type else "image/jpeg"
+
+            del file_content  # free download buffer before GPT call
 
             raw = gpt.heavy(
                 system=_VISION_BILL_TOTAL_PROMPT,
@@ -492,6 +502,7 @@ def check_duplicate(
     config: dict,
     lookups: dict,
     hash_cache: Optional[dict] = None,
+    hash_client: Optional[httpx.Client] = None,
 ) -> DuplicateResult:
     """
     Check if expense is a duplicate of any same-vendor expense.
@@ -594,10 +605,10 @@ def check_duplicate(
         if same_amount and same_date and exp_bill and oth_bill and exp_bill != oth_bill:
             # Check receipt hashes (cached)
             if exp_receipt and exp_receipt not in hash_cache:
-                hash_cache[exp_receipt] = get_receipt_hash(exp_receipt)
+                hash_cache[exp_receipt] = get_receipt_hash(exp_receipt, client=hash_client)
             exp_hash = hash_cache.get(exp_receipt) if exp_receipt else None
             if oth_receipt and oth_receipt not in hash_cache:
-                hash_cache[oth_receipt] = get_receipt_hash(oth_receipt)
+                hash_cache[oth_receipt] = get_receipt_hash(oth_receipt, client=hash_client)
             oth_hash = hash_cache.get(oth_receipt) if oth_receipt else None
 
             if exp_hash and oth_hash:
@@ -629,10 +640,10 @@ def check_duplicate(
         # ------ R9: Labor, no check number, receipt comparison ------
         if is_labor and oth_is_labor and same_amount and not exp_bill and not oth_bill:
             if exp_receipt and exp_receipt not in hash_cache:
-                hash_cache[exp_receipt] = get_receipt_hash(exp_receipt)
+                hash_cache[exp_receipt] = get_receipt_hash(exp_receipt, client=hash_client)
             exp_hash = hash_cache.get(exp_receipt) if exp_receipt else None
             if oth_receipt and oth_receipt not in hash_cache:
-                hash_cache[oth_receipt] = get_receipt_hash(oth_receipt)
+                hash_cache[oth_receipt] = get_receipt_hash(oth_receipt, client=hash_client)
             oth_hash = hash_cache.get(oth_receipt) if oth_receipt else None
             if exp_hash and oth_hash:
                 if exp_hash != oth_hash:
@@ -988,7 +999,8 @@ def _resolve_role_name(sb, role_id: Optional[str]) -> str:
         if result.data:
             return result.data["rol_name"].replace(" ", "")
         return ""
-    except Exception:
+    except Exception as _exc:
+        logger.debug("Suppressed role resolve: %s", _exc)
         return ""
 
 
@@ -1004,7 +1016,8 @@ def _resolve_user_mentions(sb, user_ids_json) -> str:
         result = sb.table("users").select("user_name").in_("user_id", ids).execute()
         names = [u["user_name"] for u in (result.data or []) if u.get("user_name")]
         return " ".join(f"@{name}" for name in names)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("Suppressed user mention resolve: %s", _exc)
         return ""
 
 
@@ -1110,8 +1123,11 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
     try:
         pn_result = sb.table("projects").select("project_id, project_name").execute()
         proj_names = {p["project_id"]: p["project_name"] for p in (pn_result.data or [])}
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug("Suppressed project names load: %s", _exc)
+
+    # Shared HTTP client for receipt hash checks (connection pooling)
+    hash_client = httpx.Client(timeout=5.0)
 
     for pid, expenses in projects.items():
         authorized_list = []
@@ -1373,7 +1389,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 exp_receipt_url = _get_expense_receipt(expense, bills_map)
                 if exp_receipt_url:
                     if exp_receipt_url not in _hash_cache:
-                        _hash_cache[exp_receipt_url] = get_receipt_hash(exp_receipt_url)
+                        _hash_cache[exp_receipt_url] = get_receipt_hash(exp_receipt_url, client=hash_client)
                     exp_hash = _hash_cache[exp_receipt_url]
                     if exp_hash:
                         hash_collision = False
@@ -1388,7 +1404,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                             if not other_receipt_url:
                                 continue
                             if other_receipt_url not in _hash_cache:
-                                _hash_cache[other_receipt_url] = get_receipt_hash(other_receipt_url)
+                                _hash_cache[other_receipt_url] = get_receipt_hash(other_receipt_url, client=hash_client)
                             other_hash = _hash_cache[other_receipt_url]
                             if other_hash and other_hash == exp_hash:
                                 # Same receipt file on different bills
@@ -1427,7 +1443,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
             # 2. Duplicate check
             vendor_id = expense.get("vendor_id")
             same_vendor = by_vendor.get(vendor_id, []) if vendor_id else []
-            dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_hash_cache)
+            dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_hash_cache, hash_client=hash_client)
 
             if dup_result.verdict == "duplicate":
                 exp_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})
@@ -1560,6 +1576,8 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
                 "missing_fields": item["missing"],
             })
 
+    hash_client.close()
+
     # Update last run timestamp (skip for per-project runs to not affect global runs)
     if not project_id:
         _save_config_key("daneel_auto_auth_last_run", now)
@@ -1646,8 +1664,8 @@ async def reprocess_pending_info() -> dict:
                 sb.table("daneel_pending_info").update({
                     "missing_fields": missing,
                 }).eq("expense_id", exp_id).execute()
-            except Exception:
-                pass
+            except Exception as _exc:
+                logger.debug("Suppressed pending info update: %s", _exc)
             continue
 
         # Info is now complete -- run duplicate check
@@ -1702,13 +1720,13 @@ async def trigger_auto_auth_for_bill(
     Called after Andrew creates expenses from a receipt.
     """
     tag = "[DaneelBillAuth]"
-    print(f"{tag} START | bill={bill_id} | expenses={len(expense_ids)} | project={project_id}")
+    logger.info(f"{tag} START | bill={bill_id} | expenses={len(expense_ids)} | project={project_id}")
 
     try:
         # 1. Guard: check kill switch
         cfg = load_auto_auth_config()
         if not cfg.get("daneel_auto_auth_enabled"):
-            print(f"{tag} SKIPPED - auto-auth disabled | bill={bill_id}")
+            logger.info(f"{tag} SKIPPED - auto-auth disabled | bill={bill_id}")
             return
 
         # 2. Load shared resources ONCE
@@ -1725,7 +1743,7 @@ async def trigger_auto_auth_for_bill(
             if url:
                 receipt_groups.setdefault(url, set()).add(nb)
 
-        print(f"{tag} Resources loaded | lookups OK | bills_map={len(bills_map)} entries")
+        logger.info(f"{tag} Resources loaded | lookups OK | bills_map={len(bills_map)} entries")
 
         # 3. Fetch all expenses in one query
         exp_result = sb.table("expenses_manual_COGS") \
@@ -1734,10 +1752,10 @@ async def trigger_auto_auth_for_bill(
             .execute()
         all_fetched = exp_result.data or []
         expenses = [e for e in all_fetched if e.get("status") == "pending"]
-        print(f"{tag} Fetched {len(expenses)} pending expenses ({len(all_fetched) - len(expenses)} skipped non-pending)")
+        logger.info(f"{tag} Fetched {len(expenses)} pending expenses ({len(all_fetched) - len(expenses)} skipped non-pending)")
 
         if not expenses:
-            print(f"{tag} No pending expenses to process | bill={bill_id}")
+            logger.info(f"{tag} No pending expenses to process | bill={bill_id}")
             return
 
         # Resolve vendor info
@@ -1752,7 +1770,7 @@ async def trigger_auto_auth_for_bill(
             channel_type="project_general",
             metadata={"type": "auto_auth_bill_review", "bill_id": bill_id, "count": len(expenses)},
         )
-        print(f"{tag} Posted reviewing message | bill={bill_id}")
+        logger.info(f"{tag} Posted reviewing message | bill={bill_id}")
 
         # 5. Receipt hash check ONCE per bill
         hash_collision = False
@@ -1764,7 +1782,8 @@ async def trigger_auto_auth_for_bill(
             bill_receipt_url = _get_expense_receipt(expenses[0], bills_map)
 
         if cfg.get("daneel_receipt_hash_check_enabled", True) and bill_receipt_url:
-            bill_hash = get_receipt_hash(bill_receipt_url)
+            _hclient = httpx.Client(timeout=5.0)
+            bill_hash = get_receipt_hash(bill_receipt_url, client=_hclient)
             if bill_hash:
                 all_proj_result = sb.table("expenses_manual_COGS") \
                     .select("expense_id, bill_id") \
@@ -1781,7 +1800,7 @@ async def trigger_auto_auth_for_bill(
                         other_receipt = bills_map[other_bill].get("receipt_url")
                     if not other_receipt:
                         continue
-                    other_hash = get_receipt_hash(other_receipt)
+                    other_hash = get_receipt_hash(other_receipt, client=_hclient)
                     if other_hash and other_hash == bill_hash:
                         exp_bill_info = bills_map.get(norm_bill, {})
                         oth_bill_info = bills_map.get(other_bill, {})
@@ -1795,7 +1814,7 @@ async def trigger_auto_auth_for_bill(
                                 f"Receipt hash match: same file on bill #{bill_id} "
                                 f"and bill #{(other_exp.get('bill_id') or '').strip()} (both closed)"
                             )
-                            print(f"{tag} Receipt hash: COLLISION | bill={bill_id} | {reason_txt}")
+                            logger.warning(f"{tag} Receipt hash: COLLISION | bill={bill_id} | {reason_txt}")
                             escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
                             msg = (f"{escalation_mentions} " if escalation_mentions else "") + \
                                   f"All **{len(expenses)}** expenses from **{vname}** flagged: {reason_txt}"
@@ -1807,9 +1826,10 @@ async def trigger_auto_auth_for_bill(
                             )
                             break
             if not hash_collision:
-                print(f"{tag} Receipt hash: clear | bill={bill_id}")
+                logger.info(f"{tag} Receipt hash: clear | bill={bill_id}")
+            _hclient.close()
         else:
-            print(f"{tag} Receipt hash: skipped (disabled or no receipt URL) | bill={bill_id}")
+            logger.info(f"{tag} Receipt hash: skipped (disabled or no receipt URL) | bill={bill_id}")
 
         if hash_collision:
             return
@@ -1823,7 +1843,7 @@ async def trigger_auto_auth_for_bill(
                 .eq("vendor_id", first_vendor_id) \
                 .execute()
             same_vendor = sv_result.data or []
-        print(f"{tag} Loaded {len(same_vendor)} same-vendor expenses for duplicate check")
+        logger.info(f"{tag} Loaded {len(same_vendor)} same-vendor expenses for duplicate check")
 
         # Resolve mentions for potential messages
         bookkeeping_mentions = _resolve_mentions(sb, cfg, "daneel_bookkeeping_users", "daneel_bookkeeping_role")
@@ -1844,7 +1864,7 @@ async def trigger_auto_auth_for_bill(
             # Health check
             missing = run_health_check(expense, cfg, bills_map)
             if missing:
-                print(f"{tag} Health {exp_id[:8]}... -> FAIL: {', '.join(missing)}")
+                logger.info(f"{tag} Health {exp_id[:8]}... -> FAIL: {', '.join(missing)}")
                 rt_checks.append({"check": "health", "passed": False, "detail": "Missing: " + ", ".join(missing)})
                 missing_info_list.append({"expense": expense, "missing": missing})
                 _track_pending_info(sb, exp_id, project_id, missing)
@@ -1854,13 +1874,13 @@ async def trigger_auto_auth_for_bill(
                                                        checks=rt_checks))
                 continue
             rt_checks.append({"check": "health", "passed": True, "detail": "All required fields present"})
-            print(f"{tag} Health {exp_id[:8]}... -> PASS")
+            logger.info(f"{tag} Health {exp_id[:8]}... -> PASS")
 
             # Duplicate check
             dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_hash_cache)
 
             if dup_result.verdict == "duplicate":
-                print(f"{tag} Dup {exp_id[:8]}... -> DUPLICATE ({dup_result.rule})")
+                logger.info(f"{tag} Dup {exp_id[:8]}... -> DUPLICATE ({dup_result.rule})")
                 rt_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})
                 duplicate_list.append({"expense": expense, "rule": dup_result.rule, "details": dup_result.details})
                 decisions.append(_make_decision_entry(expense, lookups, "duplicate",
@@ -1869,7 +1889,7 @@ async def trigger_auto_auth_for_bill(
                 continue
 
             if dup_result.verdict == "need_info":
-                print(f"{tag} Dup {exp_id[:8]}... -> NEED_INFO ({dup_result.details})")
+                logger.info(f"{tag} Dup {exp_id[:8]}... -> NEED_INFO ({dup_result.details})")
                 rt_checks.append({"check": "duplicate", "passed": False, "detail": f"Need info: {dup_result.details}"})
                 need_fields = ["receipt"] if "receipt" in dup_result.rule.lower() else ["bill_id", "receipt"]
                 missing_info_list.append({"expense": expense, "missing": need_fields})
@@ -1880,7 +1900,7 @@ async def trigger_auto_auth_for_bill(
                 continue
 
             if dup_result.verdict == "ambiguous":
-                print(f"{tag} Dup {exp_id[:8]}... -> AMBIGUOUS ({dup_result.details})")
+                logger.warning(f"{tag} Dup {exp_id[:8]}... -> AMBIGUOUS ({dup_result.details})")
                 rt_checks.append({"check": "duplicate", "passed": False, "detail": f"Ambiguous: {dup_result.details}"})
                 escalation_list.append({"expense": expense, "reason": dup_result.details})
                 decisions.append(_make_decision_entry(expense, lookups, "escalated",
@@ -1890,11 +1910,11 @@ async def trigger_auto_auth_for_bill(
 
             # All checks passed - authorize in real-time
             rt_checks.append({"check": "duplicate", "passed": True, "detail": f"R1-R9 clear: {dup_result.details}"})
-            print(f"{tag} Dup {exp_id[:8]}... -> CLEAR ({dup_result.rule})")
+            logger.info(f"{tag} Dup {exp_id[:8]}... -> CLEAR ({dup_result.rule})")
             if authorize_expense(sb, exp_id, project_id, dup_result.rule):
                 authorized_list.append(expense)
                 amt = f"${float(expense.get('Amount') or 0):,.2f}"
-                print(f"{tag} Authorized {exp_id[:8]}... | {vname} {amt}")
+                logger.info(f"{tag} Authorized {exp_id[:8]}... | {vname} {amt}")
                 decisions.append(_make_decision_entry(expense, lookups, "authorized",
                                                        rule=dup_result.rule, reason=dup_result.details,
                                                        checks=rt_checks))
@@ -1991,10 +2011,9 @@ async def trigger_auto_auth_for_bill(
             "total_amount": total_auth,
         }, decisions, project_id=project_id)
 
-        print(f"{tag} DONE | bill={bill_id} | auth={n_auth}/{n_total} | missing={n_missing} | dup={n_dup} | escalated={n_esc}")
+        logger.info(f"{tag} DONE | bill={bill_id} | auth={n_auth}/{n_total} | missing={n_missing} | dup={n_dup} | escalated={n_esc}")
 
     except Exception as e:
-        print(f"{tag} ERROR | bill={bill_id} | {repr(e)}")
         logger.error(f"{tag} trigger_auto_auth_for_bill error: {e}", exc_info=True)
 
 
@@ -2075,7 +2094,8 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
             exp_bill_str = normalize_bill_id(exp_bill_raw)
             exp_receipt_url = _get_expense_receipt(expense, bills_map)
             if exp_receipt_url:
-                exp_hash = get_receipt_hash(exp_receipt_url)
+                _hclient_rt = httpx.Client(timeout=5.0)
+                exp_hash = get_receipt_hash(exp_receipt_url, client=_hclient_rt)
                 if exp_hash:
                     # Check all expenses in the project for same hash, different bill
                     all_proj_result = sb.table("expenses_manual_COGS") \
@@ -2094,7 +2114,7 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                             other_receipt = bills_map[other_bill].get("receipt_url")
                         if not other_receipt:
                             continue
-                        other_hash = get_receipt_hash(other_receipt)
+                        other_hash = get_receipt_hash(other_receipt, client=_hclient_rt)
                         if other_hash and other_hash == exp_hash:
                             exp_bill_info = bills_map.get(exp_bill_str, {})
                             oth_bill_info = bills_map.get(other_bill, {})
@@ -2123,9 +2143,11 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                                 hash_collision = True
                                 break
                     if hash_collision:
+                        _hclient_rt.close()
                         return
                     rt_checks.append({"check": "receipt_hash", "passed": True,
                                        "detail": "No cross-bill hash collision"})
+                _hclient_rt.close()
 
         # Duplicate check
         vendor_id = expense.get("vendor_id")
