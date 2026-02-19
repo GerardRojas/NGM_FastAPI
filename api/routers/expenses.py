@@ -1,13 +1,18 @@
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 from api.supabase_client import supabase
 from api.auth import get_current_user
 from typing import Optional, List
+from enum import Enum
 import asyncio
+import io
 import json
 import logging
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import pandas as pd
 from services.receipt_scanner import (
     extract_text_from_pdf as _extract_text_from_pdf,
     scan_receipt as _scan_receipt_core,
@@ -717,6 +722,173 @@ def reactivate_duplicate_alert(dismissal_id: str, user_id: str, current_user: di
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reactivating duplicate alert: {str(e)}")
+
+
+# ====== EXPORT ======
+
+class ExportFormat(str, Enum):
+    csv = "csv"
+    xlsx = "xlsx"
+
+
+@router.get("/export")
+def export_expenses(
+    format: ExportFormat,
+    project: Optional[str] = None,
+    vendor_id: Optional[str] = None,
+    txn_type: Optional[str] = None,
+    account_id: Optional[str] = None,
+    payment_type: Optional[str] = None,
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Exporta los gastos filtrados como archivo CSV o Excel (.xlsx).
+    Acepta los mismos filtros que la tabla del frontend.
+    """
+    try:
+        # ── Paginated fetch con filtros server-side ──
+        raw_expenses: list = []
+        offset = 0
+
+        while True:
+            query = supabase.table("expenses_manual_COGS").select("*")
+
+            if project:
+                query = query.eq("project", project)
+            if vendor_id:
+                query = query.eq("vendor_id", vendor_id)
+            if txn_type:
+                query = query.eq("txn_type", txn_type)
+            if account_id:
+                query = query.eq("account_id", account_id)
+            if payment_type:
+                query = query.eq("payment_type", payment_type)
+            if status:
+                query = query.eq("status", status)
+            if date_from:
+                query = query.gte("TxnDate", date_from)
+            if date_to:
+                query = query.lte("TxnDate", date_to)
+            if search:
+                query = query.ilike("LineDescription", f"%{search}%")
+
+            query = query.order("TxnDate", desc=True)
+            query = query.range(offset, offset + _PAGE_SIZE - 1)
+            resp = query.execute()
+            batch = resp.data or []
+            raw_expenses.extend(batch)
+
+            if len(batch) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
+
+        if not raw_expenses:
+            raise HTTPException(status_code=404, detail="No hay gastos que coincidan con los filtros")
+
+        # ── Enriquecer con metadata en paralelo ──
+        def fetch_txn_types():
+            return supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
+        def fetch_projects():
+            return supabase.table("projects").select("project_id, project_name").execute()
+        def fetch_vendors():
+            return supabase.table("Vendors").select("id, vendor_name").execute()
+        def fetch_payments():
+            return supabase.table("paymet_methods").select("id, payment_method_name").execute()
+        def fetch_accounts():
+            return supabase.table("accounts").select("account_id, Name").execute()
+
+        txn_types_map, projects_map, vendors_map, payment_map, accounts_map = {}, {}, {}, {}, {}
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(fetch_txn_types): "txn_types",
+                executor.submit(fetch_projects): "projects",
+                executor.submit(fetch_vendors): "vendors",
+                executor.submit(fetch_payments): "payments",
+                executor.submit(fetch_accounts): "accounts",
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    data = future.result().data or []
+                    if key == "txn_types":
+                        txn_types_map = {t["TnxType_id"]: t for t in data}
+                    elif key == "projects":
+                        projects_map = {p["project_id"]: p for p in data}
+                    elif key == "vendors":
+                        vendors_map = {v["id"]: v for v in data}
+                    elif key == "payments":
+                        payment_map = {p["id"]: p for p in data}
+                    elif key == "accounts":
+                        accounts_map = {a["account_id"]: a for a in data}
+                except Exception as exc:
+                    logger.warning("[EXPORT] Error fetching %s: %s", key, exc)
+
+        for row in raw_expenses:
+            txn = txn_types_map.get(row.get("txn_type"))
+            proj = projects_map.get(row.get("project"))
+            vendor = vendors_map.get(row.get("vendor_id"))
+            payment = payment_map.get(row.get("payment_type"))
+            account = accounts_map.get(row.get("account_id"))
+            row["txn_type_name"] = txn.get("TnxType_name") if txn else None
+            row["project_name"] = proj.get("project_name") if proj else None
+            row["vendor_name"] = vendor.get("vendor_name") if vendor else None
+            row["payment_method_name"] = payment.get("payment_method_name") if payment else None
+            row["account_name"] = account.get("Name") if account else None
+
+        # ── Construir DataFrame con columnas legibles ──
+        EXPORT_COLUMNS = {
+            "TxnDate": "Fecha",
+            "project_name": "Proyecto",
+            "txn_type_name": "Tipo de Transacción",
+            "vendor_name": "Vendor",
+            "LineDescription": "Descripción",
+            "Amount": "Monto",
+            "bill_id": "Factura #",
+            "payment_method_name": "Método de Pago",
+            "account_name": "Cuenta",
+            "status": "Estado",
+            "receipt_url": "Recibo URL",
+        }
+
+        df = pd.DataFrame(raw_expenses)
+        available = [c for c in EXPORT_COLUMNS if c in df.columns]
+        df = df[available].rename(columns=EXPORT_COLUMNS)
+
+        # ── Generar archivo ──
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        buffer = io.BytesIO()
+
+        if format == ExportFormat.csv:
+            csv_str = df.to_csv(index=False)
+            buffer.write(csv_str.encode("utf-8-sig"))  # BOM para compatibilidad con Excel
+            buffer.seek(0)
+            filename = f"expenses_{timestamp}.csv"
+            media_type = "text/csv; charset=utf-8"
+        else:
+            df.to_excel(buffer, index=False, engine="openpyxl", sheet_name="Expenses")
+            buffer.seek(0)
+            filename = f"expenses_{timestamp}.xlsx"
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+        return StreamingResponse(
+            buffer,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("[EXPORT] Error exporting expenses: %s", e)
+        raise HTTPException(status_code=500, detail=f"Error exportando gastos: {e}")
 
 
 @router.get("/{expense_id}")
