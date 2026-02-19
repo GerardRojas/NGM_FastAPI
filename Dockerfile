@@ -1,10 +1,12 @@
 # Usar imagen oficial de Python
 FROM python:3.13-slim
 
-# Instalar dependencias del sistema (incluyendo poppler-utils)
+# Instalar dependencias del sistema (runtime + build)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     poppler-utils \
+    libcairo2 \
+    gcc g++ pkg-config libcairo2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Establecer directorio de trabajo
@@ -15,7 +17,8 @@ COPY requirements.txt .
 
 # Instalar dependencias de Python
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    apt-get purge -y --auto-remove gcc g++ pkg-config libcairo2-dev
 
 # Copiar el resto del código
 COPY . .
