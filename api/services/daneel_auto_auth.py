@@ -1050,7 +1050,7 @@ def _trigger_andrew_reconciliation(bill_id: str, project_id: str, source: str):
 # Main orchestrator
 # ============================================================================
 
-async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -> dict:
+def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -> dict:
     """
     Process pending expenses.
     process_all=False (default): only new since last run.
@@ -1609,7 +1609,7 @@ async def run_auto_auth(process_all: bool = False, project_id: Optional[str] = N
 # Re-process pending info
 # ============================================================================
 
-async def reprocess_pending_info() -> dict:
+def reprocess_pending_info() -> dict:
     """Re-check expenses that were waiting for missing info."""
     cfg = load_auto_auth_config()
     if not cfg.get("daneel_auto_auth_enabled"):

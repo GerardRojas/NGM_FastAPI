@@ -62,56 +62,55 @@ async def run_auto_auth(
 ):
     """
     Manually trigger a full auto-authorization run.
-    Tries to complete within 25s and return full results.
-    If it takes longer, continues in background to avoid Render's 30s timeout.
+    Runs in a thread to avoid blocking the event loop.
+    Tries to complete within 25s; if longer, continues in background.
     Results are always saved to daneel_auth_reports.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
-    task = asyncio.create_task(_run(project_id=project_id))
-    done, _ = await asyncio.wait({task}, timeout=25.0)
-    if done:
-        try:
-            return task.result()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Auto-auth run failed: {str(e)}")
-    # Still running — let it finish in background
-    _running_tasks.add(task)
-    task.add_done_callback(_on_bg_task_done)
-    return {
-        "status": "ok",
-        "message": "Processing taking longer than expected. Results will be saved to reports.",
-        "authorized": 0,
-        "expenses_processed": 0,
-        "background": True,
-    }
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_run, project_id=project_id),
+            timeout=25.0,
+        )
+        return result
+    except asyncio.TimeoutError:
+        # Thread keeps running in background — results saved to daneel_auth_reports
+        return {
+            "status": "ok",
+            "message": "Processing taking longer than expected. Results will be saved to reports.",
+            "authorized": 0,
+            "expenses_processed": 0,
+            "background": True,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Auto-auth run failed: {str(e)}")
 
 
 @router.post("/auto-auth/run-backlog")
 async def run_auto_auth_backlog():
     """
     One-time run: process ALL pending expenses regardless of creation date.
-    Tries to complete within 25s; continues in background if needed.
+    Runs in a thread; tries to complete within 25s, continues in background if needed.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
-    task = asyncio.create_task(_run(process_all=True))
-    done, _ = await asyncio.wait({task}, timeout=25.0)
-    if done:
-        try:
-            result = task.result()
-            result["mode"] = "backlog"
-            return result
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Backlog run failed: {str(e)}")
-    _running_tasks.add(task)
-    task.add_done_callback(_on_bg_task_done)
-    return {
-        "status": "ok",
-        "mode": "backlog",
-        "message": "Backlog processing continuing in background. Check reports for results.",
-        "authorized": 0,
-        "expenses_processed": 0,
-        "background": True,
-    }
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_run, process_all=True),
+            timeout=25.0,
+        )
+        result["mode"] = "backlog"
+        return result
+    except asyncio.TimeoutError:
+        return {
+            "status": "ok",
+            "mode": "backlog",
+            "message": "Backlog processing continuing in background. Check reports for results.",
+            "authorized": 0,
+            "expenses_processed": 0,
+            "background": True,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backlog run failed: {str(e)}")
 
 
 @router.post("/auto-auth/reprocess")
@@ -122,7 +121,7 @@ async def reprocess_pending():
     """
     from api.services.daneel_auto_auth import reprocess_pending_info
     try:
-        result = await reprocess_pending_info()
+        result = await asyncio.to_thread(reprocess_pending_info)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reprocess failed: {str(e)}")
