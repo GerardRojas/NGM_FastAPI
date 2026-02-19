@@ -2,7 +2,7 @@
 Router para gestión de Bills (Facturas/Recibos)
 Tabla: bills
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
 from supabase import create_client, Client
@@ -78,13 +78,21 @@ async def get_bill(bill_id: str):
 
 
 @router.get("/{bill_id}/expenses")
-async def get_bill_expenses(bill_id: str):
+async def get_bill_expenses(
+    bill_id: str,
+    project_id: Optional[str] = Query(None, description="Filter expenses by project UUID"),
+):
     """
-    Obtiene todos los gastos asociados a un bill específico
+    Obtiene todos los gastos asociados a un bill específico.
+    Si se proporciona project_id, filtra solo los gastos de ese proyecto
+    (evita sumar gastos de otros proyectos que comparten el mismo bill_id).
     """
     try:
         # Buscar en expenses_manual_COGS por bill_id
-        response = supabase.table("expenses_manual_COGS").select("*").eq("bill_id", bill_id).execute()
+        query = supabase.table("expenses_manual_COGS").select("*").eq("bill_id", bill_id)
+        if project_id:
+            query = query.eq("project", project_id)
+        response = query.execute()
 
         return {
             "bill_id": bill_id,
