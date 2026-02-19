@@ -4,10 +4,11 @@ Endpoints for triggering, monitoring, and configuring Daneel's
 automatic expense authorization engine.
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
+import asyncio
 import logging
 
 from api.supabase_client import supabase
@@ -15,6 +16,16 @@ from api.supabase_client import supabase
 logger = logging.getLogger("daneel.auto_auth")
 
 router = APIRouter(prefix="/daneel", tags=["daneel"])
+
+# References to background tasks to prevent garbage collection
+_running_tasks: set = set()
+
+
+def _on_bg_task_done(task: asyncio.Task):
+    """Cleanup + log errors for background auto-auth tasks."""
+    _running_tasks.discard(task)
+    if not task.cancelled() and task.exception():
+        logger.error("Background auto-auth failed", exc_info=task.exception())
 
 
 # ================================
@@ -45,47 +56,61 @@ class AutoAuthConfigUpdate(BaseModel):
 # TRIGGER ENDPOINTS
 # ================================
 
-async def _safe_run(coro_func, **kwargs):
-    """Wrapper to catch and log errors in background auto-auth runs."""
-    try:
-        await coro_func(**kwargs)
-    except Exception:
-        logger.exception("Background auto-auth run failed")
-
-
 @router.post("/auto-auth/run")
 async def run_auto_auth(
-    background_tasks: BackgroundTasks,
     project_id: Optional[str] = Query(None, description="Filter to a specific project")
 ):
     """
     Manually trigger a full auto-authorization run.
-    Processes all new pending expenses since last run.
-    Optionally filter by project_id.
-    Runs in background to avoid Render's 30s proxy timeout.
-    Results are saved to daneel_auth_reports.
+    Tries to complete within 25s and return full results.
+    If it takes longer, continues in background to avoid Render's 30s timeout.
+    Results are always saved to daneel_auth_reports.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
-    background_tasks.add_task(_safe_run, _run, project_id=project_id)
+    task = asyncio.create_task(_run(project_id=project_id))
+    done, _ = await asyncio.wait({task}, timeout=25.0)
+    if done:
+        try:
+            return task.result()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Auto-auth run failed: {str(e)}")
+    # Still running — let it finish in background
+    _running_tasks.add(task)
+    task.add_done_callback(_on_bg_task_done)
     return {
-        "status": "started",
-        "message": "Auto-auth run started in background. Check /daneel/auto-auth/reports for results.",
+        "status": "ok",
+        "message": "Processing taking longer than expected. Results will be saved to reports.",
+        "authorized": 0,
+        "expenses_processed": 0,
+        "background": True,
     }
 
 
 @router.post("/auto-auth/run-backlog")
-async def run_auto_auth_backlog(background_tasks: BackgroundTasks):
+async def run_auto_auth_backlog():
     """
     One-time run: process ALL pending expenses regardless of creation date.
-    Use this to clear the historical backlog.
-    Runs in background to avoid Render's 30s proxy timeout.
+    Tries to complete within 25s; continues in background if needed.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
-    background_tasks.add_task(_safe_run, _run, process_all=True)
+    task = asyncio.create_task(_run(process_all=True))
+    done, _ = await asyncio.wait({task}, timeout=25.0)
+    if done:
+        try:
+            result = task.result()
+            result["mode"] = "backlog"
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Backlog run failed: {str(e)}")
+    _running_tasks.add(task)
+    task.add_done_callback(_on_bg_task_done)
     return {
-        "status": "started",
+        "status": "ok",
         "mode": "backlog",
-        "message": "Backlog run started in background. Check /daneel/auto-auth/reports for results.",
+        "message": "Backlog processing continuing in background. Check reports for results.",
+        "authorized": 0,
+        "expenses_processed": 0,
+        "background": True,
     }
 
 
