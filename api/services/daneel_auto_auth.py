@@ -69,6 +69,8 @@ _DEFAULT_CONFIG = {
     "daneel_gpt_fallback_confidence": 75,
     "daneel_mismatch_notify_andrew": True,
     "daneel_receipt_hash_check_enabled": True,
+    "daneel_digest_enabled": True,
+    "daneel_digest_interval_hours": 4,
 }
 
 
@@ -1318,22 +1320,12 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                                 })
                                 if bill_id_str not in _mismatch_notified:
                                     _mismatch_notified.add(bill_id_str)
-                                    info_msg = (
-                                        f"**Bill #{bill_id_str} -- Tax Note**\n\n"
-                                        f"Expenses sum (${bill_total:,.2f}) matches the invoice "
-                                        f"subtotal (${vision_subtotal:,.2f}) but not the grand total "
-                                        f"(${vision_total:,.2f}). The difference of "
-                                        f"${vision_tax:,.2f} appears to be tax that was not "
-                                        f"distributed into the expense line items.\n\n"
-                                        f"No action needed if tax is tracked separately."
+                                    # Tax note is informational — deferred to periodic digest
+                                    logger.info(
+                                        "[DaneelAutoAuth] Tax note: bill %s subtotal $%.2f, "
+                                        "total $%.2f, tax $%.2f (deferred to digest)",
+                                        bill_id_str, vision_subtotal, vision_total, vision_tax,
                                     )
-                                    post_daneel_message(
-                                        content=info_msg, project_id=pid,
-                                        channel_type="project_general",
-                                        metadata={
-                                            "type": "bill_tax_note", "bill_id": bill_id_str,
-                                            "source": "vision"
-                                        })
                             else:
                                 reason_txt = (
                                     f"OCR mismatch: invoice ${vision_total:,.2f} "
@@ -1517,48 +1509,8 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                     expense, lookups, "authorized", rule=rule, reason=det,
                     checks=chks))
 
-        # Phase 4: Post batch messages for this project (smart layer)
-        from api.services.daneel_smart_layer import (
-            craft_batch_auth_message as _smart_batch,
-            craft_missing_info_message as _smart_missing,
-            craft_escalation_message as _smart_escalation,
-        )
-
-        if authorized_list:
-            msg = _smart_batch(authorized_list, lookups)
-            post_daneel_message(
-                content=msg,
-                project_id=pid,
-                channel_type="project_general",
-                metadata={"type": "auto_auth_batch", "count": len(authorized_list),
-                          "total": sum(float(e.get("Amount") or 0) for e in authorized_list)},
-            )
-
-        if missing_info_list:
-            resolution_summary = {
-                "auto_resolved_count": len(all_auto_resolved),
-                "auto_resolved_fields": list(set(all_auto_resolved)),
-                "still_missing_count": len(missing_info_list),
-                "attempts": all_resolve_attempts[:10],
-            }
-            msg = _smart_missing(missing_info_list, lookups,
-                                 bookkeeping_mentions, resolution_summary)
-            post_daneel_message(
-                content=msg,
-                project_id=pid,
-                channel_type="project_general",
-                metadata={"type": "auto_auth_missing_info", "count": len(missing_info_list),
-                          "auto_resolved": len(all_auto_resolved)},
-            )
-
-        if escalation_list:
-            msg = _smart_escalation(escalation_list, lookups, escalation_mentions)
-            post_daneel_message(
-                content=msg,
-                project_id=pid,
-                channel_type="project_general",
-                metadata={"type": "auto_auth_escalation", "count": len(escalation_list)},
-            )
+        # Phase 4: Results deferred to periodic digest (no immediate messages)
+        # The auth report saved below feeds the digest engine.
 
         total_authorized += len(authorized_list)
         total_missing += len(missing_info_list)
@@ -1919,7 +1871,7 @@ async def trigger_auto_auth_for_bill(
                                                        rule=dup_result.rule, reason=dup_result.details,
                                                        checks=rt_checks))
 
-        # 8. Post ONE consolidated summary
+        # 8. Compute summary stats (message deferred to periodic digest)
         total_auth = sum(float(e.get("Amount") or 0) for e in authorized_list)
         n_auth = len(authorized_list)
         n_total = len(expenses)
@@ -1927,80 +1879,7 @@ async def trigger_auto_auth_for_bill(
         n_dup = len(duplicate_list)
         n_esc = len(escalation_list)
 
-        if n_auth == n_total:
-            # All authorized
-            summary_msg = (
-                f"**Bill #{bill_id} -- Review Complete**\n"
-                f"Authorized all **{n_auth}** expenses from **{vname}** totaling **${total_auth:,.2f}**.\n\n"
-                f"All expenses passed health check and duplicate verification."
-            )
-        elif n_auth > 0:
-            # Mixed results
-            summary_msg = (
-                f"**Bill #{bill_id} -- Review Complete**\n"
-                f"Authorized **{n_auth}/{n_total}** expenses from **{vname}** (${total_auth:,.2f}).\n\n"
-            )
-            flagged_items = []
-            for item in missing_info_list:
-                exp = item["expense"]
-                amt = f"${float(exp.get('Amount') or 0):,.2f}"
-                desc = (exp.get("LineDescription") or "No description")[:50]
-                flagged_items.append(f"- {desc} ({amt}): missing **{', '.join(item['missing'])}**")
-            for item in duplicate_list:
-                exp = item["expense"]
-                amt = f"${float(exp.get('Amount') or 0):,.2f}"
-                desc = (exp.get("LineDescription") or "No description")[:50]
-                flagged_items.append(f"- {desc} ({amt}): duplicate ({item['rule']})")
-            for item in escalation_list:
-                exp = item["expense"]
-                amt = f"${float(exp.get('Amount') or 0):,.2f}"
-                desc = (exp.get("LineDescription") or "No description")[:50]
-                flagged_items.append(f"- {desc} ({amt}): needs review ({item['reason'][:60]})")
-            if flagged_items:
-                summary_msg += f"**{n_total - n_auth}** items need attention:\n" + "\n".join(flagged_items)
-        else:
-            # None authorized
-            summary_msg = (
-                f"**Bill #{bill_id} -- Review Complete**\n"
-                f"0/{n_total} expenses authorized from **{vname}**.\n\n"
-            )
-            flagged_items = []
-            for item in missing_info_list:
-                exp = item["expense"]
-                amt = f"${float(exp.get('Amount') or 0):,.2f}"
-                desc = (exp.get("LineDescription") or "No description")[:50]
-                flagged_items.append(f"- {desc} ({amt}): missing **{', '.join(item['missing'])}**")
-            for item in duplicate_list:
-                exp = item["expense"]
-                amt = f"${float(exp.get('Amount') or 0):,.2f}"
-                desc = (exp.get("LineDescription") or "No description")[:50]
-                flagged_items.append(f"- {desc} ({amt}): duplicate ({item['rule']})")
-            for item in escalation_list:
-                exp = item["expense"]
-                amt = f"${float(exp.get('Amount') or 0):,.2f}"
-                desc = (exp.get("LineDescription") or "No description")[:50]
-                flagged_items.append(f"- {desc} ({amt}): needs review ({item['reason'][:60]})")
-            if flagged_items:
-                summary_msg += "\n".join(flagged_items)
-            if n_missing > 0 and bookkeeping_mentions:
-                summary_msg += f"\n\n{bookkeeping_mentions} Please update missing fields to proceed."
-            if n_esc > 0 and escalation_mentions:
-                summary_msg += f"\n\n{escalation_mentions} Manual review required."
-
-        post_daneel_message(
-            content=summary_msg,
-            project_id=project_id,
-            channel_type="project_general",
-            metadata={
-                "type": "auto_auth_bill_summary",
-                "bill_id": bill_id,
-                "authorized": n_auth,
-                "flagged": n_total - n_auth,
-                "total_amount": total_auth,
-            },
-        )
-
-        # 9. Save audit trail
+        # 9. Save audit trail (digest will read these reports)
         _save_auth_report(sb, "bill_realtime", {
             "bill_id": bill_id,
             "authorized": n_auth,
@@ -2071,20 +1950,12 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
         if missing:
             rt_checks.append({"check": "health", "passed": False, "detail": "Missing: " + ", ".join(missing)})
             _track_pending_info(sb, expense_id, project_id, missing)
-            # Post individual missing info message
-            bookkeeping_mentions = _resolve_mentions(sb, cfg, "daneel_bookkeeping_users", "daneel_bookkeeping_role")
-            vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
-            amt = f"${float(expense.get('Amount') or 0):,.2f}"
-            fields_str = ", ".join(missing)
-            msg = (f"{bookkeeping_mentions} " if bookkeeping_mentions else "") + \
-                  f"Expense from **{vname}** ({amt}) is missing: **{fields_str}**. " \
-                  f"Please provide to proceed with authorization."
-            post_daneel_message(
-                content=msg,
-                project_id=project_id,
-                channel_type="project_general",
-                metadata={"type": "auto_auth_missing_info", "count": 1},
-            )
+            # Save to report for periodic digest (no immediate message)
+            decision = _make_decision_entry(expense, lookups, "missing_info",
+                                            rule="HEALTH", reason=f"Missing: {', '.join(missing)}",
+                                            missing_fields=missing, checks=rt_checks)
+            _save_auth_report(sb, "realtime", {"missing_info": 1}, [decision],
+                              project_id=project_id)
             return  # don't authorize yet
         rt_checks.append({"check": "health", "passed": True, "detail": "All required fields present"})
 
@@ -2167,12 +2038,22 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
         if dup_result.verdict == "duplicate":
             rt_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})
             logger.info(f"[DaneelAutoAuth] Duplicate detected: {expense_id} ({dup_result.rule})")
+            decision = _make_decision_entry(expense, lookups, "duplicate",
+                                            rule=dup_result.rule, reason=dup_result.details,
+                                            checks=rt_checks)
+            _save_auth_report(sb, "realtime", {"duplicates": 1}, [decision],
+                              project_id=project_id)
             return
 
         if dup_result.verdict == "need_info":
             need_fields = ["receipt"] if "receipt" in dup_result.rule.lower() else ["bill_id", "receipt"]
             rt_checks.append({"check": "duplicate", "passed": False, "detail": f"Need info: {dup_result.details}"})
             _track_pending_info(sb, expense_id, project_id, need_fields)
+            decision = _make_decision_entry(expense, lookups, "missing_info",
+                                            rule=dup_result.rule, reason=dup_result.details,
+                                            missing_fields=need_fields, checks=rt_checks)
+            _save_auth_report(sb, "realtime", {"missing_info": 1}, [decision],
+                              project_id=project_id)
             return
 
         if dup_result.verdict == "ambiguous":
@@ -2201,32 +2082,20 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                                                             checks=rt_checks)
                             _save_auth_report(sb, "realtime", {"authorized": 1}, [decision],
                                               project_id=project_id)
-                            post_daneel_message(
-                                content=f"Authorized expense from **{vname}** ({amt}).",
-                                project_id=project_id,
-                                channel_type="project_general",
-                                metadata={"type": "auto_auth_success", "expense_id": expense_id},
-                            )
                         return
 
-            # Still ambiguous -- escalate to human
-            escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
-            vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
-            amt = f"${float(expense.get('Amount') or 0):,.2f}"
-            msg = (f"{escalation_mentions} " if escalation_mentions else "") + \
-                  f"Expense from **{vname}** ({amt}) requires manual review: {dup_result.details}"
-            post_daneel_message(
-                content=msg,
-                project_id=project_id,
-                channel_type="project_general",
-                metadata={"type": "auto_auth_escalation", "count": 1},
-            )
+            # Still ambiguous -- save to report for digest (no immediate message)
+            decision = _make_decision_entry(expense, lookups, "escalated",
+                                            rule=dup_result.rule, reason=dup_result.details,
+                                            checks=rt_checks)
+            _save_auth_report(sb, "realtime", {"escalated": 1}, [decision],
+                              project_id=project_id)
             return
 
         # Duplicate check passed
         rt_checks.append({"check": "duplicate", "passed": True, "detail": f"R1-R9 clear: {dup_result.details}"})
 
-        # Authorize
+        # Authorize (result goes to periodic digest, no immediate message)
         decision = None
         if authorize_expense(sb, expense_id, project_id, dup_result.rule):
             vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
@@ -2235,12 +2104,6 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
             decision = _make_decision_entry(expense, lookups, "authorized",
                                             rule=dup_result.rule, reason=dup_result.details,
                                             checks=rt_checks)
-            post_daneel_message(
-                content=f"Authorized expense from **{vname}** ({amt}).",
-                project_id=project_id,
-                channel_type="project_general",
-                metadata={"type": "auto_auth_success", "expense_id": expense_id},
-            )
 
         # Save realtime decision to report log
         if decision:

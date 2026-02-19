@@ -553,6 +553,129 @@ def craft_escalation_message(escalated: list, lookups: dict,
     return personalized if personalized else raw
 
 
+def craft_digest_message(
+    reports: list,
+    lookups: dict,
+    bookkeeping_mentions: str,
+    escalation_mentions: str,
+    project_name: str = "",
+) -> str:
+    """
+    Craft a consolidated digest from multiple auth reports.
+
+    Each report has:
+      summary: {authorized, missing_info, duplicates, escalated, total_amount, ...}
+      decisions: [{expense_id, vendor, amount, decision, rule, reason, missing_fields}, ...]
+    """
+    import json as _json
+    from collections import OrderedDict
+
+    # Aggregate across all reports
+    total_auth = 0
+    total_missing = 0
+    total_escalated = 0
+    total_duplicate = 0
+    auth_amount = 0.0
+
+    all_decisions = []
+    for r in reports:
+        s = r.get("summary") or {}
+        if isinstance(s, str):
+            try:
+                s = _json.loads(s)
+            except Exception:
+                s = {}
+        total_auth += int(s.get("authorized", 0))
+        total_missing += int(s.get("missing_info", 0))
+        total_escalated += int(s.get("escalated", 0))
+        total_duplicate += int(s.get("duplicates", 0))
+        auth_amount += float(s.get("total_amount", 0))
+
+        decisions = r.get("decisions") or []
+        if isinstance(decisions, str):
+            try:
+                decisions = _json.loads(decisions)
+            except Exception:
+                decisions = []
+        all_decisions.extend(decisions)
+
+    # Build structured digest
+    lines = []
+    header = f"**Expense Digest{' -- ' + project_name if project_name else ''}**"
+    lines.append(header)
+    lines.append("")
+
+    # Summary line
+    parts = []
+    if total_auth:
+        parts.append(f"**{total_auth}** authorized (${auth_amount:,.2f})")
+    if total_missing:
+        parts.append(f"**{total_missing}** need info")
+    if total_escalated:
+        parts.append(f"**{total_escalated}** escalated")
+    if total_duplicate:
+        parts.append(f"**{total_duplicate}** duplicates flagged")
+    lines.append(" | ".join(parts) if parts else "No new activity.")
+    lines.append("")
+
+    # Missing info detail (group by vendor + missing fields)
+    if total_missing > 0:
+        missing_decisions = [d for d in all_decisions if d.get("decision") == "missing_info"]
+        if missing_decisions:
+            lines.append("**Needs attention:**")
+            groups: OrderedDict = OrderedDict()
+            for d in missing_decisions:
+                vname = d.get("vendor", "Unknown")
+                fields = tuple(sorted(d.get("missing_fields") or []))
+                key = (vname, fields)
+                if key not in groups:
+                    groups[key] = {"count": 0, "total": 0.0}
+                groups[key]["count"] += 1
+                groups[key]["total"] += float(d.get("amount", 0))
+            for (vname, fields), g in list(groups.items())[:10]:
+                fstr = ", ".join(fields) if fields else "unknown"
+                lines.append(f"- **{vname}** ({g['count']}x, ${g['total']:,.2f}): missing {fstr}")
+            lines.append("")
+
+    # Escalation detail
+    if total_escalated > 0:
+        esc_decisions = [d for d in all_decisions if d.get("decision") == "escalated"]
+        if esc_decisions:
+            lines.append("**Manual review needed:**")
+            groups_esc: OrderedDict = OrderedDict()
+            for d in esc_decisions:
+                vname = d.get("vendor", "Unknown")
+                if vname not in groups_esc:
+                    groups_esc[vname] = {"count": 0, "total": 0.0, "reason": d.get("reason", "")}
+                groups_esc[vname]["count"] += 1
+                groups_esc[vname]["total"] += float(d.get("amount", 0))
+            for vname, g in list(groups_esc.items())[:10]:
+                lines.append(f"- **{vname}** ({g['count']}x, ${g['total']:,.2f})")
+            lines.append("")
+
+    # Mentions
+    mention_parts = []
+    if total_missing > 0 and bookkeeping_mentions:
+        mention_parts.append(f"{bookkeeping_mentions} please review missing info")
+    if total_escalated > 0 and escalation_mentions:
+        mention_parts.append(f"{escalation_mentions} please review escalated items")
+    if mention_parts:
+        lines.append(" | ".join(mention_parts))
+
+    raw = "\n".join(lines)
+
+    # GPT personality pass
+    personalized = _call_gpt(
+        _DANEEL_CONVERSATION_PROMPT,
+        f"Rewrite this digest with subtle personality. Keep ALL bold text, "
+        f"numbers, @mentions, and vendor lines EXACTLY. Only adjust framing "
+        f"text. Be concise:\n\n{raw}",
+        max_tokens=700,
+        temperature=0.4,
+    )
+    return personalized if personalized else raw
+
+
 def craft_followup_message(pending_items: list, lookups: dict,
                            hours_pending: int) -> str:
     """Craft a follow-up message for unresolved pending info."""

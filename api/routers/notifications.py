@@ -3,28 +3,15 @@
 # ============================================================================
 # Endpoints for managing push notification tokens
 
-import os
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
-from supabase import create_client, Client
 
 from api.auth import get_current_user
+from api.supabase_client import supabase
 from api.services.firebase_notifications import send_push_notification
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
-
-# ============================================================================
-# Supabase Client
-# ============================================================================
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL or SUPABASE_KEY not defined in .env")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ============================================================================

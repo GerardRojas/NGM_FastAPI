@@ -5,6 +5,7 @@
 # Used to notify users when they are @mentioned in messages
 
 import os
+import asyncio
 import logging
 from typing import List, Optional
 import firebase_admin
@@ -145,8 +146,9 @@ async def send_push_notification(
         body=body
     )
 
-    # Build data payload
-    payload_data = data or {}
+    # Build data payload (shallow copy to avoid mutating caller's dict)
+    payload_data = dict(data) if data else {}
+    payload_data["play_sound"] = "true"
     if sender_name:
         payload_data["sender_name"] = sender_name
     if avatar_color:
@@ -155,6 +157,7 @@ async def send_push_notification(
     # Ensure all values are strings (FCM requirement)
     payload_data = {k: str(v) for k, v in payload_data.items()}
 
+    loop = asyncio.get_event_loop()
     success_count = 0
 
     for token in tokens:
@@ -168,6 +171,7 @@ async def send_push_notification(
                         icon="/assets/img/greenblack_icon.png",
                         badge="/assets/img/greenblack_icon.png",
                         tag=tag,
+                        renotify=True,
                         require_interaction=True
                     ),
                     fcm_options=messaging.WebpushFCMOptions(
@@ -176,7 +180,9 @@ async def send_push_notification(
                 )
             )
 
-            response = messaging.send(message)
+            # messaging.send() is synchronous — run in thread pool to avoid
+            # blocking the event loop while waiting for Firebase HTTP response
+            response = await loop.run_in_executor(None, messaging.send, message)
             logger.info(f"[Firebase] Notification sent: {response}")
             success_count += 1
 

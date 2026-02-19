@@ -50,6 +50,8 @@ class AutoAuthConfigUpdate(BaseModel):
     daneel_smart_layer_enabled: Optional[bool] = None
     daneel_followup_hours: Optional[int] = None
     daneel_escalation_hours: Optional[int] = None
+    daneel_digest_enabled: Optional[bool] = None
+    daneel_digest_interval_hours: Optional[int] = None
 
 
 # ================================
@@ -332,11 +334,11 @@ async def list_auth_reports(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    """List recent auth reports (newest first)."""
+    """List recent auth reports with decisions (newest first)."""
     try:
         import json
         result = supabase.table("daneel_auth_reports") \
-            .select("report_id, report_type, project_id, project_name, created_at, summary") \
+            .select("report_id, report_type, project_id, project_name, created_at, summary, decisions") \
             .order("created_at", desc=True) \
             .range(offset, offset + limit - 1) \
             .execute()
@@ -349,6 +351,12 @@ async def list_auth_reports(
                     s = json.loads(s)
                 except Exception:
                     s = {}
+            d = r.get("decisions") or []
+            if isinstance(d, str):
+                try:
+                    d = json.loads(d)
+                except Exception:
+                    d = []
             reports.append({
                 "report_id": r["report_id"],
                 "report_type": r["report_type"],
@@ -360,6 +368,7 @@ async def list_auth_reports(
                 "duplicates": s.get("duplicates", 0),
                 "escalated": s.get("escalated", 0),
                 "expenses_processed": s.get("expenses_processed", 0),
+                "decisions": d,
             })
         return {"data": reports}
     except Exception as e:
@@ -494,3 +503,23 @@ async def get_pending_info_status():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting pending info status: {str(e)}")
+
+
+# ================================
+# DIGEST
+# ================================
+
+@router.post("/auto-auth/digest")
+async def run_digest(
+    project_id: Optional[str] = Query(None, description="Filter to a specific project")
+):
+    """
+    Flush the digest queue: consolidate un-sent auth results into one
+    message per project.  Designed to be called by a cron job every N hours.
+    """
+    from api.services.daneel_digest import flush_digest as _flush
+    try:
+        result = await asyncio.to_thread(_flush, project_id=project_id)
+        return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Digest flush failed: {str(e)}")
