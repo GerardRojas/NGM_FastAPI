@@ -5,19 +5,12 @@ Tabla: bills
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
-from supabase import create_client, Client
-import os
+
+from api.supabase_client import supabase
 
 router = APIRouter(prefix="/bills", tags=["bills"])
 
-# Inicializar cliente de Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+_PAGE_SIZE = 1000
 
 
 # ========================================
@@ -88,16 +81,23 @@ async def get_bill_expenses(
     (evita sumar gastos de otros proyectos que comparten el mismo bill_id).
     """
     try:
-        # Buscar en expenses_manual_COGS por bill_id
-        query = supabase.table("expenses_manual_COGS").select("*").eq("bill_id", bill_id)
-        if project_id:
-            query = query.eq("project", project_id)
-        response = query.execute()
+        # Paginated fetch to avoid Supabase 1000-row silent truncation
+        all_expenses = []
+        offset = 0
+        while True:
+            q = supabase.table("expenses_manual_COGS").select("*").eq("bill_id", bill_id)
+            if project_id:
+                q = q.eq("project", project_id)
+            batch = q.range(offset, offset + _PAGE_SIZE - 1).execute().data or []
+            all_expenses.extend(batch)
+            if len(batch) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
 
         return {
             "bill_id": bill_id,
-            "expenses": response.data or [],
-            "count": len(response.data) if response.data else 0
+            "expenses": all_expenses,
+            "count": len(all_expenses)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching bill expenses: {str(e)}")

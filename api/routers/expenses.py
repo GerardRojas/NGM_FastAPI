@@ -268,12 +268,22 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
                 no_bill.append(exp)
 
         for (bid, proj_id), group in bill_groups.items():
+            # Query the full bill total (pre-existing + just-inserted) so
+            # Daneel's reviewing message shows the real bill amount.
+            existing_resp = supabase.table("expenses_manual_COGS") \
+                .select("Amount") \
+                .eq("bill_id", bid).eq("project", proj_id) \
+                .execute()
+            full_total = sum(
+                float(e.get("Amount") or 0)
+                for e in (existing_resp.data or [])
+            )
             background_tasks.add_task(
                 trigger_auto_auth_for_bill,
                 expense_ids=[e["expense_id"] for e in group],
                 bill_id=bid,
                 project_id=proj_id,
-                total_amount=sum(float(e.get("Amount") or 0) for e in group),
+                total_amount=full_total,
             )
         for exp in no_bill:
             background_tasks.add_task(trigger_auto_auth_check, exp["expense_id"], exp["project"])
