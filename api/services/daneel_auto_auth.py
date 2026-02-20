@@ -37,6 +37,9 @@ def _get_supabase() -> Client:
     return supabase
 
 
+# Background task references (prevent GC before completion)
+_running_budget_tasks: set = set()
+
 # ============================================================================
 # Data classes
 # ============================================================================
@@ -816,11 +819,19 @@ def authorize_expense(sb, expense_id: str, project_id: str, rule: str = "passed_
         }).execute()
 
         # Trigger budget monitor (same as human auth)
+        # NOTE: run_auto_auth runs inside asyncio.to_thread(), so we must
+        # schedule back onto the main event loop thread-safely.
         try:
             from api.services.budget_monitor import trigger_project_budget_check
             import asyncio
-            loop = asyncio.get_running_loop()
-            loop.create_task(trigger_project_budget_check(project_id))
+
+            def _schedule_budget_check():
+                task = asyncio.ensure_future(trigger_project_budget_check(project_id))
+                _running_budget_tasks.add(task)
+                task.add_done_callback(_running_budget_tasks.discard)
+
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(_schedule_budget_check)
         except Exception as e:
             logger.warning(f"[DaneelAutoAuth] Budget check trigger failed: {e}")
 
@@ -1177,15 +1188,24 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
         _pt["fetch_all_project_expenses"] = round((_t() - _ts) * 1000, 1)
 
         # Load dismissed duplicate pairs (user said "not a duplicate" in health check)
-        # Build a set of frozensets for O(1) lookup: {frozenset({id1, id2}), ...}
+        # Only load pairs involving expenses in this project (avoid global scan).
         _ts = _t()
         dismissed_pairs: set = set()
+        project_expense_ids = {e.get("expense_id") or e.get("id") for e in all_project_expenses}
         try:
-            dismissed_result = sb.table("dismissed_expense_duplicates") \
-                .select("expense_id_1, expense_id_2") \
-                .execute()
-            for dp in (dismissed_result.data or []):
-                dismissed_pairs.add(frozenset({dp["expense_id_1"], dp["expense_id_2"]}))
+            # PostgREST or filter: expense_id_1 in (...) OR expense_id_2 in (...)
+            id_list = list(project_expense_ids)
+            if id_list:
+                d1 = sb.table("dismissed_expense_duplicates") \
+                    .select("expense_id_1, expense_id_2") \
+                    .in_("expense_id_1", id_list) \
+                    .execute()
+                d2 = sb.table("dismissed_expense_duplicates") \
+                    .select("expense_id_1, expense_id_2") \
+                    .in_("expense_id_2", id_list) \
+                    .execute()
+                for dp in (d1.data or []) + (d2.data or []):
+                    dismissed_pairs.add(frozenset({dp["expense_id_1"], dp["expense_id_2"]}))
         except Exception as _exc:
             logger.warning("[DaneelAutoAuth] Could not load dismissed pairs: %s", _exc)
         _pt["fetch_dismissed_pairs"] = round((_t() - _ts) * 1000, 1)
