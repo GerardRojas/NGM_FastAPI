@@ -1072,20 +1072,28 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
     project_id: if provided, only process expenses for this project.
     """
     t0 = time.monotonic()
+    _t = time.monotonic  # alias for micro-benchmarks
+    timings: dict = {}  # phase -> ms (returned to frontend)
+
+    _ts = _t()
     cfg = load_auto_auth_config()
+    timings["load_config"] = round((_t() - _ts) * 1000, 1)
 
     # Per-project manual runs bypass the global auto-auth toggle
     if not project_id and not cfg.get("daneel_auto_auth_enabled"):
         return {"status": "disabled", "message": "Auto-auth is disabled"}
 
+    _ts = _t()
     sb = _get_supabase()
     lookups = _load_lookups(sb)
+    timings["load_lookups"] = round((_t() - _ts) * 1000, 1)
     logger.info("[DaneelAutoAuth] Starting run | process_all=%s project_id=%s", process_all, project_id)
 
     last_run = cfg.get("daneel_auto_auth_last_run")
     now = datetime.now(timezone.utc).isoformat()
 
     # Fetch pending expenses
+    _ts = _t()
     query = sb.table("expenses_manual_COGS") \
         .select("*") \
         .eq("status", "pending")
@@ -1097,13 +1105,15 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
     result = query.order("created_at").execute()
 
     pending = result.data or []
+    timings["fetch_pending"] = round((_t() - _ts) * 1000, 1)
     if not pending:
         _save_config_key("daneel_auto_auth_last_run", now)
         logger.info("[DaneelAutoAuth] No pending expenses found")
-        return {"status": "ok", "message": "No new pending expenses", "authorized": 0}
+        return {"status": "ok", "message": "No new pending expenses", "authorized": 0, "timings": timings}
     logger.info("[DaneelAutoAuth] Found %d pending expenses across projects", len(pending))
 
     # Load all bills metadata (normalized keys for case-insensitive lookup)
+    _ts = _t()
     bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
     bills_map = {}
     receipt_groups = {}  # receipt_url -> set of normalized bill_ids
@@ -1114,6 +1124,8 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
         if url:
             receipt_groups.setdefault(url, set()).add(nb)
 
+    timings["fetch_bills"] = round((_t() - _ts) * 1000, 1)
+
     # Group by project
     projects = {}
     for exp in pending:
@@ -1122,8 +1134,10 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
             projects.setdefault(pid, []).append(exp)
 
     # Resolve mention targets (user-based with legacy role fallback)
+    _ts = _t()
     bookkeeping_mentions = _resolve_mentions(sb, cfg, "daneel_bookkeeping_users", "daneel_bookkeeping_role")
     escalation_mentions = _resolve_mentions(sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
+    timings["resolve_mentions"] = round((_t() - _ts) * 1000, 1)
 
     total_authorized = 0
     total_missing = 0
@@ -1133,17 +1147,22 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
     all_decisions = []    # decision entries for auth report
 
     # Resolve project names for reports
+    _ts = _t()
     proj_names = {}
     try:
         pn_result = sb.table("projects").select("project_id, project_name").execute()
         proj_names = {p["project_id"]: p["project_name"] for p in (pn_result.data or [])}
     except Exception as _exc:
         logger.debug("Suppressed project names load: %s", _exc)
+    timings["fetch_project_names"] = round((_t() - _ts) * 1000, 1)
 
     # Shared HTTP client for receipt hash checks (connection pooling)
     hash_client = httpx.Client(timeout=5.0)
+    project_timings = []  # per-project breakdown
 
     for pid, expenses in projects.items():
+        _tp0 = _t()  # project start
+        _pt = {}  # per-project timing dict
         authorized_list = []
         missing_info_list = []
         duplicate_list = []
@@ -1153,14 +1172,17 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
         all_auto_resolved = []    # fields that were auto-resolved
 
         # Load all expenses for this project (for duplicate comparison)
+        _ts = _t()
         all_project = sb.table("expenses_manual_COGS") \
             .select("*") \
             .eq("project", pid) \
             .execute()
         all_project_expenses = all_project.data or []
+        _pt["fetch_all_project_expenses"] = round((_t() - _ts) * 1000, 1)
 
         # Load dismissed duplicate pairs (user said "not a duplicate" in health check)
         # Build a set of frozensets for O(1) lookup: {frozenset({id1, id2}), ...}
+        _ts = _t()
         dismissed_pairs: set = set()
         try:
             dismissed_result = sb.table("dismissed_expense_duplicates") \
@@ -1170,6 +1192,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                 dismissed_pairs.add(frozenset({dp["expense_id_1"], dp["expense_id_2"]}))
         except Exception as _exc:
             logger.warning("[DaneelAutoAuth] Could not load dismissed pairs: %s", _exc)
+        _pt["fetch_dismissed_pairs"] = round((_t() - _ts) * 1000, 1)
 
         # Group all project expenses by vendor for O(n) duplicate comparison
         by_vendor = {}
@@ -1180,16 +1203,21 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
 
         # Phase 1: Rule engine -- classify each expense
         # Each candidate tracks a checks trail: [{check, passed, detail}]
+        _ts_phase1 = _t()
+        _health_ms = 0.0; _hint_ms = 0.0; _hash_ms = 0.0; _dup_ms = 0.0
+        _slow_expenses = []  # expenses that took >500ms
         auth_candidates = []  # (expense, rule, reason, checks) tuples
         _vision_cache = {}  # bill_id -> vision_total (avoid repeated GPT calls for same bill)
         _mismatch_notified = set()  # bill_ids already notified (one message per bill)
         _hash_cache = {}  # receipt_url -> hash string (avoid repeated HTTP HEAD per run)
 
         for expense in expenses:
+            _te0 = _t()  # per-expense start
             exp_id = expense.get("expense_id") or expense.get("id")
             exp_checks = []  # audit trail for this expense
 
             # 1. Health check (non-blocking)
+            _ts_h = _t()
             missing = run_health_check(expense, cfg, bills_map)
             if missing:
                 # 1a. Smart resolution: try to auto-fill missing fields
@@ -1217,6 +1245,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                         expense, lookups, "missing_info",
                         rule="HEALTH", reason="Health check failed (after smart resolve)",
                         missing_fields=still_missing, checks=exp_checks))
+                    _health_ms += (_t() - _ts_h) * 1000
                     continue  # Do not proceed to hint/dup checks with incomplete data
                 else:
                     # Fully resolved! Continue to duplicate check
@@ -1229,9 +1258,12 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                 # Resolve any stale pending-info record from a previous run
                 _resolve_pending_info(sb, exp_id)
 
+            _health_ms += (_t() - _ts_h) * 1000
+
             # 1b. Bill hint cross-validation (soft armoring layer)
             # Only validate CLOSED bills — open bills are still accumulating items
             # so comparing partial sums against the invoice total is meaningless.
+            _ts_hint = _t()
             from api.helpers.bill_hint_parser import parse_bill_hint, cross_validate_bill_hint
             from urllib.parse import unquote
             bill_id_raw = (expense.get("bill_id") or "").strip()
@@ -1283,6 +1315,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                             # Trigger Andrew's reconciliation protocol
                             if cfg.get("daneel_mismatch_notify_andrew", True):
                                 _trigger_andrew_reconciliation(bill_id_raw, pid, "daneel_hint")
+                        _hint_ms += (_t() - _ts_hint) * 1000
                         continue
                     else:
                         exp_checks.append({"check": "bill_hint", "passed": True,
@@ -1384,6 +1417,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                                     if cfg.get("daneel_mismatch_notify_andrew", True):
                                         _trigger_andrew_reconciliation(
                                             bill_id_raw, pid, "daneel_vision")
+                                _hint_ms += (_t() - _ts_hint) * 1000
                                 continue
                         else:
                             exp_checks.append({"check": "bill_hint", "passed": True,
@@ -1400,7 +1434,10 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                     skip_reason = f"Bill status is '{bill_status}' (only closed bills are validated)"
                 exp_checks.append({"check": "bill_hint", "passed": True, "detail": skip_reason})
 
+            _hint_ms += (_t() - _ts_hint) * 1000
+
             # 1c. Per-project receipt hash check (detect same receipt on different bills)
+            _ts_hash = _t()
             if cfg.get("daneel_receipt_hash_check_enabled", True):
                 exp_receipt_url = _get_expense_receipt(expense, bills_map)
                 if exp_receipt_url:
@@ -1452,6 +1489,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                                     hash_collision = True
                                     break
                         if hash_collision:
+                            _hash_ms += (_t() - _ts_hash) * 1000
                             continue
                         exp_checks.append({"check": "receipt_hash", "passed": True,
                                            "detail": "No cross-bill hash collision in project"})
@@ -1462,10 +1500,14 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                     exp_checks.append({"check": "receipt_hash", "passed": True,
                                        "detail": "No receipt URL available"})
 
+            _hash_ms += (_t() - _ts_hash) * 1000
+
             # 2. Duplicate check
+            _ts_dup = _t()
             vendor_id = expense.get("vendor_id")
             same_vendor = by_vendor.get(vendor_id, []) if vendor_id else []
             dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_hash_cache, hash_client=hash_client)
+            _dup_ms += (_t() - _ts_dup) * 1000
 
             if dup_result.verdict == "duplicate":
                 # Check if user already dismissed this pair via health check modal
@@ -1536,6 +1578,15 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
             # Duplicate check passed
             exp_checks.append({"check": "duplicate", "passed": True, "detail": f"R1-R9 clear: {dup_result.details}"})
 
+            # Track slow expenses (>500ms)
+            _te_elapsed = (_t() - _te0) * 1000
+            if _te_elapsed > 500:
+                _slow_expenses.append({
+                    "expense_id": exp_id,
+                    "elapsed_ms": round(_te_elapsed, 1),
+                    "vendor": lookups["vendors"].get(expense.get("vendor_id"), ""),
+                })
+
             # 3. If missing critical info, don't authorize but continue
             if missing:
                 continue
@@ -1543,7 +1594,18 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
             # 4. Rule engine cleared -- add to candidates (NOT authorized yet)
             auth_candidates.append((expense, dup_result.rule, dup_result.details, exp_checks))
 
+        _pt["phase1_rule_engine"] = round((_t() - _ts_phase1) * 1000, 1)
+        _pt["phase1_breakdown"] = {
+            "health_check_ms": round(_health_ms, 1),
+            "bill_hint_ms": round(_hint_ms, 1),
+            "receipt_hash_ms": round(_hash_ms, 1),
+            "duplicate_check_ms": round(_dup_ms, 1),
+        }
+        if _slow_expenses:
+            _pt["slow_expenses"] = _slow_expenses[:10]  # cap
+
         # Phase 2: Authorize all approved candidates
+        _ts_phase2 = _t()
         for expense, rule, det, chks in auth_candidates:
             exp_id = expense.get("expense_id") or expense.get("id")
             if authorize_expense(sb, exp_id, pid, rule):
@@ -1551,9 +1613,17 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                 decisions.append(_make_decision_entry(
                     expense, lookups, "authorized", rule=rule, reason=det,
                     checks=chks))
+        _pt["phase2_authorize"] = round((_t() - _ts_phase2) * 1000, 1)
 
         # Phase 4: Results deferred to periodic digest (no immediate messages)
         # The auth report saved below feeds the digest engine.
+
+        _pt["total"] = round((_t() - _tp0) * 1000, 1)
+        _pt["expenses_count"] = len(expenses)
+        _pt["all_project_expenses_count"] = len(all_project_expenses)
+        _pt["project_id"] = pid
+        _pt["project_name"] = proj_names.get(pid, "")
+        project_timings.append(_pt)
 
         total_authorized += len(authorized_list)
         total_missing += len(missing_info_list)
@@ -1577,6 +1647,8 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
     _save_config_key("daneel_auto_auth_last_run", now)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
+    timings["total_ms"] = elapsed_ms
+    timings["projects"] = project_timings
     summary = {
         "status": "ok",
         "authorized": total_authorized,
@@ -1585,6 +1657,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
         "escalated": total_escalated,
         "expenses_processed": len(pending),
         "missing_detail": missing_detail[:20],  # cap for response size
+        "timings": timings,
     }
     logger.info("[DaneelAutoAuth] Run complete in %dms | processed=%d authorized=%d missing=%d duplicates=%d escalated=%d",
                  elapsed_ms, len(pending), total_authorized, total_missing, total_duplicates, total_escalated)
