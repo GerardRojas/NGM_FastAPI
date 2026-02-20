@@ -162,9 +162,23 @@ async def get_auto_auth_status():
             .execute()
         auth_count = auth_result.count if hasattr(auth_result, 'count') else len(auth_result.data or [])
 
+        # Resolve last_run — fallback to most recent auth report if config key is empty
+        last_run = cfg.get("daneel_auto_auth_last_run")
+        if not last_run:
+            try:
+                latest_report = supabase.table("daneel_auth_reports") \
+                    .select("created_at") \
+                    .order("created_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+                if latest_report.data:
+                    last_run = latest_report.data[0]["created_at"]
+            except Exception:
+                pass
+
         return {
             "enabled": cfg.get("daneel_auto_auth_enabled", False),
-            "last_run": cfg.get("daneel_auto_auth_last_run"),
+            "last_run": last_run,
             "pending_info_count": pending_count,
             "authorized_last_30d": auth_count,
             "config": {
@@ -245,79 +259,97 @@ async def update_auto_auth_config(payload: AutoAuthConfigUpdate):
 async def get_project_summary():
     """
     Per-project expense summary for Daneel dashboard.
-    Returns pending, authorized-by-Daneel, and missing-info counts per project.
+    Returns counts and amounts per status, plus Daneel-specific auth stats.
     """
     try:
         from api.services.daneel_auto_auth import DANEEL_BOT_USER_ID
 
-        # Get all pending expenses grouped by project
-        pending_result = supabase.table("expenses_manual_COGS") \
-            .select("expense_id, project, status") \
-            .eq("status", "pending") \
-            .execute()
+        # Paginated fetch of ALL expenses with relevant fields
+        _PAGE = 1000
+        all_expenses = []
+        offset = 0
+        while True:
+            batch = (
+                supabase.table("expenses_manual_COGS")
+                .select("expense_id, project, status, Amount, TxnDate")
+                .range(offset, offset + _PAGE - 1)
+                .execute()
+            ).data or []
+            all_expenses.extend(batch)
+            if len(batch) < _PAGE:
+                break
+            offset += _PAGE
 
-        # Get all projects for name resolution
+        # Project name lookup
         projects_result = supabase.table("projects") \
             .select("project_id, project_name") \
             .execute()
         project_names = {p["project_id"]: p["project_name"] for p in (projects_result.data or [])}
 
-        # Get Daneel authorizations (last 30 days)
+        # Daneel authorizations (last 30 days) for per-project attribution
         thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         auth_result = supabase.table("expense_status_log") \
-            .select("expense_id, metadata") \
+            .select("expense_id") \
             .eq("changed_by", DANEEL_BOT_USER_ID) \
             .eq("new_status", "auth") \
             .gt("changed_at", thirty_days_ago) \
             .execute()
+        daneel_auth_ids = {r["expense_id"] for r in (auth_result.data or []) if r.get("expense_id")}
 
-        # Get expense->project mapping for authorized expenses
-        auth_expense_ids = [r["expense_id"] for r in (auth_result.data or []) if r.get("expense_id")]
-        auth_by_project = {}
-        if auth_expense_ids:
-            # Batch lookup in chunks of 50
-            for i in range(0, len(auth_expense_ids), 50):
-                chunk = auth_expense_ids[i:i+50]
-                exp_result = supabase.table("expenses_manual_COGS") \
-                    .select("expense_id, project") \
-                    .in_("expense_id", chunk) \
-                    .execute()
-                for e in (exp_result.data or []):
-                    pid = e.get("project")
-                    if pid:
-                        auth_by_project[pid] = auth_by_project.get(pid, 0) + 1
-
-        # Get unresolved pending info grouped by project
-        pending_info_result = supabase.table("daneel_pending_info") \
-            .select("expense_id, project_id") \
-            .is_("resolved_at", "null") \
-            .execute()
-        missing_by_project = {}
-        for pi in (pending_info_result.data or []):
-            pid = pi.get("project_id")
-            if pid:
-                missing_by_project[pid] = missing_by_project.get(pid, 0) + 1
-
-        # Aggregate pending by project
-        pending_by_project = {}
-        for e in (pending_result.data or []):
+        # Aggregate per project
+        proj_data: dict = {}
+        for e in all_expenses:
             pid = e.get("project")
-            if pid:
-                pending_by_project[pid] = pending_by_project.get(pid, 0) + 1
+            if not pid:
+                continue
+            if pid not in proj_data:
+                proj_data[pid] = {
+                    "total": 0, "total_amount": 0.0,
+                    "pending": 0, "pending_amount": 0.0,
+                    "authorized": 0, "authorized_amount": 0.0,
+                    "rejected": 0,
+                    "authorized_by_daneel": 0,
+                    "last_txn_date": None,
+                }
+            d = proj_data[pid]
+            amt = float(e.get("Amount") or 0)
+            status = (e.get("status") or "").lower()
 
-        # Build summary - only include projects that have activity
-        all_project_ids = set(pending_by_project.keys()) | set(auth_by_project.keys()) | set(missing_by_project.keys())
+            d["total"] += 1
+            d["total_amount"] += amt
+
+            if status == "pending":
+                d["pending"] += 1
+                d["pending_amount"] += amt
+            elif status == "auth":
+                d["authorized"] += 1
+                d["authorized_amount"] += amt
+                if e["expense_id"] in daneel_auth_ids:
+                    d["authorized_by_daneel"] += 1
+            elif status in ("rejected", "reject"):
+                d["rejected"] += 1
+
+            txn_date = e.get("TxnDate")
+            if txn_date and (d["last_txn_date"] is None or txn_date > d["last_txn_date"]):
+                d["last_txn_date"] = txn_date
+
+        # Build response
         summary = []
-        for pid in all_project_ids:
+        for pid, d in proj_data.items():
             summary.append({
                 "project_id": pid,
                 "project_name": project_names.get(pid, "Unknown Project"),
-                "pending": pending_by_project.get(pid, 0),
-                "authorized_by_daneel": auth_by_project.get(pid, 0),
-                "missing_info": missing_by_project.get(pid, 0),
+                "total_expenses": d["total"],
+                "total_amount": round(d["total_amount"], 2),
+                "pending": d["pending"],
+                "pending_amount": round(d["pending_amount"], 2),
+                "authorized": d["authorized"],
+                "authorized_amount": round(d["authorized_amount"], 2),
+                "authorized_by_daneel": d["authorized_by_daneel"],
+                "rejected": d["rejected"],
+                "last_txn_date": d["last_txn_date"],
             })
 
-        # Sort by pending count descending
         summary.sort(key=lambda x: x["pending"], reverse=True)
         return {"data": summary}
 

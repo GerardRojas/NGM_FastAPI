@@ -12,7 +12,7 @@ import logging
 import time
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 from services.receipt_scanner import (
     extract_text_from_pdf as _extract_text_from_pdf,
@@ -1111,8 +1111,17 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
             lambda: supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
         )
 
-        # Trigger Daneel re-check when bill_id or receipt_url is updated on a pending expense
+        # Resolve Daneel pending_info when expense leaves 'pending' status
         updated_exp = res.data[0] if res.data else {}
+        if status_changed and new_status != "pending":
+            try:
+                supabase.table("daneel_pending_info").update({
+                    "resolved_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("expense_id", expense_id).is_("resolved_at", "null").execute()
+            except Exception:
+                pass  # non-critical cleanup
+
+        # Trigger Daneel re-check when bill_id or receipt_url is updated on a pending expense
         if (updated_exp.get("status", current_status) == "pending"
                 and ("bill_id" in data or "receipt_url" in data)):
             project_id = updated_exp.get("project") or existing.get("project")
@@ -1363,6 +1372,14 @@ def soft_delete_expense(expense_id: str, user_id: str, current_user: dict = Depe
         supabase.table("expenses_manual_COGS").update(update_data).eq(
             "expense_id", expense_id
         ).execute()
+
+        # Resolve Daneel pending_info (expense is no longer pending)
+        try:
+            supabase.table("daneel_pending_info").update({
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("expense_id", expense_id).is_("resolved_at", "null").execute()
+        except Exception:
+            pass  # non-critical cleanup
 
         # Log the soft-delete
         log_data = {

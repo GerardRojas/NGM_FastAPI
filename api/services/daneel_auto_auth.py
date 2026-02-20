@@ -791,13 +791,25 @@ def gpt_resolve_ambiguous(
 # ============================================================================
 
 def authorize_expense(sb, expense_id: str, project_id: str, rule: str = "passed_all_checks") -> bool:
-    """Set expense status to 'auth' as Daneel."""
+    """Set expense status to 'auth' as Daneel.  Only acts on 'pending' expenses."""
     try:
+        # Guard: only authorize if expense is still pending (prevents race with human review)
+        current = sb.table("expenses_manual_COGS") \
+            .select("status") \
+            .eq("expense_id", expense_id) \
+            .single() \
+            .execute()
+        current_status = (current.data or {}).get("status", "")
+        if current_status != "pending":
+            logger.info("[DaneelAutoAuth] Skipping authorize for %s — status is '%s', not 'pending'",
+                        expense_id, current_status)
+            return False
+
         sb.table("expenses_manual_COGS").update({
             "status": "auth",
             "auth_status": True,
             "auth_by": DANEEL_BOT_USER_ID,
-        }).eq("expense_id", expense_id).execute()
+        }).eq("expense_id", expense_id).eq("status", "pending").execute()
 
         sb.table("expense_status_log").insert({
             "expense_id": expense_id,
@@ -1147,6 +1159,18 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
             .execute()
         all_project_expenses = all_project.data or []
 
+        # Load dismissed duplicate pairs (user said "not a duplicate" in health check)
+        # Build a set of frozensets for O(1) lookup: {frozenset({id1, id2}), ...}
+        dismissed_pairs: set = set()
+        try:
+            dismissed_result = sb.table("dismissed_expense_duplicates") \
+                .select("expense_id_1, expense_id_2") \
+                .execute()
+            for dp in (dismissed_result.data or []):
+                dismissed_pairs.add(frozenset({dp["expense_id_1"], dp["expense_id_2"]}))
+        except Exception as _exc:
+            logger.warning("[DaneelAutoAuth] Could not load dismissed pairs: %s", _exc)
+
         # Group all project expenses by vendor for O(n) duplicate comparison
         by_vendor = {}
         for e in all_project_expenses:
@@ -1410,6 +1434,12 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                                 # Only flag as duplicate when BOTH bills are closed
                                 # (open bills may have system glitches with hashes)
                                 if exp_status == "closed" and oth_status == "closed":
+                                    # Check if user already dismissed this pair
+                                    hash_pair_key = frozenset({exp_id, other_id})
+                                    if hash_pair_key in dismissed_pairs:
+                                        exp_checks.append({"check": "receipt_hash", "passed": True,
+                                                           "detail": "Hash collision but pair dismissed by user"})
+                                        continue
                                     reason_txt = (
                                         f"Receipt hash match: same file used on bill #{bill_id_raw} "
                                         f"and bill #{(other_exp.get('bill_id') or '').strip()} (both closed)"
@@ -1438,12 +1468,20 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
             dup_result = check_duplicate(expense, same_vendor, bills_map, cfg, lookups, hash_cache=_hash_cache, hash_client=hash_client)
 
             if dup_result.verdict == "duplicate":
-                exp_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})
-                duplicate_list.append({"expense": expense, "result": dup_result})
-                decisions.append(_make_decision_entry(
-                    expense, lookups, "duplicate", rule=dup_result.rule, reason=dup_result.details,
-                    checks=exp_checks))
-                continue  # do NOT authorize
+                # Check if user already dismissed this pair via health check modal
+                pair_key = frozenset({exp_id, dup_result.paired_expense_id})
+                if pair_key in dismissed_pairs:
+                    exp_checks.append({"check": "duplicate", "passed": True,
+                                       "detail": f"{dup_result.rule} triggered but pair was dismissed by user"})
+                    logger.info("[DaneelAutoAuth] Skipping dismissed duplicate pair: %s <-> %s",
+                                exp_id, dup_result.paired_expense_id)
+                else:
+                    exp_checks.append({"check": "duplicate", "passed": False, "detail": f"{dup_result.rule}: {dup_result.details}"})
+                    duplicate_list.append({"expense": expense, "result": dup_result})
+                    decisions.append(_make_decision_entry(
+                        expense, lookups, "duplicate", rule=dup_result.rule, reason=dup_result.details,
+                        checks=exp_checks))
+                    continue  # do NOT authorize
 
             if dup_result.verdict == "need_info":
                 # Add to missing info if not already there
@@ -1470,12 +1508,17 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                             min_confidence=int(cfg.get("daneel_gpt_fallback_confidence", 75)),
                         )
                         if gpt_result.verdict == "duplicate":
-                            exp_checks.append({"check": "gpt_resolve", "passed": False, "detail": gpt_result.details})
-                            duplicate_list.append({"expense": expense, "result": gpt_result})
-                            decisions.append(_make_decision_entry(
-                                expense, lookups, "duplicate", rule=gpt_result.rule, reason=gpt_result.details,
-                                checks=exp_checks))
-                            continue
+                            gpt_pair_key = frozenset({exp_id, gpt_result.paired_expense_id})
+                            if gpt_pair_key in dismissed_pairs:
+                                exp_checks.append({"check": "gpt_resolve", "passed": True,
+                                                   "detail": "GPT flagged duplicate but pair was dismissed by user"})
+                            else:
+                                exp_checks.append({"check": "gpt_resolve", "passed": False, "detail": gpt_result.details})
+                                duplicate_list.append({"expense": expense, "result": gpt_result})
+                                decisions.append(_make_decision_entry(
+                                    expense, lookups, "duplicate", rule=gpt_result.rule, reason=gpt_result.details,
+                                    checks=exp_checks))
+                                continue
                         if gpt_result.verdict == "not_duplicate":
                             exp_checks.append({"check": "gpt_resolve", "passed": True, "detail": gpt_result.details})
                             if not missing:
@@ -1530,9 +1573,8 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
 
     hash_client.close()
 
-    # Update last run timestamp (skip for per-project runs to not affect global runs)
-    if not project_id:
-        _save_config_key("daneel_auto_auth_last_run", now)
+    # Always update last run timestamp so the dashboard shows activity
+    _save_config_key("daneel_auto_auth_last_run", now)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     summary = {
