@@ -157,6 +157,31 @@ class ExpenseBatchUpdate(BaseModel):
 
 # ====== HELPERS ======
 
+_KNOWN_BUCKETS = ("pending-expenses", "vault")
+
+
+def _validate_storage_url(url: str) -> bool:
+    """Check that a receipt_url points to an actual file in Supabase Storage."""
+    if not url or not isinstance(url, str):
+        return False
+    for bucket in _KNOWN_BUCKETS:
+        marker = f"/object/public/{bucket}/"
+        if marker not in url:
+            continue
+        path = url.split(marker, 1)[1].split("?")[0]
+        parts = path.rsplit("/", 1)
+        folder = parts[0] if len(parts) > 1 else ""
+        filename = parts[-1]
+        if not filename:
+            return False
+        try:
+            files = supabase.storage.from_(bucket).list(folder)
+            return any(f.get("name") == filename for f in (files or []))
+        except Exception:
+            return False
+    return False
+
+
 def extract_rel_value(row: dict, rel_name: str, field: str):
     """
     Extrae un valor desde una relación embebida de Supabase.
@@ -361,6 +386,15 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                         "error": "No fields to update"
                     })
                     continue
+
+                # Validar receipt_url apunta a un archivo real en storage
+                if "receipt_url" in update_data and update_data["receipt_url"]:
+                    if not _validate_storage_url(update_data["receipt_url"]):
+                        failed.append({
+                            "expense_id": item.expense_id,
+                            "error": "receipt_url does not point to a valid file in storage"
+                        })
+                        continue
 
                 # Log status change if status is being updated (e.g. auto-review)
                 new_status = update_data.get("status")
@@ -1080,6 +1114,11 @@ def update_expense(expense_id: str, payload: ExpenseUpdate, current_user: dict =
             if not txn.data:
                 raise HTTPException(status_code=400, detail="Invalid txn_type")
 
+        # Validar receipt_url apunta a un archivo real en storage
+        if "receipt_url" in data and data["receipt_url"]:
+            if not _validate_storage_url(data["receipt_url"]):
+                raise HTTPException(status_code=400, detail="receipt_url does not point to a valid file in storage")
+
         # Set updated_by so DB triggers (log_category_correction, etc.) know who made the change
         uid = current_user.get("user_id") if current_user else None
         if uid:
@@ -1141,6 +1180,11 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
 
         # FK validation skipped — values come from vetted frontend dropdowns
         # and DB foreign key constraints will reject invalid IDs on UPDATE
+
+        # Validar receipt_url apunta a un archivo real en storage
+        if "receipt_url" in data and data["receipt_url"]:
+            if not _validate_storage_url(data["receipt_url"]):
+                raise HTTPException(status_code=400, detail="receipt_url does not point to a valid file in storage")
 
         # Handle status change if included in payload
         # Keep status_reason in data dict so it's stored in the expenses table

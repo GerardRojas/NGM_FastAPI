@@ -15,6 +15,7 @@ from api.auth import get_current_user
 from api.services.vault_service import (
     create_folder,
     get_folder_tree,
+    get_breadcrumb,
     list_files,
     get_file,
     upload_file,
@@ -72,6 +73,7 @@ class SearchRequest(BaseModel):
     date_to: Optional[str] = None
     is_folder: Optional[bool] = None
     limit: int = 50
+    offset: int = 0
 
 
 # ====== FOLDER ENDPOINTS ======
@@ -108,17 +110,33 @@ async def api_get_folder_tree(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/breadcrumb/{folder_id}")
+async def api_get_breadcrumb(
+    folder_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get breadcrumb path from root to folder_id (inclusive)."""
+    try:
+        return get_breadcrumb(folder_id)
+    except Exception as e:
+        logger.error("[Vault] Breadcrumb error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ====== FILE LISTING ======
 
 @router.get("/files")
 async def api_list_files(
     parent_id: Optional[str] = Query(None),
     project_id: Optional[str] = Query(None),
+    limit: int = Query(60, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
 ):
-    """List files/folders in a parent folder."""
+    """List files/folders in a parent folder (paginated)."""
     try:
-        return list_files(parent_id=parent_id, project_id=project_id)
+        return list_files(parent_id=parent_id, project_id=project_id,
+                          limit=limit, offset=offset)
     except Exception as e:
         logger.error("[Vault] List files error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -400,6 +418,7 @@ async def api_search_files(
             date_to=body.date_to,
             is_folder=body.is_folder,
             limit=body.limit,
+            offset=body.offset,
         )
         return results
     except Exception as e:

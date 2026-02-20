@@ -167,19 +167,19 @@ DEFAULT_PROJECT_FOLDERS = [
 
 
 def create_default_folders(project_id: str) -> List[Dict[str, Any]]:
-    """Create the default folder structure for a new project."""
-    created = []
-    for name in DEFAULT_PROJECT_FOLDERS:
-        row = {
+    """Create the default folder structure for a new project (single batch insert)."""
+    rows = [
+        {
             "name": name,
             "is_folder": True,
             "parent_id": None,
             "project_id": project_id,
             "uploaded_by": None,
         }
-        result = supabase.table("vault_files").insert(row).execute()
-        if result.data:
-            created.append(result.data[0])
+        for name in DEFAULT_PROJECT_FOLDERS
+    ]
+    result = supabase.table("vault_files").insert(rows).execute()
+    created = result.data or []
     logger.info("[Vault] Created %d default folders for project %s", len(created), project_id)
     return created
 
@@ -228,8 +228,9 @@ def save_to_project_folder(
 
 def get_folder_tree(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Get all folders as a flat list (frontend builds tree).
+    Get all folders as a flat list with child-item counts (frontend builds tree).
     Filtered by project_id (None = global).
+    Each folder includes 'item_count' = number of direct non-deleted children.
     """
     query = (
         supabase.table("vault_files")
@@ -243,7 +244,63 @@ def get_folder_tree(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
         query = query.is_("project_id", "null")
 
     result = query.order("name").execute()
-    return result.data or []
+    folders = result.data or []
+
+    if not folders:
+        return folders
+
+    # Batch-count direct children per folder in a single query
+    folder_ids = [f["id"] for f in folders]
+    children_result = (
+        supabase.table("vault_files")
+        .select("parent_id")
+        .in_("parent_id", folder_ids)
+        .eq("is_deleted", False)
+        .execute()
+    )
+
+    # Tally counts
+    counts: Dict[str, int] = {}
+    for row in (children_result.data or []):
+        pid = row.get("parent_id")
+        if pid:
+            counts[pid] = counts.get(pid, 0) + 1
+
+    for folder in folders:
+        folder["item_count"] = counts.get(folder["id"], 0)
+
+    return folders
+
+
+def get_breadcrumb(folder_id: str) -> List[Dict[str, str]]:
+    """
+    Return breadcrumb path from root to *folder_id* (inclusive).
+    Each entry: {id, name}.  First element is the topmost ancestor.
+    Uses the same walk-up approach as _resolve_folder_path but returns
+    structured data so the frontend can render clickable breadcrumbs.
+    """
+    if not folder_id:
+        return []
+    crumbs: List[Dict[str, str]] = []
+    current_id: Optional[str] = folder_id
+    visited: set = set()
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        result = (
+            supabase.table("vault_files")
+            .select("id, name, parent_id")
+            .eq("id", current_id)
+            .eq("is_deleted", False)
+            .limit(1)
+            .execute()
+        )
+        if not result.data:
+            break
+        row = result.data[0]
+        crumbs.append({"id": row["id"], "name": row["name"]})
+        current_id = row.get("parent_id")
+    crumbs.reverse()
+    return crumbs
 
 
 # ============================================
@@ -254,31 +311,59 @@ def list_files(
     parent_id: Optional[str] = None,
     project_id: Optional[str] = None,
     include_children: bool = False,
-) -> List[Dict[str, Any]]:
+    limit: int = 60,
+    offset: int = 0,
+) -> Dict[str, Any]:
     """
-    List files/folders in a given parent folder.
+    List files/folders in a given parent folder with pagination.
     If parent_id is None, lists root-level items.
+    Returns {data, total, pagination: {offset, limit, has_more}}.
     """
-    query = (
-        supabase.table("vault_files")
-        .select("id, name, is_folder, parent_id, project_id, bucket_path, mime_type, size_bytes, file_hash, uploaded_by, created_at, updated_at")
-        .eq("is_deleted", False)
+    # Build base filter (shared by count and data queries)
+    def _base_query(select_cols: str):
+        q = (
+            supabase.table("vault_files")
+            .select(select_cols)
+            .eq("is_deleted", False)
+        )
+        if parent_id:
+            q = q.eq("parent_id", parent_id)
+        else:
+            q = q.is_("parent_id", "null")
+        if project_id:
+            q = q.eq("project_id", project_id)
+        else:
+            if not parent_id:
+                q = q.is_("project_id", "null")
+        return q
+
+    # Count total matching items
+    count_result = _base_query("id").execute()
+    total = len(count_result.data) if count_result.data else 0
+
+    # Fetch paginated data
+    data_query = _base_query(
+        "id, name, is_folder, parent_id, project_id, bucket_path, "
+        "mime_type, size_bytes, file_hash, uploaded_by, created_at, updated_at"
+    )
+    data_result = (
+        data_query
+        .order("is_folder", desc=True)
+        .order("name")
+        .range(offset, offset + limit - 1)
+        .execute()
     )
 
-    if parent_id:
-        query = query.eq("parent_id", parent_id)
-    else:
-        query = query.is_("parent_id", "null")
-
-    if project_id:
-        query = query.eq("project_id", project_id)
-    else:
-        # When no project_id filter, show global items (project_id IS NULL)
-        if not parent_id:
-            query = query.is_("project_id", "null")
-
-    result = query.order("is_folder", desc=True).order("name").execute()
-    return result.data or []
+    items = data_result.data or []
+    return {
+        "data": items,
+        "total": total,
+        "pagination": {
+            "offset": offset,
+            "limit": limit,
+            "has_more": (offset + limit) < total,
+        },
+    }
 
 
 def get_file(file_id: str) -> Optional[Dict[str, Any]]:
@@ -623,31 +708,43 @@ def move_file(file_id: str, new_parent_id: Optional[str]) -> Dict[str, Any]:
 def soft_delete(file_id: str) -> Dict[str, Any]:
     """
     Soft-delete a file or folder.
-    For folders, recursively soft-delete all children.
+    For folders, collects all descendant IDs iteratively then batch-updates.
     """
     file_rec = get_file(file_id)
     if not file_rec:
         raise ValueError(f"File {file_id} not found")
 
-    if file_rec["is_folder"]:
-        # Recursively delete children
-        children = (
-            supabase.table("vault_files")
-            .select("id")
-            .eq("parent_id", file_id)
-            .eq("is_deleted", False)
-            .execute()
-        )
-        for child in (children.data or []):
-            soft_delete(child["id"])
+    ids_to_delete = [file_id]
 
+    if file_rec["is_folder"]:
+        # BFS to collect all descendant IDs in batches (no recursion)
+        queue = [file_id]
+        while queue:
+            parent_batch = queue
+            children = (
+                supabase.table("vault_files")
+                .select("id, is_folder")
+                .in_("parent_id", parent_batch)
+                .eq("is_deleted", False)
+                .execute()
+            )
+            queue = []
+            for child in (children.data or []):
+                ids_to_delete.append(child["id"])
+                if child["is_folder"]:
+                    queue.append(child["id"])
+
+    # Single batch update for all collected IDs
     result = (
         supabase.table("vault_files")
         .update({"is_deleted": True})
-        .eq("id", file_id)
+        .in_("id", ids_to_delete)
         .execute()
     )
-    return result.data[0] if result.data else {}
+
+    # Return the root record from the batch result
+    root = next((r for r in (result.data or []) if r["id"] == file_id), {})
+    return root
 
 
 def duplicate_file(file_id: str, user_id: str) -> Dict[str, Any]:
@@ -716,8 +813,9 @@ def search_files(
     date_to: Optional[str] = None,
     is_folder: Optional[bool] = None,
     limit: int = 50,
-) -> List[Dict[str, Any]]:
-    """Search files by name, type, date range, project."""
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Search files by name, type, date range, project. Returns paginated results."""
     q = (
         supabase.table("vault_files")
         .select("id, name, is_folder, parent_id, project_id, bucket_path, mime_type, size_bytes, uploaded_by, created_at, updated_at")
@@ -737,8 +835,16 @@ def search_files(
     if is_folder is not None:
         q = q.eq("is_folder", is_folder)
 
-    result = q.order("updated_at", desc=True).limit(limit).execute()
-    return result.data or []
+    result = q.order("updated_at", desc=True).range(offset, offset + limit - 1).execute()
+    items = result.data or []
+    return {
+        "data": items,
+        "pagination": {
+            "offset": offset,
+            "limit": limit,
+            "has_more": len(items) == limit,
+        },
+    }
 
 
 def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
@@ -806,7 +912,7 @@ def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
                 url_to_bills[url].append(bid)
 
         # Step 4: Check authorization status for expenses in these bills
-        status_map = {}
+        # NOTE: do NOT reset status_map — preserve processing/pending from Step 1.5
         for file_hash, receipt_url in hash_to_url.items():
             bill_ids = url_to_bills.get(receipt_url, [])
             if not bill_ids:

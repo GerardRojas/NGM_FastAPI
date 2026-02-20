@@ -132,6 +132,7 @@ class PendingReceiptUpdate(BaseModel):
 
 class LinkToExpenseRequest(BaseModel):
     expense_id: str
+    force: Optional[bool] = False
 
 
 class CreateExpenseFromReceiptRequest(BaseModel):
@@ -3222,8 +3223,10 @@ def _create_check_expenses(receipt_id: str, receipt_data: dict, check_flow: dict
 
     # Link receipt
     if created_expenses:
+        all_expense_ids = [e.get("expense_id") for e in created_expenses if e.get("expense_id")]
         supabase.table("pending_receipts").update({
             "expense_id": created_expenses[0].get("expense_id"),
+            "expense_ids": all_expense_ids,
             "status": "linked",
             "linked_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat()
@@ -4799,11 +4802,13 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                 receipt_flow["state"] = "completed"
                 parsed_data["receipt_flow"] = receipt_flow
                 expense_id = created_expenses[0].get("expense_id") if created_expenses else None
+                all_expense_ids = [e.get("expense_id") for e in created_expenses if e.get("expense_id")]
 
                 if created_expenses:
                     supabase.table("pending_receipts").update({
                         "status": "linked",
                         "expense_id": expense_id,
+                        "expense_ids": all_expense_ids,
                         "parsed_data": parsed_data,
                         "linked_at": datetime.utcnow().isoformat(),
                         "updated_at": datetime.utcnow().isoformat()
@@ -4932,6 +4937,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         created_expenses.append(expense)
 
                 expense_id = created_expenses[0].get("expense_id") if created_expenses else None
+                all_expense_ids = [e.get("expense_id") for e in created_expenses if e.get("expense_id")]
                 receipt_flow["state"] = "completed"
                 parsed_data["receipt_flow"] = receipt_flow
 
@@ -4939,6 +4945,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                     supabase.table("pending_receipts").update({
                         "status": "linked",
                         "expense_id": expense_id,
+                        "expense_ids": all_expense_ids,
                         "parsed_data": parsed_data,
                         "linked_at": datetime.utcnow().isoformat(),
                         "updated_at": datetime.utcnow().isoformat()
@@ -5164,9 +5171,11 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                 parsed_data["receipt_flow"] = receipt_flow
 
                 expense_id = all_created[0].get("expense_id") if all_created else None
+                all_expense_ids = [e.get("expense_id") for e in all_created if e.get("expense_id")]
                 supabase.table("pending_receipts").update({
                     "status": "split",
                     "expense_id": expense_id,
+                    "expense_ids": all_expense_ids,
                     "parsed_data": parsed_data,
                     "linked_at": datetime.utcnow().isoformat(),
                     "updated_at": datetime.utcnow().isoformat()
@@ -5259,6 +5268,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                         created_expenses.append(expense)
 
                 expense_id = created_expenses[0].get("expense_id") if created_expenses else None
+                all_expense_ids = [e.get("expense_id") for e in created_expenses if e.get("expense_id")]
                 receipt_flow["state"] = "completed"
                 parsed_data["receipt_flow"] = receipt_flow
 
@@ -5266,6 +5276,7 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                     supabase.table("pending_receipts").update({
                         "status": "linked",
                         "expense_id": expense_id,
+                        "expense_ids": all_expense_ids,
                         "parsed_data": parsed_data,
                         "linked_at": datetime.utcnow().isoformat(),
                         "updated_at": datetime.utcnow().isoformat()
@@ -5433,10 +5444,12 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                 receipt_flow["state"] = "completed"
                 parsed_data["receipt_flow"] = receipt_flow
                 expense_id = created_expenses[0].get("expense_id") if created_expenses else None
+                all_expense_ids = [e.get("expense_id") for e in created_expenses if e.get("expense_id")]
 
                 supabase.table("pending_receipts").update({
                     "status": "split",
                     "expense_id": expense_id,
+                    "expense_ids": all_expense_ids,
                     "parsed_data": parsed_data,
                     "linked_at": datetime.utcnow().isoformat(),
                     "updated_at": datetime.utcnow().isoformat()
@@ -5540,6 +5553,7 @@ def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromRecei
         supabase.table("pending_receipts") \
             .update({
                 "expense_id": expense_id,
+                "expense_ids": [expense_id],
                 "status": "linked",
                 "linked_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat()
@@ -5576,11 +5590,12 @@ def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromRecei
 def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest, current_user: dict = Depends(get_current_user)):
     """
     Link an existing pending receipt to an existing expense.
+    Returns 409 if the expense already has a different receipt_url — set force=true to overwrite.
     """
     try:
-        # Verify receipt exists
+        # Verify receipt exists and fetch file_url in one query
         receipt = supabase.table("pending_receipts") \
-            .select("id, expense_id, project_id, vendor_name, amount") \
+            .select("id, expense_id, project_id, vendor_name, amount, file_url") \
             .eq("id", receipt_id) \
             .single() \
             .execute()
@@ -5591,9 +5606,11 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest, curr
         if receipt.data.get("expense_id"):
             raise HTTPException(status_code=400, detail="Receipt already linked to an expense")
 
-        # Verify expense exists
+        new_file_url = receipt.data.get("file_url")
+
+        # Verify expense exists and check for existing receipt_url
         expense = supabase.table("expenses_manual_COGS") \
-            .select("expense_id") \
+            .select("expense_id, receipt_url") \
             .eq("expense_id", payload.expense_id) \
             .single() \
             .execute()
@@ -5601,10 +5618,22 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest, curr
         if not expense.data:
             raise HTTPException(status_code=404, detail="Expense not found")
 
+        existing_url = expense.data.get("receipt_url")
+        if existing_url and existing_url != new_file_url and not payload.force:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "expense_already_has_receipt",
+                    "current_receipt_url": existing_url,
+                    "message": "Expense already has a different receipt linked. Send force=true to overwrite."
+                }
+            )
+
         # Link them
         result = supabase.table("pending_receipts") \
             .update({
                 "expense_id": payload.expense_id,
+                "expense_ids": [payload.expense_id],
                 "status": "linked",
                 "linked_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat()
@@ -5612,16 +5641,10 @@ def link_receipt_to_expense(receipt_id: str, payload: LinkToExpenseRequest, curr
             .eq("id", receipt_id) \
             .execute()
 
-        # Also update the expense with the receipt URL
-        receipt_full = supabase.table("pending_receipts") \
-            .select("file_url") \
-            .eq("id", receipt_id) \
-            .single() \
-            .execute()
-
-        if receipt_full.data:
+        # Update expense with receipt URL
+        if new_file_url:
             supabase.table("expenses_manual_COGS") \
-                .update({"receipt_url": receipt_full.data.get("file_url")}) \
+                .update({"receipt_url": new_file_url}) \
                 .eq("expense_id", payload.expense_id) \
                 .execute()
 

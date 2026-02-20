@@ -20,9 +20,9 @@
 | Dimension | Before | After | Delta | Notes |
 |-----------|--------|-------|-------|-------|
 | R1 Error Handling | 7 | 8 | +1 | 12 bare `except:pass` → `logger.debug()`, `_load_agent_config` now logs |
-| R2 Data Integrity | 7 | 7 | — | |
+| R2 Data Integrity | 7 | 8 | +1 | check_receipt_status bug fixed (status_map reset), breadcrumb endpoint |
 | R3 Security | 7 | 7 | — | Vault bucket still public (invasive fix) |
-| R4 Performance | 6 | 6 | — | |
+| R4 Performance | 6 | 7 | +1 | list_files paginated, soft_delete batch, search paginated, folder tree counts |
 | R5 Memory Safety | 7 | 8 | +1 | `del file_content` after OCR phase, unused pdf2image import removed |
 | R6 Reliability | 6 | 7 | +1 | HTTPException → ValueError in bg-callable, skipped items logged |
 | R7 Code Quality | 5 | 6 | +1 | Bare pass patterns logged, unused import removed |
@@ -32,10 +32,11 @@
 
 ```
 Before: (7+7+7+6+7+6+5+7 + 7*2 + 7*2) / 12 = 80/12 = 6.67
-After:  (8+7+7+6+8+7+6+7 + 7*2 + 8*2) / 12 = 86/12 = 7.17
+Pass 1: (8+7+7+6+8+7+6+7 + 7*2 + 8*2) / 12 = 86/12 = 7.17
+Pass 2: (8+8+7+7+8+7+6+7 + 7*2 + 8*2) / 12 = 88/12 = 7.33
 ```
 
-**Weighted Score: 6.7 → 7.2 (+0.5)**
+**Weighted Score: 6.7 → 7.2 → 7.3 (+0.6 total)**
 
 ---
 
@@ -106,6 +107,35 @@ except Exception:
 except Exception as _exc:
     logger.debug("Suppressed: %s", _exc)
 ```
+
+### Fix 7: Paginated `list_files` (session 2026-02-20)
+- **File:** `vault_service.py` — `list_files()`
+- **Impact:** R4 — folder navigation now returns `{data, total, pagination}` with limit/offset
+- Previously returned ALL items in a folder; now defaults to 60 per page
+
+### Fix 8: Bug fix `check_receipt_status` — status_map reset
+- **File:** `vault_service.py` line ~809
+- **Impact:** R2 — `status_map = {}` on line 809 was wiping processing/pending statuses from Step 1.5
+
+### Fix 9: Folder tree with item counts
+- **File:** `vault_service.py` — `get_folder_tree()`
+- **Impact:** R4 — each folder now includes `item_count` (batch-counted in single query)
+
+### Fix 10: Breadcrumb endpoint
+- **File:** `vault.py` — `GET /vault/breadcrumb/{folder_id}`
+- **Impact:** R4 — returns `[{id, name}, ...]` from root to folder; enables clickable breadcrumb UI
+
+### Fix 11: Batch `soft_delete`
+- **File:** `vault_service.py` — `soft_delete()`
+- **Impact:** R4 — replaced recursive N+1 delete with BFS collect + single `.in_()` batch UPDATE
+
+### Fix 12: Paginated `search_files`
+- **File:** `vault_service.py` — `search_files()`
+- **Impact:** R4 — added `offset` parameter; returns `{data, pagination}` instead of bare list
+
+### Fix 13: Batch `create_default_folders`
+- **File:** `vault_service.py` — `create_default_folders()`
+- **Impact:** R4 — 9 individual INSERTs → single batch INSERT
 
 ---
 
