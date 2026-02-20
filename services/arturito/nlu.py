@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 VALID_INTENTS = [
     "BUDGET_VS_ACTUALS",    # Reporte BVA global
     "PNL_COGS",             # P&L COGS report (actuals only, no budget)
+    "PROJECT_HEALTH",       # Resumen de salud del proyecto
     "CONSULTA_ESPECIFICA",  # Consulta sobre categoría específica del BVA
     "SCOPE_OF_WORK",        # Consultas sobre SOW
     "INFO",                 # Información del sistema / ayuda
@@ -239,6 +240,27 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             "source": "local"
         }
 
+    # P&L COGS with project in natural phrasing:
+    # "genera el pnl de Del Rio", "dame el p&l del Arthur Neal", "quiero pnl para Del Rio"
+    pnl_with_project_patterns = [
+        r'(?:reporte|report|genera|generar|dame|muéstrame|muestrame|quiero|necesito)\s+(?:el\s+|un\s+)?(?:reporte\s+)?(?:de\s+)?(?:pnl|p&l|p&l\s*cogs)\s+(?:de|del|para|de\s+el)\s+(.+)',
+        r'(?:pnl|p&l|p&l\s*cogs)\s+(?:de|del|para|de\s+el)\s+(.+)',
+    ]
+    for pattern in pnl_with_project_patterns:
+        match = re.search(pattern, t)
+        if match:
+            # Extract project from original text preserving case
+            project_lower = match.group(1).strip()
+            # Find the project text in the original input (preserve user casing)
+            idx = text.lower().rfind(project_lower)
+            original_project = text[idx:idx + len(project_lower)].strip() if idx >= 0 else project_lower
+            return {
+                "intent": "PNL_COGS",
+                "entities": {"project": original_project},
+                "confidence": 1.0,
+                "source": "local"
+            }
+
     # P&L COGS without project: "pnl", "reporte pnl", "genera pnl", etc.
     pnl_no_project_patterns = [
         r'^(pnl|p&l|p&l\s*cogs|pnlcogs)$',
@@ -252,6 +274,61 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
                 "intent": "PNL_COGS",
                 "entities": {"project": None},
                 "confidence": 1.0,
+                "source": "local"
+            }
+
+    # ================================
+    # Project Health Summary
+    # ================================
+
+    # Without project FIRST (to avoid "salud del proyecto" matching as project="del proyecto")
+    health_no_project_patterns = [
+        r'^(health|salud|status|estado)(\s+del?\s+proyecto)?$',
+        r'c[oó]mo\s+(?:va|est[aá]|anda)\s+(?:el\s+)?proyecto\??$',
+        r'(?:dame|muéstrame|muestrame|quiero)\s+(?:el\s+)?(?:health|salud|status|estado)',
+        r'resumen\s+(?:del?\s+)?proyecto',
+    ]
+    for pattern in health_no_project_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "PROJECT_HEALTH",
+                "entities": {"project": None},
+                "confidence": 1.0,
+                "source": "local"
+            }
+
+    # With project: "health del rio", "salud Arthur Neal"
+    # NOTE: "status" and "estado" excluded here (too ambiguous — "status pendientes")
+    health_with_project = re.match(
+        r'^(?:health|salud)\s+(.+)$', t
+    )
+    if health_with_project:
+        proj_lower = health_with_project.group(1).strip()
+        idx = text.lower().rfind(proj_lower)
+        original = text[idx:idx + len(proj_lower)].strip() if idx >= 0 else proj_lower
+        return {
+            "intent": "PROJECT_HEALTH",
+            "entities": {"project": original},
+            "confidence": 1.0,
+            "source": "local"
+        }
+
+    # Natural: "cómo va Del Rio", "cómo está el proyecto Del Rio"
+    health_natural = re.search(
+        r'c[oó]mo\s+(?:va|est[aá]|anda)\s+(?:el\s+proyecto\s+)?(.+?)(?:\?|$)', t
+    )
+    if health_natural:
+        proj_text = health_natural.group(1).strip().rstrip("?").strip()
+        if proj_text and proj_text.lower() not in (
+            "el proyecto", "el", "todo", "el sistema", "el reporte",
+            "el budget", "el bva", "el pnl", "eso", "esto", "arturito",
+        ):
+            idx = text.lower().rfind(proj_text)
+            original = text[idx:idx + len(proj_text)].strip() if idx >= 0 else proj_text
+            return {
+                "intent": "PROJECT_HEALTH",
+                "entities": {"project": original},
+                "confidence": 0.95,
                 "source": "local"
             }
 
@@ -526,11 +603,11 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
 
         # Extraer vendor: "a Xvendor", "de Xvendor", "pagado a Xvendor"
         vendor_patterns = [
-            r'(?:a|de|para|pagado\s+a|se\s+le\s+pagó\s+a)\s+([A-Z][A-Za-z0-9\s&\'-]+?)(?:\s+(?:para|por|de|en|\$|$))',
-            r'(?:vendor|proveedor)\s+([A-Z][A-Za-z0-9\s&\'-]+?)(?:\s+(?:para|por|de|en|\$|$))',
+            r'(?:a|de|para|pagado\s+a|se\s+le\s+pagó\s+a)\s+([A-Za-z][A-Za-z0-9\s&\'-]+?)(?:\s+(?:para|por|de|en|\$|$))',
+            r'(?:vendor|proveedor)\s+([A-Za-z][A-Za-z0-9\s&\'-]+?)(?:\s+(?:para|por|de|en|\$|$))',
         ]
         for pattern in vendor_patterns:
-            match = re.search(pattern, text.strip())  # Use original case
+            match = re.search(pattern, text.strip(), re.IGNORECASE)  # Case-insensitive
             if match:
                 vendor_name = match.group(1).strip()
                 # Clean trailing words
@@ -552,10 +629,10 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
 
         # Extraer proyecto si se menciona
         project_patterns = [
-            r'(?:en|del?|para|proyecto)\s+([A-Z][A-Za-z\s]+?)(?:\s+(?:de|para|por|\$|$))',
+            r'(?:en|del?|para|proyecto)\s+([A-Za-z][A-Za-z\s]+?)(?:\s+(?:de|para|por|\$|$))',
         ]
         for pattern in project_patterns:
-            match = re.search(pattern, text.strip())  # Use original case
+            match = re.search(pattern, text.strip(), re.IGNORECASE)  # Case-insensitive
             if match:
                 proj = match.group(1).strip()
                 # Avoid matching common words
@@ -749,8 +826,21 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
    - Consultas GENERALES del proyecto: total budget, total actuals, balance global.
    - Se activa cuando NO hay trade/tema específico o piden "Budget vs Actuals", "global", "resumen".
    - Extrae: 'project' si aparece.
+   - NOTA: NO usar para P&L / PNL — eso es PNL_COGS.
 
-2) CONSULTA_ESPECIFICA
+2) PNL_COGS
+   - Reporte P&L COGS: solo ACTUALS autorizados agrupados por account (sin columna de budget).
+   - Señales: "P&L", "PNL", "PNL COGS", "profit and loss", "reporte de P&L", "pnl del proyecto X".
+   - DIFERENCIA CON BVA: P&L NO tiene budget, solo muestra lo gastado por cuenta.
+   - Extrae: 'project' si aparece.
+
+3) PROJECT_HEALTH
+   - Resumen rapido de salud del proyecto: budget %, gastos pendientes, tareas, recibos.
+   - Senales: "como va [proyecto]?", "salud de [proyecto]", "health [proyecto]", "status [proyecto]", "resumen del proyecto".
+   - NO es BVA (no genera PDF ni detalle por cuenta) — es un snapshot rapido.
+   - Extrae: 'project' si aparece.
+
+4) CONSULTA_ESPECIFICA
    - Pregunta sobre un grupo/categoría/cuenta ESPECÍFICA del BVA (HVAC, framing, windows, plumbing, etc.).
    - Mide métricas: budget, actuals, gastado, disponible, diferencia.
    - Extrae: 'topic' (SOLO el sustantivo del trade/cuenta, ej: "windows", "hvac", "plumbing"), 'project' (si aparece).
@@ -759,27 +849,27 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
      Ejemplo: "budget disponible para hvac" -> topic: "hvac" (NO "disponible para hvac").
    - REGLA: Si aparece trade + budget/actuals/gastado → SIEMPRE es CONSULTA_ESPECIFICA.
 
-3) SCOPE_OF_WORK
+5) SCOPE_OF_WORK
    - Consultas sobre el alcance de obra (SOW).
    - Señales: incluye/excluye, NIC/by owner, qué contempla, qué dice el SOW.
    - Extrae: 'project', 'question'.
 
-4) INFO
+6) INFO
    - Preguntas sobre funciones o capacidades del sistema (Arturito).
    - Ayuda, quién eres, qué puedes hacer como bot.
 
-5) NGM_HELP
+7) NGM_HELP
    - Preguntas sobre cómo usar NGM Hub o sus módulos.
    - Señales: "dónde puedo ver...", "cómo funciona...", "dónde están los...", "qué es X en el sistema".
    - Preguntas sobre ubicación de funciones: gastos, facturas, tareas, proyectos, etc.
    - Extrae: 'module' (expenses, pipeline, projects, vendors, etc.), 'topic' (qué busca).
 
-6) NGM_ACTION
+8) NGM_ACTION
    - Usuario quiere EJECUTAR una acción en el sistema (navegar, abrir modales).
    - Señales: "agregar gasto", "crear tarea", "llévame a...", "abrir...", "escanear recibo".
    - Extrae: 'action' (nombre de la acción a ejecutar).
 
-7) COPILOT
+9) COPILOT
    - Usuario quiere controlar la PAGINA ACTUAL: filtrar, ordenar, buscar, expandir/colapsar.
    - Señales: "muestrame solo...", "filtrar por...", "filtrame...", "ordenar por...", "buscar...", "expandir todo", "show only...", "filter by...".
    - Comandos para la UI de la página actual sin necesidad de navegar.
@@ -800,18 +890,18 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
      * "filter by project Arthur Neal" → {command_type: "filter", filter_target: "project", filter_value: "Arthur Neal"}
      * "sort by amount descending" → {command_type: "sort", sort_column: "amount", sort_direction: "desc"}
 
-8) REPORT_BUG
+10) REPORT_BUG
    - Usuario quiere reportar un bug, error o problema.
    - Señales: "reportar bug", "encontré un error", "algo no funciona", "hay un problema".
    - Extrae: 'description' (descripción del problema).
 
-9) EXPENSE_REMINDER
+11) EXPENSE_REMINDER
    - Usuario quiere enviar recordatorio a los autorizadores de gastos.
    - Señales: "gastos sin autorizar", "muchos gastos pendientes", "recordatorio de gastos", "avisar a los autorizadores".
    - Activar cuando el usuario se queja de gastos sin autorizar o pide enviar notificación/recordatorio.
    - Extrae: 'message' (mensaje original del usuario).
 
-10) SMALL_TALK
+12) SMALL_TALK
    - Conversación general, preguntas de conocimiento, o dudas técnicas de construcción.
    - Preguntas de conocimiento general sobre construcción: "qué es un ADU?", "cuánto cuesta un permit en San Diego?", "qué incluye el framing?", etc.
    - Saludos, chistes, preguntas no relacionadas con datos específicos de proyectos en el sistema.
@@ -823,6 +913,8 @@ PRIORIDAD DE CLASIFICACIÓN:
 - Si el usuario quiere NAVEGAR o ABRIR modales → NGM_ACTION
 - Si el usuario reporta un PROBLEMA → REPORT_BUG
 - Si el usuario quiere ENVIAR RECORDATORIO de GASTOS pendientes → EXPENSE_REMINDER
+- Si pide reporte P&L / PNL (solo actuals sin budget) → PNL_COGS
+- Si pregunta "como va" o pide resumen/salud/health/status de un proyecto → PROJECT_HEALTH
 - Si pregunta sobre datos de un PROYECTO (budget, actuals) → BUDGET_VS_ACTUALS o CONSULTA_ESPECIFICA
 - Si pregunta sobre Arturito (el bot) → INFO
 

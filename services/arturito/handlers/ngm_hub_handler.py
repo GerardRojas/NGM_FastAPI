@@ -10,6 +10,7 @@
 """
 
 import logging
+from difflib import SequenceMatcher
 from typing import Optional
 from datetime import datetime
 
@@ -23,6 +24,50 @@ from ..ngm_knowledge import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _fuzzy_find(query: str, candidates: dict[str, any], threshold: float = 0.55) -> tuple[str | None, any]:
+    """
+    Fuzzy-match *query* against a dict {name_lower: id}.
+
+    Returns (matched_name, matched_id) or (None, None).
+    Tries, in order:
+      1. Exact match
+      2. Substring (bidirectional)
+      3. Token overlap (all query tokens appear in candidate)
+      4. SequenceMatcher ratio >= threshold
+    """
+    q = query.lower().strip()
+    if not q:
+        return None, None
+
+    # 1 — exact
+    if q in candidates:
+        return q, candidates[q]
+
+    # 2 — substring (bidirectional)
+    for name, id_ in candidates.items():
+        if q in name or name in q:
+            return name, id_
+
+    # 3 — token overlap: all query tokens present in candidate
+    q_tokens = set(q.split())
+    for name, id_ in candidates.items():
+        name_tokens = set(name.split())
+        if q_tokens and q_tokens.issubset(name_tokens):
+            return name, id_
+
+    # 4 — SequenceMatcher (best ratio wins)
+    best_name, best_id, best_ratio = None, None, 0.0
+    for name, id_ in candidates.items():
+        ratio = SequenceMatcher(None, q, name).ratio()
+        if ratio > best_ratio:
+            best_name, best_id, best_ratio = name, id_, ratio
+
+    if best_ratio >= threshold:
+        return best_name, best_id
+
+    return None, None
 
 
 # -----------------------------------------------------------------------------
@@ -950,27 +995,17 @@ def handle_search_expenses(
         # Start building query
         query = supabase.table("expenses_manual_COGS").select("*")
 
-        # Filter by vendor if specified
+        # Filter by vendor if specified (fuzzy match)
         matched_vendor_id = None
         if vendor_name:
-            vendor_lower = vendor_name.lower()
-            # Find vendor ID by partial name match
-            for vname, vid in vendors_by_name.items():
-                if vendor_lower in vname or vname in vendor_lower:
-                    matched_vendor_id = vid
-                    break
+            _, matched_vendor_id = _fuzzy_find(vendor_name, vendors_by_name)
             if matched_vendor_id:
                 query = query.eq("vendor_id", matched_vendor_id)
 
-        # Filter by project if specified
+        # Filter by project if specified (fuzzy match)
         matched_project_id = None
         if project_name:
-            project_lower = project_name.lower()
-            # Find project ID by partial name match
-            for pname, pid in projects_by_name.items():
-                if project_lower in pname or pname in project_lower:
-                    matched_project_id = pid
-                    break
+            _, matched_project_id = _fuzzy_find(project_name, projects_by_name)
             if matched_project_id:
                 query = query.eq("project", matched_project_id)
 

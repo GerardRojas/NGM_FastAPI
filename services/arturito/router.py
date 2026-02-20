@@ -30,6 +30,7 @@ from .handlers import (
     handle_vault_delete,
     handle_vault_organize,
     handle_vault_upload,
+    handle_project_health,
 )
 from .permissions import is_action_permitted, get_permission_denial_message, check_role_permission
 from .persona import set_personality_level, get_identity_response
@@ -45,6 +46,7 @@ _CAPABILITY_GROUPS = {
     "Reports": [
         ("bva / budget vs actuals", "Budget vs Actuals report for any project"),
         ("pnl", "P&L COGS report"),
+        ("health / salud", "Project health summary (budget, tasks, receipts)"),
         ("budget query", "Ask about a specific budget category (e.g. 'how much on framing?')"),
     ],
     "Navigation": [
@@ -161,6 +163,13 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "required_entities": [],  # Handler manages missing project internally (ask_project flow)
         "optional_entities": ["project"],
         "description": "Genera reporte P&L COGS (actuals only, sin budget)",
+    },
+
+    "PROJECT_HEALTH": {
+        "handler": handle_project_health,
+        "required_entities": [],
+        "optional_entities": ["project"],
+        "description": "Resumen de salud del proyecto (budget, tareas, receipts)",
     },
 
     "CONSULTA_ESPECIFICA": {
@@ -331,6 +340,9 @@ INTENT_ALIASES = {
     "PNL": "PNL_COGS",
     "P&L": "PNL_COGS",
     "P&L COGS": "PNL_COGS",
+    "HEALTH": "PROJECT_HEALTH",
+    "PROJECT STATUS": "PROJECT_HEALTH",
+    "SALUD": "PROJECT_HEALTH",
 }
 
 
@@ -610,6 +622,16 @@ def route_slash_command(
         fake_intent = {
             "intent": "PNL_COGS",
             "entities": {"project": project},
+            "confidence": 1.0,
+            "raw_text": f"/{command} {args}"
+        }
+        return route(fake_intent, ctx)
+
+    if cmd in ("health", "salud", "status"):
+        project = args.strip() if args else ctx.get("space_name", "")
+        fake_intent = {
+            "intent": "PROJECT_HEALTH",
+            "entities": {"project": project or None},
             "confidence": 1.0,
             "raw_text": f"/{command} {args}"
         }

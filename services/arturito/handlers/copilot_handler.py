@@ -11,6 +11,7 @@ import logging
 import re
 import os
 import json
+from difflib import SequenceMatcher
 from typing import Optional
 from datetime import datetime, timedelta
 from api.services.gpt_client import gpt
@@ -290,8 +291,14 @@ def handle_copilot(
     # Add any extracted named entities (project name, vendor name, etc.)
     params = extract_named_entities(raw_text, action_match, params)
 
-    # Build response
+    # Disambiguate: if matched "filterByProject" but name is actually a vendor
+    # (or vice-versa), swap the command so the frontend filters correctly.
     command = action_match["command"]
+    if command in ("filterByProject", "filterByVendor") and context:
+        command, params = _disambiguate_vendor_project(
+            command, params, context
+        )
+
     description = action_match["description"]
 
     # Custom messages for special commands
@@ -422,6 +429,82 @@ def handle_generic_command(
     }
 
 
+def _disambiguate_vendor_project(
+    command: str,
+    params: dict,
+    context: dict,
+) -> tuple[str, dict]:
+    """
+    When the keyword 'gastos de' fires, it can match either filterByProject
+    or filterByVendor.  Resolve the ambiguity by checking the extracted name
+    against vendor and project lists in Supabase.
+    """
+    supabase = context.get("supabase") if context else None
+    if not supabase:
+        return command, params
+
+    name = params.get("project_name") or params.get("vendor_name")
+    if not name:
+        return command, params
+
+    name_lower = name.lower().strip()
+
+    try:
+        vendors_resp = supabase.table("Vendors").select("id, vendor_name").execute()
+        projects_resp = supabase.table("projects").select("project_id, project_name").execute()
+
+        vendor_names = {v["vendor_name"].lower(): v["vendor_name"] for v in (vendors_resp.data or [])}
+        project_names = {p["project_name"].lower(): p["project_name"] for p in (projects_resp.data or [])}
+
+        # Score against vendors (substring + fuzzy)
+        vendor_score = 0.0
+        matched_vendor = None
+        for vn in vendor_names:
+            if name_lower in vn or vn in name_lower:
+                vendor_score = 1.0
+                matched_vendor = vendor_names[vn]
+                break
+            ratio = SequenceMatcher(None, name_lower, vn).ratio()
+            if ratio > vendor_score:
+                vendor_score = ratio
+                matched_vendor = vendor_names[vn]
+
+        # Score against projects (substring + fuzzy)
+        project_score = 0.0
+        matched_project = None
+        for pn in project_names:
+            if name_lower in pn or pn in name_lower:
+                project_score = 1.0
+                matched_project = project_names[pn]
+                break
+            ratio = SequenceMatcher(None, name_lower, pn).ratio()
+            if ratio > project_score:
+                project_score = ratio
+                matched_project = project_names[pn]
+
+        # Swap command if the other entity scores higher
+        if command == "filterByProject" and vendor_score > project_score and vendor_score >= 0.55:
+            params.pop("project_name", None)
+            params["vendor_name"] = matched_vendor
+            return "filterByVendor", params
+
+        if command == "filterByVendor" and project_score > vendor_score and project_score >= 0.55:
+            params.pop("vendor_name", None)
+            params["project_name"] = matched_project
+            return "filterByProject", params
+
+        # If same command won but we found a fuzzy match, use the canonical name
+        if command == "filterByProject" and matched_project and project_score >= 0.55:
+            params["project_name"] = matched_project
+        elif command == "filterByVendor" and matched_vendor and vendor_score >= 0.55:
+            params["vendor_name"] = matched_vendor
+
+    except Exception as e:
+        logger.warning(f"Disambiguation lookup failed: {e}")
+
+    return command, params
+
+
 def extract_named_entities(raw_text: str, action: dict, params: dict) -> dict:
     """
     Extract named entities like project names, vendor names, user names from the message.
@@ -432,11 +515,11 @@ def extract_named_entities(raw_text: str, action: dict, params: dict) -> dict:
     if "project_name" in action.get("params", []) and "project_name" not in params:
         # Look for "de/del/proyecto/project" followed by a name
         project_patterns = [
-            r'(?:de|del|proyecto|project)\s+([A-Z][a-zA-Z\s]+?)(?:\s|$|,)',
-            r'(?:gastos?|tareas?)\s+(?:de|del)\s+([A-Z][a-zA-Z\s]+?)(?:\s|$|,)',
+            r'(?:de|del|proyecto|project)\s+([A-Za-z][a-zA-Z\s]+?)(?:\s|$|,)',
+            r'(?:gastos?|tareas?)\s+(?:de|del)\s+([A-Za-z][a-zA-Z\s]+?)(?:\s|$|,)',
         ]
         for pattern in project_patterns:
-            match = re.search(pattern, raw_text)
+            match = re.search(pattern, raw_text, re.IGNORECASE)
             if match:
                 params["project_name"] = match.group(1).strip()
                 break
@@ -444,11 +527,11 @@ def extract_named_entities(raw_text: str, action: dict, params: dict) -> dict:
     # Vendor name extraction
     if "vendor_name" in action.get("params", []) and "vendor_name" not in params:
         vendor_patterns = [
-            r'(?:vendor|proveedor)\s+([A-Z][a-zA-Z\s]+?)(?:\s|$|,)',
-            r'(?:de)\s+([A-Z][a-zA-Z\s]+?)(?:\s|$|,)',
+            r'(?:vendor|proveedor)\s+([A-Za-z][a-zA-Z0-9\s&\'-]+?)(?:\s|$|,)',
+            r'(?:de)\s+([A-Za-z][a-zA-Z0-9\s&\'-]+?)(?:\s|$|,)',
         ]
         for pattern in vendor_patterns:
-            match = re.search(pattern, raw_text)
+            match = re.search(pattern, raw_text, re.IGNORECASE)
             if match:
                 params["vendor_name"] = match.group(1).strip()
                 break

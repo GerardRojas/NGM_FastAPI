@@ -8,6 +8,7 @@ from .sow_handler import handle_scope_of_work
 from .ngm_hub_handler import handle_ngm_help, handle_ngm_action, handle_bug_report, handle_expense_reminder, handle_list_projects, handle_list_vendors, handle_create_vendor, handle_create_project, handle_search_expenses
 from .copilot_handler import handle_copilot
 from .vault_handler import handle_vault_search, handle_vault_list, handle_vault_create_folder, handle_vault_delete, handle_vault_organize, handle_vault_upload
+from .health_summary_handler import handle_project_health
 
 __all__ = [
     "handle_budget_vs_actuals",
@@ -31,4 +32,5 @@ __all__ = [
     "handle_vault_delete",
     "handle_vault_organize",
     "handle_vault_upload",
+    "handle_project_health",
 ]
