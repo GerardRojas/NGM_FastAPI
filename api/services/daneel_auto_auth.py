@@ -68,6 +68,7 @@ _DEFAULT_CONFIG = {
     "daneel_gpt_fallback_enabled": False,
     "daneel_gpt_fallback_confidence": 75,
     "daneel_mismatch_notify_andrew": True,
+    "daneel_bill_hint_ocr_enabled": True,
     "daneel_receipt_hash_check_enabled": True,
     "daneel_digest_enabled": True,
     "daneel_digest_interval_hours": 4,
@@ -208,35 +209,29 @@ def _get_bill_siblings(norm_bill: str, bills_map: dict, receipt_groups: dict) ->
 
 
 # ============================================================================
-# Receipt hash (lightweight -- HTTP HEAD only, no file download)
+# Receipt fingerprint (zero-network: URL path is the identity)
 # ============================================================================
 
 def get_receipt_hash(receipt_url: Optional[str], client: Optional[httpx.Client] = None) -> Optional[str]:
     """
-    Get a lightweight fingerprint for a receipt file via HTTP HEAD.
-    Uses ETag or Content-Length as proxy.  Returns None if unavailable.
-    Pass a shared ``client`` to reuse TCP connections across calls.
+    Return a normalized fingerprint for a receipt URL.
+
+    Supabase Storage URLs are deterministic: same file = same path.
+    We strip query-string tokens (which rotate) and normalize to get a
+    stable identity — no HTTP call needed.
+
+    The ``client`` parameter is kept for backward compatibility but ignored.
     """
     if not receipt_url:
         return None
     try:
-        _own_client = client is None
-        _client = client or httpx.Client(timeout=5.0)
-        try:
-            resp = _client.head(receipt_url, follow_redirects=True)
-            etag = resp.headers.get("etag")
-            if etag:
-                return f"etag:{etag}"
-            cl = resp.headers.get("content-length")
-            ct = resp.headers.get("content-type", "")
-            if cl:
-                return f"cl:{cl}:{ct}"
-        finally:
-            if _own_client:
-                _client.close()
-    except Exception as e:
-        logger.warning(f"[DaneelAutoAuth] HEAD failed for {receipt_url}: {e}")
-    return None
+        from urllib.parse import urlparse, unquote
+        parsed = urlparse(receipt_url)
+        # Normalize: lowercase host + decoded path (ignore query/fragment tokens)
+        return f"{parsed.netloc.lower()}{unquote(parsed.path).rstrip('/')}"
+    except Exception:
+        # Fallback: use raw URL stripped of query string
+        return receipt_url.split("?")[0].split("#")[0]
 
 
 # ============================================================================
@@ -1156,8 +1151,9 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
         logger.debug("Suppressed project names load: %s", _exc)
     timings["fetch_project_names"] = round((_t() - _ts) * 1000, 1)
 
-    # Shared HTTP client for receipt hash checks (connection pooling)
-    hash_client = httpx.Client(timeout=5.0)
+    # Receipt hash no longer needs HTTP calls (URL-path based), but keep
+    # variable for backward compat with check_duplicate() signature.
+    hash_client = None
     project_timings = []  # per-project breakdown
 
     for pid, expenses in projects.items():
@@ -1321,8 +1317,8 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                         exp_checks.append({"check": "bill_hint", "passed": True,
                                            "detail": f"Bill total ${bill_total:,.2f} matches hint ${hint['amount_hint']:,.2f}"})
                 else:
-                    # No amount in filename -- fall back to GPT Vision OCR
-                    if receipt_url:
+                    # No amount in filename -- fall back to GPT Vision OCR (if enabled)
+                    if receipt_url and cfg.get("daneel_bill_hint_ocr_enabled", True):
                         if bill_id_str in _vision_cache:
                             vision_result = _vision_cache[bill_id_str]
                         else:
@@ -1422,9 +1418,12 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                         else:
                             exp_checks.append({"check": "bill_hint", "passed": True,
                                                "detail": "No filename hint; Vision OCR could not extract total"})
-                    else:
+                    elif not receipt_url:
                         exp_checks.append({"check": "bill_hint", "passed": True,
                                            "detail": "No amount hint in receipt filename (no receipt URL)"})
+                    else:
+                        exp_checks.append({"check": "bill_hint", "passed": True,
+                                           "detail": "No filename hint; Vision OCR disabled"})
             else:
                 if not bill_id_str:
                     skip_reason = "No bill"
@@ -1641,7 +1640,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
                 "missing_fields": item["missing"],
             })
 
-    hash_client.close()
+    # hash_client is None now (URL-path fingerprinting, no HTTP)
 
     # Always update last run timestamp so the dashboard shows activity
     _save_config_key("daneel_auto_auth_last_run", now)
@@ -1849,8 +1848,7 @@ async def trigger_auto_auth_for_bill(
             bill_receipt_url = _get_expense_receipt(expenses[0], bills_map)
 
         if cfg.get("daneel_receipt_hash_check_enabled", True) and bill_receipt_url:
-            _hclient = httpx.Client(timeout=5.0)
-            bill_hash = get_receipt_hash(bill_receipt_url, client=_hclient)
+            bill_hash = get_receipt_hash(bill_receipt_url)
             if bill_hash:
                 all_proj_result = sb.table("expenses_manual_COGS") \
                     .select("expense_id, bill_id") \
@@ -1867,7 +1865,7 @@ async def trigger_auto_auth_for_bill(
                         other_receipt = bills_map[other_bill].get("receipt_url")
                     if not other_receipt:
                         continue
-                    other_hash = get_receipt_hash(other_receipt, client=_hclient)
+                    other_hash = get_receipt_hash(other_receipt)
                     if other_hash and other_hash == bill_hash:
                         exp_bill_info = bills_map.get(norm_bill, {})
                         oth_bill_info = bills_map.get(other_bill, {})
@@ -1894,7 +1892,6 @@ async def trigger_auto_auth_for_bill(
                             break
             if not hash_collision:
                 logger.info(f"{tag} Receipt hash: clear | bill={bill_id}")
-            _hclient.close()
         else:
             logger.info(f"{tag} Receipt hash: skipped (disabled or no receipt URL) | bill={bill_id}")
 
@@ -2080,8 +2077,7 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
             exp_bill_str = normalize_bill_id(exp_bill_raw)
             exp_receipt_url = _get_expense_receipt(expense, bills_map)
             if exp_receipt_url:
-                _hclient_rt = httpx.Client(timeout=5.0)
-                exp_hash = get_receipt_hash(exp_receipt_url, client=_hclient_rt)
+                exp_hash = get_receipt_hash(exp_receipt_url)
                 if exp_hash:
                     # Check all expenses in the project for same hash, different bill
                     all_proj_result = sb.table("expenses_manual_COGS") \
@@ -2100,7 +2096,7 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                             other_receipt = bills_map[other_bill].get("receipt_url")
                         if not other_receipt:
                             continue
-                        other_hash = get_receipt_hash(other_receipt, client=_hclient_rt)
+                        other_hash = get_receipt_hash(other_receipt)
                         if other_hash and other_hash == exp_hash:
                             exp_bill_info = bills_map.get(exp_bill_str, {})
                             oth_bill_info = bills_map.get(other_bill, {})
@@ -2129,11 +2125,9 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
                                 hash_collision = True
                                 break
                     if hash_collision:
-                        _hclient_rt.close()
                         return
                     rt_checks.append({"check": "receipt_hash", "passed": True,
                                        "detail": "No cross-bill hash collision"})
-                _hclient_rt.close()
 
         # Duplicate check
         vendor_id = expense.get("vendor_id")
