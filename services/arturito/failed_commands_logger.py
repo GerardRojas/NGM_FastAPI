@@ -154,7 +154,8 @@ async def get_failed_commands(
 async def get_failed_commands_stats(
     supabase: Client,
     user_id: Optional[str] = None,
-    days_back: int = 30
+    days_back: int = 30,
+    since_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Get aggregated statistics about failed commands.
@@ -163,15 +164,28 @@ async def get_failed_commands_stats(
         supabase: Supabase client
         user_id: Filter by user (None for all users - admin only)
         days_back: How many days back to analyze
+        since_override: ISO timestamp — if set, clamp days_back so the window
+                        starts no earlier than this date (non-destructive reset)
 
     Returns:
         Dict with statistics (total failures, top pages, top errors, etc.)
     """
     try:
+        # Clamp days_back if a reset timestamp is provided
+        effective_days = days_back
+        if since_override:
+            try:
+                reset_dt = datetime.fromisoformat(since_override)
+                delta = datetime.now() - reset_dt
+                if delta.days < effective_days:
+                    effective_days = max(delta.days, 1)
+            except Exception:
+                pass
+
         # Call the PostgreSQL function we created
         result = supabase.rpc(
             "get_failed_commands_stats",
-            {"p_user_id": user_id, "p_days_back": days_back}
+            {"p_user_id": user_id, "p_days_back": effective_days}
         ).execute()
 
         if result.data and len(result.data) > 0:

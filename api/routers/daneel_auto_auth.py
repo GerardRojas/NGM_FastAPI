@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 import asyncio
+import json
 import logging
 
 from api.supabase_client import supabase
@@ -135,15 +136,31 @@ async def reprocess_pending():
 # ================================
 
 @router.get("/auto-auth/status")
-async def get_auto_auth_status():
+async def get_auto_auth_status(days: int = Query(30, ge=1, le=365)):
     """
     Get auto-auth status: config, last run, pending info count,
-    and recent authorization stats.
+    recent authorization stats, and breakdown rates.
     """
     try:
         from api.services.daneel_auto_auth import load_auto_auth_config, DANEEL_BOT_USER_ID
 
         cfg = load_auto_auth_config()
+
+        # Compute cutoff — respect non-destructive reset timestamp
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        try:
+            reset_row = supabase.table("agent_config").select("value").eq("key", "daneel_stats_reset_at").execute()
+            if reset_row.data:
+                raw = reset_row.data[0]["value"]
+                reset_ts = datetime.fromisoformat(json.loads(raw) if raw.startswith('"') else raw)
+                if reset_ts.tzinfo is None:
+                    reset_ts = reset_ts.replace(tzinfo=timezone.utc)
+                if reset_ts > cutoff:
+                    cutoff = reset_ts
+        except Exception:
+            pass
+
+        cutoff_iso = cutoff.isoformat()
 
         # Count unresolved pending info
         pending_result = supabase.table("daneel_pending_info") \
@@ -152,16 +169,42 @@ async def get_auto_auth_status():
             .execute()
         pending_count = pending_result.count if hasattr(pending_result, 'count') else len(pending_result.data or [])
 
-        # Count recent authorizations by Daneel (last 30 days)
-        from datetime import timedelta
-        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        # Count recent authorizations by Daneel
         auth_result = supabase.table("expense_status_log") \
             .select("id", count="exact") \
             .eq("changed_by", DANEEL_BOT_USER_ID) \
             .eq("new_status", "auth") \
-            .gt("changed_at", thirty_days_ago) \
+            .gt("changed_at", cutoff_iso) \
             .execute()
         auth_count = auth_result.count if hasattr(auth_result, 'count') else len(auth_result.data or [])
+
+        # Breakdown rates from daneel_auth_reports.summary
+        rates = {"success_rate": 0, "duplicate_rate": 0, "missing_rate": 0, "escalation_rate": 0}
+        total_processed = 0
+        try:
+            reports = supabase.table("daneel_auth_reports") \
+                .select("summary") \
+                .gte("created_at", cutoff_iso) \
+                .limit(1000) \
+                .execute()
+            agg_authorized = 0
+            agg_duplicates = 0
+            agg_missing = 0
+            agg_escalated = 0
+            for row in (reports.data or []):
+                s = row.get("summary") or {}
+                agg_authorized += int(s.get("authorized", 0))
+                agg_duplicates += int(s.get("duplicates", 0))
+                agg_missing += int(s.get("missing_info", 0))
+                agg_escalated += int(s.get("escalated", 0))
+                total_processed += int(s.get("expenses_processed", 0))
+            if total_processed > 0:
+                rates["success_rate"] = round(agg_authorized / total_processed * 100, 1)
+                rates["duplicate_rate"] = round(agg_duplicates / total_processed * 100, 1)
+                rates["missing_rate"] = round(agg_missing / total_processed * 100, 1)
+                rates["escalation_rate"] = round(agg_escalated / total_processed * 100, 1)
+        except Exception as e:
+            logger.warning("[DaneelStatus] Could not compute breakdown rates: %s", e)
 
         # Resolve last_run — fallback to most recent auth report if config key is empty
         last_run = cfg.get("daneel_auto_auth_last_run")
@@ -182,6 +225,9 @@ async def get_auto_auth_status():
             "last_run": last_run,
             "pending_info_count": pending_count,
             "authorized_last_30d": auth_count,
+            "total_processed": total_processed,
+            "rates": rates,
+            "period_days": days,
             "config": {
                 "require_bill": cfg.get("daneel_auto_auth_require_bill", True),
                 "require_receipt": cfg.get("daneel_auto_auth_require_receipt", True),

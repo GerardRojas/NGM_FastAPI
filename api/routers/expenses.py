@@ -703,25 +703,52 @@ def get_dismissed_duplicates(user_id: str, current_user: dict = Depends(get_curr
 
 
 @router.post("/dismissed-duplicates", status_code=201)
-def dismiss_duplicate_pair(payload: DismissDuplicateRequest, current_user: dict = Depends(get_current_user)):
+def dismiss_duplicate_pair(
+    payload: DismissDuplicateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Marca un par de expenses como "no es duplicado".
+    After dismissal, triggers Daneel re-check and returns updated duplicate_ids
+    so the frontend can remove highlights immediately without reloading.
     """
     try:
         # Ordenar IDs para consistencia
         id1, id2 = sorted([payload.expense_id_1, payload.expense_id_2])
 
         # Insertar con ON CONFLICT para idempotencia
-        result = supabase.table("dismissed_expense_duplicates").upsert({
+        supabase.table("dismissed_expense_duplicates").upsert({
             "user_id": payload.user_id,
             "expense_id_1": id1,
             "expense_id_2": id2,
             "dismissed_reason": payload.reason
         }, on_conflict="user_id,expense_id_1,expense_id_2").execute()
 
+        # Fetch both expenses to get project + trigger Daneel re-check
+        project_id = None
+        from api.services.daneel_auto_auth import trigger_auto_auth_check
+        for eid in (payload.expense_id_1, payload.expense_id_2):
+            exp = supabase.table("expenses_manual_COGS") \
+                .select("expense_id, project, status") \
+                .eq("expense_id", eid) \
+                .single() \
+                .execute()
+            if exp.data:
+                if not project_id:
+                    project_id = exp.data.get("project")
+                if exp.data.get("status") == "pending" and exp.data.get("project"):
+                    background_tasks.add_task(trigger_auto_auth_check, eid, exp.data["project"])
+
+        # Return updated duplicate_ids for this project so frontend can refresh highlights
+        updated_duplicate_ids = []
+        if project_id:
+            updated_duplicate_ids = _compute_duplicate_ids(project_id)
+
         return {
             "message": "Duplicate pair dismissed successfully",
-            "user_id": payload.user_id
+            "user_id": payload.user_id,
+            "duplicate_ids": updated_duplicate_ids,
         }
 
     except Exception as e:
@@ -739,6 +766,79 @@ def reactivate_duplicate_alert(dismissal_id: str, user_id: str, current_user: di
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reactivating duplicate alert: {str(e)}")
+
+
+# ====== DUPLICATE SCAN (for frontend table highlights) ======
+
+def _compute_duplicate_ids(project_id: str) -> list:
+    """
+    Compute expense IDs with potential duplicates for a project.
+    Excludes dismissed pairs and review-status expenses.
+    Used by both the /duplicate-scan endpoint and the dismiss response.
+    """
+    expenses = supabase.table("expenses_manual_COGS") \
+        .select("expense_id, Amount, TxnDate, vendor_id") \
+        .eq("project", project_id) \
+        .neq("status", "review") \
+        .order("TxnDate", desc=True) \
+        .limit(1000) \
+        .execute()
+
+    if not expenses.data:
+        return []
+
+    # Load dismissed pairs
+    dismissed_pairs: set = set()
+    try:
+        dismissed_result = supabase.table("dismissed_expense_duplicates") \
+            .select("expense_id_1, expense_id_2") \
+            .execute()
+        for dp in (dismissed_result.data or []):
+            dismissed_pairs.add(frozenset({dp["expense_id_1"], dp["expense_id_2"]}))
+    except Exception:
+        pass
+
+    # Group by (amount, vendor_id, date)
+    groups: dict = {}
+    for exp in expenses.data:
+        key = f"{exp.get('Amount')}|{exp.get('vendor_id')}|{(exp.get('TxnDate') or '')[:10]}"
+        groups.setdefault(key, []).append(exp.get("expense_id"))
+
+    # Build result — exclude dismissed pairs
+    duplicate_ids: set = set()
+    for ids in groups.values():
+        if len(ids) < 2:
+            continue
+        if len(ids) == 2 and frozenset(ids) in dismissed_pairs:
+            continue
+        active_ids = []
+        for eid in ids:
+            is_dismissed = any(
+                frozenset({eid, other}) in dismissed_pairs
+                for other in ids if other != eid
+            )
+            if not is_dismissed:
+                active_ids.append(eid)
+        if len(active_ids) >= 2:
+            duplicate_ids.update(active_ids)
+
+    return list(duplicate_ids)
+
+
+@router.get("/duplicate-scan")
+def scan_duplicates(
+    project: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Lightweight duplicate scan for a project.
+    Returns expense_ids that have potential duplicates, excluding dismissed pairs
+    and review-status expenses.  The frontend uses this to highlight rows.
+    """
+    try:
+        return {"duplicate_ids": _compute_duplicate_ids(project)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error scanning duplicates: {str(e)}")
 
 
 # ====== EXPORT ======

@@ -1096,10 +1096,21 @@ async def get_failed_commands_stats_endpoint(
 
         from api.supabase_client import supabase
 
+        # Load non-destructive reset timestamp (if any)
+        since_override = None
+        try:
+            reset_row = supabase.table("agent_config").select("value").eq("key", "arturito_stats_reset_at").execute()
+            if reset_row.data:
+                raw = reset_row.data[0]["value"]
+                since_override = json.loads(raw) if raw.startswith('"') else raw
+        except Exception:
+            pass
+
         stats = await get_failed_commands_stats(
             supabase=supabase,
             user_id=user_id,
-            days_back=days_back
+            days_back=days_back,
+            since_override=since_override,
         )
 
         return stats

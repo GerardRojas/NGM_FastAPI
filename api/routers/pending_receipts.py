@@ -383,15 +383,32 @@ def get_project_receipts(
 # to prevent FastAPI from matching "/agent-stats" as a receipt_id.
 
 @router.get("/agent-stats")
-def get_agent_stats(current_user: dict = Depends(get_current_user)):
+def get_agent_stats(
+    days: int = Query(30, ge=1, le=365),
+    current_user: dict = Depends(get_current_user),
+):
     """Return aggregate stats for the receipt agent."""
     try:
-        # Get receipts from last 30 days
-        thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).isoformat()
+        # Compute cutoff — respect non-destructive reset timestamp
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        try:
+            reset_row = supabase.table("agent_config").select("value").eq("key", "andrew_stats_reset_at").execute()
+            if reset_row.data:
+                raw = reset_row.data[0]["value"]
+                reset_ts = datetime.fromisoformat(json.loads(raw) if raw.startswith('"') else raw)
+                # Strip tzinfo for safe comparison with naive utcnow()
+                if reset_ts.tzinfo is not None:
+                    reset_ts = reset_ts.replace(tzinfo=None)
+                if reset_ts > cutoff:
+                    cutoff = reset_ts
+        except Exception:
+            pass  # config key missing — use normal cutoff
+
+        cutoff_iso = cutoff.isoformat()
         all_receipts = supabase.table("pending_receipts") \
             .select("id, status, parsed_data, project_id, created_at") \
             .in_("status", ["ready", "linked", "error", "duplicate", "check_review"]) \
-            .gte("created_at", thirty_days_ago) \
+            .gte("created_at", cutoff_iso) \
             .order("created_at", desc=True) \
             .execute()
 
@@ -448,6 +465,7 @@ def get_agent_stats(current_user: dict = Depends(get_current_user)):
             "manual_reviews": manual_reviews,
             "ocr_failures": ocr_failures,
             "error_logs": error_logs,
+            "period_days": days,
         }
 
     except Exception as e:
@@ -532,6 +550,43 @@ def clear_agent_metrics(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         logger.error(f"[agent-metrics] Error clearing metrics: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error clearing metrics: {str(e)}")
+
+
+# ====== NON-DESTRUCTIVE RESET (all agents) ======
+
+_VALID_AGENT_IDS = {"andrew", "daneel", "arturito"}
+
+
+@router.post("/agents/{agent_id}/reset-stats")
+def reset_agent_stats(agent_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Non-destructive stats reset: stores a timestamp in agent_config.
+    All stat queries use MAX(reset_at, cutoff_date) so data is preserved.
+    """
+    if agent_id not in _VALID_AGENT_IDS:
+        raise HTTPException(status_code=400, detail=f"Invalid agent_id. Must be one of: {', '.join(_VALID_AGENT_IDS)}")
+
+    try:
+        config_key = f"{agent_id}_stats_reset_at"
+        now = datetime.utcnow().isoformat()
+        json_val = json.dumps(now)
+
+        existing = supabase.table("agent_config").select("key").eq("key", config_key).execute()
+        if existing.data:
+            supabase.table("agent_config") \
+                .update({"value": json_val, "updated_at": now}) \
+                .eq("key", config_key) \
+                .execute()
+        else:
+            supabase.table("agent_config") \
+                .insert({"key": config_key, "value": json_val, "updated_at": now}) \
+                .execute()
+
+        return {"ok": True, "agent": agent_id, "reset_at": now}
+
+    except Exception as e:
+        logger.error(f"[reset-stats] Error resetting {agent_id} stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error resetting stats: {str(e)}")
 
 
 # ====== VAULT BATCH PROCESSING ======

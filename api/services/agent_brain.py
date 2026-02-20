@@ -964,7 +964,7 @@ async def _builtin_check_budget(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _builtin_check_duplicates(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Scan for duplicate expenses in the project."""
+    """Scan for duplicate expenses in the project (excludes dismissed pairs)."""
     from api.supabase_client import supabase as sb
 
     project_id = params.get("project_id")
@@ -973,14 +973,26 @@ async def _builtin_check_duplicates(params: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         expenses = sb.table("expenses_manual_COGS") \
-            .select("expense_id, Amount, TxnDate, vendor_id, LineDescription") \
+            .select("expense_id, Amount, TxnDate, vendor_id, LineDescription, status") \
             .eq("project", project_id) \
+            .neq("status", "review") \
             .order("TxnDate", desc=True) \
             .limit(500) \
             .execute()
 
         if not expenses.data:
             return {"message": "No expenses found.", "duplicates": []}
+
+        # Load dismissed pairs for this project's expenses
+        dismissed_pairs: set = set()
+        try:
+            dismissed_result = sb.table("dismissed_expense_duplicates") \
+                .select("expense_id_1, expense_id_2") \
+                .execute()
+            for dp in (dismissed_result.data or []):
+                dismissed_pairs.add(frozenset({dp["expense_id_1"], dp["expense_id_2"]}))
+        except Exception:
+            pass
 
         # Group by (amount, vendor_id, date) to find potential duplicates
         groups: Dict[str, list] = {}
@@ -990,14 +1002,19 @@ async def _builtin_check_duplicates(params: Dict[str, Any]) -> Dict[str, Any]:
 
         duplicates = []
         for key, group in groups.items():
-            if len(group) >= 2:
-                duplicates.append({
-                    "count": len(group),
-                    "amount": group[0].get("Amount"),
-                    "date": (group[0].get("TxnDate") or "")[:10],
-                    "expense_ids": [e.get("expense_id") for e in group],
-                    "descriptions": [e.get("LineDescription", "")[:40] for e in group],
-                })
+            if len(group) < 2:
+                continue
+            # Filter out pairs that have been dismissed
+            ids = [e.get("expense_id") for e in group]
+            if len(ids) == 2 and frozenset(ids) in dismissed_pairs:
+                continue
+            duplicates.append({
+                "count": len(group),
+                "amount": group[0].get("Amount"),
+                "date": (group[0].get("TxnDate") or "")[:10],
+                "expense_ids": ids,
+                "descriptions": [e.get("LineDescription", "")[:40] for e in group],
+            })
 
         return {
             "total_expenses_scanned": len(expenses.data),
