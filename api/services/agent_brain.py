@@ -973,7 +973,7 @@ async def _builtin_check_duplicates(params: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         expenses = sb.table("expenses_manual_COGS") \
-            .select("expense_id, Amount, TxnDate, vendor_id, LineDescription, status") \
+            .select("expense_id, Amount, TxnDate, vendor_id, LineDescription, bill_id, account_id, status") \
             .eq("project", project_id) \
             .neq("status", "review") \
             .order("TxnDate", desc=True) \
@@ -1008,12 +1008,38 @@ async def _builtin_check_duplicates(params: Dict[str, Any]) -> Dict[str, Any]:
             ids = [e.get("expense_id") for e in group]
             if len(ids) == 2 and frozenset(ids) in dismissed_pairs:
                 continue
+            # Filter out same-bill line items with different descriptions or accounts
+            real_dups = []
+            for e in group:
+                is_just_line_item = True
+                for other in group:
+                    if other.get("expense_id") == e.get("expense_id"):
+                        continue
+                    if frozenset({e.get("expense_id"), other.get("expense_id")}) in dismissed_pairs:
+                        continue
+                    b1 = (e.get("bill_id") or "").strip()
+                    b2 = (other.get("bill_id") or "").strip()
+                    d1 = (e.get("LineDescription") or "").strip().lower()
+                    d2 = (other.get("LineDescription") or "").strip().lower()
+                    a1 = e.get("account_id") or ""
+                    a2 = other.get("account_id") or ""
+                    same_bill = b1 and b2 and b1 == b2
+                    diff_desc = d1 and d2 and d1 != d2
+                    diff_acct = a1 and a2 and a1 != a2
+                    if same_bill and (diff_desc or diff_acct):
+                        continue
+                    is_just_line_item = False
+                    break
+                if not is_just_line_item:
+                    real_dups.append(e)
+            if len(real_dups) < 2:
+                continue
             duplicates.append({
-                "count": len(group),
-                "amount": group[0].get("Amount"),
-                "date": (group[0].get("TxnDate") or "")[:10],
-                "expense_ids": ids,
-                "descriptions": [e.get("LineDescription", "")[:40] for e in group],
+                "count": len(real_dups),
+                "amount": real_dups[0].get("Amount"),
+                "date": (real_dups[0].get("TxnDate") or "")[:10],
+                "expense_ids": [e.get("expense_id") for e in real_dups],
+                "descriptions": [e.get("LineDescription", "")[:40] for e in real_dups],
             })
 
         return {

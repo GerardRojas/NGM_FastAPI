@@ -559,6 +559,15 @@ def check_duplicate(
         if exp_account_id and oth_account_id and exp_account_id != oth_account_id:
             continue
 
+        # ------ R2b: Same bill + different descriptions = separate line items ------
+        # Two expenses on the same invoice with different product descriptions
+        # are distinct line items, not duplicates (e.g. multiple items from Home Depot).
+        desc_sim = string_similarity(exp_desc, oth_desc) if (exp_desc and oth_desc) else 100.0
+        if (exp_bill and oth_bill
+                and string_similarity(exp_bill, oth_bill) >= 90
+                and desc_sim < fuzzy_thresh):
+            continue
+
         # ------ R5: Recurring labor payment ------
         if (same_amount and diff_date
                 and (is_labor or oth_is_labor)
@@ -579,10 +588,11 @@ def check_duplicate(
                 and (is_check or oth_is_check)):
             continue
 
-        # ------ R3: Identical purchase (same date + same bill) ------
+        # ------ R3: Identical purchase (same date + same bill + similar desc) ------
         if (same_amount and same_date
                 and exp_bill and oth_bill
-                and string_similarity(exp_bill, oth_bill) >= 90):
+                and string_similarity(exp_bill, oth_bill) >= 90
+                and desc_sim >= fuzzy_thresh):
             return DuplicateResult(
                 verdict="duplicate",
                 rule="R3",

@@ -807,11 +807,12 @@ def reactivate_duplicate_alert(dismissal_id: str, user_id: str, current_user: di
 def _compute_duplicate_ids(project_id: str) -> list:
     """
     Compute expense IDs with potential duplicates for a project.
-    Excludes dismissed pairs and review-status expenses.
+    Excludes dismissed pairs, review-status expenses, and same-bill
+    line items that have different descriptions or accounts.
     Used by both the /duplicate-scan endpoint and the dismiss response.
     """
     expenses = supabase.table("expenses_manual_COGS") \
-        .select("expense_id, Amount, TxnDate, vendor_id") \
+        .select("expense_id, Amount, TxnDate, vendor_id, bill_id, LineDescription, account_id") \
         .eq("project", project_id) \
         .neq("status", "review") \
         .order("TxnDate", desc=True) \
@@ -820,6 +821,9 @@ def _compute_duplicate_ids(project_id: str) -> list:
 
     if not expenses.data:
         return []
+
+    # Build lookup for quick access
+    exp_map = {e["expense_id"]: e for e in expenses.data if e.get("expense_id")}
 
     # Load dismissed pairs
     dismissed_pairs: set = set()
@@ -838,21 +842,49 @@ def _compute_duplicate_ids(project_id: str) -> list:
         key = f"{exp.get('Amount')}|{exp.get('vendor_id')}|{(exp.get('TxnDate') or '')[:10]}"
         groups.setdefault(key, []).append(exp.get("expense_id"))
 
-    # Build result — exclude dismissed pairs
+    # Build result — exclude dismissed pairs and same-bill line items
     duplicate_ids: set = set()
     for ids in groups.values():
         if len(ids) < 2:
             continue
         if len(ids) == 2 and frozenset(ids) in dismissed_pairs:
             continue
+
+        # Filter out pairs that are clearly separate line items on the same bill
         active_ids = []
         for eid in ids:
             is_dismissed = any(
                 frozenset({eid, other}) in dismissed_pairs
                 for other in ids if other != eid
             )
-            if not is_dismissed:
+            if is_dismissed:
+                continue
+            # Check if ALL other expenses in the group are same-bill line items
+            is_only_same_bill_items = True
+            for other_id in ids:
+                if other_id == eid:
+                    continue
+                if frozenset({eid, other_id}) in dismissed_pairs:
+                    continue
+                e1 = exp_map.get(eid, {})
+                e2 = exp_map.get(other_id, {})
+                bill1 = (e1.get("bill_id") or "").strip()
+                bill2 = (e2.get("bill_id") or "").strip()
+                desc1 = (e1.get("LineDescription") or "").strip().lower()
+                desc2 = (e2.get("LineDescription") or "").strip().lower()
+                acct1 = e1.get("account_id") or ""
+                acct2 = e2.get("account_id") or ""
+                # Same bill + (different description OR different account) = line items
+                same_bill = bill1 and bill2 and bill1 == bill2
+                diff_desc = desc1 and desc2 and desc1 != desc2
+                diff_acct = acct1 and acct2 and acct1 != acct2
+                if same_bill and (diff_desc or diff_acct):
+                    continue  # this pair is separate line items
+                is_only_same_bill_items = False
+                break
+            if not is_only_same_bill_items:
                 active_ids.append(eid)
+
         if len(active_ids) >= 2:
             duplicate_ids.update(active_ids)
 
