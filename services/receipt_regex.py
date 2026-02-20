@@ -839,6 +839,10 @@ def assemble_scan_result(
 # ── Vendor detection ──────────────────────────────────────────
 
 _VENDOR_SIGNATURES = {
+    'home_depot_receipt': [
+        r'Customer\s+Receipt.*Sales\s+Person',
+        r'Order\s*#\s*H\d{4}-\d{5,}',
+    ],
     'home_depot': [
         r'HOME\s+DEPOT',
         r'SPECIAL\s+SERVICES\s+CUSTOMER\s+INVOICE',
@@ -977,6 +981,204 @@ def _parse_home_depot(text: str) -> dict:
 
     if subtotal_parts:
         meta['subtotal'] = round(sum(subtotal_parts), 2)
+
+    meta['items_sum'] = round(sum(i['amount'] for i in meta['line_items']), 2)
+    meta['confidence'] = _compute_confidence(meta)
+    return meta
+
+
+# ── Home Depot Customer Receipt parser ───────────────────────
+
+# Match item start: "## DESCRIPTION N/A SKU ..."
+_HDR_ITEM_RE = re.compile(
+    r'^(\d{2})\s+'          # Item number (01-99)
+    r'(.+?)\s+'             # Description (lazy, stops before N/A)
+    r'N/A\s+'               # Model # column (always N/A)
+    r'(\d{3,})',            # SKU (3+ digits)
+)
+
+# Fee lines that should be captured as separate items
+_HDR_FEE_RE = re.compile(
+    r'^((?:PAINTCARE|HAZMAT|ENV(?:IRONMENTAL)?|RECYCLING)\s+FEE\b.+?)\s+(\d{5,})\s+',
+    re.IGNORECASE,
+)
+
+# Lines to skip inside an item block (not description continuation)
+_HDR_SKIP_RE = re.compile(
+    r'^(?:DISCOUNT|PREFERRED\s+PRICING|Page\s+\d|Customer\s+Receipt|'
+    r'#\s+Item\s+Description|Store\s+#|Sales\s+Person)',
+    re.IGNORECASE,
+)
+
+# Lines that mark the end of the items section
+_HDR_STOP_RE = re.compile(
+    r'^(?:Subtotal|Discounts?|Sales\s+Tax|Order\s+Total|Balance|'
+    r'90\s+DAY\s+RETURN|Pro\s+Xtra|Payment\s+Method|Member\s+Statement)',
+    re.IGNORECASE,
+)
+
+
+def _parse_home_depot_receipt(text: str) -> dict:
+    """Parse Home Depot Customer Receipt format (in-store / carryout).
+
+    Layout (pdfplumber):
+      ## Description  N/A  SKU  $UnitPrice / unit  Qty  $Subtotal
+      (continuation lines for wrapped descriptions)
+      DISCOUNT / PREFERRED PRICING lines (skipped)
+      PAINTCARE FEE lines (separate item)
+
+    Totals section:
+      Subtotal  $X  (pre-discount)
+      Discounts -$X
+      Sales Tax $X
+      Order Total $X
+    """
+    lines = text.split('\n')
+    meta = {
+        'grand_total': None, 'subtotal': None,
+        'tax_amount': None, 'tax_label': None,
+        'date': None, 'bill_id': None,
+        'payment_hints': [], 'line_items': [],
+        'items_sum': 0, 'vendor_detected': 'home_depot_receipt',
+    }
+
+    # ── Bill ID: "Order # H####-######" ──
+    for line in lines:
+        m = re.search(r'Order\s*#\s*(H\d{4}-\d{5,7})', line)
+        if m:
+            meta['bill_id'] = m.group(1)
+            break
+
+    # ── Date: "M/DD/YYYY" in header (first 5 lines) ──
+    for line in lines[:5]:
+        m = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', line)
+        if m:
+            mo, dy, yr = m.group(1), m.group(2), m.group(3)
+            if 1 <= int(mo) <= 12 and 1 <= int(dy) <= 31:
+                meta['date'] = f"{yr}-{mo.zfill(2)}-{dy.zfill(2)}"
+                break
+
+    # ── Payment hints ──
+    meta['payment_hints'] = _extract_payment_hints(text)
+
+    # ── Phase 1: find all item start lines & fee lines ──
+    item_starts = []   # (line_idx, item_num, desc, sku, subtotal)
+    fee_items = []     # (line_idx, desc, amount)
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Numbered item: "## DESC N/A SKU $price ... $subtotal"
+        m = _HDR_ITEM_RE.match(stripped)
+        if m and '$' in stripped:
+            item_num = int(m.group(1))
+            desc = m.group(2).strip()
+            sku = m.group(3)
+            amts = _AMT_RE.findall(stripped)
+            if amts:
+                subtotal = _parse_amt(amts[-1])
+                item_starts.append((idx, item_num, desc, sku, subtotal))
+            continue
+
+        # Fee line: "PAINTCARE FEE 1GL-2GL SKU $price / unit qty $subtotal"
+        fm = _HDR_FEE_RE.match(stripped)
+        if fm and '$' in stripped:
+            fee_desc = fm.group(1).strip()
+            amts = _AMT_RE.findall(stripped)
+            if amts:
+                fee_items.append((idx, fee_desc, _parse_amt(amts[-1])))
+
+    # ── Phase 2: build items with description continuations ──
+    # Precompute set of all item/fee start indices for boundary detection
+    boundary_indices = set(s[0] for s in item_starts)
+    boundary_indices.update(f[0] for f in fee_items)
+
+    for pos, (idx, item_num, desc, sku, subtotal) in enumerate(item_starts):
+        # Walk subsequent lines for description continuation
+        for j in range(idx + 1, min(idx + 7, len(lines))):
+            cont = lines[j].strip()
+            if not cont:
+                continue
+
+            # Stop at next item, fee, or totals section
+            if j in boundary_indices:
+                break
+            if _HDR_STOP_RE.match(cont):
+                break
+
+            # Skip non-description lines
+            if _HDR_SKIP_RE.match(cont):
+                continue
+            # Skip date-only lines (page headers)
+            if re.match(r'^\d{1,2}/\d{1,2}/\d{4}', cont):
+                continue
+
+            # Pure text continuation (no dollar amounts)
+            if '$' not in cont:
+                desc += ' ' + cont
+                continue
+
+            # Mixed: text before first $ is description, rest is pricing
+            dollar_pos = cont.find('$')
+            text_before = cont[:dollar_pos].strip()
+            if text_before:
+                desc += ' ' + text_before
+
+        # Clean description
+        desc = re.sub(r'-\s+', '-', desc)      # "1000- Pack" → "1000-Pack"
+        desc = re.sub(r'\s{2,}', ' ', desc).strip()
+
+        # Extract quantity: last "QTY $SUBTOTAL" pattern on the item line
+        qty = 1
+        qty_m = re.search(r'\b(\d+)\s+\$[\d,.]+\.\d{2}\s*$', lines[idx].strip())
+        if qty_m:
+            potential_qty = int(qty_m.group(1))
+            if 1 <= potential_qty <= 999:
+                qty = potential_qty
+
+        item_desc = f"{qty}x {desc}" if qty > 1 else desc
+        meta['line_items'].append({
+            'description': item_desc,
+            'amount': subtotal,
+            'sku': sku,
+        })
+
+    # Add fee items
+    for _, fee_desc, fee_amount in fee_items:
+        meta['line_items'].append({
+            'description': fee_desc,
+            'amount': fee_amount,
+        })
+
+    # ── Phase 3: totals ──
+    receipt_subtotal = None
+    discount = 0
+
+    for line in lines:
+        stripped = line.strip()
+        upper = stripped.upper()
+
+        if re.match(r'^SUBTOTAL\b', upper) and 'MERCHANDISE' not in upper:
+            amts = _find_amounts(line)
+            if amts:
+                receipt_subtotal = amts[-1]
+        elif re.match(r'^DISCOUNTS?\b', upper):
+            amts = _AMT_RE.findall(line)
+            if amts:
+                discount = _parse_amt(amts[0])
+        elif re.match(r'^SALES\s+TAX\b', upper):
+            amts = _find_amounts(line)
+            if amts:
+                meta['tax_amount'] = amts[-1]
+                meta['tax_label'] = 'SALES TAX'
+        elif 'ORDER TOTAL' in upper:
+            amts = _find_amounts(line)
+            if amts:
+                meta['grand_total'] = amts[-1]
+
+    # Net subtotal = receipt subtotal - discounts (for cross-validation)
+    if receipt_subtotal is not None:
+        meta['subtotal'] = round(receipt_subtotal - discount, 2)
 
     meta['items_sum'] = round(sum(i['amount'] for i in meta['line_items']), 2)
     meta['confidence'] = _compute_confidence(meta)
@@ -1551,6 +1753,7 @@ def extract_filename_hints(filename: Optional[str]) -> dict:
 # ── Best extraction orchestrator ──────────────────────────────
 
 _VENDOR_PARSERS = {
+    'home_depot_receipt': _parse_home_depot_receipt,
     'home_depot': _parse_home_depot,
     'wayfair': _parse_wayfair,
     'sf_transport': _parse_sf_transport,

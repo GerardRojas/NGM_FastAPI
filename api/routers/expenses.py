@@ -9,6 +9,7 @@ import asyncio
 import io
 import json
 import logging
+import time
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -23,6 +24,19 @@ router = APIRouter(prefix="/expenses", tags=["Expenses"])
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 1000
+_TRANSIENT_RETRIES = 3  # retries for Errno 11 / connection pool exhaustion
+
+
+def _retry_transient(fn, retries=_TRANSIENT_RETRIES):
+    """Execute *fn()* with retries on transient socket errors (Errno 11)."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            if "Resource temporarily unavailable" in str(exc) and attempt < retries - 1:
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            raise
 
 
 def _bg_insert(table_name: str, data, label: str = ""):
@@ -373,10 +387,13 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                 if user_id:
                     update_data["updated_by"] = user_id
 
-                # Actualizar el gasto
-                res = supabase.table("expenses_manual_COGS").update(update_data).eq(
-                    "expense_id", item.expense_id
-                ).execute()
+                # Actualizar el gasto (retry on Errno 11)
+                _eid = item.expense_id
+                res = _retry_transient(
+                    lambda: supabase.table("expenses_manual_COGS").update(update_data).eq(
+                        "expense_id", _eid
+                    ).execute()
+                )
 
                 if res.data:
                     updated.append(res.data[0])
@@ -1004,8 +1021,10 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
     - change_reason: Optional reason for changes (e.g., "Client correction", "Categorization error")
     """
     try:
-        # Verificar que el gasto existe y obtener datos actuales
-        existing_resp = supabase.table("expenses_manual_COGS").select("*").eq("expense_id", expense_id).single().execute()
+        # Verificar que el gasto existe y obtener datos actuales (retry on Errno 11)
+        existing_resp = _retry_transient(
+            lambda: supabase.table("expenses_manual_COGS").select("*").eq("expense_id", expense_id).single().execute()
+        )
         if not existing_resp.data:
             raise HTTPException(status_code=404, detail="Expense not found")
 
@@ -1087,8 +1106,10 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         if user_id:
             data["updated_by"] = user_id
 
-        # Actualizar
-        res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
+        # Actualizar (retry on Errno 11)
+        res = _retry_transient(
+            lambda: supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
+        )
 
         # Trigger Daneel re-check when bill_id or receipt_url is updated on a pending expense
         updated_exp = res.data[0] if res.data else {}
