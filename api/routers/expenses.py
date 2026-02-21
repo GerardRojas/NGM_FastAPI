@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from api.supabase_client import supabase
 from api.auth import get_current_user
 from typing import Optional, List
@@ -9,10 +9,11 @@ import asyncio
 import io
 import json
 import logging
+import math
 import time
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
 import pandas as pd
 from services.receipt_scanner import (
     extract_text_from_pdf as _extract_text_from_pdf,
@@ -49,8 +50,15 @@ def _bg_insert(table_name: str, data, label: str = ""):
 
 # ====== MODELOS ======
 
+class ExpenseStatusEnum(str, Enum):
+    """Valores validos para el campo status de un expense."""
+    pending = "pending"
+    auth    = "auth"
+    review  = "review"
+
+
 def _validate_uuid_or_none(v, field_name=''):
-    """Validate string is a valid UUID; return None if empty/invalid."""
+    """Validate string is a valid UUID; raise ValueError if non-empty but invalid."""
     if v is None:
         return None
     if isinstance(v, str):
@@ -61,20 +69,59 @@ def _validate_uuid_or_none(v, field_name=''):
             _uuid.UUID(stripped)
             return stripped
         except (ValueError, AttributeError):
-            print(f"[VALIDATION] Invalid UUID for {field_name}: {repr(v)}")
-            return None
+            raise ValueError(f"{field_name} must be a valid UUID, got: {repr(v)}")
     return v
+
+
+def _validate_amount(v):
+    """Validate Amount is a finite positive number within business range."""
+    if v is None:
+        return None
+    if not isinstance(v, (int, float)):
+        raise ValueError("Amount must be a number")
+    if math.isnan(v) or math.isinf(v):
+        raise ValueError("Amount cannot be NaN or Infinity")
+    if v < 0:
+        raise ValueError("Amount cannot be negative")
+    if v > 999_999.99:
+        raise ValueError("Amount cannot exceed 999,999.99")
+    return round(v, 2)
+
+
+def _validate_txn_date(v):
+    """Validate TxnDate is a valid ISO-8601 date string (YYYY-MM-DD or full ISO)."""
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise ValueError("TxnDate must be a string in ISO format (YYYY-MM-DD)")
+    stripped = v.strip()
+    if stripped == '':
+        return None
+    try:
+        # Accept YYYY-MM-DD or full ISO datetime
+        if len(stripped) == 10:
+            date.fromisoformat(stripped)
+        else:
+            datetime.fromisoformat(stripped.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        raise ValueError(f"TxnDate must be ISO format (YYYY-MM-DD), got: {repr(v)}")
+    return stripped
+
+
+def _escape_like(s: str) -> str:
+    """Escape SQL LIKE wildcard characters (%, _) for safe ilike queries."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class ExpenseCreate(BaseModel):
     project: str  # UUID del proyecto
     txn_type: Optional[str] = None  # UUID del tipo de transacción
     TxnDate: Optional[str] = None  # Fecha en formato ISO
-    bill_id: Optional[str] = None  # Invoice/Bill number (TEXT, not UUID)
+    bill_id: Optional[str] = Field(None, max_length=500)  # Invoice/Bill number (TEXT)
     vendor_id: Optional[str] = None  # UUID del vendor
     payment_type: Optional[str] = None  # UUID del método de pago
     Amount: Optional[float] = None
-    LineDescription: Optional[str] = None
+    LineDescription: Optional[str] = Field(None, max_length=5000)
     TxnId_QBO: Optional[str] = None
     LineUID: Optional[str] = None
     show_on_reports: Optional[bool] = None
@@ -94,6 +141,16 @@ class ExpenseCreate(BaseModel):
                 raise ValueError(f'project must be a valid UUID, got: {repr(v)}')
         return v
 
+    @field_validator('Amount', mode='before')
+    @classmethod
+    def validate_amount(cls, v):
+        return _validate_amount(v)
+
+    @field_validator('TxnDate', mode='before')
+    @classmethod
+    def validate_txn_date(cls, v):
+        return _validate_txn_date(v)
+
     @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'created_by', mode='before')
     @classmethod
     def uuid_field_validate(cls, v, info):
@@ -109,17 +166,17 @@ class ExpenseCreate(BaseModel):
 
 class ExpenseBatchCreate(BaseModel):
     """Modelo para crear múltiples gastos en una sola llamada"""
-    expenses: List[ExpenseCreate]
+    expenses: List[ExpenseCreate] = Field(..., max_length=500)
 
 
 class ExpenseUpdate(BaseModel):
     txn_type: Optional[str] = None
     TxnDate: Optional[str] = None
-    bill_id: Optional[str] = None  # Invoice/Bill number (TEXT, not UUID)
+    bill_id: Optional[str] = Field(None, max_length=500)
     vendor_id: Optional[str] = None
     payment_type: Optional[str] = None
     Amount: Optional[float] = None
-    LineDescription: Optional[str] = None
+    LineDescription: Optional[str] = Field(None, max_length=5000)
     TxnId_QBO: Optional[str] = None
     LineUID: Optional[str] = None
     show_on_reports: Optional[bool] = None
@@ -128,8 +185,18 @@ class ExpenseUpdate(BaseModel):
     auth_status: Optional[bool] = None
     auth_by: Optional[str] = None
     receipt_url: Optional[str] = None  # URL del recibo/factura en Storage
-    status: Optional[str] = None  # 'pending', 'auth', 'review' - for auto-review on field changes
-    status_reason: Optional[str] = None  # Reason for status change (used with auto-review)
+    status: Optional[ExpenseStatusEnum] = None
+    status_reason: Optional[str] = Field(None, max_length=1000)
+
+    @field_validator('Amount', mode='before')
+    @classmethod
+    def validate_amount(cls, v):
+        return _validate_amount(v)
+
+    @field_validator('TxnDate', mode='before')
+    @classmethod
+    def validate_txn_date(cls, v):
+        return _validate_txn_date(v)
 
     @field_validator('txn_type', 'vendor_id', 'payment_type', 'account_id', 'auth_by', mode='before')
     @classmethod
@@ -152,7 +219,7 @@ class ExpenseUpdateItem(BaseModel):
 
 class ExpenseBatchUpdate(BaseModel):
     """Modelo para actualizar múltiples gastos en una sola llamada"""
-    updates: List[ExpenseUpdateItem]
+    updates: List[ExpenseUpdateItem] = Field(..., max_length=500)
 
 
 # ====== HELPERS ======
@@ -470,14 +537,20 @@ def list_expenses(project: Optional[str] = None, limit: Optional[int] = None, cu
     """
     Lista todos los gastos, opcionalmente filtrados por project.
     Incluye información de tipo de transacción, proyecto, vendor, etc.
-    Si no se especifica limit, devuelve todos los gastos.
+    Si no se especifica limit, devuelve todos los gastos (capped a 50000).
     """
     try:
         # Obtener los gastos — paginar para superar límite de 1000 de Supabase
         raw_expenses: list = []
         page_size = 1000
         offset = 0
-        effective_limit = limit  # None = sin límite = traer todos
+        # Cap limit to avoid DoS via memory exhaustion
+        if limit is not None:
+            if limit < 1:
+                raise HTTPException(status_code=400, detail="limit must be >= 1")
+            effective_limit = min(limit, 50000)
+        else:
+            effective_limit = None  # sin limite explicito, pero el loop pagina
 
         while True:
             query = supabase.table("expenses_manual_COGS").select("*")
@@ -554,7 +627,7 @@ def list_all_expenses(limit: Optional[int] = 1000, current_user: dict = Depends(
         # Paginated fetch to avoid Supabase 1000-row silent truncation
         raw_expenses = []
         offset = 0
-        max_rows = limit or 10000
+        max_rows = min(limit or 10000, 50000)  # hard cap to prevent DoS
         while offset < max_rows:
             page_end = min(offset + _PAGE_SIZE, max_rows) - 1
             resp = (
@@ -748,6 +821,10 @@ def dismiss_duplicate_pair(
     so the frontend can remove highlights immediately without reloading.
     """
     try:
+        # Validar que no sea self-duplicate
+        if payload.expense_id_1 == payload.expense_id_2:
+            raise HTTPException(status_code=400, detail="expense_id_1 and expense_id_2 must be different")
+
         # Ordenar IDs para consistencia
         id1, id2 = sorted([payload.expense_id_1, payload.expense_id_2])
 
@@ -957,7 +1034,7 @@ def export_expenses(
             if date_to:
                 query = query.lte("TxnDate", date_to)
             if search:
-                query = query.ilike("LineDescription", f"%{search}%")
+                query = query.ilike("LineDescription", f"%{_escape_like(search)}%")
 
             query = query.order("TxnDate", desc=True)
             query = query.range(offset, offset + _PAGE_SIZE - 1)
@@ -1226,9 +1303,9 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         status_changed = False
 
         if new_status:
-            valid_statuses = ['pending', 'auth', 'review']
-            if new_status not in valid_statuses:
-                raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
+            # ExpenseStatusEnum ya valida en Pydantic; extraer valor string
+            new_status = new_status.value if hasattr(new_status, 'value') else new_status
+            data["status"] = new_status
 
             if new_status != current_status:
                 status_changed = True
@@ -1394,8 +1471,8 @@ def delete_expense(expense_id: str, user_id: Optional[str] = None, delete_reason
 # ====== STATUS MANAGEMENT ======
 
 class ExpenseStatusUpdate(BaseModel):
-    status: str  # 'pending', 'auth', 'review'
-    reason: Optional[str] = None
+    status: ExpenseStatusEnum
+    reason: Optional[str] = Field(None, max_length=1000)
     metadata: Optional[dict] = None
 
 
@@ -1420,13 +1497,8 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
         Updated expense with log entry
     """
     try:
-        # Validate status
-        valid_statuses = ['pending', 'auth', 'review']
-        if payload.status not in valid_statuses:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
-            )
+        # ExpenseStatusEnum ya valida via Pydantic; extraer string
+        status_value = payload.status.value if hasattr(payload.status, 'value') else payload.status
 
         # Get current expense data
         expense_resp = supabase.table("expenses_manual_COGS").select(
@@ -1440,7 +1512,7 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
         old_status = current_expense.get("status") or ("auth" if current_expense.get("auth_status") else "pending")
 
         # Permission check for 'review' status
-        if payload.status == 'review':
+        if status_value == 'review':
             user_resp = supabase.table("users").select(
                 "user_id, rols!users_user_rol_fkey(rol_name)"
             ).eq("user_id", user_id).single().execute()
@@ -1460,13 +1532,13 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
                 )
 
         # Update expense status
-        update_data = {"status": payload.status, "updated_by": user_id}
+        update_data = {"status": status_value, "updated_by": user_id}
 
         # Also update legacy auth_status for backwards compatibility
-        if payload.status == 'auth':
+        if status_value == 'auth':
             update_data["auth_status"] = True
             update_data["auth_by"] = user_id
-        elif payload.status == 'pending':
+        elif status_value == 'pending':
             update_data["auth_status"] = False
             update_data["auth_by"] = None
 
@@ -1478,7 +1550,7 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
         log_data = {
             "expense_id": expense_id,
             "old_status": old_status,
-            "new_status": payload.status,
+            "new_status": status_value,
             "changed_by": user_id,
             "reason": payload.reason,
             "metadata": payload.metadata or {}
@@ -1487,7 +1559,7 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
         supabase.table("expense_status_log").insert(log_data).execute()
 
         # Trigger budget check when expense is authorized
-        if payload.status == 'auth':
+        if status_value == 'auth':
             project_id = current_expense.get("project")
             if project_id:
                 from api.services.budget_monitor import trigger_project_budget_check
@@ -1497,7 +1569,7 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
             "message": "Status updated successfully",
             "expense_id": expense_id,
             "old_status": old_status,
-            "new_status": payload.status,
+            "new_status": status_value,
             "logged": True
         }
 
@@ -1857,20 +1929,36 @@ def get_expenses_summary_by_project(current_user: dict = Depends(get_current_use
 
 
 
+class AutoCategorizeRequest(BaseModel):
+    """Modelo tipado para auto-categorización de gastos."""
+    stage: str = Field(..., min_length=1, max_length=200)
+    expenses: List[dict] = Field(..., min_length=1, max_length=500)
+    project_id: Optional[str] = None
+
+    @field_validator('stage', mode='before')
+    @classmethod
+    def stage_not_blank(cls, v):
+        if isinstance(v, str) and not v.strip():
+            raise ValueError("stage cannot be empty or whitespace")
+        return v.strip() if isinstance(v, str) else v
+
+    @field_validator('project_id', mode='before')
+    @classmethod
+    def validate_project_id(cls, v):
+        return _validate_uuid_or_none(v, 'project_id')
+
+
 @router.post("/auto-categorize")
-async def auto_categorize_expenses(payload: dict, current_user: dict = Depends(get_current_user)):
+async def auto_categorize_expenses(payload: AutoCategorizeRequest, current_user: dict = Depends(get_current_user)):
     """
     Auto-categorizes expenses using GPT-4 based on construction stage and description.
     Delegates to shared service: services/receipt_scanner.auto_categorize()
     Now includes caching and feedback loop support.
     """
     try:
-        stage = payload.get("stage")
-        expenses = payload.get("expenses", [])
-        project_id = payload.get("project_id")  # Optional for feedback loop
-
-        if not stage or not expenses:
-            raise HTTPException(status_code=400, detail="Missing stage or expenses")
+        stage = payload.stage
+        expenses = payload.expenses
+        project_id = payload.project_id
 
         # Read GPT fallback threshold from agent_config (DB-persisted)
         _min_conf = 60
@@ -1902,57 +1990,61 @@ async def auto_categorize_expenses(payload: dict, current_user: dict = Depends(g
         raise HTTPException(status_code=500, detail=f"Error auto-categorizing expenses: {str(e)}")
 
 
+class CategorizationCorrectionRequest(BaseModel):
+    """Modelo tipado para correcciones de categorización."""
+    project_id: str
+    user_id: str
+    description: str = Field(..., min_length=1, max_length=2000)
+    construction_stage: str = Field(..., min_length=1, max_length=200)
+    corrected_account_id: str
+    corrected_account_name: str = Field(..., min_length=1, max_length=500)
+    expense_id: Optional[str] = None
+    original_account_id: Optional[str] = None
+    original_account_name: Optional[str] = Field(None, max_length=500)
+    original_confidence: Optional[int] = Field(None, ge=0, le=100)
+    correction_reason: Optional[str] = Field(None, max_length=1000)
+
+    @field_validator('project_id', 'user_id', 'corrected_account_id', mode='before')
+    @classmethod
+    def validate_required_uuids(cls, v, info):
+        if not v or (isinstance(v, str) and not v.strip()):
+            raise ValueError(f"{info.field_name} is required")
+        return _validate_uuid_or_none(v, info.field_name) or v
+
+    @field_validator('expense_id', 'original_account_id', mode='before')
+    @classmethod
+    def validate_optional_uuids(cls, v, info):
+        return _validate_uuid_or_none(v, info.field_name)
+
+
 @router.post("/categorization-correction")
-async def save_categorization_correction(payload: dict, current_user: dict = Depends(get_current_user)):
+async def save_categorization_correction(payload: CategorizationCorrectionRequest, current_user: dict = Depends(get_current_user)):
     """
     Save a user correction to auto-categorization for feedback loop.
     This helps improve future categorizations by learning from user corrections.
-
-    Expected payload:
-    {
-        "project_id": "uuid",
-        "expense_id": "uuid",  # optional
-        "description": "Item description",
-        "construction_stage": "Framing",
-        "original_account_id": "uuid",
-        "original_account_name": "Materials",
-        "original_confidence": 85,
-        "corrected_account_id": "uuid",
-        "corrected_account_name": "Lumber & Materials",
-        "correction_reason": "Optional reason",  # optional
-        "user_id": "uuid"  # from auth
-    }
     """
     try:
-        required_fields = [
-            "project_id", "description", "construction_stage",
-            "corrected_account_id", "corrected_account_name", "user_id"
-        ]
-        for field in required_fields:
-            if not payload.get(field):
-                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-
         # Insert into categorization_corrections table
         correction_data = {
-            "project_id": payload["project_id"],
-            "user_id": payload["user_id"],
-            "description": payload["description"],
-            "construction_stage": payload["construction_stage"],
-            "corrected_account_id": payload["corrected_account_id"],
-            "corrected_account_name": payload["corrected_account_name"],
+            "project_id": payload.project_id,
+            "user_id": payload.user_id,
+            "description": payload.description,
+            "construction_stage": payload.construction_stage,
+            "corrected_account_id": payload.corrected_account_id,
+            "corrected_account_name": payload.corrected_account_name,
         }
 
         # Optional fields
-        if payload.get("expense_id"):
-            correction_data["expense_id"] = payload["expense_id"]
-        if payload.get("original_account_id"):
-            correction_data["original_account_id"] = payload["original_account_id"]
-        if payload.get("original_account_name"):
-            correction_data["original_account_name"] = payload["original_account_name"]
-        if payload.get("original_confidence"):
-            correction_data["original_confidence"] = payload["original_confidence"]
-        if payload.get("correction_reason"):
-            correction_data["correction_reason"] = payload["correction_reason"]
+        if payload.expense_id:
+            correction_data["expense_id"] = payload.expense_id
+        if payload.original_account_id:
+            correction_data["original_account_id"] = payload.original_account_id
+        if payload.original_account_name:
+            correction_data["original_account_name"] = payload.original_account_name
+        if payload.original_confidence is not None:
+            correction_data["original_confidence"] = payload.original_confidence
+        if payload.correction_reason:
+            correction_data["correction_reason"] = payload.correction_reason
 
         result = supabase.table("categorization_corrections").insert(correction_data).execute()
 

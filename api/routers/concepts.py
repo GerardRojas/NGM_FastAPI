@@ -252,8 +252,16 @@ async def get_concept(concept_id: str):
                 "line_total": (cm["quantity"] or 0) * (cm["unit_cost_override"] or mat_info.get("price_numeric") or 0)
             })
 
-        # Calcular total de materiales
+        # Calcular desglose de costos
         total_materials_cost = sum(m["line_total"] for m in materials)
+        waste_pct    = float(c.get("waste_percent") or 0)
+        overhead_pct = float(c.get("overhead_percentage") or 0)
+        base_cost    = float(c.get("base_cost") or 0)
+        labor_cost   = float(c.get("labor_cost") or 0)
+
+        materials_with_waste = total_materials_cost * (1 + waste_pct / 100)
+        subtotal = materials_with_waste + base_cost + labor_cost
+        total_with_overhead = round(subtotal * (1 + overhead_pct / 100), 2)
 
         return {
             "id": c["id"],
@@ -264,10 +272,10 @@ async def get_concept(concept_id: str):
             "subcategory_id": c["subcategory_id"],
             "class_id": c["class_id"],
             "unit_id": c["unit_id"],
-            "base_cost": c["base_cost"],
-            "labor_cost": c["labor_cost"],
-            "overhead_percentage": c["overhead_percentage"],
-            "waste_percent": c.get("waste_percent", 0),
+            "base_cost": base_cost,
+            "labor_cost": labor_cost,
+            "overhead_percentage": overhead_pct,
+            "waste_percent": waste_pct,
             "calculated_cost": c["calculated_cost"],
             "image": c["image"],
             "notes": c["notes"],
@@ -284,7 +292,18 @@ async def get_concept(concept_id: str):
             # Materiales
             "materials": materials,
             "materials_count": len(materials),
-            "total_materials_cost": total_materials_cost
+            "total_materials_cost": total_materials_cost,
+            # Desglose de costos completo
+            "cost_breakdown": {
+                "materials_raw": total_materials_cost,
+                "waste_amount": round(total_materials_cost * waste_pct / 100, 2),
+                "materials_with_waste": round(materials_with_waste, 2),
+                "base_cost": base_cost,
+                "labor_cost": labor_cost,
+                "subtotal": round(subtotal, 2),
+                "overhead_amount": round(subtotal * overhead_pct / 100, 2),
+                "total": total_with_overhead,
+            },
         }
     except HTTPException:
         raise
@@ -642,26 +661,60 @@ async def remove_material_from_concept(concept_id: str, material_entry_id: str):
 
 async def recalculate_concept_cost(concept_id: str):
     """
-    Recalcula el costo total de materiales de un concepto.
+    Recalcula el costo total de un concepto aplicando waste y overhead.
+
+    Formula (estandar construccion):
+      1. materials_cost        = SUM(qty * unit_cost)
+      2. materials_with_waste  = materials_cost * (1 + waste_percent / 100)
+      3. subtotal              = materials_with_waste + base_cost + labor_cost
+      4. calculated_cost       = subtotal * (1 + overhead_percentage / 100)
     """
     try:
-        # Obtener materiales
-        materials_resp = supabase.table("concept_materials").select("material_id, quantity, unit_cost_override").eq("concept_id", concept_id).execute()
+        # 1. Obtener datos del concepto (waste, overhead, base, labor)
+        concept_resp = (
+            supabase.table("concepts")
+            .select("waste_percent, overhead_percentage, base_cost, labor_cost")
+            .eq("id", concept_id)
+            .single()
+            .execute()
+        )
+        concept = concept_resp.data or {}
+        waste_pct    = float(concept.get("waste_percent") or 0)
+        overhead_pct = float(concept.get("overhead_percentage") or 0)
+        base_cost    = float(concept.get("base_cost") or 0)
+        labor_cost   = float(concept.get("labor_cost") or 0)
 
-        total = 0
+        # 2. Sumar costo de materiales
+        materials_resp = (
+            supabase.table("concept_materials")
+            .select("material_id, quantity, unit_cost_override")
+            .eq("concept_id", concept_id)
+            .execute()
+        )
+
+        materials_cost = 0.0
         for cm in materials_resp.data or []:
             if cm["unit_cost_override"]:
-                unit_cost = cm["unit_cost_override"]
+                unit_cost = float(cm["unit_cost_override"])
             else:
                 mat_resp = supabase.table("materials").select("price_numeric").eq('"ID"', cm["material_id"]).execute()
-                unit_cost = mat_resp.data[0].get("price_numeric", 0) if mat_resp.data else 0
+                unit_cost = float(mat_resp.data[0].get("price_numeric") or 0) if mat_resp.data else 0.0
 
-            total += (cm["quantity"] or 0) * (unit_cost or 0)
+            materials_cost += (float(cm["quantity"] or 0)) * unit_cost
 
-        # Actualizar concepto
-        supabase.table("concepts").update({"calculated_cost": total}).eq("id", concept_id).execute()
+        # 3. Aplicar waste (solo a materiales)
+        materials_with_waste = materials_cost * (1 + waste_pct / 100)
 
-        return total
+        # 4. Sumar base_cost + labor_cost
+        subtotal = materials_with_waste + base_cost + labor_cost
+
+        # 5. Aplicar overhead (al subtotal completo)
+        calculated_cost = round(subtotal * (1 + overhead_pct / 100), 2)
+
+        # 6. Actualizar concepto
+        supabase.table("concepts").update({"calculated_cost": calculated_cost}).eq("id", concept_id).execute()
+
+        return calculated_cost
     except Exception as e:
         logger.error("Error recalculating concept cost: %s", e)
         return 0
