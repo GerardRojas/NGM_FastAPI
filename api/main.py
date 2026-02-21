@@ -90,6 +90,12 @@ from api.routers.categorization_ml import router as categorization_ml_router
 # ========= REPORTING: PDF report generation & Vault storage ==========
 from api.routers.reporting import router as reporting_router
 
+# ========= ANALYTICS: Project dashboards, KPIs, vendor intelligence ==========
+from api.routers.analytics import router as analytics_router
+
+# ========= TIMELINE: Phase & milestone management for projects ==========
+from api.routers.timeline import router as timeline_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -224,6 +230,12 @@ app.include_router(categorization_ml_router)
 
 # Reporting (PDF report generation, Vault storage)
 app.include_router(reporting_router)
+
+# Analytics (Project dashboards, KPIs, vendor intelligence, cost trends)
+app.include_router(analytics_router)
+
+# Timeline (Phase & milestone CRUD for project timelines)
+app.include_router(timeline_router)
 
 _mem_logger = logging.getLogger("memory")
 
