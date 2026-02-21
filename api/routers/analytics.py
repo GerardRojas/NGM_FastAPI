@@ -170,9 +170,9 @@ async def project_health(
     vendor_map: dict[str, str] = {}
     if vendor_ids_in_expenses:
         try:
-            v_resp = supabase.table("Vendors").select("vendor_id, vendor_name").execute()
+            v_resp = supabase.table("Vendors").select("id, vendor_name").execute()
             for v in (v_resp.data or []):
-                vendor_map[str(v.get("vendor_id", ""))] = v.get("vendor_name", "Unknown")
+                vendor_map[str(v.get("id", ""))] = v.get("vendor_name", "Unknown")
         except Exception as exc:
             logger.warning("[analytics:health] vendors fetch: %s", exc)
 
@@ -974,9 +974,9 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
     vendor_name_map: dict[str, str] = {}
     if vendor_agg:
         try:
-            vn_resp = supabase.table("Vendors").select("vendor_id, vendor_name").execute()
+            vn_resp = supabase.table("Vendors").select("id, vendor_name").execute()
             for v in (vn_resp.data or []):
-                vendor_name_map[str(v.get("vendor_id", ""))] = v.get("vendor_name", "Unknown")
+                vendor_name_map[str(v.get("id", ""))] = v.get("vendor_name", "Unknown")
         except Exception as exc:
             logger.warning("[analytics:executive_kpis] vendors fetch: %s", exc)
 
@@ -1019,7 +1019,7 @@ async def vendors_summary(current_user: dict = Depends(get_current_user)):
     # --- Vendors catalog ---
     vendors: list[dict] = []
     try:
-        v_resp = supabase.table("Vendors").select("vendor_id, vendor_name").execute()
+        v_resp = supabase.table("Vendors").select("id, vendor_name").execute()
         vendors = v_resp.data or []
     except Exception as exc:
         logger.error("[analytics:vendors_summary] vendors fetch: %s", exc)
@@ -1027,7 +1027,7 @@ async def vendors_summary(current_user: dict = Depends(get_current_user)):
 
     vendor_map: dict[str, str] = {}
     for v in vendors:
-        vendor_map[str(v.get("vendor_id", ""))] = v.get("vendor_name", "Unknown")
+        vendor_map[str(v.get("id", ""))] = v.get("vendor_name", "Unknown")
 
     # --- ALL authorized expenses (paginated) ---
     all_expenses = _paginated_fetch(
@@ -1336,9 +1336,9 @@ async def expense_intelligence(
         # --- Lookup tables ---
         vendor_map: dict[str, str] = {}
         try:
-            v_resp = supabase.table("Vendors").select("vendor_id, vendor_name").execute()
+            v_resp = supabase.table("Vendors").select("id, vendor_name").execute()
             for v in (v_resp.data or []):
-                vendor_map[str(v.get("vendor_id", ""))] = v.get("vendor_name", "Unknown")
+                vendor_map[str(v.get("id", ""))] = v.get("vendor_name", "Unknown")
         except Exception as exc:
             logger.warning("[analytics:expense-intelligence] vendors fetch: %s", exc)
 
