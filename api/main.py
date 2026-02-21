@@ -318,6 +318,21 @@ def _purge_stale_caches():
     except Exception:
         pass
 
+    # --- company_knowledge: _cache (purge entries past 10min TTL) ---
+    try:
+        from api.services.company_knowledge import _cache, _CACHE_TTL
+        stale = [k for k, v in _cache.items() if now - v["ts"] >= _CACHE_TTL]
+        for k in stale:
+            del _cache[k]
+    except Exception:
+        pass
+
+    # --- agent_attention: expired sessions ---
+    try:
+        from api.services.agent_attention import cleanup
+        cleanup()
+    except Exception:
+        pass
 
 
 # ========================================
@@ -356,6 +371,16 @@ async def debug_memory():
         cache_sizes["ml.last_trained_at"] = (
             ml.last_trained_at.isoformat() if ml.last_trained_at else None
         )
+    except Exception:
+        pass
+    try:
+        from api.services.company_knowledge import _cache
+        cache_sizes["company_knowledge._cache"] = len(_cache)
+    except Exception:
+        pass
+    try:
+        from api.services.agent_attention import get_active_sessions_count
+        cache_sizes["agent_attention.sessions"] = get_active_sessions_count()
     except Exception:
         pass
 

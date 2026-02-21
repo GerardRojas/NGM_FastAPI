@@ -71,9 +71,10 @@ async def run_auto_auth(
     Results are always saved to daneel_auth_reports.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
+    loop = asyncio.get_running_loop()
     try:
         result = await asyncio.wait_for(
-            asyncio.to_thread(_run, project_id=project_id),
+            asyncio.to_thread(_run, project_id=project_id, _loop=loop),
             timeout=25.0,
         )
         return result
@@ -97,9 +98,10 @@ async def run_auto_auth_backlog():
     Runs in a thread; tries to complete within 25s, continues in background if needed.
     """
     from api.services.daneel_auto_auth import run_auto_auth as _run
+    loop = asyncio.get_running_loop()
     try:
         result = await asyncio.wait_for(
-            asyncio.to_thread(_run, process_all=True),
+            asyncio.to_thread(_run, process_all=True, _loop=loop),
             timeout=25.0,
         )
         result["mode"] = "backlog"
@@ -124,8 +126,9 @@ async def reprocess_pending():
     Call this after bookkeepers update expenses with missing data.
     """
     from api.services.daneel_auto_auth import reprocess_pending_info
+    loop = asyncio.get_running_loop()
     try:
-        result = await asyncio.to_thread(reprocess_pending_info)
+        result = await asyncio.to_thread(reprocess_pending_info, _loop=loop)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Reprocess failed: {str(e)}")

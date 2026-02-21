@@ -3,7 +3,7 @@ Router para gestion de Concepts (Conceptos compuestos de materiales)
 """
 import logging
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from supabase import create_client, Client
 import os
@@ -43,6 +43,20 @@ class ConceptCreate(BaseModel):
     is_template: Optional[bool] = False
     builder: Optional[dict] = None  # Builder state JSON (inline items, labor, totals)
 
+    @field_validator("waste_percent", "overhead_percentage")
+    @classmethod
+    def non_negative_percentages(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Percentage values must be >= 0")
+        return v
+
+    @field_validator("base_cost", "labor_cost")
+    @classmethod
+    def non_negative_costs(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Cost values must be >= 0")
+        return v
+
 
 class ConceptUpdate(BaseModel):
     code: Optional[str] = None
@@ -63,6 +77,20 @@ class ConceptUpdate(BaseModel):
     is_template: Optional[bool] = None
     builder: Optional[dict] = None
 
+    @field_validator("waste_percent", "overhead_percentage")
+    @classmethod
+    def non_negative_percentages(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Percentage values must be >= 0")
+        return v
+
+    @field_validator("base_cost", "labor_cost")
+    @classmethod
+    def non_negative_costs(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Cost values must be >= 0")
+        return v
+
 
 class ConceptMaterialAdd(BaseModel):
     material_id: str
@@ -71,6 +99,20 @@ class ConceptMaterialAdd(BaseModel):
     unit_cost_override: Optional[float] = None
     notes: Optional[str] = None
     sort_order: Optional[int] = 0
+
+    @field_validator("quantity")
+    @classmethod
+    def positive_quantity(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("Quantity must be > 0")
+        return v
+
+    @field_validator("unit_cost_override")
+    @classmethod
+    def non_negative_cost_override(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("Unit cost override must be >= 0")
+        return v
 
 
 class ConceptMaterialSync(BaseModel):
@@ -222,15 +264,22 @@ async def get_concept(concept_id: str):
             "*"
         ).eq("concept_id", concept_id).order("sort_order").execute()
 
-        # Obtener info de cada material
+        # Batch-fetch all material info in a single query (avoids N+1)
+        material_ids = list(set(
+            cm["material_id"] for cm in (materials_resp.data or []) if cm.get("material_id")
+        ))
+        materials_map = {}
+        if material_ids:
+            mat_batch = supabase.table("materials").select(
+                '"ID", "Short Description", "Full Description", "Brand", "Image", "Price", price_numeric, "Unit"'
+            ).in_('"ID"', material_ids).execute()
+            for m in (mat_batch.data or []):
+                materials_map[m["ID"]] = m
+
+        # Build materials list
         materials = []
         for cm in materials_resp.data or []:
-            # Buscar info del material
-            mat_resp = supabase.table("materials").select(
-                '"ID", "Short Description", "Full Description", "Brand", "Image", "Price", price_numeric, "Unit"'
-            ).eq('"ID"', cm["material_id"]).execute()
-
-            mat_info = mat_resp.data[0] if mat_resp.data else {}
+            mat_info = materials_map.get(cm["material_id"], {})
 
             materials.append({
                 "id": cm["id"],
@@ -515,16 +564,23 @@ async def get_concept_materials(concept_id: str):
         # Obtener materiales
         response = supabase.table("concept_materials").select("*").eq("concept_id", concept_id).order("sort_order").execute()
 
+        # Batch-fetch all material info in a single query (avoids N+1)
+        mat_ids = list(set(
+            cm["material_id"] for cm in (response.data or []) if cm.get("material_id")
+        ))
+        mat_map = {}
+        if mat_ids:
+            mat_batch = supabase.table("materials").select(
+                '"ID", "Short Description", "Brand", "Image", price_numeric, "Unit"'
+            ).in_('"ID"', mat_ids).execute()
+            for m in (mat_batch.data or []):
+                mat_map[m["ID"]] = m
+
         materials = []
         total_cost = 0
 
         for cm in response.data or []:
-            # Buscar info del material
-            mat_resp = supabase.table("materials").select(
-                '"ID", "Short Description", "Brand", "Image", price_numeric, "Unit"'
-            ).eq('"ID"', cm["material_id"]).execute()
-
-            mat_info = mat_resp.data[0] if mat_resp.data else {}
+            mat_info = mat_map.get(cm["material_id"], {})
             effective_cost = cm["unit_cost_override"] or mat_info.get("price_numeric") or 0
             line_total = (cm["quantity"] or 0) * effective_cost
 
@@ -698,7 +754,14 @@ async def recalculate_concept_cost(concept_id: str):
                 unit_cost = float(cm["unit_cost_override"])
             else:
                 mat_resp = supabase.table("materials").select("price_numeric").eq('"ID"', cm["material_id"]).execute()
-                unit_cost = float(mat_resp.data[0].get("price_numeric") or 0) if mat_resp.data else 0.0
+                if not mat_resp.data:
+                    logger.warning(
+                        "Material '%s' not found in materials table (concept %s) — using $0",
+                        cm["material_id"], concept_id
+                    )
+                    unit_cost = 0.0
+                else:
+                    unit_cost = float(mat_resp.data[0].get("price_numeric") or 0)
 
             materials_cost += (float(cm["quantity"] or 0)) * unit_cost
 

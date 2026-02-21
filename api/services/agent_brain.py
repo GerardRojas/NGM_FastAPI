@@ -147,12 +147,17 @@ async def invoke_brain(
     channel_id: Optional[str] = None,
     message_id: Optional[str] = None,
     attachments: Optional[list] = None,
+    is_followup: bool = False,
 ) -> None:
     """
-    Main brain entry point. Called from BackgroundTask after @mention detection.
+    Main brain entry point. Called from BackgroundTask after @mention detection
+    or from an active attention session (follow-up).
 
-    Builds context, calls GPT-5.1 for routing, dispatches the decision.
-    Never raises -- all errors are caught and posted as agent messages.
+    Args:
+        is_followup: True if this is a follow-up message from an attention
+                     session (no explicit @mention). Adjusts routing:
+                     - Fetches more conversation history (20 vs 10)
+                     - Skips cooldown (session already validated)
     """
     tag = f"[AgentBrain:{agent_name}]"
 
@@ -161,8 +166,8 @@ async def invoke_brain(
         logger.info("%s Ignoring message from bot user %s", tag, user_id)
         return
 
-    # Rate limit
-    if not _check_cooldown(user_id, agent_name):
+    # Rate limit (skip for follow-ups — session already rate-limited)
+    if not is_followup and not _check_cooldown(user_id, agent_name):
         logger.info("%s Cooldown active for user %s", tag, user_id)
         return
 
@@ -174,10 +179,29 @@ async def invoke_brain(
     try:
         t0 = time.monotonic()
 
-        # 1. Build context
+        # 1. Build context (channel history + knowledge modules)
+        #    Follow-ups get more history for better conversation continuity
         context = await _build_brain_context(
-            agent_name, project_id, channel_type, channel_id
+            agent_name, project_id, channel_type, channel_id,
+            msg_limit=20 if is_followup else 10,
         )
+        if is_followup:
+            context["is_followup"] = True
+
+        # 1b. Inject company/user knowledge (modular, lightweight)
+        try:
+            from api.services.company_knowledge import build_knowledge_context
+            knowledge = await build_knowledge_context(
+                agent_name=agent_name,
+                user_id=user_id,
+                project_id=project_id,
+                user_text=user_text,
+            )
+            if knowledge:
+                context["knowledge"] = knowledge
+                logger.info("%s Knowledge context loaded (%d chars)", tag, len(knowledge))
+        except Exception as know_err:
+            logger.debug("%s Knowledge context failed (non-blocking): %s", tag, know_err)
 
         # 2. Route via GPT
         decision = await _route(
@@ -283,8 +307,14 @@ async def _build_brain_context(
     project_id: Optional[str],
     channel_type: str,
     channel_id: Optional[str],
+    msg_limit: int = 10,
 ) -> Dict[str, Any]:
-    """Fetch project name and recent messages for the routing prompt."""
+    """Fetch project name and recent messages for the routing prompt.
+
+    Args:
+        msg_limit: Number of recent messages to fetch (10 for @mentions,
+                   20 for follow-ups to provide better conversation continuity).
+    """
     from api.supabase_client import supabase as sb
 
     context: Dict[str, Any] = {
@@ -306,13 +336,13 @@ async def _build_brain_context(
         except Exception as _exc:
             logger.debug("Suppressed: %s", _exc)
 
-    # Recent messages in this channel (last 10)
+    # Recent messages in this channel
     try:
         query = sb.table("messages") \
             .select("content, user_id, created_at") \
             .eq("channel_type", channel_type) \
             .order("created_at", desc=True) \
-            .limit(10)
+            .limit(msg_limit)
 
         if channel_id:
             query = query.eq("channel_id", channel_id)
@@ -424,6 +454,11 @@ async def _route(
             "(PDF, image), use the process_receipt function."
         )
 
+    # Inject knowledge context if available
+    knowledge_ctx = context.get("knowledge", "")
+    if knowledge_ctx:
+        knowledge_ctx = "\n" + knowledge_ctx + "\n"
+
     system_prompt = BRAIN_ROUTING_PROMPT.format(
         brain_summary=persona["brain_summary"],
         function_menu=format_functions_for_llm(agent_name),
@@ -435,6 +470,20 @@ async def _route(
         attachments_context=attachments_ctx,
         recent_messages=recent,
     )
+
+    # Append knowledge after the main prompt (keeps routing prompt clean)
+    if knowledge_ctx:
+        system_prompt += knowledge_ctx
+
+    # For follow-up messages, add context hint so GPT knows this is a continuation
+    if context.get("is_followup"):
+        system_prompt += (
+            "\n## IMPORTANT: This is a FOLLOW-UP message\n"
+            "The user is continuing an ongoing conversation with you. "
+            "They did NOT use @mention — your attention session detected this as a continuation. "
+            "Look at the recent conversation to understand what they're referring to. "
+            "Respond naturally as if you're mid-conversation.\n"
+        )
 
     # Configurable min confidence for routing (default 0.9)
     # Below this threshold, we escalate from mini to heavy model
@@ -2083,16 +2132,16 @@ async def _post_response(
         )
     elif agent_name == "daneel":
         from api.helpers.daneel_messenger import post_daneel_message
-        # Daneel messenger requires project_id and doesn't support channel_id
-        if project_id:
+        if project_id or channel_id:
             post_daneel_message(
                 content=content,
                 project_id=project_id,
                 channel_type=channel_type,
+                channel_id=channel_id,
                 metadata=meta,
             )
         else:
-            logger.warning("[AgentBrain:daneel] Cannot post without project_id")
+            logger.warning("[AgentBrain:daneel] Cannot post without project_id or channel_id")
 
 
 # ---------------------------------------------------------------------------

@@ -24,10 +24,13 @@ class TaskCreate(BaseModel):
     project: Optional[str] = None  # UUID del proyecto
     owner: Optional[str] = None  # UUID del owner
     collaborator: Optional[str] = None  # UUID del colaborador
+    collaborators: Optional[List[str]] = None  # Array of collaborator UUIDs
     type: Optional[str] = None  # UUID del tipo de tarea
     department: Optional[str] = None  # UUID del departamento
+    priority: Optional[str] = None  # UUID or name de la prioridad
     due_date: Optional[str] = None  # Fecha YYYY-MM-DD
     deadline: Optional[str] = None  # Fecha YYYY-MM-DD
+    task_notes: Optional[str] = None  # Notas adicionales
     status: str = "not started"  # Nombre del status
 
     @field_validator("task_description")
@@ -350,12 +353,18 @@ def create_task(payload: TaskCreate) -> Dict[str, Any]:
             "Colaborators_id": payload.collaborator,
             "task_type": payload.type,
             "task_department": payload.department,
+            "task_priority": payload.priority,
             "due_date": payload.due_date,
             "deadline": payload.deadline,
+            "task_notes": payload.task_notes,
         }
         for col, val in optional_mappings.items():
             if val is not None:
                 task_data[col] = val
+
+        # Handle collaborators array (new multi-select field)
+        if payload.collaborators:
+            task_data["collaborators_ids"] = payload.collaborators
 
         # Insertar tarea
         response = supabase.table("tasks").insert(task_data).execute()
@@ -3337,6 +3346,43 @@ def get_next_available_slot(user_id: str, estimated_hours: float = 2.0) -> Dict[
 
     except Exception as e:
         logger.error(f"[WORKLOAD] ERROR in next-available: {repr(e)}")
+        logger.debug(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error: {e}") from e
+
+
+# ====== TASK DEPENDENCIES ENDPOINTS ======
+
+@router.get("/dependencies")
+def get_all_dependencies(project_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Returns task dependencies for the Operation Manager timeline.
+    Optionally filter by project_id (via tasks table join).
+    """
+    try:
+        query = supabase.table("task_dependencies").select(
+            "dependency_id, predecessor_task_id, successor_task_id, "
+            "dependency_type, lag_hours, is_auto_generated"
+        )
+
+        if project_id:
+            # Get task IDs for the project first, then filter dependencies
+            tasks_resp = supabase.table("tasks").select("task_id").eq(
+                "project_id", project_id
+            ).execute()
+            task_ids = [t["task_id"] for t in (tasks_resp.data or [])]
+            if not task_ids:
+                return {"dependencies": []}
+            # Filter where predecessor OR successor is in this project
+            query = query.or_(
+                f"predecessor_task_id.in.({','.join(task_ids)}),"
+                f"successor_task_id.in.({','.join(task_ids)})"
+            )
+
+        resp = query.execute()
+        return {"dependencies": resp.data or []}
+
+    except Exception as e:
+        logger.error(f"[DEPENDENCIES] ERROR: {repr(e)}")
         logger.debug(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error: {e}") from e
 

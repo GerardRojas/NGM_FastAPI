@@ -193,7 +193,7 @@ async def get_failed_commands_stats(
             return {
                 "total_failures": stats.get("total_failures", 0),
                 "unique_commands": stats.get("unique_commands", 0),
-                "gpt_attempt_rate": float(stats.get("gpt_attempt_rate", 0)),
+                "gpt_attempt_rate": float(stats.get("gpt_attempt_rate") or 0),
                 "top_pages": stats.get("top_pages", []),
                 "top_errors": stats.get("top_errors", []),
                 "most_common_commands": stats.get("most_common_commands", []),

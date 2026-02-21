@@ -187,6 +187,8 @@ def extract_mentioned_user_ids(content: str, sender_user_id: str) -> List[str]:
     """
     Extract user IDs from @mentions in message content.
     Returns list of user IDs that were mentioned (excluding sender).
+    Frontend sends @GermanOsorio (spaces stripped), so we match both
+    the raw captured name AND against user_name with spaces removed.
     """
     # Find all @mentions (assuming format @Username)
     mention_pattern = r"@(\w+)"
@@ -196,18 +198,33 @@ def extract_mentioned_user_ids(content: str, sender_user_id: str) -> List[str]:
         return []
 
     try:
-        # Look up user IDs by name
+        # Look up user IDs by name (exact match first)
         result = supabase.table("users") \
             .select("user_id, user_name") \
             .in_("user_name", mentioned_names) \
             .execute()
 
         user_ids = []
+        matched_names = set()
         for user in (result.data or []):
             user_id = str(user.get("user_id", ""))
-            # Don't notify the sender
             if user_id and user_id != sender_user_id:
                 user_ids.append(user_id)
+                matched_names.add(user.get("user_name", ""))
+
+        # For unmatched names, try matching against user_name with spaces removed
+        # This handles "German Osorio" stored in DB matching @GermanOsorio in content
+        unmatched = [n for n in mentioned_names if n not in matched_names]
+        if unmatched:
+            all_users = supabase.table("users") \
+                .select("user_id, user_name") \
+                .execute()
+            for user in (all_users.data or []):
+                name_nospaces = re.sub(r"\s+", "", user.get("user_name", ""))
+                if name_nospaces in unmatched:
+                    user_id = str(user.get("user_id", ""))
+                    if user_id and user_id != sender_user_id and user_id not in user_ids:
+                        user_ids.append(user_id)
 
         return user_ids
     except Exception as e:
@@ -289,14 +306,17 @@ def _detect_agent_mentions(
     channel_type: str,
     channel_id: str | None,
     attachments: list | None = None,
-) -> None:
+) -> bool:
     """
     Scan message content for @Andrew/@Daneel mentions.
     Launches a brain BackgroundTask for each mentioned agent.
+    Also starts an attention session for natural follow-up routing.
+
+    Returns True if at least one agent mention was detected.
     """
     matches = _AGENT_MENTION_RE.findall(content)
     if not matches:
-        return
+        return False
 
     # Deduplicate (case-insensitive)
     seen = set()
@@ -307,6 +327,20 @@ def _detect_agent_mentions(
         seen.add(agent_key)
 
         logger.info("[Messages] Agent mention detected: @%s by user %s", name, user_name)
+
+        # Start attention session (so follow-ups route automatically)
+        try:
+            from api.services.agent_attention import start_session
+            start_session(
+                user_id=user_id,
+                agent_name=agent_key,
+                channel_type=channel_type,
+                project_id=project_id,
+                channel_id=channel_id,
+            )
+        except Exception as attn_err:
+            logger.debug("[Messages] Attention session start error (non-blocking): %s", attn_err)
+
         background_tasks.add_task(
             _run_agent_brain,
             agent_key,
@@ -318,6 +352,8 @@ def _detect_agent_mentions(
             channel_id,
             attachments,
         )
+
+    return True
 
 
 _RECEIPT_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -333,34 +369,62 @@ async def _run_agent_brain(
     channel_type: str,
     channel_id: str | None,
     attachments: list | None = None,
+    is_followup: bool = False,
 ) -> None:
     """Run the async agent brain from a BackgroundTask."""
+    import traceback as _tb
+
+    def _post_to_channel(content: str, metadata: dict | None = None):
+        """Post a message to the channel as the agent (sync helper)."""
+        try:
+            if agent_name == "andrew":
+                from api.helpers.andrew_messenger import post_andrew_message
+                post_andrew_message(
+                    content=content,
+                    project_id=project_id,
+                    channel_type=channel_type,
+                    channel_id=channel_id,
+                    metadata=metadata or {"agent_message": True},
+                )
+            elif agent_name == "daneel":
+                from api.helpers.daneel_messenger import post_daneel_message
+                post_daneel_message(
+                    content=content,
+                    project_id=project_id,
+                    channel_type=channel_type,
+                    channel_id=channel_id,
+                    metadata=metadata or {"agent_message": True},
+                )
+        except Exception as post_err:
+            logger.error("[Messages] Failed to post agent message: %s", post_err)
+
     try:
+        logger.info("[Messages] _run_agent_brain START | agent=%s user=%s project=%s channel=%s",
+                     agent_name, user_name, project_id, channel_type)
+
         # Immediate ack for Andrew + file attachments (before GPT routing)
+        has_receipt_attachment = False
         if agent_name == "andrew" and attachments:
             for att in attachments:
                 att_type = (att.get("type") or "").lower()
                 att_name = (att.get("name") or "").lower()
                 if att_type in _RECEIPT_TYPES or att_name.endswith(_RECEIPT_EXTS):
-                    try:
-                        from api.helpers.andrew_messenger import post_andrew_message
-                        post_andrew_message(
-                            content=f"Got it! Processing **{att.get('name', 'receipt')}**...",
-                            project_id=project_id,
-                            channel_type=channel_type,
-                            channel_id=channel_id,
-                            metadata={
-                                "agent_message": True,
-                                "receipt_status": "processing",
-                                "processing_started": True,
-                            },
-                        )
-                        logger.info("[Messages] Immediate ack posted for %s", att.get('name'))
-                    except Exception as e:
-                        logger.warning("[Messages] Immediate ack failed (non-blocking): %s", e)
+                    has_receipt_attachment = True
+                    _post_to_channel(
+                        f"Got it! Processing **{att.get('name', 'receipt')}**...",
+                        metadata={
+                            "agent_message": True,
+                            "receipt_status": "processing",
+                            "processing_started": True,
+                        },
+                    )
+                    logger.info("[Messages] Immediate ack posted for %s", att.get('name'))
                     break
 
+        logger.info("[Messages] Importing agent_brain...")
         from api.services.agent_brain import invoke_brain
+        logger.info("[Messages] agent_brain imported OK, calling invoke_brain...")
+
         await invoke_brain(
             agent_name=agent_name,
             user_text=user_text,
@@ -370,9 +434,17 @@ async def _run_agent_brain(
             channel_type=channel_type,
             channel_id=channel_id,
             attachments=attachments,
+            is_followup=is_followup,
         )
+        logger.info("[Messages] _run_agent_brain COMPLETE | agent=%s followup=%s", agent_name, is_followup)
+
     except Exception as e:
-        logger.error("[Messages] Agent brain error (%s): %s", agent_name, e)
+        logger.error("[Messages] Agent brain error (%s): %s\n%s", agent_name, e, _tb.format_exc())
+        # Post error message to channel so user sees feedback
+        _post_to_channel(
+            "Something went wrong while processing your request. Please try again.",
+            metadata={"agent_message": True, "error": str(e)},
+        )
 
 
 async def send_message_notifications(
@@ -584,10 +656,11 @@ def create_message(
         except Exception as bg_err:
             logger.warning("[Messages] Background task setup error (non-blocking): %s", bg_err)
 
-        # --- Agent Brain: detect @Andrew / @Daneel mentions ---
+        # --- Agent Brain: detect @mentions OR active attention sessions ---
         try:
             if not is_bot_user(user_id):
-                _detect_agent_mentions(
+                # 1. Check for explicit @mentions first
+                mentions_found = _detect_agent_mentions(
                     background_tasks,
                     payload.content,
                     user_id,
@@ -597,6 +670,38 @@ def create_message(
                     payload.channel_id,
                     payload.attachments,
                 )
+
+                # 2. If NO explicit @mention, check for active attention session
+                #    (follow-up messages in an ongoing agent conversation)
+                if not mentions_found:
+                    try:
+                        from api.services.agent_attention import consume_session
+                        session = consume_session(
+                            user_id=user_id,
+                            channel_type=payload.channel_type,
+                            content=payload.content,
+                            project_id=payload.project_id,
+                            channel_id=payload.channel_id,
+                        )
+                        if session:
+                            logger.info(
+                                "[Messages] Attention session follow-up: %s -> @%s (remaining=%d)",
+                                sender_name, session.agent_name, session.remaining
+                            )
+                            background_tasks.add_task(
+                                _run_agent_brain,
+                                session.agent_name,
+                                payload.content,
+                                user_id,
+                                sender_name,
+                                payload.project_id,
+                                payload.channel_type,
+                                payload.channel_id,
+                                payload.attachments,
+                                True,  # is_followup flag
+                            )
+                    except Exception as attn_err:
+                        logger.debug("[Messages] Attention check error (non-blocking): %s", attn_err)
         except Exception as brain_err:
             logger.warning("[Messages] Agent brain setup error (non-blocking): %s", brain_err)
 
@@ -1083,9 +1188,17 @@ def get_my_mentions(
         user_id = current_user["user_id"]
         user_name = current_user.get("user_name", "")
 
-        # Search for messages that contain @username pattern
-        # This is a simple text search - for production, use a dedicated mentions table
-        search_pattern = f"%@{user_name}%"
+        # Frontend strips spaces from names: "German Osorio" -> @GermanOsorio
+        # Search with ilike (broad), then filter in Python with word-boundary
+        # regex to eliminate false positives (e.g. @German vs @GermanOsorio).
+        name_nospaces = re.sub(r"\s+", "", user_name)
+        search_pattern = f"%@{name_nospaces}%"
+
+        # Build word-boundary regex for Python-side filtering
+        # Matches @GermanOsorio followed by non-word char or end of string
+        _mention_re = re.compile(
+            rf"@{re.escape(name_nospaces)}\b", re.IGNORECASE
+        )
 
         query = supabase.table("messages") \
             .select("*, users!user_id(user_name, avatar_color, user_photo)") \
@@ -1093,10 +1206,17 @@ def get_my_mentions(
             .neq("user_id", user_id) \
             .or_("is_deleted.is.null,is_deleted.eq.false")
 
-        result = query.order("created_at", desc=True).limit(limit).execute()
+        # Fetch extra rows since Python-side regex may filter some out
+        result = query.order("created_at", desc=True).limit(limit * 2).execute()
+
+        # Python-side word-boundary filter (eliminates false positives)
+        filtered_rows = [
+            row for row in (result.data or [])
+            if _mention_re.search(row.get("content", ""))
+        ][:limit]
 
         # Get read status from message_mentions table
-        message_ids = [str(row.get("id", "")) for row in (result.data or []) if row.get("id")]
+        message_ids = [str(row.get("id", "")) for row in filtered_rows if row.get("id")]
         read_message_ids = set()
         if message_ids:
             try:
@@ -1111,7 +1231,7 @@ def get_my_mentions(
                 pass
 
         mentions = []
-        for row in (result.data or []):
+        for row in filtered_rows:
             user_data = row.get("users") or {}
             if isinstance(user_data, list) and user_data:
                 user_data = user_data[0]

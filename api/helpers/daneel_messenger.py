@@ -52,17 +52,22 @@ def _ensure_bot_user_exists():
 
 def post_daneel_message(
     content: str,
-    project_id: str,
+    project_id: str = None,
     channel_type: str = "project_general",
+    channel_id: str = None,
     metadata: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Post a message to a project channel as the Daneel bot.
 
+    For project channels: pass project_id (+ channel_type like project_general).
+    For group channels: pass channel_id (+ channel_type="group").
+
     Args:
         content: Message text (markdown supported)
-        project_id: Project UUID
-        channel_type: Channel type (default: project_accounting)
+        project_id: Project UUID (for project channels)
+        channel_type: Channel type (default: project_general)
+        channel_id: Channel UUID (for group/custom channels)
         metadata: Optional metadata dict (e.g. alert_type, account_name)
 
     Returns:
@@ -74,21 +79,29 @@ def post_daneel_message(
         message_data = {
             "content": content,
             "channel_type": channel_type,
-            "project_id": project_id,
             "user_id": DANEEL_BOT_USER_ID,
             "metadata": metadata or {},
             "created_at": datetime.utcnow().isoformat(),
         }
 
-        logger.info("[DaneelMessenger] Inserting message | project=%s | type=%s", project_id, channel_type)
+        if channel_id:
+            message_data["channel_id"] = channel_id
+        elif project_id:
+            message_data["project_id"] = project_id
+        else:
+            logger.warning("[DaneelMessenger] WARNING: No project_id or channel_id provided")
+            return None
+
+        target = f"channel={channel_id}" if channel_id else f"project={project_id}"
+        logger.info("[DaneelMessenger] Inserting message | %s | type=%s", target, channel_type)
         result = supabase.table("messages").insert(message_data).execute()
 
         if result.data and len(result.data) > 0:
             msg_id = result.data[0].get("id", "?")
-            logger.info("[DaneelMessenger] Message posted OK | id=%s | project=%s", msg_id, project_id)
+            logger.info("[DaneelMessenger] Message posted OK | id=%s | %s", msg_id, target)
             return result.data[0]
 
-        logger.warning("[DaneelMessenger] Insert returned no data | project=%s", project_id)
+        logger.warning("[DaneelMessenger] Insert returned no data | %s", target)
         return None
 
     except Exception as e:

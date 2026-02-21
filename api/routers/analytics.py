@@ -567,6 +567,122 @@ async def budget_vs_actual(
 
 
 # ============================================================
+# 3b. GET /analytics/projects/{project_id}/expense-timeline
+# ============================================================
+
+@router.get("/projects/{project_id}/expense-timeline")
+async def expense_timeline(
+    project_id: str,
+    year: Optional[int] = Query(default=None, description="Budget year (defaults to current)"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Returns individual expense records enriched with AccountCategory,
+    plus budget data grouped by category. Frontend aggregates by day/week/month.
+    """
+    budget_year = year or date.today().year
+
+    # --- Accounts catalog with AccountCategory ---
+    accounts_map: dict[str, dict] = {}  # account_id -> {name, category}
+    try:
+        acc_resp = supabase.table("accounts").select(
+            "account_id, Name, AccountCategory"
+        ).execute()
+        for a in (acc_resp.data or []):
+            aid = str(a.get("account_id", ""))
+            accounts_map[aid] = {
+                "name": a.get("Name", "Unknown"),
+                "category": a.get("AccountCategory") or "Uncategorized",
+            }
+    except Exception as exc:
+        logger.error("[analytics:expense-timeline] accounts fetch: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch accounts")
+
+    # --- Authorized expenses (paginated) ---
+    raw_expenses = _paginated_fetch(
+        "expenses_manual_COGS",
+        "Amount, TxnDate, account_id",
+        {"project": project_id, "auth_status": True},
+        neq_filters={"status": "review"},
+    )
+
+    expenses: list[dict] = []
+    all_dates: list[str] = []
+    for e in raw_expenses:
+        txn_date = e.get("TxnDate") or ""
+        if not txn_date:
+            continue
+        aid = str(e.get("account_id") or "")
+        acc_info = accounts_map.get(aid, {"name": "Unknown", "category": "Uncategorized"})
+        amt = _round2(_safe_float(e.get("Amount")))
+        expenses.append({
+            "date": txn_date,
+            "amount": amt,
+            "account_id": aid,
+            "account_name": acc_info["name"],
+            "account_category": acc_info["category"],
+        })
+        all_dates.append(txn_date)
+
+    # --- Date range ---
+    date_range = {"first_date": None, "last_date": None}
+    if all_dates:
+        sorted_dates = sorted(all_dates)
+        date_range["first_date"] = sorted_dates[0]
+        date_range["last_date"] = sorted_dates[-1]
+
+    # --- Budgets grouped by AccountCategory ---
+    budget_by_cat: dict[str, dict] = defaultdict(
+        lambda: {"accounts": [], "total_budget": 0.0}
+    )
+    total_budget = 0.0
+    try:
+        bud_resp = (
+            supabase.table("budgets_qbo")
+            .select("account_id, account_name, amount_sum")
+            .eq("ngm_project_id", project_id)
+            .eq("year", budget_year)
+            .eq("active", True)
+            .execute()
+        )
+        for b in (bud_resp.data or []):
+            aid = str(b.get("account_id") or "")
+            aname = b.get("account_name") or accounts_map.get(aid, {}).get("name", "Unknown")
+            cat = accounts_map.get(aid, {}).get("category", "Uncategorized")
+            amt = _round2(_safe_float(b.get("amount_sum")))
+            budget_by_cat[cat]["accounts"].append({
+                "account_id": aid,
+                "account_name": aname,
+                "budget": amt,
+            })
+            budget_by_cat[cat]["total_budget"] = _round2(
+                budget_by_cat[cat]["total_budget"] + amt
+            )
+            total_budget += amt
+    except Exception as exc:
+        logger.error("[analytics:expense-timeline] budgets fetch: %s", exc)
+        # Non-fatal: return expenses without budget data
+        pass
+
+    budget_categories = [
+        {
+            "account_category": cat,
+            "accounts": info["accounts"],
+            "total_budget": _round2(info["total_budget"]),
+        }
+        for cat, info in sorted(budget_by_cat.items())
+    ]
+
+    return {
+        "project_id": project_id,
+        "date_range": date_range,
+        "expenses": expenses,
+        "budget_by_category": budget_categories,
+        "total_budget": _round2(total_budget),
+    }
+
+
+# ============================================================
 # 4. GET /analytics/executive/kpis
 # ============================================================
 

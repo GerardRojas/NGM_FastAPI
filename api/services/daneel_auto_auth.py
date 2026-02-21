@@ -384,10 +384,18 @@ def gpt_vision_extract_bill_total(receipt_url: str, amount_tolerance: float = 0.
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         data = _json.loads(raw)
-        total = float(data.get("total", 0))
-        subtotal = float(data.get("subtotal", 0))
-        tax = float(data.get("tax", 0))
-        confidence = int(data.get("confidence", 0))
+        if not isinstance(data, dict):
+            logger.warning("[DaneelAutoAuth] Vision: GPT response is not a JSON object")
+            return None
+        def _safe_num(v, default=0):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return default
+        total = _safe_num(data.get("total", 0))
+        subtotal = _safe_num(data.get("subtotal", 0))
+        tax = _safe_num(data.get("tax", 0))
+        confidence = int(_safe_num(data.get("confidence", 0)))
 
         if total <= 0 or confidence < 50:
             logger.info(f"[DaneelAutoAuth] Vision: low confidence ({confidence}%) or zero total")
@@ -798,7 +806,7 @@ def gpt_resolve_ambiguous(
 # Authorize a single expense (mirrors update_expense_status logic)
 # ============================================================================
 
-def authorize_expense(sb, expense_id: str, project_id: str, rule: str = "passed_all_checks") -> bool:
+def authorize_expense(sb, expense_id: str, project_id: str, rule: str = "passed_all_checks", *, _loop=None) -> bool:
     """Set expense status to 'auth' as Daneel.  Only acts on 'pending' expenses."""
     try:
         # Guard: only authorize if expense is still pending (prevents race with human review)
@@ -829,19 +837,24 @@ def authorize_expense(sb, expense_id: str, project_id: str, rule: str = "passed_
         }).execute()
 
         # Trigger budget monitor (same as human auth)
-        # NOTE: run_auto_auth runs inside asyncio.to_thread(), so we must
-        # schedule back onto the main event loop thread-safely.
         try:
             from api.services.budget_monitor import trigger_project_budget_check
             import asyncio
 
-            def _schedule_budget_check():
+            try:
+                loop = asyncio.get_running_loop()
+                # In event loop thread (BackgroundTask context) — schedule directly
                 task = asyncio.ensure_future(trigger_project_budget_check(project_id))
                 _running_budget_tasks.add(task)
                 task.add_done_callback(_running_budget_tasks.discard)
-
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(_schedule_budget_check)
+            except RuntimeError:
+                # In worker thread (asyncio.to_thread) — schedule onto caller's loop
+                if _loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        trigger_project_budget_check(project_id), _loop
+                    )
+                else:
+                    logger.warning("[DaneelAutoAuth] Budget check skipped: no event loop available (missing _loop)")
         except Exception as e:
             logger.warning(f"[DaneelAutoAuth] Budget check trigger failed: {e}")
 
@@ -1067,11 +1080,13 @@ def _trigger_andrew_reconciliation(bill_id: str, project_id: str, source: str):
     """Fire Andrew's mismatch reconciliation in a background thread (non-blocking)."""
     try:
         from api.services.andrew_mismatch_protocol import run_mismatch_reconciliation
-        import asyncio
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(
-            None, run_mismatch_reconciliation, bill_id, project_id, source
+        import threading
+        t = threading.Thread(
+            target=run_mismatch_reconciliation,
+            args=(bill_id, project_id, source),
+            daemon=True,
         )
+        t.start()
     except Exception as e:
         logger.warning(f"[DaneelAutoAuth] Andrew reconciliation trigger failed: {e}")
 
@@ -1080,7 +1095,7 @@ def _trigger_andrew_reconciliation(bill_id: str, project_id: str, source: str):
 # Main orchestrator
 # ============================================================================
 
-def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -> dict:
+def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None, _loop=None) -> dict:
     """
     Process pending expenses.
     process_all=False (default): only new since last run.
@@ -1637,7 +1652,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
         _ts_phase2 = _t()
         for expense, rule, det, chks in auth_candidates:
             exp_id = expense.get("expense_id") or expense.get("id")
-            if authorize_expense(sb, exp_id, pid, rule):
+            if authorize_expense(sb, exp_id, pid, rule, _loop=_loop):
                 authorized_list.append(expense)
                 decisions.append(_make_decision_entry(
                     expense, lookups, "authorized", rule=rule, reason=det,
@@ -1705,7 +1720,7 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None) -
 # Re-process pending info
 # ============================================================================
 
-def reprocess_pending_info() -> dict:
+def reprocess_pending_info(_loop=None) -> dict:
     """Re-check expenses that were waiting for missing info."""
     cfg = load_auto_auth_config()
     if not cfg.get("daneel_auto_auth_enabled"):
@@ -1789,7 +1804,7 @@ def reprocess_pending_info() -> dict:
             continue
 
         # All clear -- authorize
-        if authorize_expense(sb, exp_id, project_id, "reprocessed_" + dup_result.rule):
+        if authorize_expense(sb, exp_id, project_id, "reprocessed_" + dup_result.rule, _loop=_loop):
             authorized += 1
 
         _resolve_pending_info(sb, exp_id)
