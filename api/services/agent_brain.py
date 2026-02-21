@@ -134,28 +134,6 @@ If it's still unclear, use "clarify" and ask a specific question.
 
 
 # ---------------------------------------------------------------------------
-# Greeting fast-path (skip GPT for simple hellos)
-# ---------------------------------------------------------------------------
-
-_GREETING_PATTERNS = {
-    "hi", "hello", "hey", "hola", "sup", "yo", "howdy",
-    "good morning", "good afternoon", "good evening",
-    "buenos dias", "buenas tardes", "buenas noches", "buenas",
-    "whats up", "what's up", "que tal", "qué tal",
-}
-
-def _detect_greeting(text: str) -> Optional[str]:
-    """Return a greeting response if text is a simple hello, else None."""
-    cleaned = text.strip().lower().rstrip("!.?,")
-    # Remove @mention prefix if present
-    import re
-    cleaned = re.sub(r"@\w+\s*", "", cleaned).strip()
-    if not cleaned or cleaned in _GREETING_PATTERNS:
-        return ""  # empty string = let _handle_free_chat generate a response
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -224,17 +202,6 @@ async def invoke_brain(
                 logger.info("%s Knowledge context loaded (%d chars)", tag, len(knowledge))
         except Exception as know_err:
             logger.debug("%s Knowledge context failed (non-blocking): %s", tag, know_err)
-
-        # 1c. Fast-path: detect simple greetings (skip GPT call entirely)
-        _greeting = _detect_greeting(user_text)
-        if _greeting:
-            logger.info("%s Greeting fast-path: '%s'", tag, user_text[:30])
-            await _handle_free_chat(
-                agent_name, persona,
-                {"action": "free_chat", "response": _greeting, "confidence": 1.0},
-                user_text, project_id, channel_type, channel_id,
-            )
-            return
 
         # 2. Route via GPT
         decision = await _route(
