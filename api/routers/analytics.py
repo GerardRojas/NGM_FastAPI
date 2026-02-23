@@ -1006,6 +1006,285 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
 
 
 # ============================================================
+# 4b. GET /analytics/health/all
+# ============================================================
+
+@router.get("/health/all")
+async def health_all(current_user: dict = Depends(get_current_user)):
+    """
+    Aggregated health snapshot across ALL active projects.
+    Returns the same shape as /projects/{project_id}/health so the
+    frontend dashboard can render either single-project or all-projects
+    using the same UI.
+    """
+
+    # --- Active projects ---
+    active_project_ids: list[str] = []
+    try:
+        proj_resp = (
+            supabase.table("projects")
+            .select("project_id, project_status(status)")
+            .execute()
+        )
+        for p in (proj_resp.data or []):
+            ps = p.get("project_status") or {}
+            if isinstance(ps, list):
+                ps = ps[0] if ps else {}
+            if (ps.get("status") or "").lower() == "active":
+                active_project_ids.append(str(p.get("project_id", "")))
+    except Exception as exc:
+        logger.error("[analytics:health_all] projects fetch: %s", exc)
+
+    # --- Budget (all active budgets) ---
+    budget_total = 0.0
+    try:
+        bud_offset = 0
+        while True:
+            bud_resp = (
+                supabase.table("budgets_qbo")
+                .select("amount_sum")
+                .eq("active", True)
+                .range(bud_offset, bud_offset + _PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = bud_resp.data or []
+            for row in batch:
+                budget_total += _safe_float(row.get("amount_sum"))
+            if len(batch) < _PAGE_SIZE:
+                break
+            bud_offset += _PAGE_SIZE
+    except Exception as exc:
+        logger.error("[analytics:health_all] budget fetch: %s", exc)
+
+    # --- Expenses (all, paginated) ---
+    all_expenses = _paginated_fetch(
+        "expenses_manual_COGS",
+        "expense_id, Amount, status, txn_type_id, vendor_id, TxnDate",
+        {},
+        neq_filters={"status": "review"},
+    )
+
+    authorized_rows = []
+    pending_rows = []
+    for e in all_expenses:
+        st = (e.get("status") or "").lower()
+        if st in ("auth", "authorized"):
+            authorized_rows.append(e)
+        elif st == "pending":
+            pending_rows.append(e)
+
+    authorized_amount = sum(_safe_float(e.get("Amount")) for e in authorized_rows)
+    pending_auth_amount = sum(_safe_float(e.get("Amount")) for e in pending_rows)
+    spent_total = authorized_amount
+    spent_percent = _round2((spent_total / budget_total * 100) if budget_total else 0.0)
+
+    # --- by_category ---
+    txn_type_map: dict[str, str] = {}
+    try:
+        tt_resp = supabase.table("txn_types").select("txn_type_id, txn_type_name").execute()
+        for t in (tt_resp.data or []):
+            txn_type_map[str(t.get("txn_type_id", ""))] = t.get("txn_type_name", "Unknown")
+    except Exception as exc:
+        logger.warning("[analytics:health_all] txn_types fetch: %s", exc)
+
+    cat_agg: dict[str, dict] = defaultdict(lambda: {"amount": 0.0, "count": 0})
+    for e in all_expenses:
+        tid = str(e.get("txn_type_id") or "")
+        cat_name = txn_type_map.get(tid, "Uncategorized")
+        cat_agg[cat_name]["amount"] += _safe_float(e.get("Amount"))
+        cat_agg[cat_name]["count"] += 1
+
+    by_category = sorted(
+        [{"name": k, "amount": _round2(v["amount"]), "count": v["count"]}
+         for k, v in cat_agg.items()],
+        key=lambda x: x["amount"],
+        reverse=True,
+    )
+
+    # --- top_vendors ---
+    vendor_ids_in_expenses = {
+        str(e.get("vendor_id")) for e in all_expenses if e.get("vendor_id")
+    }
+    vendor_map: dict[str, str] = {}
+    if vendor_ids_in_expenses:
+        try:
+            v_resp = supabase.table("Vendors").select("id, vendor_name").execute()
+            for v in (v_resp.data or []):
+                vendor_map[str(v.get("id", ""))] = v.get("vendor_name", "Unknown")
+        except Exception as exc:
+            logger.warning("[analytics:health_all] vendors fetch: %s", exc)
+
+    vendor_agg: dict[str, dict] = defaultdict(lambda: {"amount": 0.0, "count": 0})
+    for e in all_expenses:
+        vid = str(e.get("vendor_id") or "")
+        if not vid:
+            continue
+        vname = vendor_map.get(vid, "Unknown Vendor")
+        vendor_agg[vname]["amount"] += _safe_float(e.get("Amount"))
+        vendor_agg[vname]["count"] += 1
+
+    top_vendors = sorted(
+        [{"vendor_name": k, "amount": _round2(v["amount"]), "count": v["count"]}
+         for k, v in vendor_agg.items()],
+        key=lambda x: x["amount"],
+        reverse=True,
+    )[:10]
+
+    # --- monthly_spend (authorized only) ---
+    month_agg: dict[str, float] = defaultdict(float)
+    for e in authorized_rows:
+        txn_date = e.get("TxnDate") or ""
+        if len(txn_date) >= 7:
+            month_agg[txn_date[:7]] += _safe_float(e.get("Amount"))
+
+    monthly_spend = sorted(
+        [{"month": m, "amount": _round2(a)} for m, a in month_agg.items()],
+        key=lambda x: x["month"],
+    )
+
+    # --- Pending receipts (global) ---
+    pending_receipts_count = 0
+    try:
+        pr_resp = (
+            supabase.table("pending_receipts")
+            .select("id", count="exact")
+            .is_("expense_id", "null")
+            .execute()
+        )
+        pending_receipts_count = (
+            pr_resp.count
+            if hasattr(pr_resp, "count") and pr_resp.count is not None
+            else len(pr_resp.data or [])
+        )
+    except Exception as exc:
+        logger.warning("[analytics:health_all] pending_receipts: %s", exc)
+
+    # --- Tasks (all projects) ---
+    tasks_payload = {"total": 0, "completed": 0, "in_progress": 0,
+                     "backlog": 0, "completion_percent": 0.0}
+    try:
+        st_resp = supabase.table("tasks_status").select("task_status_id, task_status").execute()
+        status_map = {
+            s["task_status_id"]: (s.get("task_status") or "").lower()
+            for s in (st_resp.data or [])
+        }
+
+        all_tasks: list[dict] = []
+        tasks_offset = 0
+        while True:
+            t_resp = (
+                supabase.table("tasks")
+                .select("task_status")
+                .range(tasks_offset, tasks_offset + _PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = t_resp.data or []
+            all_tasks.extend(batch)
+            if len(batch) < _PAGE_SIZE:
+                break
+            tasks_offset += _PAGE_SIZE
+
+        task_counts: dict[str, int] = defaultdict(int)
+        for t in all_tasks:
+            name = status_map.get(t.get("task_status"), "other")
+            task_counts[name] += 1
+
+        total_tasks = sum(task_counts.values())
+        completed = task_counts.get("done", 0) + task_counts.get("completed", 0)
+        in_progress = task_counts.get("in progress", 0) + task_counts.get("in_progress", 0)
+        backlog = total_tasks - completed - in_progress
+
+        tasks_payload = {
+            "total": total_tasks,
+            "completed": completed,
+            "in_progress": in_progress,
+            "backlog": max(backlog, 0),
+            "completion_percent": _round2(
+                (completed / total_tasks * 100) if total_tasks else 0.0
+            ),
+        }
+    except Exception as exc:
+        logger.warning("[analytics:health_all] tasks: %s", exc)
+
+    # --- Daneel (global) ---
+    daneel_payload = {"authorization_rate": 0.0, "pending_info": 0,
+                      "total_processed": 0}
+    try:
+        import json as _json
+        dr_offset = 0
+        total_processed = 0
+        total_authorized = 0
+        while True:
+            dr_resp = (
+                supabase.table("daneel_auth_reports")
+                .select("summary")
+                .range(dr_offset, dr_offset + _PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = dr_resp.data or []
+            for r in batch:
+                s = r.get("summary") or {}
+                if isinstance(s, str):
+                    try:
+                        s = _json.loads(s)
+                    except Exception:
+                        s = {}
+                total_processed += int(s.get("expenses_processed", 0))
+                total_authorized += int(s.get("authorized", 0))
+            if len(batch) < _PAGE_SIZE:
+                break
+            dr_offset += _PAGE_SIZE
+
+        auth_rate = _round2(
+            (total_authorized / total_processed * 100) if total_processed else 0.0
+        )
+
+        pending_info = 0
+        try:
+            pi_resp = (
+                supabase.table("daneel_pending_info")
+                .select("expense_id", count="exact")
+                .is_("resolved_at", "null")
+                .execute()
+            )
+            pending_info = (
+                pi_resp.count
+                if hasattr(pi_resp, "count") and pi_resp.count is not None
+                else len(pi_resp.data or [])
+            )
+        except Exception:
+            pass
+
+        daneel_payload = {
+            "authorization_rate": auth_rate,
+            "pending_info": pending_info,
+            "total_processed": total_processed,
+        }
+    except Exception as exc:
+        logger.warning("[analytics:health_all] daneel: %s", exc)
+
+    return {
+        "project_id": "all",
+        "project_name": "All Projects",
+        "budget_total": _round2(budget_total),
+        "spent_total": _round2(spent_total),
+        "spent_percent": spent_percent,
+        "remaining": _round2(budget_total - spent_total),
+        "pending_auth_count": len(pending_rows),
+        "pending_auth_amount": _round2(pending_auth_amount),
+        "authorized_count": len(authorized_rows),
+        "authorized_amount": _round2(authorized_amount),
+        "pending_receipts_count": pending_receipts_count,
+        "by_category": by_category,
+        "top_vendors": top_vendors,
+        "monthly_spend": monthly_spend,
+        "daneel": daneel_payload,
+        "tasks": tasks_payload,
+        "active_projects_count": len(active_project_ids),
+    }
+
+
+# ============================================================
 # 5. GET /analytics/vendors/summary
 # ============================================================
 

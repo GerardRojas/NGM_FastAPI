@@ -676,6 +676,13 @@ async def _execute_function_call(
             params["_user_name"] = user_name
             params["_user_text"] = user_text
 
+        # Inject channel/project context for builtin handlers
+        if fn_def["handler"].startswith("_builtin:"):
+            params["_channel_id"] = channel_id
+            params["_channel_type"] = channel_type
+            params["_project_id"] = project_id
+            params["_user_name"] = user_name
+
         # Execute the handler
         t_fn = time.monotonic()
         result = await _call_handler(agent_name, fn_def, params)
@@ -1922,6 +1929,275 @@ async def _builtin_process_receipt(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Failed to process receipt: {str(e)[:150]}"}
 
 
+# ---------------------------------------------------------------------------
+# Bill lookup utility (shared by review_bill and future bill-related handlers)
+# ---------------------------------------------------------------------------
+
+async def _find_bill_flexible(
+    bill_identifier: str,
+    project_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Flexible bill finder that handles numeric, alphanumeric, and UUID inputs.
+    Returns {"found": True, "bill_id": ..., "bill_number": ..., "bill_data": {...}}
+    or {"found": False, "error": "...", "matches": [...]} for ambiguous/not-found.
+    """
+    from api.supabase_client import supabase as sb
+
+    # Clean identifier: strip common prefixes
+    raw = bill_identifier.strip()
+    cleaned = re.sub(
+        r'(?i)^(bill|check|inv|invoice|factura|receipt)\s*#?\s*',
+        '', raw
+    ).strip().lstrip('#').strip()
+
+    if not cleaned:
+        return {"found": False, "error": "Empty bill reference after cleaning."}
+
+    select_cols = "id, bill_number, status, vendor_id, expected_total, receipt_url, project_id"
+
+    # 1. Try UUID match
+    if len(cleaned) == 36 and '-' in cleaned:
+        try:
+            result = sb.table("bills").select(select_cols).eq("id", cleaned).execute()
+            if result.data:
+                d = result.data[0]
+                return {"found": True, "bill_id": d["id"], "bill_number": d.get("bill_number"), "bill_data": d}
+        except Exception:
+            pass
+
+    # 2. If purely numeric, try bill_number exact match
+    if cleaned.isdigit():
+        query = sb.table("bills").select(select_cols).eq("bill_number", int(cleaned))
+        if project_id:
+            query = query.eq("project_id", project_id)
+        result = query.execute()
+        if result.data:
+            if len(result.data) == 1:
+                d = result.data[0]
+                return {"found": True, "bill_id": d["id"], "bill_number": d.get("bill_number"), "bill_data": d}
+            else:
+                return {
+                    "found": False,
+                    "error": f"Multiple bills match #{cleaned}.",
+                    "matches": [{"bill_id": r["id"], "bill_number": r.get("bill_number"), "status": r.get("status")} for r in result.data[:5]],
+                }
+
+    # 3. If alphanumeric, extract numeric part and try bill_number
+    numeric_part = re.search(r'\d+', cleaned)
+    if numeric_part and not cleaned.isdigit():
+        num = int(numeric_part.group())
+        query = sb.table("bills").select(select_cols).eq("bill_number", num)
+        if project_id:
+            query = query.eq("project_id", project_id)
+        result = query.execute()
+        if result.data:
+            if len(result.data) == 1:
+                d = result.data[0]
+                return {"found": True, "bill_id": d["id"], "bill_number": d.get("bill_number"), "bill_data": d}
+            else:
+                return {
+                    "found": False,
+                    "error": f"Multiple bills match number {num}.",
+                    "matches": [{"bill_id": r["id"], "bill_number": r.get("bill_number"), "status": r.get("status")} for r in result.data[:5]],
+                }
+
+    # 4. Try searching expenses by bill_id text (ILIKE)
+    try:
+        exp_result = sb.table("expenses_manual_COGS") \
+            .select("bill_id") \
+            .ilike("bill_id", f"%{cleaned}%") \
+            .limit(10) \
+            .execute()
+
+        if exp_result.data:
+            unique_bill_ids = list({r["bill_id"] for r in exp_result.data if r.get("bill_id")})
+            if len(unique_bill_ids) == 1:
+                bid = unique_bill_ids[0]
+                bill_result = sb.table("bills").select(select_cols).eq("id", bid).execute()
+                if bill_result.data:
+                    d = bill_result.data[0]
+                    return {"found": True, "bill_id": d["id"], "bill_number": d.get("bill_number"), "bill_data": d}
+            elif len(unique_bill_ids) > 1:
+                # Look up each to provide disambiguation info
+                matches = []
+                for bid in unique_bill_ids[:5]:
+                    br = sb.table("bills").select(select_cols).eq("id", bid).execute()
+                    if br.data:
+                        matches.append({
+                            "bill_id": br.data[0]["id"],
+                            "bill_number": br.data[0].get("bill_number"),
+                            "status": br.data[0].get("status"),
+                        })
+                return {
+                    "found": False,
+                    "error": f"Multiple bills match '{raw}'.",
+                    "matches": matches,
+                }
+    except Exception:
+        pass
+
+    return {"found": False, "error": f"No bill found matching '{raw}'. Please check the bill number."}
+
+
+# ---------------------------------------------------------------------------
+# Bill review handler
+# ---------------------------------------------------------------------------
+
+async def _builtin_review_bill(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Look up a bill by number/reference and post a review card with all items."""
+    from api.supabase_client import supabase as sb
+
+    tag = "[AgentBrain:andrew]"
+    bill_identifier = params.get("bill_identifier", "")
+    project_id = params.get("_project_id") or params.get("project_id")
+    channel_id = params.get("_channel_id")
+
+    if not bill_identifier:
+        return {"error": "Please specify a bill number or reference."}
+
+    try:
+        # Find the bill
+        lookup = await _find_bill_flexible(bill_identifier, project_id)
+
+        if not lookup["found"]:
+            if lookup.get("matches"):
+                return {"status": "ambiguous", "matches": lookup["matches"], "message": lookup["error"]}
+            return {"message": lookup["error"]}
+
+        bill_id = lookup["bill_id"]
+        bill_number = lookup.get("bill_number")
+        bill_data = lookup.get("bill_data", {})
+
+        # Fetch expenses for this bill with account + vendor joins
+        expenses_result = sb.table("expenses_manual_COGS") \
+            .select(
+                "id, LineDescription, Amount, TxnDate, account_id, status, "
+                "categorization_confidence, categorization_source, show_on_reports, "
+                "vendor_id, bill_id"
+            ) \
+            .eq("bill_id", bill_id) \
+            .order("created_at") \
+            .execute()
+
+        if not expenses_result.data:
+            bill_ref = f"Bill #{bill_number}" if bill_number else f"Bill {bill_id[:8]}"
+            return {"message": f"No expense items found for {bill_ref}."}
+
+        # Fetch account names for the expense account_ids
+        account_ids = list({e.get("account_id") for e in expenses_result.data if e.get("account_id")})
+        account_map = {}
+        if account_ids:
+            acc_result = sb.table("accounts") \
+                .select("id, Name, AccountCategory") \
+                .in_("id", account_ids) \
+                .execute()
+            for a in (acc_result.data or []):
+                account_map[a["id"]] = {"name": a.get("Name", ""), "category": a.get("AccountCategory", "")}
+
+        # Fetch vendor name from bill's vendor_id or first expense vendor_id
+        vendor_name = "Unknown vendor"
+        vendor_id = bill_data.get("vendor_id")
+        if not vendor_id:
+            # Try from first expense
+            for exp in expenses_result.data:
+                if exp.get("vendor_id"):
+                    vendor_id = exp["vendor_id"]
+                    break
+        if vendor_id:
+            try:
+                v_result = sb.table("Vendors").select("vendor_name").eq("vendor_id", vendor_id).limit(1).execute()
+                if v_result.data:
+                    vendor_name = v_result.data[0].get("vendor_name", "Unknown vendor")
+            except Exception:
+                pass
+
+        # Build items list and summary
+        items = []
+        total_amount = 0.0
+        auth_count = 0
+        pending_count = 0
+        review_count = 0
+        voided_count = 0
+
+        for exp in expenses_result.data:
+            acc_id = exp.get("account_id")
+            acc_info = account_map.get(acc_id, {})
+            amount = float(exp.get("Amount") or 0)
+            status = exp.get("status", "pending")
+            show_on_reports = exp.get("show_on_reports")
+            if show_on_reports is None:
+                show_on_reports = True
+
+            total_amount += amount
+            if not show_on_reports:
+                voided_count += 1
+            elif status == "auth":
+                auth_count += 1
+            elif status == "review":
+                review_count += 1
+            else:
+                pending_count += 1
+
+            items.append({
+                "expense_id": exp["id"],
+                "description": exp.get("LineDescription") or "Unnamed item",
+                "amount": amount,
+                "date": exp.get("TxnDate"),
+                "account_id": acc_id,
+                "account_name": acc_info.get("name", ""),
+                "account_category": acc_info.get("category", ""),
+                "status": status,
+                "confidence": exp.get("categorization_confidence") or 0,
+                "show_on_reports": show_on_reports,
+            })
+
+        bill_ref = f"Bill #{bill_number}" if bill_number else f"Bill {bill_id[:8]}"
+        bill_status = bill_data.get("status", "open")
+
+        # Build message content
+        content = (
+            f"**{bill_ref}** -- {vendor_name}\n"
+            f"{len(items)} items | ${total_amount:,.2f} total | "
+            f"{auth_count} authorized, {pending_count} pending, {review_count} in review"
+        )
+        if voided_count > 0:
+            content += f", {voided_count} voided"
+
+        metadata = {
+            "agent_message": True,
+            "bill_review_card": True,
+            "bill_id": bill_id,
+            "bill_number": bill_number,
+            "bill_status": bill_status,
+            "vendor_name": vendor_name,
+            "items": items,
+            "summary": {
+                "total_items": len(items),
+                "total_amount": total_amount,
+                "auth_count": auth_count,
+                "pending_count": pending_count,
+                "review_count": review_count,
+                "voided_count": voided_count,
+            },
+        }
+
+        # Post the review card message
+        from api.helpers.andrew_messenger import post_andrew_message
+        post_andrew_message(
+            content=content,
+            project_id=project_id,
+            channel_id=channel_id,
+            metadata=metadata,
+        )
+
+        return {"status": "card_posted"}
+
+    except Exception as e:
+        logger.error("%s review_bill error: %s\n%s", tag, e, traceback.format_exc())
+        return {"error": f"Failed to look up bill: {str(e)[:150]}"}
+
+
 # Handler registry
 _BUILTIN_HANDLERS = {
     "process_receipt": _builtin_process_receipt,
@@ -1931,6 +2207,7 @@ _BUILTIN_HANDLERS = {
     "check_duplicates": _builtin_check_duplicates,
     "expense_health_report": _builtin_expense_health_report,
     "reprocess_pending": _builtin_reprocess_pending,
+    "review_bill": _builtin_review_bill,
 }
 
 
@@ -2045,6 +2322,21 @@ def _format_result(agent_name: str, fn_name: str, result: Any) -> str:
                 f"- Receipt ID: {result.get('receipt_id', '?')[:8]}..."
             )
         return result.get("error", "Unknown processing result.")
+
+    if fn_name == "review_bill":
+        status = result.get("status", "")
+        if status == "card_posted":
+            return ""  # handler posted its own message
+        if status == "ambiguous":
+            matches = result.get("matches", [])
+            lines = ["I found multiple bills matching that:\n"]
+            for m in matches:
+                bn = m.get("bill_number", "?")
+                bs = m.get("status", "?")
+                lines.append(f"- Bill #{bn} ({bs})")
+            lines.append("\nWhich one did you mean?")
+            return "\n".join(lines)
+        return result.get("message", "Done.")
 
     if fn_name == "reconcile_bill":
         # Mismatch protocol returns a rich dict

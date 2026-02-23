@@ -174,6 +174,13 @@ class EditCategoriesRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+class BillReviewActionRequest(BaseModel):
+    """Payload for bill review card actions (send-to-review, void)"""
+    bill_id: str
+    expense_ids: List[str]
+    user_id: Optional[str] = None
+
+
 class VaultBatchRequest(BaseModel):
     """Batch process receipts from vault's Receipts folder"""
     vault_file_ids: List[str]
@@ -6002,3 +6009,133 @@ async def confirm_bill_category_changes(payload: EditCategoriesRequest, current_
     except Exception as e:
         logger.error(f"[bill-categories] Error confirming changes: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error confirming category changes: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Bill review protocol: bulk actions
+# ---------------------------------------------------------------------------
+
+@router.post("/bill-review/send-to-review")
+async def bill_review_send_to_review(
+    payload: BillReviewActionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Bulk set selected expenses to 'review' status via bill review card."""
+    try:
+        if not payload.expense_ids:
+            raise HTTPException(status_code=400, detail="No expense IDs provided")
+
+        user_id = payload.user_id or current_user.get("user_id")
+        updated_count = 0
+        errors = []
+
+        for expense_id in payload.expense_ids:
+            try:
+                # Safety: verify expense belongs to this bill
+                check = supabase.table("expenses_manual_COGS") \
+                    .select("id, status") \
+                    .eq("id", expense_id) \
+                    .eq("bill_id", payload.bill_id) \
+                    .execute()
+
+                if not check.data:
+                    errors.append(f"Expense {expense_id[:8]} not found on this bill")
+                    continue
+
+                old_status = check.data[0].get("status", "pending")
+
+                supabase.table("expenses_manual_COGS") \
+                    .update({
+                        "status": "review",
+                        "status_reason": "Sent to review via bill review protocol",
+                        "updated_at": datetime.utcnow().isoformat(),
+                        "updated_by": user_id,
+                    }) \
+                    .eq("id", expense_id) \
+                    .execute()
+
+                # Log status change
+                try:
+                    supabase.table("expense_status_log").insert({
+                        "expense_id": expense_id,
+                        "old_status": old_status,
+                        "new_status": "review",
+                        "changed_by": user_id,
+                        "reason": "Sent to review via bill review protocol",
+                    }).execute()
+                except Exception:
+                    pass  # Non-critical
+
+                updated_count += 1
+
+            except Exception as e:
+                logger.error(f"[bill-review] Error updating {expense_id}: {e}")
+                errors.append(str(e))
+
+        return {
+            "success": True,
+            "updated_count": updated_count,
+            "errors": errors if errors else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[bill-review] send-to-review error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/bill-review/void-items")
+async def bill_review_void_items(
+    payload: BillReviewActionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Soft-delete selected expenses by setting show_on_reports=false."""
+    try:
+        if not payload.expense_ids:
+            raise HTTPException(status_code=400, detail="No expense IDs provided")
+
+        user_id = payload.user_id or current_user.get("user_id")
+        voided_count = 0
+        errors = []
+
+        for expense_id in payload.expense_ids:
+            try:
+                # Safety: verify expense belongs to this bill
+                check = supabase.table("expenses_manual_COGS") \
+                    .select("id") \
+                    .eq("id", expense_id) \
+                    .eq("bill_id", payload.bill_id) \
+                    .execute()
+
+                if not check.data:
+                    errors.append(f"Expense {expense_id[:8]} not found on this bill")
+                    continue
+
+                supabase.table("expenses_manual_COGS") \
+                    .update({
+                        "show_on_reports": False,
+                        "status_reason": "Voided via bill review protocol",
+                        "updated_at": datetime.utcnow().isoformat(),
+                        "updated_by": user_id,
+                    }) \
+                    .eq("id", expense_id) \
+                    .execute()
+
+                voided_count += 1
+
+            except Exception as e:
+                logger.error(f"[bill-review] Error voiding {expense_id}: {e}")
+                errors.append(str(e))
+
+        return {
+            "success": True,
+            "voided_count": voided_count,
+            "errors": errors if errors else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[bill-review] void-items error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

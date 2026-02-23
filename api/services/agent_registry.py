@@ -86,9 +86,9 @@ ANDREW_FUNCTIONS: List[Dict[str, Any]] = [
     {
         "name": "edit_bill_categories",
         "description": (
-            "Review and modify expense categories for items in an existing bill. "
-            "Shows an interactive card with dropdowns to change account assignments. "
-            "USE THIS when the user wants to review, change, or fix categories for materials/items in a bill."
+            "Directly edit expense account assignments for items in a bill using "
+            "interactive dropdowns. Use ONLY when the user explicitly asks to change "
+            "or reassign categories/accounts for specific items."
         ),
         "parameters": [
             {"name": "bill_identifier", "type": "string", "required": True,
@@ -96,7 +96,23 @@ ANDREW_FUNCTIONS: List[Dict[str, Any]] = [
             {"name": "material_name", "type": "string", "required": False,
              "description": "Optional - specific material/item name to focus on"},
         ],
-        "handler": "api.routers.pending_receipts:edit_bill_categories",
+        "handler": "api.routers.pending_receipts.edit_bill_categories",
+        "long_running": False,
+    },
+    {
+        "name": "review_bill",
+        "description": (
+            "Look up and review a bill, invoice, or check by its number or reference. "
+            "Shows all line items with amounts, accounts, authorization status, and confidence. "
+            "USE THIS when the user mentions a bill number, check number, or invoice reference "
+            "and wants to see, review, or discuss it. Examples: 'review bill H-349', "
+            "'let me see check 342', 'pull up invoice 1234', 'revisar factura 349'."
+        ),
+        "parameters": [
+            {"name": "bill_identifier", "type": "string", "required": True,
+             "description": "Bill number, check number, invoice reference, or ID (e.g. 'H-349', '342', 'INV-1234')"},
+        ],
+        "handler": "_builtin:review_bill",
         "long_running": False,
     },
 ]
