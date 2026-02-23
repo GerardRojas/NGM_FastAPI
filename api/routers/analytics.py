@@ -118,17 +118,19 @@ async def project_health(
     # --- Expenses (paginated) ---
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
-        "expense_id, Amount, status, txn_type_id, vendor_id, TxnDate",
+        "expense_id, Amount, status, auth_status, txn_type_id, vendor_id, TxnDate, account_id",
         {"project": project_id},
         neq_filters={"status": "review"},
     )
 
     # Separate authorized vs pending
+    # Use BOTH status='auth' and auth_status=True to match expense-timeline
     authorized_rows = []
     pending_rows = []
     for e in all_expenses:
         st = (e.get("status") or "").lower()
-        if st in ("auth", "authorized"):
+        auth_flag = e.get("auth_status") is True
+        if st in ("auth", "authorized") or auth_flag:
             authorized_rows.append(e)
         elif st == "pending":
             pending_rows.append(e)
@@ -139,33 +141,38 @@ async def project_health(
     spent_percent = _round2((spent_total / budget_total * 100) if budget_total else 0.0)
     remaining = _round2(budget_total - spent_total)
 
-    # --- by_category (txn_type_id -> name) ---
-    # Fetch txn_types catalog
-    txn_type_map: dict[str, str] = {}
+    # --- by_category (account_id -> AccountCategory) ---
+    # Use AccountCategory from accounts table (same as expense-timeline)
+    accounts_map: dict[str, dict] = {}
     try:
-        tt_resp = supabase.table("txn_types").select("txn_type_id, txn_type_name").execute()
-        for t in (tt_resp.data or []):
-            txn_type_map[str(t.get("txn_type_id", ""))] = t.get("txn_type_name", "Unknown")
+        acc_resp = supabase.table("accounts").select(
+            "account_id, Name, AccountCategory"
+        ).execute()
+        for a in (acc_resp.data or []):
+            accounts_map[str(a.get("account_id", ""))] = {
+                "name": a.get("Name", "Unknown"),
+                "category": a.get("AccountCategory") or "Uncategorized",
+            }
     except Exception as exc:
-        logger.warning("[analytics:health] txn_types fetch: %s", exc)
+        logger.warning("[analytics:health] accounts fetch: %s", exc)
 
     cat_agg: dict[str, dict] = defaultdict(lambda: {"amount": 0.0, "count": 0})
-    for e in all_expenses:
-        tid = str(e.get("txn_type_id") or "")
-        cat_name = txn_type_map.get(tid, "Uncategorized")
+    for e in authorized_rows:
+        aid = str(e.get("account_id") or "")
+        cat_name = accounts_map.get(aid, {}).get("category", "Uncategorized")
         cat_agg[cat_name]["amount"] += _safe_float(e.get("Amount"))
         cat_agg[cat_name]["count"] += 1
 
     by_category = sorted(
-        [{"name": k, "amount": _round2(v["amount"]), "count": v["count"]}
+        [{"category": k, "amount": _round2(v["amount"]), "count": v["count"]}
          for k, v in cat_agg.items()],
         key=lambda x: x["amount"],
         reverse=True,
     )
 
-    # --- top_vendors (vendor_id -> name) ---
+    # --- top_vendors (vendor_id -> name, authorized only) ---
     vendor_ids_in_expenses = {
-        str(e.get("vendor_id")) for e in all_expenses if e.get("vendor_id")
+        str(e.get("vendor_id")) for e in authorized_rows if e.get("vendor_id")
     }
     vendor_map: dict[str, str] = {}
     if vendor_ids_in_expenses:
@@ -177,7 +184,7 @@ async def project_health(
             logger.warning("[analytics:health] vendors fetch: %s", exc)
 
     vendor_agg: dict[str, dict] = defaultdict(lambda: {"amount": 0.0, "count": 0})
-    for e in all_expenses:
+    for e in authorized_rows:
         vid = str(e.get("vendor_id") or "")
         if not vid:
             continue
@@ -263,35 +270,18 @@ async def project_health(
         logger.warning("[analytics:health] tasks: %s", exc)
 
     # --- Daneel ---
-    daneel_payload = {"authorization_rate": 0.0, "pending_info": 0,
-                      "total_processed": 0}
+    # Auth rate: computed from actual expense data (single source of truth)
+    # to avoid overcounting when Daneel re-processes the same expenses
+    total_non_review = len(all_expenses)
+    total_auth = len(authorized_rows)
+    daneel_auth_rate = _round2(
+        (total_auth / total_non_review * 100) if total_non_review else 0.0
+    )
+
+    daneel_payload = {"authorization_rate": daneel_auth_rate, "pending_info": 0,
+                      "total_processed": total_non_review}
     try:
-        reports_resp = (
-            supabase.table("daneel_auth_reports")
-            .select("summary")
-            .eq("project_id", project_id)
-            .order("created_at", desc=True)
-            .limit(50)
-            .execute()
-        )
-        total_processed = 0
-        total_authorized = 0
-        for r in (reports_resp.data or []):
-            s = r.get("summary") or {}
-            if isinstance(s, str):
-                import json
-                try:
-                    s = json.loads(s)
-                except Exception:
-                    s = {}
-            total_processed += int(s.get("expenses_processed", 0))
-            total_authorized += int(s.get("authorized", 0))
-
-        auth_rate = _round2(
-            (total_authorized / total_processed * 100) if total_processed else 0.0
-        )
-
-        # Pending info count
+        # Pending info count (expenses waiting for missing fields)
         pending_info = 0
         try:
             pi_resp = (
@@ -309,11 +299,7 @@ async def project_health(
         except Exception:
             pass
 
-        daneel_payload = {
-            "authorization_rate": auth_rate,
-            "pending_info": pending_info,
-            "total_processed": total_processed,
-        }
+        daneel_payload["pending_info"] = pending_info
     except Exception as exc:
         logger.warning("[analytics:health] daneel: %s", exc)
 
