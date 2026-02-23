@@ -345,7 +345,7 @@ def create_task(payload: TaskCreate) -> Dict[str, Any]:
         status_id = status_response.data[0]["task_status_id"]
 
         # Preparar datos para insertar (solo campos con valor)
-        task_data = {"task_description": payload.task_description, "task_status": status_id}
+        task_data = {"task_description": payload.task_description, "task_status": status_id, "task_finished_status": None}
         optional_mappings = {
             "company_management": payload.company,
             "project_id": payload.project,
