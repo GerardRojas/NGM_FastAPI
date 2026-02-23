@@ -12,7 +12,24 @@
       "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" log --diff-filter=D --summary)",
       "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" show --name-only HEAD~5..HEAD)",
       "Bash(git -C \"c:\\\\Users\\\\germa\\\\Desktop\\\\NGM_API\" log --all --oneline)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git merge:*)",
+      "Bash(git status:*)",
+      "Bash(python -c:*)",
+      "Bash(git fetch:*)",
+      "Bash(git stash:*)",
+      "Bash(where:*)",
+      "Bash(pip show:*)",
+      "Bash(findstr:*)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\" -c \"from api.services.agent_brain import invoke_brain; print\\(''agent_brain OK''\\)\")",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\":*)",
+      "Bash(\".venv\\\\Scripts\\\\pip.exe\" list)",
+      "WebFetch(domain:docs.x.ai)",
+      "Bash(curl:*)",
+      "Bash(\".venv\\\\Scripts\\\\pip.exe\" install openai)",
+      "Bash(.venv\\\\Scripts\\\\uvicorn:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(.venv/Scripts/pip.exe install:*)"
     ]
   }
 }

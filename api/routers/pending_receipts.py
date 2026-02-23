@@ -5906,7 +5906,13 @@ async def edit_bill_categories(
             .eq("bill_id", bill_id)
 
         if material_name:
-            expenses_query = expenses_query.ilike("description", f"%{material_name}%")
+            # Split into keywords for flexible matching:
+            # "misc supplies" → match descriptions containing BOTH "misc" AND "supplies"
+            # This handles punctuation, word order, and filler words
+            stop_words = {"the", "a", "an", "of", "for", "in", "on", "to", "and", "or", "el", "la", "de", "del", "los", "las", "un", "una"}
+            keywords = [w for w in re.split(r'[\s,.\-/]+', material_name.strip()) if w.lower() not in stop_words and len(w) > 1]
+            for kw in keywords:
+                expenses_query = expenses_query.ilike("description", f"%{kw}%")
 
         expenses_result = expenses_query.execute()
 
@@ -5985,13 +5991,54 @@ async def confirm_bill_category_changes(payload: EditCategoriesRequest, current_
                 continue
 
             try:
-                supabase.table("expenses_manual_COGS") \
-                    .update({
-                        "account_id": new_account_id,
-                        "updated_at": datetime.utcnow().isoformat()
-                    }) \
+                # Check current status — if already authorized, reset to pending
+                # so Daneel re-validates with the new category
+                current = supabase.table("expenses_manual_COGS") \
+                    .select("id, status, account_id") \
                     .eq("id", expense_id) \
                     .execute()
+
+                old_status = "pending"
+                old_account_id = None
+                if current.data:
+                    old_status = current.data[0].get("status", "pending")
+                    old_account_id = current.data[0].get("account_id")
+
+                # Skip if account didn't actually change
+                if old_account_id == new_account_id:
+                    continue
+
+                update_data = {
+                    "account_id": new_account_id,
+                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_by": user_id,
+                    "categorization_source": "manual",
+                    "categorization_confidence": 100,
+                }
+
+                # If was authorized, reset to pending for Daneel re-review
+                if old_status == "auth":
+                    update_data["status"] = "pending"
+                    update_data["status_reason"] = "Category changed via bill review — awaiting re-authorization"
+                    update_data["auth_by"] = None
+
+                supabase.table("expenses_manual_COGS") \
+                    .update(update_data) \
+                    .eq("id", expense_id) \
+                    .execute()
+
+                # Log status change if it happened
+                if old_status == "auth":
+                    try:
+                        supabase.table("expense_status_log").insert({
+                            "expense_id": expense_id,
+                            "old_status": old_status,
+                            "new_status": "pending",
+                            "changed_by": user_id,
+                            "reason": "Category changed via bill review — awaiting re-authorization",
+                        }).execute()
+                    except Exception:
+                        pass  # Non-critical
 
                 updated_count += 1
             except Exception as e:
@@ -6009,6 +6056,39 @@ async def confirm_bill_category_changes(payload: EditCategoriesRequest, current_
     except Exception as e:
         logger.error(f"[bill-categories] Error confirming changes: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error confirming category changes: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Bill review protocol: trigger edit categories card
+# ---------------------------------------------------------------------------
+
+@router.post("/bill-review/edit-categories")
+async def bill_review_trigger_edit_categories(
+    payload: BillReviewActionRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Trigger the edit_bill_categories card for a bill from the review card."""
+    try:
+        bill_id = payload.bill_id
+        if not bill_id:
+            raise HTTPException(status_code=400, detail="bill_id is required")
+
+        # Reuse the existing edit_bill_categories function
+        result = await edit_bill_categories(
+            bill_identifier=bill_id,
+            project_id=None,  # will be resolved from bill
+        )
+
+        if result.get("status") == "error":
+            raise HTTPException(status_code=404, detail=result.get("message", "Bill not found"))
+
+        return {"success": True, "message": result.get("message", "Edit card posted")}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[bill-review] edit-categories error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
