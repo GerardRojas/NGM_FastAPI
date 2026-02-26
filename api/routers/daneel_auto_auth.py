@@ -368,16 +368,17 @@ async def get_project_summary():
             d["total"] += 1
             d["total_amount"] += amt
 
-            if status == "pending":
-                d["pending"] += 1
-                d["pending_amount"] += amt
-            elif status == "auth":
+            if status == "auth":
                 d["authorized"] += 1
                 d["authorized_amount"] += amt
                 if e["expense_id"] in daneel_auth_ids:
                     d["authorized_by_daneel"] += 1
             elif status in ("rejected", "reject"):
                 d["rejected"] += 1
+            else:
+                # pending, review, empty, or null → all count as pending
+                d["pending"] += 1
+                d["pending_amount"] += amt
 
             txn_date = e.get("TxnDate")
             if txn_date and (d["last_txn_date"] is None or txn_date > d["last_txn_date"]):

@@ -576,6 +576,26 @@ def check_duplicate(
                 and desc_sim < fuzzy_thresh):
             continue
 
+        # ------ R2c: Same invoice batch entry (short creation gap) ------
+        # Items from the same invoice entered within a short time window (< 5 min)
+        # are intentional line items, not duplicates -- even if descriptions are
+        # very similar (e.g. two joint compounds from Home Depot that cost the same).
+        # Only skip if descriptions are not virtually identical (< 98% similarity),
+        # since identical descriptions within 5s are caught separately.
+        if (exp_bill and oth_bill
+                and string_similarity(exp_bill, oth_bill) >= 90
+                and desc_sim < 98):
+            exp_created = expense.get("created_at") or ""
+            oth_created = other.get("created_at") or ""
+            if exp_created and oth_created:
+                try:
+                    ts1 = datetime.fromisoformat(str(exp_created).replace("Z", "+00:00"))
+                    ts2 = datetime.fromisoformat(str(oth_created).replace("Z", "+00:00"))
+                    if abs((ts1 - ts2).total_seconds()) < 300:
+                        continue  # Same invoice, entered quickly, different items
+                except (ValueError, TypeError):
+                    pass
+
         # ------ R5: Recurring labor payment ------
         if (same_amount and diff_date
                 and (is_labor or oth_is_labor)
