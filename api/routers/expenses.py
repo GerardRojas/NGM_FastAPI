@@ -437,8 +437,8 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
 
         for item in payload.updates:
             try:
-                # Preparar datos para actualización (excluir None)
-                update_data = item.data.model_dump(exclude_none=True)
+                # Preparar datos para actualización (excluir campos no enviados)
+                update_data = item.data.model_dump(exclude_unset=True)
                 # Safety net: remove any remaining empty strings (prevents UUID parse errors)
                 update_data = {k: v for k, v in update_data.items() if not (isinstance(v, str) and v.strip() == '')}
 
@@ -446,6 +446,20 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                 # exclude_none=True drops auth_by=None, so re-add it explicitly.
                 if update_data.get('status') == 'review' and update_data.get('auth_status') is False:
                     update_data['auth_by'] = None
+
+                # Validate: reject assignment to a closed bill
+                new_bill_id = update_data.get("bill_id")
+                if new_bill_id:
+                    try:
+                        bill_resp = supabase.table("bills").select("status").eq("bill_id", new_bill_id).execute()
+                        if bill_resp.data and bill_resp.data[0].get("status") == "closed":
+                            failed.append({
+                                "expense_id": item.expense_id,
+                                "error": f"Cannot assign to closed bill '{new_bill_id}'. Reopen it first."
+                            })
+                            continue
+                    except Exception:
+                        pass  # Non-critical: don't block update if bill check fails
 
                 if not update_data:
                     failed.append({
@@ -1287,6 +1301,18 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
+        # Validate: reject assignment to a closed bill
+        new_bill_id = data.get("bill_id")
+        if new_bill_id:
+            try:
+                bill_resp = supabase.table("bills").select("status").eq("bill_id", new_bill_id).execute()
+                if bill_resp.data and bill_resp.data[0].get("status") == "closed":
+                    raise HTTPException(status_code=400, detail=f"Cannot assign to closed bill '{new_bill_id}'. Reopen it first.")
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # Non-critical: don't block update if bill check fails
+
         # FK validation skipped — values come from vetted frontend dropdowns
         # and DB foreign key constraints will reject invalid IDs on UPDATE
 
@@ -1321,7 +1347,7 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         change_logs = []
         if current_status in ['review', 'auth'] and user_id:
             # Important fields to track
-            tracked_fields = ['account_id', 'Amount', 'LineDescription', 'txn_type', 'vendor_id', 'payment_type', 'TxnDate']
+            tracked_fields = ['account_id', 'Amount', 'LineDescription', 'txn_type', 'vendor_id', 'payment_type', 'TxnDate', 'bill_id']
 
             for field in tracked_fields:
                 if field in data:
