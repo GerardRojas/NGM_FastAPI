@@ -476,14 +476,10 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                     })
                     continue
 
-                # Validar receipt_url apunta a un archivo real en storage
+                # Validate receipt_url (non-blocking: log warning but allow save)
                 if "receipt_url" in update_data and update_data["receipt_url"]:
                     if not _validate_storage_url(update_data["receipt_url"]):
-                        failed.append({
-                            "expense_id": item.expense_id,
-                            "error": "receipt_url does not point to a valid file in storage"
-                        })
-                        continue
+                        logger.warning(f"[BATCH] receipt_url validation failed for expense {item.expense_id}: {update_data['receipt_url'][:150]}")
 
                 # Log status change if status is being updated (e.g. auto-review)
                 new_status = update_data.get("status")
@@ -1245,10 +1241,10 @@ def update_expense(expense_id: str, payload: ExpenseUpdate, current_user: dict =
             if not txn.data:
                 raise HTTPException(status_code=400, detail="Invalid txn_type")
 
-        # Validar receipt_url apunta a un archivo real en storage
+        # Validate receipt_url (non-blocking: log warning but allow save)
         if "receipt_url" in data and data["receipt_url"]:
             if not _validate_storage_url(data["receipt_url"]):
-                raise HTTPException(status_code=400, detail="receipt_url does not point to a valid file in storage")
+                logger.warning(f"[PUT] receipt_url validation failed for expense {expense_id}: {data['receipt_url'][:150]}")
 
         # Set updated_by so DB triggers (log_category_correction, etc.) know who made the change
         uid = current_user.get("user_id") if current_user else None
@@ -1329,10 +1325,10 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         # FK validation skipped — values come from vetted frontend dropdowns
         # and DB foreign key constraints will reject invalid IDs on UPDATE
 
-        # Validar receipt_url apunta a un archivo real en storage
+        # Validate receipt_url (non-blocking: log warning but allow save)
         if "receipt_url" in data and data["receipt_url"]:
             if not _validate_storage_url(data["receipt_url"]):
-                raise HTTPException(status_code=400, detail="receipt_url does not point to a valid file in storage")
+                logger.warning(f"[PATCH] receipt_url validation failed for expense {expense_id}: {data['receipt_url'][:150]}")
 
         # Handle status change if included in payload
         # Keep status_reason in data dict so it's stored in the expenses table
