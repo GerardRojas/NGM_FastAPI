@@ -224,7 +224,7 @@ class ExpenseBatchUpdate(BaseModel):
 
 # ====== HELPERS ======
 
-_KNOWN_BUCKETS = ("pending-expenses", "vault")
+_KNOWN_BUCKETS = ("pending-expenses", "vault", "expenses-receipts")
 
 
 def _validate_storage_url(url: str) -> bool:
