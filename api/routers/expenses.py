@@ -231,11 +231,16 @@ def _validate_storage_url(url: str) -> bool:
     """Check that a receipt_url points to an actual file in Supabase Storage."""
     if not url or not isinstance(url, str):
         return False
+    # Strip URL fragment (#...) which can be introduced by special chars in filenames
+    clean_url = url.split("#")[0]
     for bucket in _KNOWN_BUCKETS:
         marker = f"/object/public/{bucket}/"
-        if marker not in url:
+        if marker not in clean_url:
             continue
-        path = url.split(marker, 1)[1].split("?")[0]
+        path = clean_url.split(marker, 1)[1].split("?")[0]
+        # URL-decode the path for comparison (e.g., %23 -> #)
+        from urllib.parse import unquote
+        path = unquote(path)
         parts = path.rsplit("/", 1)
         folder = parts[0] if len(parts) > 1 else ""
         filename = parts[-1]
