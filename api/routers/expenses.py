@@ -447,17 +447,20 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                 if update_data.get('status') == 'review' and update_data.get('auth_status') is False:
                     update_data['auth_by'] = None
 
-                # Validate: reject assignment to a closed bill
+                # Validate: reject assignment to a closed bill (only if bill_id is changing)
                 new_bill_id = update_data.get("bill_id")
                 if new_bill_id:
                     try:
-                        bill_resp = supabase.table("bills").select("status").eq("bill_id", new_bill_id).execute()
-                        if bill_resp.data and bill_resp.data[0].get("status") == "closed":
-                            failed.append({
-                                "expense_id": item.expense_id,
-                                "error": f"Cannot assign to closed bill '{new_bill_id}'. Reopen it first."
-                            })
-                            continue
+                        current_exp = supabase.table("expenses_manual_COGS").select("bill_id").eq("expense_id", item.expense_id).execute()
+                        current_bill_id = current_exp.data[0].get("bill_id") if current_exp.data else None
+                        if new_bill_id != current_bill_id:
+                            bill_resp = supabase.table("bills").select("status").eq("bill_id", new_bill_id).execute()
+                            if bill_resp.data and bill_resp.data[0].get("status") == "closed":
+                                failed.append({
+                                    "expense_id": item.expense_id,
+                                    "error": f"Cannot assign to closed bill '{new_bill_id}'. Reopen it first."
+                                })
+                                continue
                     except Exception:
                         pass  # Non-critical: don't block update if bill check fails
 
@@ -1301,13 +1304,18 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         if not data:
             raise HTTPException(status_code=400, detail="No fields to update")
 
-        # Validate: reject assignment to a closed bill
+        # Validate: reject assignment to a closed bill (only if bill_id is changing)
         new_bill_id = data.get("bill_id")
         if new_bill_id:
             try:
-                bill_resp = supabase.table("bills").select("status").eq("bill_id", new_bill_id).execute()
-                if bill_resp.data and bill_resp.data[0].get("status") == "closed":
-                    raise HTTPException(status_code=400, detail=f"Cannot assign to closed bill '{new_bill_id}'. Reopen it first.")
+                # Fetch current expense to compare bill_id
+                current_exp = supabase.table("expenses_manual_COGS").select("bill_id").eq("expense_id", expense_id).execute()
+                current_bill_id = current_exp.data[0].get("bill_id") if current_exp.data else None
+                # Only block if the bill_id is actually CHANGING to a closed bill
+                if new_bill_id != current_bill_id:
+                    bill_resp = supabase.table("bills").select("status").eq("bill_id", new_bill_id).execute()
+                    if bill_resp.data and bill_resp.data[0].get("status") == "closed":
+                        raise HTTPException(status_code=400, detail=f"Cannot assign to closed bill '{new_bill_id}'. Reopen it first.")
             except HTTPException:
                 raise
             except Exception:
