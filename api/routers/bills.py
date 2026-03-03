@@ -162,21 +162,23 @@ async def update_bill(bill_id: str, bill: BillUpdate):
         if bill.status and bill.status.lower() not in valid_statuses:
             raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
 
-        # Construir datos a actualizar
+        # Construir datos a actualizar using model_fields_set
+        # to distinguish between "not sent" and "sent as null"
         update_data = {}
+        sent = bill.model_fields_set
 
-        if bill.vendor_id is not None:
-            update_data["vendor_id"] = bill.vendor_id if bill.vendor_id else None
-        if bill.expected_total is not None:
+        if "vendor_id" in sent:
+            update_data["vendor_id"] = bill.vendor_id or None
+        if "expected_total" in sent:
             update_data["expected_total"] = bill.expected_total
-        if bill.status is not None:
-            update_data["status"] = bill.status.lower()
-        if bill.split_projects is not None:
+        if "status" in sent:
+            update_data["status"] = bill.status.lower() if bill.status else None
+        if "split_projects" in sent:
             update_data["split_projects"] = bill.split_projects
-        if bill.receipt_url is not None:
-            update_data["receipt_url"] = bill.receipt_url if bill.receipt_url else None
-        if bill.notes is not None:
-            update_data["notes"] = bill.notes if bill.notes else None
+        if "receipt_url" in sent:
+            update_data["receipt_url"] = bill.receipt_url or None
+        if "notes" in sent:
+            update_data["notes"] = bill.notes or None
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
