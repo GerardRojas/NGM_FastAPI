@@ -5,19 +5,9 @@ Waste, overhead, profit margins, etc. para el Concept Builder
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
-from supabase import create_client, Client
-import os
+from api.supabase_client import supabase
 
 router = APIRouter(prefix="/percentage-items", tags=["percentage-items"])
-
-# Inicializar cliente de Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ========================================

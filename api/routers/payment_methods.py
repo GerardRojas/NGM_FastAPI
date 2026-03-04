@@ -5,19 +5,9 @@ NOTA: La tabla en Supabase se llama "paymet_methods" (con typo)
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from supabase import create_client, Client
-import os
+from api.supabase_client import supabase
 
 router = APIRouter(prefix="/payment-methods", tags=["payment_methods"])
-
-# Inicializar cliente de Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ========================================

@@ -464,11 +464,8 @@ _db_loaded = False
 def _get_supabase():
     """Get Supabase client for permission persistence."""
     try:
-        from supabase import create_client
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        if url and key:
-            return create_client(url, key)
+        from api.supabase_client import supabase
+        return supabase
     except Exception as e:
         logger.warning(f"[Permissions] Supabase unavailable: {e}")
     return None

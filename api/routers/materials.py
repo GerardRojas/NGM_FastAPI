@@ -5,21 +5,11 @@ import logging
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
-from supabase import create_client, Client
-import os
+from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/materials", tags=["materials"])
-
-# Inicializar cliente de Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ========================================

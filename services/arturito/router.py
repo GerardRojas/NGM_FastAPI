@@ -121,13 +121,7 @@ def _log_intent(context: Dict[str, Any], intent_obj: Dict[str, Any],
                 delegated_to: str = None) -> None:
     """Log an intent to arturito_intent_log. Non-blocking, never fails the main flow."""
     try:
-        from supabase import create_client
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        if not url or not key:
-            return
-
-        sb = create_client(url, key)
+        from api.supabase_client import supabase as sb
         sb.rpc("log_arturito_intent", {
             "p_user_email": context.get("user_email", ""),
             "p_user_role": context.get("user_role", ""),
