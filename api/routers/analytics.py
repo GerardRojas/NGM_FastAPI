@@ -1045,16 +1045,19 @@ async def health_all(current_user: dict = Depends(get_current_user)):
     # --- Expenses (all, paginated) ---
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
-        "expense_id, Amount, status, txn_type_id, vendor_id, TxnDate",
+        "expense_id, Amount, status, auth_status, txn_type_id, vendor_id, TxnDate",
         {},
         neq_filters={"status": "review"},
     )
 
+    # Separate authorized vs pending
+    # Use BOTH status='auth' and auth_status=True to match per-project health
     authorized_rows = []
     pending_rows = []
     for e in all_expenses:
         st = (e.get("status") or "").lower()
-        if st in ("auth", "authorized"):
+        auth_flag = e.get("auth_status") is True
+        if st in ("auth", "authorized") or auth_flag:
             authorized_rows.append(e)
         elif st == "pending":
             pending_rows.append(e)

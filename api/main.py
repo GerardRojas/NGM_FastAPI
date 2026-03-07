@@ -96,6 +96,9 @@ from api.routers.analytics import router as analytics_router
 # ========= TIMELINE: Phase & milestone management for projects ==========
 from api.routers.timeline import router as timeline_router
 
+# ========= STRIPE: Client invoice payment via Checkout ==========
+from api.routers.stripe_payments import router as stripe_payments_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -236,6 +239,9 @@ app.include_router(analytics_router)
 
 # Timeline (Phase & milestone CRUD for project timelines)
 app.include_router(timeline_router)
+
+# Stripe (Client invoice payments via Checkout)
+app.include_router(stripe_payments_router)
 
 _mem_logger = logging.getLogger("memory")
 

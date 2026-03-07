@@ -40,7 +40,7 @@ _UNREAD_CACHE_MAX = 100  # max entries to prevent unbounded growth
 
 class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1)
-    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct|group)$")
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group)$")
     channel_id: Optional[str] = None  # For custom/direct/group channels
     project_id: Optional[str] = None  # For project channels
     reply_to_id: Optional[str] = None
@@ -67,7 +67,7 @@ class MessageResponse(BaseModel):
 
 
 class ChannelClearRequest(BaseModel):
-    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct|group)$")
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group)$")
     channel_id: Optional[str] = None
     project_id: Optional[str] = None
 
@@ -89,7 +89,7 @@ class ThreadReplyCreate(BaseModel):
 
 
 class MarkReadRequest(BaseModel):
-    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|custom|direct|group)$")
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group)$")
     channel_id: Optional[str] = None
     project_id: Optional[str] = None
 
@@ -246,7 +246,8 @@ def get_channel_name(channel_type: str, project_id: str = None, channel_id: str 
                 channel_label = {
                     "project_general": "General",
                     "project_accounting": "Accounting",
-                    "project_receipts": "Receipts"
+                    "project_receipts": "Receipts",
+                    "project_photos": "Photos"
                 }.get(channel_type, "")
                 return f"{proj_result.data.get('project_name', '')} · {channel_label}"
 
@@ -1257,7 +1258,8 @@ def get_my_mentions(
                             channel_type_label = {
                                 "project_general": "General",
                                 "project_accounting": "Accounting",
-                                "project_receipts": "Receipts"
+                                "project_receipts": "Receipts",
+                                "project_photos": "Photos"
                             }.get(row.get("channel_type"), "")
                             channel_name = f"{proj_result.data.get('project_name', '')} · {channel_type_label}"
                     except:
@@ -1288,6 +1290,7 @@ def get_my_mentions(
                 "sender_photo": user_data.get("user_photo") if isinstance(user_data, dict) else None,
                 "sender_avatar_color": user_data.get("avatar_color") if isinstance(user_data, dict) else None,
                 "is_read": is_read,
+                "metadata": row.get("metadata"),
             }
             mentions.append(mention)
 
