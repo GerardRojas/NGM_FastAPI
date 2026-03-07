@@ -26,8 +26,11 @@ class ProjectCreate(BaseModel):
 class ProjectUpdate(BaseModel):
     project_name: str | None = None
     source_company: str | None = None
+    address: str | None = None
     city: str | None = None
     status: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 # ====== HELPERS ======
@@ -304,7 +307,7 @@ def delete_project(project_id: str):
 def update_project(project_id: str, payload: ProjectUpdate):
     """
     Actualiza un proyecto existente.
-    Campos actualizables: project_name, source_company, city, status
+    Campos actualizables: project_name, source_company, address, city, status, latitude, longitude
     """
     try:
         # Verificar que el proyecto existe
