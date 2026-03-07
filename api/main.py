@@ -99,6 +99,9 @@ from api.routers.timeline import router as timeline_router
 # ========= STRIPE: Client invoice payment via Checkout ==========
 from api.routers.stripe_payments import router as stripe_payments_router
 
+# ========= INVOICE LINKS: Signed payment links for clients ==========
+from api.routers.invoice_links import router as invoice_links_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -242,6 +245,9 @@ app.include_router(timeline_router)
 
 # Stripe (Client invoice payments via Checkout)
 app.include_router(stripe_payments_router)
+
+# Invoice Links (Signed payment links for clients)
+app.include_router(invoice_links_router)
 
 _mem_logger = logging.getLogger("memory")
 
