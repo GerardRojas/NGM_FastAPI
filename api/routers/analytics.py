@@ -118,7 +118,7 @@ async def project_health(
     # --- Expenses (paginated) ---
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
-        "expense_id, Amount, status, auth_status, txn_type_id, vendor_id, TxnDate, account_id",
+        "expense_id, Amount, status, auth_status, txn_type, vendor_id, TxnDate, account_id",
         {"project": project_id},
         neq_filters={"status": "review"},
     )
@@ -1045,7 +1045,7 @@ async def health_all(current_user: dict = Depends(get_current_user)):
     # --- Expenses (all, paginated) ---
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
-        "expense_id, Amount, status, auth_status, txn_type_id, vendor_id, TxnDate",
+        "expense_id, Amount, status, auth_status, txn_type, vendor_id, TxnDate",
         {},
         neq_filters={"status": "review"},
     )
@@ -1070,15 +1070,15 @@ async def health_all(current_user: dict = Depends(get_current_user)):
     # --- by_category ---
     txn_type_map: dict[str, str] = {}
     try:
-        tt_resp = supabase.table("txn_types").select("txn_type_id, txn_type_name").execute()
+        tt_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
         for t in (tt_resp.data or []):
-            txn_type_map[str(t.get("txn_type_id", ""))] = t.get("txn_type_name", "Unknown")
+            txn_type_map[str(t.get("TnxType_id", ""))] = t.get("TnxType_name", "Unknown")
     except Exception as exc:
         logger.warning("[analytics:health_all] txn_types fetch: %s", exc)
 
     cat_agg: dict[str, dict] = defaultdict(lambda: {"amount": 0.0, "count": 0})
     for e in all_expenses:
-        tid = str(e.get("txn_type_id") or "")
+        tid = str(e.get("txn_type") or "")
         cat_name = txn_type_map.get(tid, "Uncategorized")
         cat_agg[cat_name]["amount"] += _safe_float(e.get("Amount"))
         cat_agg[cat_name]["count"] += 1
@@ -1196,38 +1196,17 @@ async def health_all(current_user: dict = Depends(get_current_user)):
         logger.warning("[analytics:health_all] tasks: %s", exc)
 
     # --- Daneel (global) ---
-    daneel_payload = {"authorization_rate": 0.0, "pending_info": 0,
-                      "total_processed": 0}
+    # Auth rate: computed from actual expense data (single source of truth)
+    # to avoid overcounting when Daneel re-processes the same expenses
+    total_non_review = len(all_expenses)
+    total_auth = len(authorized_rows)
+    daneel_auth_rate = _round2(
+        (total_auth / total_non_review * 100) if total_non_review else 0.0
+    )
+
+    daneel_payload = {"authorization_rate": daneel_auth_rate, "pending_info": 0,
+                      "total_processed": total_non_review}
     try:
-        import json as _json
-        dr_offset = 0
-        total_processed = 0
-        total_authorized = 0
-        while True:
-            dr_resp = (
-                supabase.table("daneel_auth_reports")
-                .select("summary")
-                .range(dr_offset, dr_offset + _PAGE_SIZE - 1)
-                .execute()
-            )
-            batch = dr_resp.data or []
-            for r in batch:
-                s = r.get("summary") or {}
-                if isinstance(s, str):
-                    try:
-                        s = _json.loads(s)
-                    except Exception:
-                        s = {}
-                total_processed += int(s.get("expenses_processed", 0))
-                total_authorized += int(s.get("authorized", 0))
-            if len(batch) < _PAGE_SIZE:
-                break
-            dr_offset += _PAGE_SIZE
-
-        auth_rate = _round2(
-            (total_authorized / total_processed * 100) if total_processed else 0.0
-        )
-
         pending_info = 0
         try:
             pi_resp = (
@@ -1244,11 +1223,7 @@ async def health_all(current_user: dict = Depends(get_current_user)):
         except Exception:
             pass
 
-        daneel_payload = {
-            "authorization_rate": auth_rate,
-            "pending_info": pending_info,
-            "total_processed": total_processed,
-        }
+        daneel_payload["pending_info"] = pending_info
     except Exception as exc:
         logger.warning("[analytics:health_all] daneel: %s", exc)
 
@@ -1400,7 +1375,7 @@ async def vendor_scorecard(
     # --- Vendor expenses (paginated) ---
     vendor_expenses = _paginated_fetch(
         "expenses_manual_COGS",
-        "expense_id, Amount, project, TxnDate, txn_type_id, auth_status",
+        "expense_id, Amount, project, TxnDate, txn_type, auth_status",
         {"vendor_id": vendor_id, "auth_status": True},
         neq_filters={"status": "review"},
     )
@@ -1463,9 +1438,9 @@ async def vendor_scorecard(
     # --- By category (txn_type) with price trends ---
     txn_type_map: dict[str, str] = {}
     try:
-        tt_resp = supabase.table("txn_types").select("txn_type_id, txn_type_name").execute()
+        tt_resp = supabase.table("txn_types").select("TnxType_id, TnxType_name").execute()
         for t in (tt_resp.data or []):
-            txn_type_map[str(t.get("txn_type_id", ""))] = t.get("txn_type_name", "Unknown")
+            txn_type_map[str(t.get("TnxType_id", ""))] = t.get("TnxType_name", "Unknown")
     except Exception as exc:
         logger.warning("[analytics:vendor_scorecard] txn_types fetch: %s", exc)
 
@@ -1502,7 +1477,7 @@ async def vendor_scorecard(
         }
     )
     for e in vendor_expenses:
-        tid = str(e.get("txn_type_id") or "")
+        tid = str(e.get("txn_type") or "")
         amt = _safe_float(e.get("Amount"))
         cat_agg[tid]["total"] += amt
         cat_agg[tid]["count"] += 1
