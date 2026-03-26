@@ -102,9 +102,12 @@ async def api_get_folder_tree(
     project_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user),
 ):
-    """Get folder tree for a project (or global vault)."""
+    """Get folder tree for a project (or global vault).
+    Pass project_id=__none__ to explicitly fetch folders with no project."""
     try:
-        return get_folder_tree(project_id)
+        # __none__ is a sentinel value to explicitly query project_id IS NULL
+        effective_id = None if project_id == "__none__" else project_id
+        return get_folder_tree(effective_id)
     except Exception as e:
         logger.error("[Vault] Get tree error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

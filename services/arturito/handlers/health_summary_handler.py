@@ -1,15 +1,19 @@
 # services/arturito/handlers/health_summary_handler.py
 # ====================================================
 # Handler: Project Health Summary
-# Returns a consolidated snapshot: budget, pending auth, tasks, receipts
+# Returns a consolidated snapshot: budget, pending auth, tasks, receipts, photos
 # ====================================================
 
+import os
 import logging
-from typing import Dict, Any
+import re
+from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
 from api.supabase_client import supabase
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 
 # Reuse project resolution helpers from BVA handler
 from .bva_handler import (
@@ -72,7 +76,7 @@ def handle_project_health(
     if not project:
         return {
             "ok": False,
-            "text": f"No encontré el proyecto '{project_input}'. Verifica el nombre.",
+            "text": f"I couldn't find the project '{project_input}'. Please check the name.",
             "action": "project_not_found",
         }
 
@@ -84,10 +88,12 @@ def handle_project_health(
     pending_info = _fetch_pending_auth(project_id)
     tasks_info = _fetch_tasks_summary(project_id)
     receipts_info = _fetch_pending_receipts(project_id)
+    recent_photos = _fetch_recent_photos(project_id)
 
     # --- Format response ---
     response_text = _format_health_summary(
         project_name, budget_info, pending_info, tasks_info, receipts_info,
+        recent_photos,
     )
 
     return {
@@ -101,6 +107,7 @@ def handle_project_health(
             "pending_auth": pending_info,
             "tasks": tasks_info,
             "receipts": receipts_info,
+            "recent_photos": recent_photos,
         },
     }
 
@@ -223,6 +230,69 @@ def _fetch_pending_receipts(project_id: str) -> Dict[str, Any]:
         return {"count": 0}
 
 
+def _fetch_recent_photos(project_id: str, limit: int = 6) -> List[Dict[str, Any]]:
+    """Fetch the most recent photos from the project's Photos vault folder."""
+    try:
+        # Find the Photos folder for this project
+        folder_resp = (
+            supabase.table("vault_files")
+            .select("id")
+            .eq("project_id", project_id)
+            .eq("is_folder", True)
+            .eq("name", "Photos")
+            .limit(1)
+            .execute()
+        )
+        folders = folder_resp.data or []
+        if not folders:
+            return []
+
+        photos_folder_id = folders[0]["id"]
+
+        # Fetch recent image files from that folder
+        files_resp = (
+            supabase.table("vault_files")
+            .select("id, name, bucket_path, created_at")
+            .eq("parent_id", photos_folder_id)
+            .eq("is_folder", False)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        files = files_resp.data or []
+        if not files:
+            return []
+
+        base = f"{SUPABASE_URL}/storage/v1/object/public/vault/"
+        result = []
+        for f in files:
+            bp = f.get("bucket_path", "")
+            url = base + bp if bp else ""
+            thumb = url + "?width=200&height=200&resize=cover" if url else ""
+
+            # Parse NGMCAM filename: NGMCAM_Milestone-Name_YYYYMMDD_HHMMSS.ext
+            milestone = ""
+            date_str = ""
+            match = re.match(r"^NGMCAM_(.+?)_(\d{8})_\d{6}\.", f.get("name", ""))
+            if match:
+                milestone = match.group(1).replace("-", " ")
+                raw_date = match.group(2)
+                date_str = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+
+            result.append({
+                "id": f["id"],
+                "name": f.get("name", ""),
+                "url": url,
+                "thumbnail_url": thumb,
+                "milestone": milestone,
+                "date": date_str,
+            })
+        return result
+    except Exception as e:
+        logger.error("[HEALTH] Photos fetch error: %s", e)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Formatter
 # ---------------------------------------------------------------------------
@@ -233,47 +303,53 @@ def _format_health_summary(
     pending: Dict[str, Any],
     tasks: Dict[str, Any],
     receipts: Dict[str, Any],
+    photos: List[Dict[str, Any]] = None,
 ) -> str:
     def fmt(amount: float) -> str:
         return f"${abs(amount):,.2f}"
 
-    lines = [f"Salud del Proyecto: {project_name}", ""]
+    lines = [f"Project Health: {project_name}", ""]
 
     # Budget
     lines.append("BUDGET")
     if budget["total_budget"]:
         lines.append(f"  Total budget:   {fmt(budget['total_budget'])}")
-        lines.append(f"  Total gastado:  {fmt(budget['total_actuals'])}  ({budget['pct_used']}%)")
+        lines.append(f"  Total spent:    {fmt(budget['total_actuals'])}  ({budget['pct_used']}%)")
         remaining = budget["remaining"]
-        label = "Disponible" if remaining >= 0 else "Sobre-budget"
+        label = "Available" if remaining >= 0 else "Over-budget"
         lines.append(f"  {label}:     {fmt(remaining)}")
     else:
-        lines.append(f"  Sin budget cargado. Total gastado: {fmt(budget['total_actuals'])}")
+        lines.append(f"  No budget loaded. Total spent: {fmt(budget['total_actuals'])}")
 
     # Pending auth
     lines.append("")
-    lines.append("GASTOS PENDIENTES")
+    lines.append("PENDING EXPENSES")
     if pending["count"]:
-        lines.append(f"  {pending['count']} gastos sin autorizar  ({fmt(pending['total'])})")
+        lines.append(f"  {pending['count']} expenses pending authorization  ({fmt(pending['total'])})")
     else:
-        lines.append("  Todos los gastos estan autorizados.")
+        lines.append("  All expenses authorized.")
 
     # Tasks
     lines.append("")
-    lines.append("TAREAS")
+    lines.append("TASKS")
     if tasks["total"]:
         parts = [f"{name}: {count}" for name, count in tasks["by_status"].items()]
         lines.append(f"  {' | '.join(parts)}")
         lines.append(f"  Total: {tasks['total']}")
     else:
-        lines.append("  Sin tareas registradas.")
+        lines.append("  No tasks registered.")
 
     # Receipts
     lines.append("")
     lines.append("RECEIPTS")
     if receipts["count"]:
-        lines.append(f"  {receipts['count']} recibos pendientes de procesar")
+        lines.append(f"  {receipts['count']} receipts pending review")
     else:
-        lines.append("  Todos los recibos estan procesados.")
+        lines.append("  All receipts processed.")
+
+    # Photos
+    if photos:
+        lines.append("")
+        lines.append(f"RECENT PHOTOS ({len(photos)})")
 
     return "\n".join(lines)
