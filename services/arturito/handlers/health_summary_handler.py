@@ -149,8 +149,9 @@ def _fetch_all_expenses(project_id: str) -> list:
 
 def _classify_expenses(rows: list) -> tuple:
     """
-    Classify expenses into authorized and pending using both status and
-    auth_status fields (matches analytics endpoint logic).
+    Classify expenses into authorized and pending.
+    Primary field: status ('auth' = authorized, 'pending' = pending).
+    Fallback: auth_status boolean (deprecated but still synced).
     Returns (authorized_total, authorized_count, pending_total, pending_count).
     """
     auth_total = 0.0
@@ -158,13 +159,16 @@ def _classify_expenses(rows: list) -> tuple:
     pending_total = 0.0
     pending_count = 0
     for r in rows:
-        amt = float(r.get("Amount") or r.get("amount") or 0)
-        st = (r.get("status") or "").lower()
-        auth_flag = r.get("auth_status") is True
-        if st in ("auth", "authorized") or auth_flag:
+        try:
+            amt = float(r.get("Amount") or r.get("amount") or 0)
+        except (ValueError, TypeError):
+            amt = 0.0
+        st = (r.get("status") or "").lower().strip()
+        auth_flag = r.get("auth_status") in (True, "true", 1)
+        if st == "auth" or auth_flag:
             auth_total += amt
             auth_count += 1
-        elif st == "pending":
+        elif st == "pending" or (not st and not auth_flag):
             pending_total += amt
             pending_count += 1
     return auth_total, auth_count, pending_total, pending_count
