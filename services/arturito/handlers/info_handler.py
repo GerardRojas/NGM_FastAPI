@@ -37,41 +37,43 @@ def handle_info(
             "action": "identity"
         }
 
-    # Información de personalidad actual
-    if topic == "personality" or "sarcasmo" in raw_text:
+    # Current personality info
+    if topic == "personality" or "sarcasm" in raw_text or "sarcasmo" in raw_text:
         level = get_personality_level(space_id)
         modes = {
-            1: "modo corporativo (aburrido)",
-            2: "modo amigable",
-            3: "modo normal",
-            4: "modo sarcástico",
-            5: "modo ultra sarcástico"
+            1: "corporate mode (boring)",
+            2: "friendly mode",
+            3: "normal mode",
+            4: "sarcastic mode",
+            5: "ultra sarcastic mode"
         }
         return {
-            "text": f"Estoy en nivel **{level}/5** - {modes.get(level, 'normal')}.\n\nSi quieres que sea más nice (o más pesado), usa `/sarcasmo 1-5`.",
+            "text": f"I'm at level **{level}/5** - {modes.get(level, 'normal')}.\n\nUse `/sarcasm 1-5` to adjust.",
             "action": "personality_info"
         }
 
-    # Ayuda general (default)
-    help_text = """A ver, te explico rápido qué puedo hacer:
+    # General help (default)
+    help_text = """Here's what I can do:
 
-**Navegación** (te llevo a donde quieras):
-- "llévame a gastos" / "abre pipeline" / "ir a proyectos"
+**Navigation** - I'll take you where you need to go:
+- "go to expenses" / "open pipeline" / "take me to projects"
 
-**Acciones** (hago cosas por ti):
-- "agregar un gasto" / "crear tarea" / "escanear recibo"
+**Actions** - I get things done:
+- "add an expense" / "create a task" / "scan a receipt"
 
-**Copilot** (controlo la página actual):
-- "filtrar por proyecto X" / "mostrar solo pendientes" / "limpiar filtros"
+**Copilot** - I control the current page:
+- "filter by project X" / "show only pending" / "clear filters"
 
-**Preguntas** (sé dónde están las cosas):
-- "¿cómo agrego un gasto?" / "¿dónde veo mis tareas?"
+**Questions** - I know where things are:
+- "how do I add an expense?" / "where are my tasks?"
 
-**Bugs** (creo tickets):
-- "tengo un bug" / "algo no funciona"
+**Reports** - Project data at your fingertips:
+- "BVA for [project]" / "show budget vs actuals"
 
-Si soy muy sarcástico usa `/sarcasmo 1-5` para bajarle.
-Si soy muy aburrido... también."""
+**Bugs** - I'll create a ticket:
+- "I found a bug" / "something is broken"
+
+Use `/sarcasm 1-5` to adjust my personality level."""
 
     return {
         "text": help_text,
@@ -87,7 +89,7 @@ def get_system_status() -> Dict[str, Any]:
     import os
 
     return {
-        "bot_name": "Arturito",
+        "bot_name": "Art",
         "version": "2.0.0",
         "environment": os.getenv("ENVIRONMENT", "development"),
         "openai_configured": bool(os.getenv("OPENAI_API_KEY")),

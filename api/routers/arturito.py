@@ -101,7 +101,7 @@ async def receive_message(message: ChatMessage):
 
         if not text:
             return BotResponse(
-                text="No recibí ningún mensaje. ¿En qué puedo ayudarte?",
+                text="I didn't get a message. How can I help?",
                 action="empty_message"
             )
 
@@ -147,7 +147,7 @@ async def receive_message(message: ChatMessage):
     except Exception as e:
         logger_art.error("[ART] /message error: %s", e)
         return BotResponse(
-            text="Ocurrio un error procesando tu mensaje.",
+            text="Something went wrong processing your message. Please try again.",
             action="error",
         )
 
@@ -223,7 +223,7 @@ async def web_chat(message: WebChatMessage):
 
         if not text:
             return BotResponse(
-                text="No recibí ningún mensaje. ¿En qué puedo ayudarte?",
+                text="I didn't get a message. How can I help?",
                 action="empty_message"
             )
 
@@ -292,7 +292,7 @@ async def web_chat(message: WebChatMessage):
     except Exception as e:
         logger_art.error("[ART] /web-chat error: %s", e)
         return BotResponse(
-            text="Ocurrio un error procesando tu mensaje. Por favor intenta de nuevo.",
+            text="Something went wrong processing your message. Please try again.",
             action="error",
         )
 
@@ -398,7 +398,7 @@ async def google_chat_webhook(payload: Dict[str, Any]):
 
     except Exception as e:
         logger_art.error("[ART] /webhook error: %s", e)
-        return {"text": "Ocurrio un error procesando tu mensaje."}
+        return {"text": "Something went wrong processing your message. Please try again."}
 
 
 # ================================

@@ -414,8 +414,8 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             "source": "local"
         }
 
-    # Saludos simples
-    if re.match(r'^(hola|hi|hello|hey|buenos días|buenas tardes|good morning)[\s!.,]*$', t):
+    # Saludos simples (con o sin nombre del bot)
+    if re.match(r'^(hola|hi|hello|hey|buenos d[ií]as|buenas tardes|good morning|sup|yo|what\'?s up)(\s+(art|arturito))?[\s!.,]*$', t):
         return {
             "intent": "GREETING",
             "entities": {},
