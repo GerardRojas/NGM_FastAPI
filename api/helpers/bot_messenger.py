@@ -1,8 +1,8 @@
 # api/helpers/bot_messenger.py
 # ================================
-# Arturito Bot Message Helper
+# Art Bot Message Helper
 # ================================
-# Posts messages to project channels or group channels as the Arturito bot user.
+# Posts messages to project channels or group channels as the Art bot user.
 # Messages are inserted directly into the messages table;
 # Supabase Realtime delivers them to connected frontends automatically.
 
@@ -10,7 +10,7 @@ from api.supabase_client import supabase
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-ARTURITO_BOT_USER_ID = "00000000-0000-0000-0000-000000000001"
+ART_BOT_USER_ID = "00000000-0000-0000-0000-000000000001"
 
 _bot_user_verified = False
 
@@ -24,7 +24,7 @@ def _ensure_bot_user_exists():
     try:
         result = supabase.table("users") \
             .select("user_id") \
-            .eq("user_id", ARTURITO_BOT_USER_ID) \
+            .eq("user_id", ART_BOT_USER_ID) \
             .execute()
 
         if not result.data or len(result.data) == 0:
@@ -34,8 +34,8 @@ def _ensure_bot_user_exists():
             dummy_hash = hash_password("BOT_NO_LOGIN")
 
             supabase.table("users").insert({
-                "user_id": ARTURITO_BOT_USER_ID,
-                "user_name": "Arturito",
+                "user_id": ART_BOT_USER_ID,
+                "user_name": "Art",
                 "avatar_color": 145,
                 "password_hash": dummy_hash,
             }).execute()
@@ -78,7 +78,7 @@ def post_bot_message(
         message_data = {
             "content": content,
             "channel_type": channel_type,
-            "user_id": ARTURITO_BOT_USER_ID,
+            "user_id": ART_BOT_USER_ID,
             "metadata": metadata or {},
             "created_at": datetime.utcnow().isoformat(),
         }

@@ -48,8 +48,8 @@ from api.routers.bills import router as bills_router
 # ========= NUEVO: AUTH LOGIN ==========
 from api.auth import router as auth_router
 
-# ========= ARTURITO: Chat Bot ==========
-from api.routers.arturito import router as arturito_router
+# ========= ART: Chat Bot ==========
+from api.routers.arturito import router as art_router
 
 # ========= MESSAGES: Chat Module ==========
 from api.routers.messages import router as messages_router
@@ -181,8 +181,8 @@ app.include_router(bills_router)
 # Permissions (control de acceso basado en roles)
 app.include_router(permissions_router)
 
-# Arturito Chat Bot (Google Chat integration)
-app.include_router(arturito_router)
+# Art Chat Bot (Google Chat integration)
+app.include_router(art_router)
 
 # Messages (Chat module - channels, threads, reactions)
 app.include_router(messages_router)

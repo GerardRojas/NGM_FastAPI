@@ -562,7 +562,7 @@ def clear_agent_metrics(current_user: dict = Depends(get_current_user)):
 
 # ====== NON-DESTRUCTIVE RESET (all agents) ======
 
-_VALID_AGENT_IDS = {"andrew", "daneel", "arturito"}
+_VALID_AGENT_IDS = {"andrew", "daneel", "art", "arturito"}
 
 
 @router.post("/agents/{agent_id}/reset-stats")

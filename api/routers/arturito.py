@@ -1,6 +1,6 @@
 # api/routers/arturito.py
 # ================================
-# ARTURITO - NGM Chat Bot Backend
+# ART - NGM Chat Bot Backend
 # ================================
 # Entry point para mensajes desde Google Chat y NGM HUB Web.
 # Usa OpenAI Assistants API para memoria contextual eficiente.
@@ -37,7 +37,7 @@ from services.arturito.failed_commands_logger import (
     get_failed_commands_stats,
 )
 
-router = APIRouter(prefix="/arturito", tags=["arturito"])
+router = APIRouter(prefix="/art", tags=["art"])
 
 
 # ================================
@@ -128,7 +128,7 @@ async def receive_message(message: ChatMessage):
             )
 
         # Limpiar mención del bot
-        clean_text = re.sub(r'^@?\s*arturito[,:]?\s*', '', text, flags=re.IGNORECASE).strip()
+        clean_text = re.sub(r'^@?\s*(?:art|arturito)[,:]?\s*', '', text, flags=re.IGNORECASE).strip()
         if not clean_text:
             clean_text = text
 
@@ -145,7 +145,7 @@ async def receive_message(message: ChatMessage):
         )
 
     except Exception as e:
-        logger_art.error("[ARTURITO] /message error: %s", e)
+        logger_art.error("[ART] /message error: %s", e)
         return BotResponse(
             text="Ocurrio un error procesando tu mensaje.",
             action="error",
@@ -173,7 +173,7 @@ async def receive_slash_command(command: SlashCommand):
         )
 
     except Exception as e:
-        logger_art.error("[ARTURITO] /slash error: %s", e)
+        logger_art.error("[ART] /slash error: %s", e)
         return BotResponse(
             text=f"Error ejecutando /{command.command}",
             action="error",
@@ -269,7 +269,7 @@ async def web_chat(message: WebChatMessage):
             )
 
             if error:
-                logger_art.warning("[ARTURITO] Assistants API error: %s", error)
+                logger_art.warning("[ART] Assistants API error: %s", error)
             return BotResponse(
                 text=response_text,
                 action="chat_response",
@@ -280,7 +280,7 @@ async def web_chat(message: WebChatMessage):
         response = route(intent_result, context)
 
         if response.get("error"):
-            logger_art.warning("[ARTURITO] Route handler error: %s", response.get('error'))
+            logger_art.warning("[ART] Route handler error: %s", response.get('error'))
 
         return BotResponse(
             text=response.get("text", ""),
@@ -290,7 +290,7 @@ async def web_chat(message: WebChatMessage):
         )
 
     except Exception as e:
-        logger_art.error("[ARTURITO] /web-chat error: %s", e)
+        logger_art.error("[ART] /web-chat error: %s", e)
         return BotResponse(
             text="Ocurrio un error procesando tu mensaje. Por favor intenta de nuevo.",
             action="error",
@@ -397,7 +397,7 @@ async def google_chat_webhook(payload: Dict[str, Any]):
         return {"text": ""}
 
     except Exception as e:
-        logger_art.error("[ARTURITO] /webhook error: %s", e)
+        logger_art.error("[ART] /webhook error: %s", e)
         return {"text": "Ocurrio un error procesando tu mensaje."}
 
 
@@ -644,7 +644,7 @@ def _get_cached_entities():
             ))
             g_cache["ts"] = now
         except Exception as e:
-            logger_art.warning("[ARTURITO] Entity cache refresh error: %s", e)
+            logger_art.warning("[ART] Entity cache refresh error: %s", e)
 
     return p_cache["data"], v_cache["data"], g_cache["data"]
 
@@ -814,7 +814,7 @@ async def interpret_intent(request: IntentRequest, current_user: dict = Depends(
         )
 
     except Exception as e:
-        logger_art.error("[ARTURITO] interpret-intent error: %s", e)
+        logger_art.error("[ART] interpret-intent error: %s", e)
         return IntentResponse(type="chat")
 
 
@@ -913,7 +913,7 @@ If you can't interpret the command as a filter action, return:
         return FilterInterpretResponse(understood=False)
 
     except Exception as e:
-        logger_art.error("[ARTURITO] Filter interpretation error: %s", e)
+        logger_art.error("[ART] Filter interpretation error: %s", e)
         return FilterInterpretResponse(understood=False)
 
 
@@ -991,7 +991,7 @@ If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}
         return []
 
     except Exception as e:
-        logger_art.error("[ARTURITO] Semantic search error: %s", e)
+        logger_art.error("[ART] Semantic search error: %s", e)
         return []
 
 
@@ -1065,17 +1065,17 @@ async def search_accounts(query: str, limit: int = 5):
 
         # Phase 2: If no good match found (best score < 70), try GPT semantic search
         if not scored_accounts or scored_accounts[0]["score"] < 70:
-            logger_art.info("[ARTURITO] Fuzzy match weak (best: %s), trying GPT semantic search...", scored_accounts[0]['score'] if scored_accounts else 0)
+            logger_art.info("[ART] Fuzzy match weak (best: %s), trying GPT semantic search...", scored_accounts[0]['score'] if scored_accounts else 0)
 
             semantic_matches = await semantic_account_search(query, accounts)
             if semantic_matches:
-                logger_art.info("[ARTURITO] GPT found %d semantic matches", len(semantic_matches))
+                logger_art.info("[ART] GPT found %d semantic matches", len(semantic_matches))
                 return {"matches": semantic_matches[:limit], "method": "semantic"}
 
         return {"matches": scored_accounts[:limit], "method": "fuzzy"}
 
     except Exception as e:
-        logger_art.error("[ARTURITO] Account search error: %s", e)
+        logger_art.error("[ART] Account search error: %s", e)
         return {"matches": []}
 
 

@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
- NGM HUB Handler for Arturito
+ NGM HUB Handler for Art
 ═══════════════════════════════════════════════════════════════════════════════
  Handles:
  - Help/FAQ questions about NGM HUB modules
@@ -401,7 +401,7 @@ async def handle_bug_report(
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     task_title = f"[BUG] Reportado por {user_name} - {timestamp}"
-    task_description = f"""**Bug reportado via Arturito**
+    task_description = f"""**Bug reportado via Art**
 
 **Reportado por:** {user_name}
 **Página:** {current_page}
@@ -411,7 +411,7 @@ async def handle_bug_report(
 {message}
 
 ---
-*Este ticket fue creado automáticamente por Arturito*
+*Este ticket fue creado automáticamente por Art*
 """
 
     return {
