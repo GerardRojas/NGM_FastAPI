@@ -682,6 +682,9 @@ async def _execute_function_call(
             params["_channel_type"] = channel_type
             params["_project_id"] = project_id
             params["_user_name"] = user_name
+            params["_user_id"] = user_id
+            params["_raw_text"] = user_text
+            params["_channel_key"] = f"{channel_type}_{channel_id or project_id or ''}"
 
         # Execute the handler
         t_fn = time.monotonic()
@@ -2198,6 +2201,278 @@ async def _builtin_review_bill(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Failed to look up bill: {str(e)[:150]}"}
 
 
+# ---------------------------------------------------------------------------
+# Hari Builtin Handlers
+# ---------------------------------------------------------------------------
+
+async def _builtin_hari_create_task(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a task from natural language instruction."""
+    from api.services.hari_coordinator import (
+        create_task, resolve_user_by_name, check_instructor_permission, is_hari_enabled
+    )
+
+    if not is_hari_enabled():
+        return {"error": "Hari coordinator is not enabled. Ask an admin to enable it in Agent Hub."}
+
+    user_id = params.get("_user_id", "")
+    perm = check_instructor_permission(user_id)
+    if not perm["allowed"]:
+        return {"error": "I take instructions from management roles. " + perm.get("reason", "")}
+
+    assignee_name = params.get("assignee_name", "")
+    assignee = resolve_user_by_name(assignee_name)
+    if not assignee:
+        return {"error": f"Could not find a user matching '{assignee_name}'. Please check the name."}
+
+    task = create_task(
+        instruction_text=params.get("_raw_text", ""),
+        description=params.get("task_description", ""),
+        created_by=user_id,
+        assigned_to=assignee["user_id"],
+        project_id=params.get("_project_id"),
+        channel_key=params.get("_channel_key", ""),
+        deadline=params.get("deadline"),
+        location=params.get("location"),
+    )
+
+    if "error" in task:
+        return task
+
+    return {
+        "status": "created",
+        "task_id": task.get("id"),
+        "assignee_name": assignee["user_name"],
+        "description": params.get("task_description", ""),
+        "deadline": task.get("deadline"),
+        "location": params.get("location"),
+        "needs_confirmation": True,
+    }
+
+
+async def _builtin_hari_schedule_event(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Schedule a time-bound event."""
+    from api.services.hari_coordinator import (
+        create_task, resolve_user_by_name, check_instructor_permission, is_hari_enabled
+    )
+
+    if not is_hari_enabled():
+        return {"error": "Hari coordinator is not enabled. Ask an admin to enable it in Agent Hub."}
+
+    user_id = params.get("_user_id", "")
+    perm = check_instructor_permission(user_id)
+    if not perm["allowed"]:
+        return {"error": "I take instructions from management roles. " + perm.get("reason", "")}
+
+    # Resolve attendees if provided
+    attendee_names = params.get("attendees", "")
+    attendee_list = []
+    if attendee_names:
+        for name in attendee_names.split(","):
+            name = name.strip()
+            user = resolve_user_by_name(name)
+            if user:
+                attendee_list.append(user["user_name"])
+            else:
+                attendee_list.append(name + " (not found)")
+
+    task = create_task(
+        instruction_text=params.get("_raw_text", ""),
+        description=params.get("event_description", ""),
+        created_by=user_id,
+        assigned_to=None,
+        project_id=params.get("_project_id"),
+        channel_key=params.get("_channel_key", ""),
+        deadline=params.get("event_time"),
+        location=params.get("location"),
+        metadata={
+            "type": "event",
+            "attendees": attendee_list,
+        },
+    )
+
+    if "error" in task:
+        return task
+
+    return {
+        "status": "scheduled",
+        "task_id": task.get("id"),
+        "event": params.get("event_description", ""),
+        "time": task.get("deadline"),
+        "attendees": attendee_list,
+        "location": params.get("location"),
+    }
+
+
+async def _builtin_hari_assign_person(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Reassign a person to a project/task/location."""
+    from api.services.hari_coordinator import (
+        create_task, resolve_user_by_name, check_instructor_permission, is_hari_enabled
+    )
+
+    if not is_hari_enabled():
+        return {"error": "Hari coordinator is not enabled. Ask an admin to enable it in Agent Hub."}
+
+    user_id = params.get("_user_id", "")
+    perm = check_instructor_permission(user_id)
+    if not perm["allowed"]:
+        return {"error": "I take instructions from management roles. " + perm.get("reason", "")}
+
+    person = resolve_user_by_name(params.get("person_name", ""))
+    if not person:
+        return {"error": f"Could not find a user matching '{params.get('person_name', '')}'. Please check the name."}
+
+    task = create_task(
+        instruction_text=params.get("_raw_text", ""),
+        description=f"Assignment: {params.get('assignment', '')}",
+        created_by=user_id,
+        assigned_to=person["user_id"],
+        project_id=params.get("_project_id"),
+        channel_key=params.get("_channel_key", ""),
+        deadline=params.get("start_date"),
+        metadata={"type": "assignment"},
+    )
+
+    if "error" in task:
+        return task
+
+    return {
+        "status": "assigned",
+        "task_id": task.get("id"),
+        "person": person["user_name"],
+        "assignment": params.get("assignment", ""),
+        "start_date": task.get("deadline"),
+    }
+
+
+async def _builtin_hari_check_tasks(params: Dict[str, Any]) -> Dict[str, Any]:
+    """List tasks with filters."""
+    from api.services.hari_coordinator import get_tasks, resolve_user_by_name
+
+    assignee_name = params.get("assignee_name")
+    assigned_to = None
+    if assignee_name:
+        user = resolve_user_by_name(assignee_name)
+        if user:
+            assigned_to = user["user_id"]
+
+    tasks = get_tasks(
+        project_id=params.get("_project_id"),
+        assigned_to=assigned_to,
+        status=params.get("status", "all"),
+        limit=20,
+    )
+
+    # Enrich with user names
+    user_cache = {}
+    enriched = []
+    for t in tasks:
+        aid = t.get("assigned_to")
+        if aid and aid not in user_cache:
+            try:
+                from api.supabase_client import supabase as sb
+                r = sb.table("users").select("user_name").eq("user_id", aid).execute()
+                user_cache[aid] = r.data[0]["user_name"] if r.data else "Unknown"
+            except Exception:
+                user_cache[aid] = "Unknown"
+
+        enriched.append({
+            "id": t.get("id", "")[:8],
+            "description": t.get("description", ""),
+            "assignee": user_cache.get(aid, "Unassigned") if aid else "Unassigned",
+            "deadline": t.get("deadline"),
+            "status": t.get("status", ""),
+            "escalations": t.get("escalation_count", 0),
+        })
+
+    return {"tasks": enriched, "count": len(enriched)}
+
+
+async def _builtin_hari_update_task(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Update an existing task."""
+    from api.services.hari_coordinator import (
+        find_task_by_description, complete_task, update_task_field,
+        resolve_user_by_name, parse_deadline, check_instructor_permission, is_hari_enabled
+    )
+
+    if not is_hari_enabled():
+        return {"error": "Hari coordinator is not enabled."}
+
+    user_id = params.get("_user_id", "")
+    perm = check_instructor_permission(user_id)
+    if not perm["allowed"]:
+        return {"error": "I take instructions from management roles. " + perm.get("reason", "")}
+
+    task_id_or_desc = params.get("task_identifier", "")
+    action = params.get("action", "").lower()
+    new_value = params.get("new_value")
+
+    # Find the task
+    task = find_task_by_description(task_id_or_desc, params.get("_project_id"))
+    if not task:
+        return {"error": f"Could not find a task matching '{task_id_or_desc}'."}
+
+    tid = task["id"]
+
+    if action == "complete":
+        result = complete_task(tid, user_id, notes=new_value)
+        if "error" not in result:
+            return {"status": "completed", "description": task.get("description", "")}
+        return result
+
+    elif action == "extend":
+        new_deadline = parse_deadline(new_value)
+        if not new_deadline:
+            return {"error": f"Could not parse deadline: '{new_value}'"}
+        result = update_task_field(tid, {"deadline": new_deadline})
+        if "error" not in result:
+            return {"status": "extended", "description": task.get("description", ""), "new_deadline": new_deadline}
+        return result
+
+    elif action == "reassign":
+        new_user = resolve_user_by_name(new_value)
+        if not new_user:
+            return {"error": f"Could not find user '{new_value}'"}
+        result = update_task_field(tid, {"assigned_to": new_user["user_id"]})
+        if "error" not in result:
+            return {"status": "reassigned", "description": task.get("description", ""), "new_assignee": new_user["user_name"]}
+        return result
+
+    elif action == "cancel":
+        from api.services.hari_coordinator import cancel_task
+        result = cancel_task(tid)
+        if "error" not in result:
+            return {"status": "cancelled", "description": task.get("description", "")}
+        return result
+
+    elif action == "add_note":
+        meta = task.get("metadata", {})
+        notes = meta.get("notes", [])
+        notes.append({"text": new_value, "at": datetime.now(timezone.utc).isoformat(), "by": user_id})
+        meta["notes"] = notes
+        result = update_task_field(tid, {"metadata": meta})
+        if "error" not in result:
+            return {"status": "note_added", "description": task.get("description", "")}
+        return result
+
+    else:
+        return {"error": f"Unknown action: '{action}'. Use: complete, extend, reassign, cancel, add_note."}
+
+
+async def _builtin_hari_weekly_summary(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate weekly task digest."""
+    from api.services.hari_coordinator import generate_weekly_summary
+    days = params.get("days", 7)
+    if isinstance(days, str):
+        try:
+            days = int(days)
+        except ValueError:
+            days = 7
+    return generate_weekly_summary(
+        project_id=params.get("_project_id"),
+        days=days,
+    )
+
+
 # Handler registry
 _BUILTIN_HANDLERS = {
     "process_receipt": _builtin_process_receipt,
@@ -2208,6 +2483,12 @@ _BUILTIN_HANDLERS = {
     "expense_health_report": _builtin_expense_health_report,
     "reprocess_pending": _builtin_reprocess_pending,
     "review_bill": _builtin_review_bill,
+    "hari_create_task": _builtin_hari_create_task,
+    "hari_schedule_event": _builtin_hari_schedule_event,
+    "hari_assign_person": _builtin_hari_assign_person,
+    "hari_check_tasks": _builtin_hari_check_tasks,
+    "hari_update_task": _builtin_hari_update_task,
+    "hari_weekly_summary": _builtin_hari_weekly_summary,
 }
 
 
@@ -2358,6 +2639,95 @@ def _format_result(agent_name: str, fn_name: str, result: Any) -> str:
             f"{authorized} authorized, {flagged} flagged, {missing} need info."
         )
 
+    # ── Hari functions ──
+
+    if fn_name == "create_task":
+        desc = result.get("description", "")
+        assignee = result.get("assignee_name", "Unassigned")
+        deadline = result.get("deadline", "No deadline")
+        location = result.get("location")
+        lines = [
+            f"Task created.",
+            f"- **Assignee:** {assignee}",
+            f"- **Task:** {desc}",
+            f"- **Deadline:** {deadline}",
+        ]
+        if location:
+            lines.append(f"- **Location:** {location}")
+        if result.get("needs_confirmation"):
+            lines.append("\nConfirm? (yes / edit / cancel)")
+        return "\n".join(lines)
+
+    if fn_name == "schedule_event":
+        event = result.get("event", "")
+        time_str = result.get("time", "TBD")
+        attendees = result.get("attendees", [])
+        location = result.get("location")
+        lines = [
+            f"Event scheduled.",
+            f"- **Event:** {event}",
+            f"- **Time:** {time_str}",
+        ]
+        if attendees:
+            lines.append(f"- **Attendees:** {', '.join(attendees)}")
+        if location:
+            lines.append(f"- **Location:** {location}")
+        return "\n".join(lines)
+
+    if fn_name == "assign_person":
+        return (
+            f"Assignment confirmed.\n"
+            f"- **{result.get('person', '')}** assigned to: {result.get('assignment', '')}\n"
+            f"- **Starting:** {result.get('start_date', 'Immediately')}"
+        )
+
+    if fn_name == "check_tasks":
+        tasks = result.get("tasks", [])
+        count = result.get("count", 0)
+        if count == 0:
+            return "No tasks found matching that criteria."
+        lines = [f"**{count} task(s) found:**\n"]
+        for t in tasks:
+            status_icon = {"active": "○", "in_progress": "◑", "completed": "●",
+                          "overdue": "⚠", "blocked": "✕"}.get(t["status"], "?")
+            dl = t.get("deadline", "No deadline")
+            lines.append(
+                f"{status_icon} **{t['description']}**\n"
+                f"  Assigned: {t['assignee']} | Due: {dl} | Status: {t['status']}"
+            )
+        return "\n".join(lines)
+
+    if fn_name == "update_task":
+        s = result.get("status", "")
+        desc = result.get("description", "")
+        if s == "completed":
+            return f"Task completed: **{desc}**"
+        if s == "extended":
+            return f"Deadline extended for **{desc}** to {result.get('new_deadline', 'TBD')}"
+        if s == "reassigned":
+            return f"**{desc}** reassigned to {result.get('new_assignee', '')}"
+        if s == "cancelled":
+            return f"Task cancelled: **{desc}**"
+        if s == "note_added":
+            return f"Note added to **{desc}**"
+        return f"Task updated: {s}"
+
+    if fn_name == "weekly_summary":
+        s = result
+        lines = [
+            f"**Task Summary** (last {s.get('period_days', 7)} days)\n",
+            f"- Created: **{s.get('tasks_created', 0)}**",
+            f"- Completed: **{s.get('tasks_completed', 0)}**",
+            f"- Overdue: **{s.get('tasks_overdue', 0)}**",
+            f"- Blocked: **{s.get('tasks_blocked', 0)}**",
+        ]
+        overdue = s.get("overdue_details", [])
+        if overdue:
+            lines.append("\n**Overdue:**")
+            for o in overdue:
+                lines.append(f"  - {o['description']} ({o['assignee']}) - due {o.get('deadline', '?')}")
+        return "\n".join(lines)
+
     # Generic fallback: render dict as key-value list
     lines = []
     for k, v in result.items():
@@ -2434,6 +2804,18 @@ async def _post_response(
             )
         else:
             logger.warning("[AgentBrain:daneel] Cannot post without project_id or channel_id")
+    elif agent_name == "hari":
+        from api.helpers.hari_messenger import post_hari_message
+        if project_id or channel_id:
+            post_hari_message(
+                content=content,
+                project_id=project_id,
+                channel_type=channel_type,
+                channel_id=channel_id,
+                metadata=meta,
+            )
+        else:
+            logger.warning("[AgentBrain:hari] Cannot post without project_id or channel_id")
 
 
 # ---------------------------------------------------------------------------

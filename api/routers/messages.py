@@ -21,7 +21,7 @@ from uuid import UUID
 from api.supabase_client import supabase
 from api.auth import get_current_user
 from api.services.firebase_notifications import notify_mentioned_users, notify_message_recipients
-from api.services.agent_personas import is_bot_user, AGENT_PERSONAS
+from api.services.agent_personas import is_bot_user, AGENT_PERSONAS, BOT_USER_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -675,6 +675,7 @@ def create_message(
                 # 2. If NO explicit @mention, check for active attention session
                 #    (follow-up messages in an ongoing agent conversation)
                 if not mentions_found:
+                    routed_via_session = False
                     try:
                         from api.services.agent_attention import consume_session
                         session = consume_session(
@@ -701,8 +702,38 @@ def create_message(
                                 payload.attachments,
                                 True,  # is_followup flag
                             )
+                            routed_via_session = True
                     except Exception as attn_err:
                         logger.debug("[Messages] Attention check error (non-blocking): %s", attn_err)
+
+                    # 3. If still not routed, check if this is a DM channel with a bot
+                    #    (auto-route to the bot agent without needing @mention)
+                    if not routed_via_session and payload.channel_id and payload.channel_type == "direct":
+                        try:
+                            member_ids = get_channel_member_ids(payload.channel_id, exclude_user_id=user_id)
+                            for mid in member_ids:
+                                if is_bot_user(mid):
+                                    agent_key = BOT_USER_IDS.get(mid)
+                                    if agent_key:
+                                        logger.info(
+                                            "[Messages] DM auto-route: %s -> @%s (channel=%s)",
+                                            sender_name, agent_key, payload.channel_id
+                                        )
+                                        background_tasks.add_task(
+                                            _run_agent_brain,
+                                            agent_key,
+                                            payload.content,
+                                            user_id,
+                                            sender_name,
+                                            payload.project_id,
+                                            payload.channel_type,
+                                            payload.channel_id,
+                                            payload.attachments,
+                                            True,  # treat as follow-up (no rate limit)
+                                        )
+                                    break  # Only route to the first bot in the DM
+                        except Exception as dm_err:
+                            logger.debug("[Messages] DM bot auto-route error (non-blocking): %s", dm_err)
         except Exception as brain_err:
             logger.warning("[Messages] Agent brain setup error (non-blocking): %s", brain_err)
 

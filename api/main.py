@@ -73,6 +73,7 @@ from api.routers.adu_calculator import router as adu_calculator_router
 # ========= DANEEL AUTO-AUTH: Automated Expense Authorization ==========
 from api.routers.daneel_auto_auth import router as daneel_auto_auth_router
 from api.routers.andrew_mismatch import router as andrew_mismatch_router
+from api.routers.hari import router as hari_router
 
 # ========= VAULT: File Storage Module ==========
 from api.routers.vault import router as vault_router
@@ -218,6 +219,9 @@ app.include_router(daneel_auto_auth_router)
 
 # Andrew Mismatch Reconciliation (bill mismatch detection & correction)
 app.include_router(andrew_mismatch_router)
+
+# Hari Coordinator (task delegation, scheduling, follow-up)
+app.include_router(hari_router)
 
 # Vault (file storage with folders, versioning, chunked uploads)
 app.include_router(vault_router)
