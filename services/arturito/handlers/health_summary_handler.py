@@ -140,7 +140,7 @@ def _fetch_all_expenses(project_id: str) -> list:
     while True:
         resp = (
             supabase.table("expenses_manual_COGS")
-            .select("Amount, amount, status, auth_status")
+            .select("Amount, status, auth_status")
             .eq("project", project_id)
             .neq("status", "review")
             .range(offset, offset + page_size - 1)
@@ -167,7 +167,7 @@ def _classify_expenses(rows: list) -> tuple:
     pending_count = 0
     for r in rows:
         try:
-            amt = float(r.get("Amount") or r.get("amount") or 0)
+            amt = float(r.get("Amount") or 0)
         except (ValueError, TypeError):
             amt = 0.0
         st = (r.get("status") or "").lower().strip()
