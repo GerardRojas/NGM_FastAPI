@@ -31,6 +31,8 @@ def handle_project_progress(
     """
     from .bva_handler import resolve_project, fetch_recent_projects, _gpt_ask_missing_entity
     from .health_summary_handler import (
+        _fetch_all_expenses,
+        _classify_expenses,
         _fetch_budget_info,
         _fetch_pending_auth,
         _fetch_tasks_summary,
@@ -79,9 +81,16 @@ def handle_project_progress(
 
     # ---- Fetch sections independently ----
     photos_data = _fetch_latest_photos(project_id)
-    budget_data = _safe_fetch(_fetch_budget_info, project_id, "budget")
+
+    # Fetch expenses once, share for budget + pending
+    try:
+        all_expenses = _fetch_all_expenses(project_id)
+    except Exception as e:
+        logger.error("[Progress] expenses fetch error: %s", e)
+        all_expenses = []
+    budget_data = _safe_fetch(lambda pid: _fetch_budget_info(pid, _cached_expenses=all_expenses), project_id, "budget")
     tasks_data = _safe_fetch(_fetch_tasks_summary, project_id, "tasks")
-    pending_auth = _safe_fetch(_fetch_pending_auth, project_id, "pending_auth")
+    pending_auth = _safe_fetch(lambda pid: _fetch_pending_auth(pid, _cached_expenses=all_expenses), project_id, "pending_auth")
     pending_rcpt = _safe_fetch(_fetch_pending_receipts, project_id, "pending_receipts")
 
     # ---- Normalize empty results to None ----

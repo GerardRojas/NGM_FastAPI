@@ -84,8 +84,14 @@ def handle_project_health(
     project_name = project.get("project_name") or project.get("name") or project_input
 
     # --- Fetch all metrics ---
-    budget_info = _fetch_budget_info(project_id)
-    pending_info = _fetch_pending_auth(project_id)
+    # Fetch expenses once, share for budget + pending
+    try:
+        all_expenses = _fetch_all_expenses(project_id)
+    except Exception as e:
+        logger.error("[HEALTH] Expenses fetch error: %s", e)
+        all_expenses = []
+    budget_info = _fetch_budget_info(project_id, _cached_expenses=all_expenses)
+    pending_info = _fetch_pending_auth(project_id, _cached_expenses=all_expenses)
     tasks_info = _fetch_tasks_summary(project_id)
     receipts_info = _fetch_pending_receipts(project_id)
     recent_photos = _fetch_recent_photos(project_id)
@@ -116,37 +122,55 @@ def handle_project_health(
 # Data fetchers (lightweight — no pagination needed for aggregates)
 # ---------------------------------------------------------------------------
 
-def _sum_expenses(project_id: str, auth_status: bool) -> tuple[float, int]:
+def _fetch_all_expenses(project_id: str) -> list:
     """
-    Paginated SUM of expenses for a project, filtered by auth_status.
-    Rebuilds query each page to avoid reusing a consumed builder.
-    Returns (total_amount, row_count).
+    Paginated fetch of ALL expenses for a project (excluding review).
+    Returns raw rows with Amount, status, and auth_status.
     """
-    total = 0.0
-    count = 0
+    all_rows = []
     page_size = 1000
     offset = 0
     while True:
         resp = (
             supabase.table("expenses_manual_COGS")
-            .select("Amount, amount")
+            .select("Amount, amount, status, auth_status")
             .eq("project", project_id)
-            .eq("auth_status", auth_status)
             .neq("status", "review")
             .range(offset, offset + page_size - 1)
             .execute()
         )
         batch = resp.data or []
-        for r in batch:
-            total += float(r.get("Amount") or r.get("amount") or 0)
-        count += len(batch)
+        all_rows.extend(batch)
         if len(batch) < page_size:
             break
         offset += page_size
-    return total, count
+    return all_rows
 
 
-def _fetch_budget_info(project_id: str) -> Dict[str, Any]:
+def _classify_expenses(rows: list) -> tuple:
+    """
+    Classify expenses into authorized and pending using both status and
+    auth_status fields (matches analytics endpoint logic).
+    Returns (authorized_total, authorized_count, pending_total, pending_count).
+    """
+    auth_total = 0.0
+    auth_count = 0
+    pending_total = 0.0
+    pending_count = 0
+    for r in rows:
+        amt = float(r.get("Amount") or r.get("amount") or 0)
+        st = (r.get("status") or "").lower()
+        auth_flag = r.get("auth_status") is True
+        if st in ("auth", "authorized") or auth_flag:
+            auth_total += amt
+            auth_count += 1
+        elif st == "pending":
+            pending_total += amt
+            pending_count += 1
+    return auth_total, auth_count, pending_total, pending_count
+
+
+def _fetch_budget_info(project_id: str, _cached_expenses: list = None) -> Dict[str, Any]:
     """Budget total + actuals total for the project."""
     try:
         # Budget (few rows per project — no pagination needed)
@@ -161,8 +185,9 @@ def _fetch_budget_info(project_id: str) -> Dict[str, Any]:
             float(r.get("amount_sum") or 0) for r in (bud_resp.data or [])
         )
 
-        # Actuals (authorized only) — paginated to avoid 1000-row limit
-        total_actuals, _ = _sum_expenses(project_id, auth_status=True)
+        # Actuals — classify using both status and auth_status (matches analytics)
+        all_expenses = _cached_expenses if _cached_expenses is not None else _fetch_all_expenses(project_id)
+        total_actuals, _, _, _ = _classify_expenses(all_expenses)
 
         pct = (total_actuals / total_budget * 100) if total_budget else 0.0
         return {
@@ -176,11 +201,12 @@ def _fetch_budget_info(project_id: str) -> Dict[str, Any]:
         return {"total_budget": 0, "total_actuals": 0, "remaining": 0, "pct_used": 0}
 
 
-def _fetch_pending_auth(project_id: str) -> Dict[str, Any]:
+def _fetch_pending_auth(project_id: str, _cached_expenses: list = None) -> Dict[str, Any]:
     """Count + total $ of expenses awaiting authorization."""
     try:
-        total, count = _sum_expenses(project_id, auth_status=False)
-        return {"count": count, "total": round(total, 2)}
+        all_expenses = _cached_expenses if _cached_expenses is not None else _fetch_all_expenses(project_id)
+        _, _, pending_total, pending_count = _classify_expenses(all_expenses)
+        return {"count": pending_count, "total": round(pending_total, 2)}
     except Exception as e:
         logger.error("[HEALTH] Pending auth fetch error: %s", e)
         return {"count": 0, "total": 0}
