@@ -25,7 +25,10 @@ _thread_cache: Dict[str, Dict[str, Any]] = {}
 _THREAD_CACHE_MAX = 150
 _THREAD_TTL = 7200  # 2 hours
 
-# Model to use
+# Model for Assistants API
+# Note: Assistants API does NOT support gpt-5.x models.
+# gpt_client.py MINI_MODEL (gpt-5-mini) uses the Responses API which is different.
+# For Assistants, we must use gpt-4o-mini (fast/cheap) or gpt-4o (heavy).
 MODEL = "gpt-4o-mini"
 
 
