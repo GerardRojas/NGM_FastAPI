@@ -26,7 +26,7 @@ _THREAD_CACHE_MAX = 150
 _THREAD_TTL = 7200  # 2 hours
 
 # Model to use
-MODEL = "gpt-5-mini"
+MODEL = "gpt-4o-mini"
 
 
 _openai_client: Optional[OpenAI] = None
