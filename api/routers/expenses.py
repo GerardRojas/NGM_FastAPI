@@ -74,16 +74,14 @@ def _validate_uuid_or_none(v, field_name=''):
 
 
 def _validate_amount(v):
-    """Validate Amount is a finite positive number within business range."""
+    """Validate Amount is a finite number within business range."""
     if v is None:
         return None
     if not isinstance(v, (int, float)):
         raise ValueError("Amount must be a number")
     if math.isnan(v) or math.isinf(v):
         raise ValueError("Amount cannot be NaN or Infinity")
-    if v < 0:
-        raise ValueError("Amount cannot be negative")
-    if v > 999_999.99:
+    if abs(v) > 999_999.99:
         raise ValueError("Amount cannot exceed 999,999.99")
     return round(v, 2)
 
