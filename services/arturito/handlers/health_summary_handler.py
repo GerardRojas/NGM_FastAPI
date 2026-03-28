@@ -12,6 +12,7 @@ from typing import Dict, Any, List
 logger = logging.getLogger(__name__)
 
 from api.supabase_client import supabase
+from api.services.gpt_client import gpt
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 
@@ -102,6 +103,11 @@ def handle_project_health(
         recent_photos,
     )
 
+    # --- AI summary (non-blocking, best-effort) ---
+    ai_summary = _generate_ai_summary(
+        project_name, budget_info, pending_info, tasks_info, receipts_info,
+    )
+
     return {
         "ok": True,
         "text": response_text,
@@ -114,6 +120,7 @@ def handle_project_health(
             "tasks": tasks_info,
             "receipts": receipts_info,
             "recent_photos": recent_photos,
+            "ai_summary": ai_summary,
         },
     }
 
@@ -321,6 +328,43 @@ def _fetch_recent_photos(project_id: str, limit: int = 6) -> List[Dict[str, Any]
     except Exception as e:
         logger.error("[HEALTH] Photos fetch error: %s", e)
         return []
+
+
+# ---------------------------------------------------------------------------
+# AI Summary
+# ---------------------------------------------------------------------------
+
+_SUMMARY_PROMPT = (
+    "You are a concise construction project analyst. "
+    "Given the following project health metrics, write a 2-3 sentence executive "
+    "summary in English. Highlight the most important finding (over-budget, "
+    "pending items, or healthy status). Be direct, no greetings."
+)
+
+
+def _generate_ai_summary(
+    project_name: str,
+    budget: Dict[str, Any],
+    pending: Dict[str, Any],
+    tasks: Dict[str, Any],
+    receipts: Dict[str, Any],
+) -> str:
+    """Generate a short AI summary of the health data. Returns '' on failure."""
+    try:
+        data_block = (
+            f"Project: {project_name}\n"
+            f"Budget: ${budget.get('total_budget', 0):,.2f}\n"
+            f"Spent: ${budget.get('total_actuals', 0):,.2f} ({budget.get('pct_used', 0)}%)\n"
+            f"Remaining: ${budget.get('remaining', 0):,.2f}\n"
+            f"Pending expenses: {pending.get('count', 0)} (${pending.get('total', 0):,.2f})\n"
+            f"Tasks: {tasks.get('total', 0)} ({', '.join(f'{k}: {v}' for k, v in (tasks.get('by_status') or {}).items())})\n"
+            f"Unprocessed receipts: {receipts.get('count', 0)}"
+        )
+        result = gpt.mini(_SUMMARY_PROMPT, data_block, max_tokens=200)
+        return (result or "").strip()
+    except Exception as e:
+        logger.warning("[HEALTH] AI summary generation failed: %s", e)
+        return ""
 
 
 # ---------------------------------------------------------------------------
