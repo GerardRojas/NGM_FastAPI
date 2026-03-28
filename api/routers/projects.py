@@ -21,6 +21,8 @@ class ProjectCreate(BaseModel):
     address: str | None = None
     city: str | None = None
     status: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class ProjectUpdate(BaseModel):

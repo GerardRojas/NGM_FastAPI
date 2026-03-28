@@ -19,6 +19,7 @@ from services.receipt_scanner import (
     extract_text_from_pdf as _extract_text_from_pdf,
     scan_receipt as _scan_receipt_core,
     auto_categorize as _auto_categorize_core,
+    auto_categorize_fast as _auto_categorize_fast,
 )
 
 router = APIRouter(prefix="/expenses", tags=["Expenses"])
@@ -1967,6 +1968,7 @@ class AutoCategorizeRequest(BaseModel):
     stage: str = Field(..., min_length=1, max_length=200)
     expenses: List[dict] = Field(..., min_length=1, max_length=500)
     project_id: Optional[str] = None
+    mode: Optional[str] = Field(default="standard", description="'standard' (AI) or 'fast' (rules only)")
 
     @field_validator('stage', mode='before')
     @classmethod
@@ -1980,32 +1982,48 @@ class AutoCategorizeRequest(BaseModel):
     def validate_project_id(cls, v):
         return _validate_uuid_or_none(v, 'project_id')
 
+    @field_validator('mode', mode='before')
+    @classmethod
+    def validate_mode(cls, v):
+        allowed = {"standard", "fast"}
+        if v and v not in allowed:
+            raise ValueError(f"mode must be one of: {allowed}")
+        return v or "standard"
+
 
 @router.post("/auto-categorize")
 async def auto_categorize_expenses(payload: AutoCategorizeRequest, current_user: dict = Depends(get_current_user)):
     """
-    Auto-categorizes expenses using GPT-4 based on construction stage and description.
-    Delegates to shared service: services/receipt_scanner.auto_categorize()
-    Now includes caching and feedback loop support.
+    Auto-categorizes expenses based on construction stage and description.
+    Modes:
+      - 'standard': Cache -> Affinity -> ML -> GPT (accurate, slower)
+      - 'fast':     Cache -> Affinity -> ML -> Keyword Rules (no AI, instant)
     """
     try:
         stage = payload.stage
         expenses = payload.expenses
         project_id = payload.project_id
+        mode = payload.mode or "standard"
 
-        # Read GPT fallback threshold from agent_config (DB-persisted)
-        _min_conf = 60
-        try:
-            cfg_r = supabase.table("agent_config").select("key, value").eq("key", "min_confidence").single().execute()
-            if cfg_r.data:
-                _min_conf = int(cfg_r.data["value"])
-        except Exception:
-            pass
+        if mode == "fast":
+            result = await asyncio.to_thread(
+                _auto_categorize_fast,
+                stage=stage, expenses=expenses, project_id=project_id,
+            )
+        else:
+            # Standard mode: read GPT fallback threshold from agent_config
+            _min_conf = 60
+            try:
+                cfg_r = supabase.table("agent_config").select("key, value").eq("key", "min_confidence").single().execute()
+                if cfg_r.data:
+                    _min_conf = int(cfg_r.data["value"])
+            except Exception:
+                pass
 
-        result = await asyncio.to_thread(
-            _auto_categorize_core,
-            stage=stage, expenses=expenses, project_id=project_id, min_confidence=_min_conf,
-        )
+            result = await asyncio.to_thread(
+                _auto_categorize_core,
+                stage=stage, expenses=expenses, project_id=project_id, min_confidence=_min_conf,
+            )
 
         return {
             "success": True,

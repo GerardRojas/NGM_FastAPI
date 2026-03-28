@@ -1,11 +1,13 @@
 """
-Process Manager State API Router
+NGM Board State API Router
 =================================
-Endpoints for managing the shared visual state of the Process Manager.
-This includes: node positions, custom modules, flow positions, draft states.
+Endpoints for managing the shared visual state of NGM Board (formerly Process Manager).
+This includes: node positions, custom modules, flow positions, draft states,
+and per-board namespaced state (board_{id}_{datatype}).
 All authorized users share the same state.
 """
 
+import re
 from fastapi import APIRouter, HTTPException, Query, Depends
 from api.auth import get_current_user
 from pydantic import BaseModel
@@ -13,7 +15,7 @@ from typing import Optional, Union, List, Any
 
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/process-manager", tags=["Process Manager State"])
+router = APIRouter(prefix="/process-manager", tags=["NGM Board State"])
 
 
 # ========================================
@@ -25,8 +27,8 @@ class ProcessManagerStateUpdate(BaseModel):
     updated_by: Optional[str] = None
 
 
-# Valid state keys for the process manager
-VALID_STATE_KEYS = [
+# Static state keys (legacy + new)
+STATIC_STATE_KEYS = [
     'node_positions',      # Position of module nodes in overview
     'custom_modules',      # User-created custom modules
     'flow_positions',      # Position of nodes in flowcharts
@@ -37,7 +39,24 @@ VALID_STATE_KEYS = [
     'orgchart_connections',# Connections between user nodes
     'orgchart_groups',     # Group areas in org chart
     'orgchart_hidden_users', # Hidden user IDs in org chart
+    # NGM Board system
+    'boards_registry',     # Board list with metadata
 ]
+
+# Dynamic board-prefixed keys: board_{boardId}_{dataType}
+BOARD_KEY_PATTERN = re.compile(
+    r'^board_[a-zA-Z0-9_-]+_'
+    r'(modules|connections|positions|flow_positions|draft_states|canvas_elements|settings)$'
+)
+
+
+def is_valid_state_key(key: str) -> bool:
+    """Check if a state key is valid (static or board-prefixed)."""
+    return key in STATIC_STATE_KEYS or bool(BOARD_KEY_PATTERN.match(key))
+
+
+# Keep backward compat alias
+VALID_STATE_KEYS = STATIC_STATE_KEYS
 
 
 # ========================================
@@ -50,10 +69,10 @@ async def get_process_manager_state(state_key: str, current_user: dict = Depends
     Get a specific state from the process manager shared state.
     Valid keys: node_positions, custom_modules, flow_positions, draft_states, module_connections
     """
-    if state_key not in VALID_STATE_KEYS:
+    if not is_valid_state_key(state_key):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid state_key. Must be one of: {', '.join(VALID_STATE_KEYS)}"
+            detail=f"Invalid state_key: '{state_key}'. Must be a known key or match board_{{id}}_{{type}} pattern."
         )
 
     try:
@@ -69,7 +88,7 @@ async def get_process_manager_state(state_key: str, current_user: dict = Depends
             # Return empty default if not found
             return {
                 "state_key": state_key,
-                "state_data": [] if state_key in ('custom_modules', 'orgchart_connections', 'orgchart_groups', 'orgchart_hidden_users') else {},
+                "state_data": [] if state_key in ('custom_modules', 'orgchart_connections', 'orgchart_groups', 'orgchart_hidden_users', 'boards_registry') or state_key.endswith('_modules') or state_key.endswith('_connections') else {},
                 "updated_at": None,
                 "updated_by": None
             }
@@ -84,10 +103,10 @@ async def update_process_manager_state(state_key: str, update: ProcessManagerSta
     Creates the entry if it doesn't exist (upsert behavior).
     Changes are logged to the history table automatically via database trigger.
     """
-    if state_key not in VALID_STATE_KEYS:
+    if not is_valid_state_key(state_key):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid state_key. Must be one of: {', '.join(VALID_STATE_KEYS)}"
+            detail=f"Invalid state_key: '{state_key}'. Must be a known key or match board_{{id}}_{{type}} pattern."
         )
 
     try:
@@ -150,10 +169,10 @@ async def get_process_manager_history(
     Get history of changes for a specific state key.
     Useful for audit trail and recovery.
     """
-    if state_key not in VALID_STATE_KEYS:
+    if not is_valid_state_key(state_key):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid state_key. Must be one of: {', '.join(VALID_STATE_KEYS)}"
+            detail=f"Invalid state_key: '{state_key}'. Must be a known key or match board_{{id}}_{{type}} pattern."
         )
 
     try:
@@ -176,10 +195,10 @@ async def restore_from_history(state_key: str, history_id: str, current_user: di
     Restore a state from a specific history entry.
     Useful for recovering from accidental changes.
     """
-    if state_key not in VALID_STATE_KEYS:
+    if not is_valid_state_key(state_key):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid state_key. Must be one of: {', '.join(VALID_STATE_KEYS)}"
+            detail=f"Invalid state_key: '{state_key}'. Must be a known key or match board_{{id}}_{{type}} pattern."
         )
 
     try:

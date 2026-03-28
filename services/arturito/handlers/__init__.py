@@ -9,6 +9,8 @@ from .ngm_hub_handler import handle_ngm_help, handle_ngm_action, handle_bug_repo
 from .copilot_handler import handle_copilot
 from .vault_handler import handle_vault_search, handle_vault_list, handle_vault_create_folder, handle_vault_delete, handle_vault_organize, handle_vault_upload
 from .health_summary_handler import handle_project_health
+from .cam_handler import handle_cam_photo_search
+from .progress_handler import handle_project_progress
 
 __all__ = [
     "handle_budget_vs_actuals",
@@ -33,4 +35,6 @@ __all__ = [
     "handle_vault_organize",
     "handle_vault_upload",
     "handle_project_health",
+    "handle_cam_photo_search",
+    "handle_project_progress",
 ]

@@ -277,6 +277,18 @@ ARTURITO_PERMISSIONS: Dict[str, Dict[str, Any]] = {
         "risk_level": "low",
         "category": "read",
     },
+    "CAM_PHOTO_SEARCH": {
+        "enabled": True,
+        "description": "Search construction photos from NGM Cam",
+        "risk_level": "low",
+        "category": "read",
+    },
+    "PROJECT_PROGRESS": {
+        "enabled": True,
+        "description": "Composite progress report (photos, budget, tasks, pending)",
+        "risk_level": "low",
+        "category": "read",
+    },
 
     # ================================
     # CREATE Operations (medium risk)
@@ -553,7 +565,7 @@ def reset_permissions_to_defaults() -> bool:
     defaults = {
         "LIST_PROJECTS": True, "LIST_VENDORS": True,
         "BUDGET_VS_ACTUALS": True, "CONSULTA_ESPECIFICA": True,
-        "SCOPE_OF_WORK": True, "SEARCH_EXPENSES": True,
+        "SCOPE_OF_WORK": True, "SEARCH_EXPENSES": True, "CAM_PHOTO_SEARCH": True, "PROJECT_PROGRESS": True,
         "CREATE_VENDOR": True, "CREATE_PROJECT": True,
         "DELETE_VENDOR": False, "DELETE_PROJECT": False,
         "UPDATE_VENDOR": False, "UPDATE_PROJECT": False,

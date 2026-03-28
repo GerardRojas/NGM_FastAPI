@@ -1746,3 +1746,263 @@ def auto_categorize(
         "categorizations": categorizations,
         "metrics": metrics
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# auto_categorize_fast  --  Independent fast-mode categorization
+# ══════════════════════════════════════════════════════════════════
+# Parallel to auto_categorize() (NOT a replacement).
+# Uses: Cache → Vendor Affinity → ML → Keyword Rule Engine.
+# Does NOT call GPT. Items that can't be resolved are returned with
+# confidence=0 and reasoning="unresolved" so the caller can decide.
+# ══════════════════════════════════════════════════════════════════
+
+def auto_categorize_fast(
+    stage: str,
+    expenses: list,
+    project_id: Optional[str] = None,
+    receipt_id: Optional[str] = None,
+    min_confidence: int = 60,
+    vendor_id: Optional[str] = None,
+) -> dict:
+    """
+    Fast auto-categorization without GPT. Independent function.
+
+    Uses deterministic tiers only:
+      Tier 1:   Description cache (MD5 hash, 30-day TTL)
+      Tier 1.5: Vendor affinity (>= 90% ratio, >= 5 uses)
+      Tier 1.75: ML classification (TF-IDF + k-NN, >= 90% confidence)
+      Tier 2:   Keyword Rule Engine (regex + construction taxonomy)
+
+    Items that no tier can resolve are returned with confidence=0
+    and reasoning="unresolved - review manually".
+
+    Args/Returns: Same signature as auto_categorize() for drop-in switching.
+    """
+    start_time = time.time()
+
+    if not stage or not expenses:
+        raise ValueError("Missing stage or expenses")
+
+    cache_hits = 0
+    cache_misses = 0
+    affinity_hits = 0
+    ml_hits = 0
+    rule_hits = 0
+    categorizations = []
+    remaining = list(expenses)
+
+    # ── Tier 1: Batch cache lookup ─────────────────────────────
+    hash_map = {}
+    for exp in remaining:
+        h = _generate_description_hash(exp["description"])
+        hash_map.setdefault(h, []).append(exp)
+
+    all_hashes = list(hash_map.keys())
+    cached_rows = {}
+    if all_hashes:
+        try:
+            cutoff = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(time.time() - 30 * 24 * 60 * 60),
+            )
+            for chunk_start in range(0, len(all_hashes), 200):
+                chunk = all_hashes[chunk_start : chunk_start + 200]
+                resp = (
+                    supabase.table("categorization_cache")
+                    .select("description_hash, account_id, account_name, confidence, reasoning, warning, cache_id")
+                    .in_("description_hash", chunk)
+                    .eq("construction_stage", stage)
+                    .gte("created_at", cutoff)
+                    .order("created_at", desc=True)
+                    .execute()
+                )
+                for row in resp.data or []:
+                    h = row["description_hash"]
+                    if h not in cached_rows:
+                        cached_rows[h] = row
+        except Exception as e:
+            logger.warning(f"[FastCat][Cache] Batch lookup error: {e}")
+
+    hit_cache_ids = []
+    still_remaining = []
+    for exp in remaining:
+        h = _generate_description_hash(exp["description"])
+        row = cached_rows.get(h)
+        if row:
+            cache_hits += 1
+            hit_cache_ids.append(row["cache_id"])
+            categorizations.append({
+                "rowIndex": exp["rowIndex"],
+                "account_id": row["account_id"],
+                "account_name": row["account_name"],
+                "confidence": row["confidence"],
+                "reasoning": (row.get("reasoning") or "") + " [from cache]",
+                "warning": row.get("warning"),
+                "source": "cache",
+            })
+        else:
+            cache_misses += 1
+            still_remaining.append(exp)
+    remaining = still_remaining
+
+    # Bulk increment hit counts (fire-and-forget)
+    if hit_cache_ids:
+        try:
+            for cid in hit_cache_ids:
+                supabase.rpc("increment_cache_hit", {"p_cache_id": cid}).execute()
+        except Exception:
+            pass
+
+    # ── Tier 1.5: Vendor affinity ──────────────────────────────
+    if vendor_id and remaining:
+        affinity = _get_vendor_affinity(vendor_id)
+        if affinity:
+            still_remaining = []
+            for exp in remaining:
+                categorizations.append({
+                    "rowIndex": exp["rowIndex"],
+                    "account_id": affinity["account_id"],
+                    "account_name": affinity["account_name"],
+                    "confidence": affinity["confidence"],
+                    "reasoning": affinity["reasoning"],
+                    "warning": None,
+                    "source": "affinity",
+                })
+                _save_to_cache(exp["description"], stage, affinity)
+                affinity_hits += 1
+            remaining = still_remaining
+            logger.info(f"[FastCat][Affinity] {affinity_hits} items -> {affinity['account_name']}")
+
+    # ── Tier 1.75: ML classification ───────────────────────────
+    if remaining:
+        try:
+            from api.services.categorization_ml import get_ml_service
+
+            ml_service = get_ml_service()
+            ml_service.ensure_trained(supabase)
+
+            if ml_service.is_trained:
+                ml_results = ml_service.predict_batch(
+                    remaining,
+                    construction_stage=stage,
+                    min_confidence=90.0,
+                )
+                still_remaining = []
+                for exp, ml_result in zip(remaining, ml_results):
+                    if ml_result:
+                        ml_hits += 1
+                        categorizations.append({
+                            "rowIndex": exp["rowIndex"],
+                            "account_id": ml_result["account_id"],
+                            "account_name": ml_result["account_name"],
+                            "confidence": ml_result["confidence"],
+                            "reasoning": f"ML classification (confidence {ml_result['confidence']}%)",
+                            "warning": None,
+                            "source": "ml",
+                        })
+                        _save_to_cache(exp["description"], stage, ml_result)
+                    else:
+                        still_remaining.append(exp)
+                remaining = still_remaining
+                logger.info(f"[FastCat][ML] {ml_hits}/{ml_hits + len(remaining)} items classified")
+        except Exception as e:
+            logger.warning(f"[FastCat][ML] Error (falling through): {e}")
+
+    # ── Tier 2: Keyword Rule Engine ────────────────────────────
+    if remaining:
+        try:
+            # Fetch accounts (needed by rule engine)
+            accounts_resp = supabase.table("accounts").select("account_id, Name, AcctNum").execute()
+            accounts = accounts_resp.data or []
+            accounts_list = [
+                {"account_id": a.get("account_id"), "name": a.get("Name", ""), "number": a.get("AcctNum")}
+                for a in accounts
+                if "Labor" not in a.get("Name", "")
+            ]
+
+            from api.services.categorization_rules import get_rule_engine
+
+            rule_engine = get_rule_engine()
+            rule_engine.load_accounts(accounts_list)
+
+            still_remaining = []
+            for exp in remaining:
+                result = rule_engine.categorize(exp["description"], stage)
+                if result and result.get("account_id"):
+                    rule_hits += 1
+                    categorizations.append({
+                        "rowIndex": exp["rowIndex"],
+                        "account_id": result["account_id"],
+                        "account_name": result["account_name"],
+                        "confidence": result["confidence"],
+                        "reasoning": result["reasoning"],
+                        "warning": result.get("warning"),
+                        "source": "rules",
+                    })
+                    _save_to_cache(exp["description"], stage, result)
+                elif result and result.get("confidence") == 0:
+                    # Power tool or other rejection -- include as-is
+                    rule_hits += 1
+                    categorizations.append({
+                        "rowIndex": exp["rowIndex"],
+                        "account_id": result.get("account_id"),
+                        "account_name": result.get("account_name"),
+                        "confidence": 0,
+                        "reasoning": result["reasoning"],
+                        "warning": result.get("warning"),
+                        "source": "rules",
+                    })
+                else:
+                    still_remaining.append(exp)
+            remaining = still_remaining
+            logger.info(f"[FastCat][Rules] {rule_hits}/{rule_hits + len(remaining)} items classified")
+        except Exception as e:
+            logger.warning(f"[FastCat][Rules] Error (marking unresolved): {e}")
+
+    # ── Unresolved items (no GPT fallback in fast mode) ────────
+    for exp in remaining:
+        categorizations.append({
+            "rowIndex": exp["rowIndex"],
+            "account_id": None,
+            "account_name": None,
+            "confidence": 0,
+            "reasoning": "unresolved - review manually",
+            "warning": "No confident match found (fast mode, no AI fallback)",
+            "source": "unresolved",
+        })
+
+    # Sort by rowIndex
+    categorizations.sort(key=lambda x: x["rowIndex"])
+
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    metrics = {
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "affinity_hits": affinity_hits,
+        "ml_hits": ml_hits,
+        "rule_hits": rule_hits,
+        "unresolved": len(remaining),
+        "total_items": len(expenses),
+        "processing_time_ms": elapsed_ms,
+        "mode": "fast",
+    }
+
+    _save_categorization_metrics(
+        project_id=project_id,
+        receipt_id=receipt_id,
+        stage=stage,
+        categorizations=categorizations,
+        metrics=metrics,
+    )
+
+    logger.info(
+        f"[FastCat] Done: {len(expenses)} items in {elapsed_ms}ms "
+        f"(cache={cache_hits}, affinity={affinity_hits}, ml={ml_hits}, "
+        f"rules={rule_hits}, unresolved={len(remaining)})"
+    )
+
+    return {
+        "categorizations": categorizations,
+        "metrics": metrics,
+    }

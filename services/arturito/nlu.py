@@ -45,6 +45,8 @@ VALID_INTENTS = [
     "VAULT_DELETE",         # Delete file from vault
     "VAULT_ORGANIZE",       # Auto-organize vault by type
     "VAULT_UPLOAD",         # Upload file to vault (redirect to UI)
+    "CAM_PHOTO_SEARCH",     # Search construction photos from NGM Cam
+    "PROJECT_PROGRESS",     # Composite progress report (photos + budget + tasks)
     "UNKNOWN",              # No clasificado
 ]
 
@@ -274,6 +276,70 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
                 "intent": "PNL_COGS",
                 "entities": {"project": None},
                 "confidence": 1.0,
+                "source": "local"
+            }
+
+    # ================================
+    # Project Progress Report
+    # ================================
+    # Must be BEFORE Project Health to capture "progress" before "status/health"
+
+    # Without project: "progress", "progress report", "avance", "reporte de avance"
+    progress_no_project_patterns = [
+        r'^(?:progress|progress\s+report|avance|reporte\s+de\s+(?:avance|progreso))$',
+        r'^(?:dame|mu[eé]strame|muestrame|quiero|show\s+me)\s+(?:el\s+)?(?:progress(?:\s+report)?|avance|reporte\s+de\s+(?:avance|progreso))',
+    ]
+    for pattern in progress_no_project_patterns:
+        if re.search(pattern, t):
+            return {
+                "intent": "PROJECT_PROGRESS",
+                "entities": {"project": None},
+                "confidence": 1.0,
+                "source": "local"
+            }
+
+    # Direct: "progress Del Rio", "progress report Oak Creek", "avance Del Rio"
+    progress_with_project = re.match(
+        r'^(?:progress(?:\s+report)?|avance|reporte\s+de\s+(?:avance|progreso))\s+(.+)$', t
+    )
+    if progress_with_project:
+        proj_lower = progress_with_project.group(1).strip()
+        # Strip trailing ? and common filler
+        proj_lower = re.sub(r'[\?\!]+$', '', proj_lower).strip()
+        proj_lower = re.sub(r'\s+(?:por\s+favor|please|pls)$', '', proj_lower, flags=re.IGNORECASE).strip()
+        # Strip "for/of/para" (always prepositions, never part of project names)
+        proj_lower = re.sub(r'^(?:for|of|para)\s+', '', proj_lower, flags=re.IGNORECASE).strip()
+        # Strip "de/del + proyecto" together (e.g. "del proyecto Del Rio" -> "del rio")
+        before_proy = proj_lower
+        proj_lower = re.sub(r'^(?:(?:de|del)\s+)?(?:(?:el|la)\s+)?proyecto\s+', '', proj_lower, flags=re.IGNORECASE).strip()
+        if proj_lower == before_proy:
+            # "proyecto" was not found — strip standalone "de" (not "del", which can be part of names)
+            proj_lower = re.sub(r'^de\s+', '', proj_lower, flags=re.IGNORECASE).strip()
+        if proj_lower:
+            idx = text.lower().rfind(proj_lower)
+            original = text[idx:idx + len(proj_lower)].strip() if idx >= 0 else proj_lower
+            return {
+                "intent": "PROJECT_PROGRESS",
+                "entities": {"project": original},
+                "confidence": 1.0,
+                "source": "local"
+            }
+
+    # Natural: "progress report for Del Rio", "avance del proyecto La Costa"
+    progress_natural = re.search(
+        r'(?:progress(?:\s+report)?|avance|reporte\s+de\s+(?:avance|progreso))\s+(?:for|de|del|para|of)\s+(?:(?:el\s+)?proyecto\s+)?(.+?)(?:\?|$)', t
+    )
+    if progress_natural:
+        proj_text = progress_natural.group(1).strip().rstrip("?").strip()
+        if proj_text and proj_text.lower() not in (
+            "el proyecto", "el", "todo", "el sistema",
+        ):
+            idx = text.lower().rfind(proj_text)
+            original = text[idx:idx + len(proj_text)].strip() if idx >= 0 else proj_text
+            return {
+                "intent": "PROJECT_PROGRESS",
+                "entities": {"project": original},
+                "confidence": 0.95,
                 "source": "local"
             }
 
@@ -563,6 +629,99 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             return {
                 "intent": "VAULT_ORGANIZE",
                 "entities": {},
+                "confidence": 0.9,
+                "source": "local"
+            }
+
+    # ================================
+    # NGM Cam Photo Search
+    # ================================
+
+    # Direct "cam <project>" command (from ask_project re-send flow)
+    # Exclude "cam photos/fotos..." which should fall through to photo patterns
+    cam_direct = re.match(r'^cam\s+(?!photos?\b|fotos?\b|imagenes?\b|images?\b|pictures?\b)(.+)$', t)
+    if cam_direct:
+        return {
+            "intent": "CAM_PHOTO_SEARCH",
+            "entities": {"project": cam_direct.group(1).strip()},
+            "confidence": 1.0,
+            "source": "local"
+        }
+
+    # Photo search patterns (bilingual)
+    # Each pattern captures the PROJECT portion after prepositions.
+    # "proyecto/project" keyword is handled separately to avoid leaking into project name.
+    cam_photo_patterns = [
+        # "show me foundation photos from Del Rio" / "muestrame fotos de trenching de Del Rio"
+        r'(?:show|muestra|muestrame|ver|dame|ensename|ense[ñn]ame)\s+.*(?:photos?|fotos?|imagenes?|images?|pictures?)\s+(?:from|de|del|para|of|en)\s+(?:(?:el\s+)?proyecto\s+)?(.+)',
+        # "cam photos from Del Rio" / "ngm cam fotos de Del Rio"
+        r'(?:ngm\s*cam|cam)\s+(?:photos?|fotos?)\s+(?:from|de|del|para|of|en)\s+(?:(?:el\s+)?proyecto\s+)?(.+)',
+        # "photos from Del Rio" / "fotos de Del Rio"
+        r'(?:photos?|fotos?|imagenes?|images?|pictures?)\s+(?:from|de|del|para|of|en)\s+(?:(?:el\s+)?proyecto\s+)?(.+)',
+        # "show cam from Del Rio" / "muestra ngm cam de Del Rio"
+        r'(?:show|muestra|muestrame|ver|dame)\s+.*(?:ngm\s*cam|cam)\s+(?:from|de|del|para|of|en)\s+(?:(?:el\s+)?proyecto\s+)?(.+)',
+        # Reversed: "Del Rio photos" / "Del Rio fotos" / "Del Rio cam"
+        r'(.+?)\s+(?:photos?|fotos?|imagenes?|images?|pictures?|(?:ngm\s*)?cam)$',
+    ]
+
+    for pattern in cam_photo_patterns:
+        match = re.search(pattern, t)
+        if match:
+            rest = match.group(1).strip()
+            # Clean trailing filler
+            rest = re.sub(r'\s+(?:por\s+favor|please|pls)$', '', rest, flags=re.IGNORECASE).strip()
+
+            entities = {}
+
+            # Try to extract milestone keyword from full text
+            milestone_match = re.search(
+                r'\b(foundation|framing|trenching|drywall|electrical|plumbing|roofing|siding|'
+                r'concrete|demolition|grading|landscaping|hvac|painting|insulation|stucco|'
+                r'flooring|cabinets|tile|countertops|fixtures|cleanup|rough[\s-]?in|finish|'
+                r'cimentacion|excavacion|relleno|compactacion)\b',
+                t, re.IGNORECASE
+            )
+            if milestone_match:
+                entities["milestone"] = milestone_match.group(1)
+
+            # Try to extract explicit date (MM/DD/YYYY or MM-DD-YYYY)
+            date_match = re.search(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', t)
+            if date_match:
+                m, d, y = date_match.group(1), date_match.group(2), date_match.group(3)
+                if len(y) == 2:
+                    y = "20" + y
+                yyyymmdd = f"{y}{m.zfill(2)}{d.zfill(2)}"
+                entities["date_from"] = yyyymmdd
+                entities["date_to"] = yyyymmdd
+
+            # Remove milestone/date text from project name if present
+            project = rest
+            if milestone_match:
+                before = project
+                ms_pos = project.lower().find(milestone_match.group(0).lower())
+                project = re.sub(re.escape(milestone_match.group(0)), '', project, flags=re.IGNORECASE).strip()
+                if project != before and ms_pos == 0:
+                    # Milestone was at start of capture (standard pattern);
+                    # strip the orphan connecting preposition after it
+                    project = re.sub(r'^(?:de|del|from|of)\s+', '', project, flags=re.IGNORECASE).strip()
+            if date_match:
+                before = project
+                project = re.sub(re.escape(date_match.group(0)), '', project, flags=re.IGNORECASE).strip()
+                if project != before:
+                    # Date was inside capture group; strip orphan connecting preposition
+                    project = re.sub(r'\s+(?:de|del|from|of|on|en)$', '', project, flags=re.IGNORECASE).strip()
+            # Strip "proyecto/project" keyword if present
+            project = re.sub(r'^(?:(?:el\s+)?proyecto|project)\s+', '', project, flags=re.IGNORECASE).strip()
+            # Clean other orphan prepositions at boundaries
+            project = re.sub(r'^(?:from|en|in|on|before|after|antes|despues)\s+', '', project, flags=re.IGNORECASE).strip()
+            project = re.sub(r'\s+(?:from|en|in|on|before|after|antes|despues)$', '', project, flags=re.IGNORECASE).strip()
+
+            if project:
+                entities["project"] = project
+
+            return {
+                "intent": "CAM_PHOTO_SEARCH",
+                "entities": entities,
                 "confidence": 0.9,
                 "source": "local"
             }
@@ -907,12 +1066,36 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
    - Saludos, chistes, preguntas no relacionadas con datos específicos de proyectos en el sistema.
    - IMPORTANTE: Si la pregunta es sobre un CONCEPTO o DEFINICIÓN (no sobre datos de un proyecto del sistema), es SMALL_TALK.
 
+13) CAM_PHOTO_SEARCH
+   - User wants to see construction photos from NGM Cam for a specific project.
+   - Signals: "show photos", "fotos del proyecto", "cam photos", "NGM Cam photos", "pictures from", "muestrame fotos".
+   - Extracts: 'project' (required - project name), 'milestone' (optional - construction phase like Foundation, Framing, Trenching, Drywall), 'date_from' (optional YYYYMMDD), 'date_to' (optional YYYYMMDD).
+   - For relative dates like "last week", "yesterday", "before March": compute the YYYYMMDD equivalent based on today's date.
+   - Examples:
+     * "show me photos from Del Rio" -> project: "Del Rio"
+     * "trenching photos from Arthur Neal" -> project: "Arthur Neal", milestone: "Trenching"
+     * "photos from Del Rio before 03/01/2026" -> project: "Del Rio", date_to: "20260301"
+     * "fotos de foundation del proyecto Thrasher" -> project: "Thrasher", milestone: "Foundation"
+
+14) PROJECT_PROGRESS
+   - Composite progress report combining photos + budget + tasks + pending items.
+   - Signals: "progress report", "progress", "avance", "reporte de avance", "reporte de progreso".
+   - DIFFERENCE from PROJECT_HEALTH: triggered ONLY by "progress"/"avance" keywords.
+     Does NOT match "status", "health", "salud", "como va" (those are PROJECT_HEALTH).
+   - Extracts: 'project' if mentioned.
+   - Examples:
+     * "progress report Del Rio" -> project: "Del Rio"
+     * "avance del proyecto Oak Creek" -> project: "Oak Creek"
+     * "progress" (no project) -> project: null
+
 PRIORIDAD DE CLASIFICACIÓN:
 - Si el usuario quiere CONTROLAR la pagina actual (filtrar, ordenar, buscar) → COPILOT
 - Si el usuario pregunta sobre FUNCIONES del sistema NGM Hub → NGM_HELP
 - Si el usuario quiere NAVEGAR o ABRIR modales → NGM_ACTION
 - Si el usuario reporta un PROBLEMA → REPORT_BUG
 - Si el usuario quiere ENVIAR RECORDATORIO de GASTOS pendientes → EXPENSE_REMINDER
+- Si pide ver FOTOS o PHOTOS de construccion de un proyecto (cam, fotos, photos, pictures) → CAM_PHOTO_SEARCH
+- Si pide PROGRESS REPORT o AVANCE de un proyecto → PROJECT_PROGRESS (NOT PROJECT_HEALTH)
 - Si pide reporte P&L / PNL (solo actuals sin budget) → PNL_COGS
 - Si pregunta "como va" o pide resumen/salud/health/status de un proyecto → PROJECT_HEALTH
 - Si pregunta sobre datos de un PROYECTO (budget, actuals) → BUDGET_VS_ACTUALS o CONSULTA_ESPECIFICA
@@ -936,7 +1119,10 @@ REGLAS DE RESPUESTA:
     "filter_value": "...",
     "sort_column": "...",
     "sort_direction": "...",
-    "search_query": "..."
+    "search_query": "...",
+    "milestone": "...",
+    "date_from": "...",
+    "date_to": "..."
   },
   "confidence": 0.85
 }

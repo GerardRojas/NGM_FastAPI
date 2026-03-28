@@ -31,6 +31,8 @@ from .handlers import (
     handle_vault_organize,
     handle_vault_upload,
     handle_project_health,
+    handle_cam_photo_search,
+    handle_project_progress,
 )
 from .permissions import is_action_permitted, get_permission_denial_message, check_role_permission
 from .persona import set_personality_level, get_identity_response
@@ -47,6 +49,7 @@ _CAPABILITY_GROUPS = {
         ("bva / budget vs actuals", "Budget vs Actuals report for any project"),
         ("pnl", "P&L COGS report"),
         ("health / salud", "Project health summary (budget, tasks, receipts)"),
+        ("progress report", "Composite progress report (photos, budget, tasks, pending)"),
         ("budget query", "Ask about a specific budget category (e.g. 'how much on framing?')"),
     ],
     "Navigation": [
@@ -67,6 +70,10 @@ _CAPABILITY_GROUPS = {
         ("search files", "Find files in the vault"),
         ("list files", "Browse vault contents"),
         ("create folder", "Create a new vault folder"),
+    ],
+    "Photos": [
+        ("show photos from [project]", "View construction photos from NGM Cam"),
+        ("show [milestone] photos from [project]", "Filter photos by construction milestone"),
     ],
     "Other": [
         ("scope of work", "Ask about a project's scope"),
@@ -89,6 +96,8 @@ def _format_capabilities_for_user(current_page: str = None) -> str:
         priority_groups = ["Copilot", "Navigation", "Data"]
     elif "vault" in page:
         priority_groups = ["Vault", "Navigation"]
+    elif "cam" in page:
+        priority_groups = ["Photos", "Navigation"]
     elif "budget" in page:
         priority_groups = ["Reports", "Data"]
 
@@ -321,6 +330,21 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "optional_entities": [],
         "description": "Upload files to the vault (redirects to UI)",
     },
+
+    # ---- NGM Cam (Photo Registry) ----
+
+    "CAM_PHOTO_SEARCH": {
+        "handler": handle_cam_photo_search,
+        "required_entities": [],
+        "optional_entities": ["project", "milestone", "date_from", "date_to"],
+        "description": "Search construction photos by project, milestone, or date",
+    },
+    "PROJECT_PROGRESS": {
+        "handler": handle_project_progress,
+        "required_entities": [],
+        "optional_entities": ["project"],
+        "description": "Composite progress report: photos, budget, tasks, pending items",
+    },
 }
 
 # Aliases de intents (mapeo de nombres alternativos)
@@ -337,6 +361,12 @@ INTENT_ALIASES = {
     "HEALTH": "PROJECT_HEALTH",
     "PROJECT STATUS": "PROJECT_HEALTH",
     "SALUD": "PROJECT_HEALTH",
+    "PHOTOS": "CAM_PHOTO_SEARCH",
+    "FOTOS": "CAM_PHOTO_SEARCH",
+    "CAM": "CAM_PHOTO_SEARCH",
+    "PROGRESS": "PROJECT_PROGRESS",
+    "AVANCE": "PROJECT_PROGRESS",
+    "PROGRESS REPORT": "PROJECT_PROGRESS",
 }
 
 
