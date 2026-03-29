@@ -66,6 +66,7 @@ from api.routers.pending_receipts import router as pending_receipts_router
 # ========= PROCESS MANAGER: Code-based Process Documentation ==========
 from api.routers.processes import router as processes_router
 from api.routers.process_manager import router as process_manager_router
+from api.routers.ngm_board_items import router as ngm_board_items_router
 
 # ========= ADU CALCULATOR: Allowance ADU Calculator ==========
 from api.routers.adu_calculator import router as adu_calculator_router
@@ -210,6 +211,9 @@ app.include_router(processes_router)
 
 # Process Manager Visual State (shared state for process manager UI)
 app.include_router(process_manager_router)
+
+# NGM Board Items (boards, tables, folders with dedicated tables)
+app.include_router(ngm_board_items_router)
 
 # ADU Calculator (allowance calculator with GPT screenshot analysis)
 app.include_router(adu_calculator_router)

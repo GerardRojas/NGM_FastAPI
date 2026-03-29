@@ -40,7 +40,8 @@ STATIC_STATE_KEYS = [
     'orgchart_groups',     # Group areas in org chart
     'orgchart_hidden_users', # Hidden user IDs in org chart
     # NGM Board system
-    'boards_registry',     # Board list with metadata
+    'boards_registry',     # Board list with metadata (legacy, migrating to ngm_board_items)
+    'tables_registry',     # Table list with metadata (legacy, migrating to ngm_board_items)
 ]
 
 # Dynamic board-prefixed keys: board_{boardId}_{dataType}
@@ -49,10 +50,17 @@ BOARD_KEY_PATTERN = re.compile(
     r'(modules|connections|positions|flow_positions|draft_states|canvas_elements|settings)$'
 )
 
+# Dynamic table-prefixed keys (legacy): table_{tableId}_{dataType}
+TABLE_KEY_PATTERN = re.compile(
+    r'^table_[a-zA-Z0-9_-]+_(data|columns)$'
+)
+
 
 def is_valid_state_key(key: str) -> bool:
-    """Check if a state key is valid (static or board-prefixed)."""
-    return key in STATIC_STATE_KEYS or bool(BOARD_KEY_PATTERN.match(key))
+    """Check if a state key is valid (static, board-prefixed, or table-prefixed)."""
+    return (key in STATIC_STATE_KEYS
+            or bool(BOARD_KEY_PATTERN.match(key))
+            or bool(TABLE_KEY_PATTERN.match(key)))
 
 
 # Keep backward compat alias
