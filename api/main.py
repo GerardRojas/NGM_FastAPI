@@ -104,6 +104,9 @@ from api.routers.stripe_payments import router as stripe_payments_router
 # ========= INVOICE LINKS: Signed payment links for clients ==========
 from api.routers.invoice_links import router as invoice_links_router
 
+# ========= COMMENTS: Cross-module cell commenting with @mentions ==========
+from api.routers.comments import router as comments_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -256,6 +259,9 @@ app.include_router(stripe_payments_router)
 
 # Invoice Links (Signed payment links for clients)
 app.include_router(invoice_links_router)
+
+# Comments (cross-module cell commenting with @mentions)
+app.include_router(comments_router)
 
 _mem_logger = logging.getLogger("memory")
 

@@ -40,8 +40,8 @@ _UNREAD_CACHE_MAX = 100  # max entries to prevent unbounded growth
 
 class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1)
-    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group)$")
-    channel_id: Optional[str] = None  # For custom/direct/group channels
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group|broadcast)$")
+    channel_id: Optional[str] = None  # For custom/direct/group/broadcast channels
     project_id: Optional[str] = None  # For project channels
     reply_to_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -67,16 +67,18 @@ class MessageResponse(BaseModel):
 
 
 class ChannelClearRequest(BaseModel):
-    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group)$")
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group|broadcast)$")
     channel_id: Optional[str] = None
     project_id: Optional[str] = None
 
 
 class ChannelCreate(BaseModel):
-    type: str = Field(..., pattern="^(custom|direct|group)$")
+    type: str = Field(..., pattern="^(custom|direct|group|broadcast)$")
     name: Optional[str] = None
     description: Optional[str] = None
     member_ids: List[str] = []
+    write_roles: List[str] = []  # Role names that can write (CEO/COO always can)
+    read_roles: List[str] = []   # Role names that can see channel (empty = everyone, CEO/COO always can)
 
 
 class ReactionToggle(BaseModel):
@@ -89,7 +91,7 @@ class ThreadReplyCreate(BaseModel):
 
 
 class MarkReadRequest(BaseModel):
-    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group)$")
+    channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group|broadcast)$")
     channel_id: Optional[str] = None
     project_id: Optional[str] = None
 
@@ -129,7 +131,7 @@ def normalize_message(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def normalize_channel(row: Dict[str, Any]) -> Dict[str, Any]:
     """Convert raw Supabase row to standardized channel format"""
-    return {
+    result = {
         "id": str(row.get("id", "")),
         "name": row.get("name"),
         "description": row.get("description"),
@@ -139,11 +141,16 @@ def normalize_channel(row: Dict[str, Any]) -> Dict[str, Any]:
         "unread_count": row.get("unread_count", 0),
         "members": row.get("members", []),
     }
+    # Broadcast-specific fields
+    if row.get("type") == "broadcast":
+        result["write_roles"] = row.get("write_roles") or []
+        result["read_roles"] = row.get("read_roles") or []
+    return result
 
 
 def build_channel_key(channel_type: str, channel_id: Optional[str], project_id: Optional[str]) -> str:
     """Build the channel_key string matching the messages table generated column."""
-    if channel_type in ("custom", "direct", "group"):
+    if channel_type in ("custom", "direct", "group", "broadcast"):
         return f"{channel_type}:{channel_id}"
     else:
         return f"{channel_type}:{project_id}"
@@ -526,9 +533,9 @@ def get_messages(
             .eq("channel_type", channel_type)
 
         # Filter by channel
-        if channel_type in ["custom", "direct", "group"]:
+        if channel_type in ["custom", "direct", "group", "broadcast"]:
             if not channel_id:
-                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group channels")
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group/broadcast channels")
             query = query.eq("channel_id", channel_id)
         else:
             # Project channels
@@ -569,6 +576,20 @@ def create_message(
     """Create a new message"""
     try:
         user_id = current_user["user_id"]
+        user_role = current_user.get("role") or ""
+
+        # Broadcast channels: check write permission
+        if payload.channel_type == "broadcast" and payload.channel_id:
+            if user_role not in ("CEO", "COO"):
+                # Fetch channel to check write_roles
+                ch_res = supabase.table("channels") \
+                    .select("write_roles") \
+                    .eq("id", payload.channel_id) \
+                    .single() \
+                    .execute()
+                write_roles = (ch_res.data or {}).get("write_roles") or []
+                if user_role not in write_roles:
+                    raise HTTPException(status_code=403, detail="You don't have write permission in this broadcast channel")
 
         data = {
             "content": payload.content,
@@ -581,9 +602,9 @@ def create_message(
             data["metadata"] = payload.metadata
 
         # Set channel reference
-        if payload.channel_type in ["custom", "direct", "group"]:
+        if payload.channel_type in ["custom", "direct", "group", "broadcast"]:
             if not payload.channel_id:
-                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group channels")
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group/broadcast channels")
             data["channel_id"] = payload.channel_id
         else:
             if not payload.project_id:
@@ -937,6 +958,22 @@ def get_channels(
                 channel["members"] = members
                 channels.append(channel)
 
+        # Also fetch broadcast channels visible to this user's role
+        user_role = current_user.get("role") or ""
+        broadcast_res = supabase.table("channels") \
+            .select("*") \
+            .eq("type", "broadcast") \
+            .execute()
+
+        existing_ids = {c["id"] for c in channels}
+        for bc in (broadcast_res.data or []):
+            if bc["id"] in existing_ids:
+                continue
+            read_roles = bc.get("read_roles") or []
+            # CEO/COO see all; empty read_roles = everyone can see
+            if user_role in ("CEO", "COO") or not read_roles or user_role in read_roles:
+                channels.append(normalize_channel(bc))
+
         return {"channels": channels}
 
     except Exception as e:
@@ -1117,6 +1154,23 @@ def create_channel(
 
                     return {"channel": existing, "existing": True}
 
+        # For broadcast channels, deduplicate by name and validate
+        if payload.type == "broadcast":
+            if not payload.name:
+                raise HTTPException(status_code=400, detail="Name required for broadcast channels")
+            if not payload.write_roles:
+                raise HTTPException(status_code=400, detail="At least one write role required for broadcast channels")
+
+            existing = supabase.table("channels") \
+                .select("id, type, name, description, created_by, created_at, write_roles, read_roles") \
+                .eq("type", "broadcast") \
+                .eq("name", payload.name) \
+                .execute()
+
+            if existing.data:
+                channel = normalize_channel(existing.data[0])
+                return {"channel": channel, "existing": True}
+
         # Create channel
         channel_data = {
             "type": payload.type,
@@ -1124,6 +1178,11 @@ def create_channel(
             "description": payload.description,
             "created_by": user_id,
         }
+
+        # Broadcast-specific fields
+        if payload.type == "broadcast":
+            channel_data["write_roles"] = payload.write_roles
+            channel_data["read_roles"] = payload.read_roles
 
         result = supabase.table("channels").insert(channel_data).execute()
 
@@ -1185,7 +1244,7 @@ def search_messages(
         if channel_type:
             query = query.eq("channel_type", channel_type)
 
-            if channel_type in ["custom", "direct"] and channel_id:
+            if channel_type in ["custom", "direct", "group", "broadcast"] and channel_id:
                 query = query.eq("channel_id", channel_id)
             elif project_id:
                 query = query.eq("project_id", project_id)
@@ -1441,9 +1500,9 @@ def clear_channel_messages(
             .delete() \
             .eq("channel_type", payload.channel_type)
 
-        if payload.channel_type in ["custom", "direct", "group"]:
+        if payload.channel_type in ["custom", "direct", "group", "broadcast"]:
             if not payload.channel_id:
-                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group channels")
+                raise HTTPException(status_code=400, detail="channel_id required for custom/direct/group/broadcast channels")
             query = query.eq("channel_id", payload.channel_id)
         else:
             if not payload.project_id:
