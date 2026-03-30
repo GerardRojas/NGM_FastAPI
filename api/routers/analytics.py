@@ -1332,9 +1332,55 @@ async def vendors_summary(current_user: dict = Depends(get_current_user)):
     # Sort by total_amount descending
     vendors_list.sort(key=lambda x: x["total_amount"], reverse=True)
 
+    # --- Pareto data (cumulative %) ---
+    cumulative = 0.0
+    pareto: list[dict] = []
+    for v in vendors_list:
+        cumulative += v["total_amount"]
+        pareto.append({
+            "vendor_name": v["vendor_name"],
+            "amount": v["total_amount"],
+            "cumulative_pct": _round2((cumulative / total_spend_all * 100) if total_spend_all > 0 else 0.0),
+        })
+
+    # --- New vs Recurring by month ---
+    # "New" = vendor's first_txn_date falls in that month
+    # "Recurring" = vendor existed before that month
+    new_vs_recurring: list[dict] = []
+    today_d = date.today()
+    y_nr, m_nr = today_d.year, today_d.month
+    last_12_months: list[str] = []
+    for _ in range(12):
+        last_12_months.append(f"{y_nr:04d}-{m_nr:02d}")
+        m_nr -= 1
+        if m_nr < 1:
+            m_nr = 12
+            y_nr -= 1
+    last_12_months.reverse()
+
+    for mo in last_12_months:
+        new_count = 0
+        recurring_count = 0
+        for v in vendors_list:
+            first = v.get("first_txn_date") or ""
+            last = v.get("last_txn_date") or ""
+            if not first:
+                continue
+            first_mo = first[:7]
+            last_mo = last[:7] if last else ""
+            # Vendor was active this month if first_txn <= month and last_txn >= month
+            if first_mo <= mo and (last_mo >= mo if last_mo else False):
+                if first_mo == mo:
+                    new_count += 1
+                else:
+                    recurring_count += 1
+        new_vs_recurring.append({"month": mo, "new": new_count, "recurring": recurring_count})
+
     return {
         "vendors": vendors_list,
         "total_spend_all_vendors": _round2(total_spend_all),
+        "pareto": pareto,
+        "new_vs_recurring": new_vs_recurring,
     }
 
 
@@ -1701,6 +1747,58 @@ async def expense_intelligence(
             "avg_per_expense": avg_per_expense,
         }
 
+        # --- Day-of-week aggregation ---
+        dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        dow_agg: dict[int, dict] = {i: {"amount": 0.0, "count": 0} for i in range(7)}
+        for e in all_expenses:
+            txn_date = e.get("TxnDate") or ""
+            if len(txn_date) >= 10:
+                try:
+                    d = datetime.strptime(txn_date[:10], "%Y-%m-%d").date()
+                    dow_agg[d.weekday()]["amount"] += _safe_float(e.get("Amount"))
+                    dow_agg[d.weekday()]["count"] += 1
+                except (ValueError, TypeError):
+                    pass
+        by_day_of_week = [
+            {"day": dow_names[i], "amount": _round2(dow_agg[i]["amount"]), "count": dow_agg[i]["count"]}
+            for i in range(7)
+        ]
+
+        # --- Category trends (category x month matrix for stacked area) ---
+        cat_month_agg: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for e in all_expenses:
+            txn_date = e.get("TxnDate") or ""
+            if len(txn_date) >= 7:
+                month_key = txn_date[:7]
+                tid = str(e.get("txn_type") or "")
+                cat_name = txn_type_map.get(tid, "Uncategorized")
+                cat_month_agg[cat_name][month_key] += _safe_float(e.get("Amount"))
+
+        # Use top 6 categories by total spend, rest as "Other"
+        cat_totals_sorted = sorted(cat_agg.items(), key=lambda x: x[1]["amount"], reverse=True)
+        top_cats = [c[0] for c in cat_totals_sorted[:6]]
+        category_trends = []
+        for cat in top_cats:
+            series = [{"month": mo, "amount": _round2(cat_month_agg[cat].get(mo, 0.0))} for mo in last_12]
+            category_trends.append({"category": cat, "series": series})
+        # "Other" bucket
+        other_cats = set(cat_month_agg.keys()) - set(top_cats)
+        if other_cats:
+            other_series = []
+            for mo in last_12:
+                total = sum(cat_month_agg[c].get(mo, 0.0) for c in other_cats)
+                other_series.append({"month": mo, "amount": _round2(total)})
+            category_trends.append({"category": "Other", "series": other_series})
+
+        # --- MoM (month-over-month) delta ---
+        mom_delta_pct = 0.0
+        mom_delta_amount = 0.0
+        if len(monthly_spend) >= 2:
+            curr = monthly_spend[-1]["amount"]
+            prev = monthly_spend[-2]["amount"]
+            mom_delta_amount = _round2(curr - prev)
+            mom_delta_pct = _round2(((curr - prev) / prev * 100) if prev > 0 else 0.0)
+
         # --- Anomaly detection (z-score > 2) ---
         amounts = [_safe_float(e.get("Amount")) for e in all_expenses]
         top_anomalies: list[dict] = []
@@ -1737,6 +1835,9 @@ async def expense_intelligence(
             "by_payment_method": by_payment_method,
             "totals": totals,
             "top_anomalies": top_anomalies,
+            "by_day_of_week": by_day_of_week,
+            "category_trends": category_trends,
+            "mom_delta": {"amount": mom_delta_amount, "pct": mom_delta_pct},
         }
 
     except HTTPException:
@@ -1943,6 +2044,46 @@ async def budget_health(
             ((total_budget - total_spent) / total_budget * 100) if total_budget > 0 else 0.0
         )
 
+        # --- Projected end-of-year spend ---
+        today_date = date.today()
+        day_of_year = today_date.timetuple().tm_yday
+        days_in_year = 366 if (today_date.year % 4 == 0 and (today_date.year % 100 != 0 or today_date.year % 400 == 0)) else 365
+        days_remaining = days_in_year - day_of_year
+
+        # Calculate daily burn from all expenses this year
+        ytd_expenses = [e for e in all_expenses if (e.get("TxnDate") or "")[:4] == str(today_date.year)]
+        ytd_spent = sum(_safe_float(e.get("Amount")) for e in ytd_expenses)
+        daily_burn = ytd_spent / day_of_year if day_of_year > 0 else 0.0
+        projected_eoy_spend = _round2(ytd_spent + (daily_burn * days_remaining))
+
+        # --- Budget utilization distribution (histogram buckets) ---
+        utilization_buckets = {"0-25": 0, "25-50": 0, "50-75": 0, "75-100": 0, "100+": 0}
+        for p in projects_list:
+            pct = p.get("spent_pct", 0)
+            if pct <= 25:
+                utilization_buckets["0-25"] += 1
+            elif pct <= 50:
+                utilization_buckets["25-50"] += 1
+            elif pct <= 75:
+                utilization_buckets["50-75"] += 1
+            elif pct <= 100:
+                utilization_buckets["75-100"] += 1
+            else:
+                utilization_buckets["100+"] += 1
+
+        utilization_distribution = [
+            {"range": k, "count": v} for k, v in utilization_buckets.items()
+        ]
+
+        # --- Average runway (months remaining) across projects ---
+        runways: list[float] = []
+        for p in projects_list:
+            br = p.get("burn_rate_monthly", 0)
+            remaining_budget = p.get("budget_total", 0) - p.get("actual_spent", 0)
+            if br > 0 and remaining_budget > 0:
+                runways.append(round(remaining_budget / br, 1))
+        avg_runway_months = _round2(sum(runways) / len(runways)) if runways else 0.0
+
         summary = {
             "total_budget": _round2(total_budget),
             "total_spent": _round2(total_spent),
@@ -1950,12 +2091,16 @@ async def budget_health(
             "projects_over_budget": projects_over_budget,
             "projects_healthy": projects_healthy,
             "projects_warning": projects_warning,
+            "projected_eoy_spend": projected_eoy_spend,
+            "daily_burn_rate": _round2(daily_burn),
+            "avg_runway_months": avg_runway_months,
         }
 
         return {
             "projects": projects_list,
             "by_account": by_account,
             "summary": summary,
+            "utilization_distribution": utilization_distribution,
         }
 
     except HTTPException:
