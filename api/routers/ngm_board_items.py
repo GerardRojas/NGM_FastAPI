@@ -32,6 +32,8 @@ class ItemCreate(BaseModel):
     board_type: Optional[str] = None            # 'process' | 'freeform'
     cols: Optional[int] = 5
     rows: Optional[int] = 10
+    visibility: Optional[str] = "public"        # 'public' | 'private'
+    collaborators: Optional[List[str]] = []     # UUIDs of users who can see when private
 
 
 class ItemUpdate(BaseModel):
@@ -40,6 +42,8 @@ class ItemUpdate(BaseModel):
     board_type: Optional[str] = None
     cols: Optional[int] = None
     rows: Optional[int] = None
+    visibility: Optional[str] = None            # 'public' | 'private'
+    collaborators: Optional[List[str]] = None   # UUIDs
 
 
 class TableDataUpdate(BaseModel):
@@ -62,7 +66,10 @@ async def list_items(
     item_type: Optional[str] = Query(None, description="Filter by type: board, table, folder"),
     current_user: dict = Depends(get_current_user)
 ):
-    """List all items, optionally filtered by folder and/or type."""
+    """List items, optionally filtered by folder and/or type.
+    Filters out private items the user can't see."""
+    user_id = current_user.get("user_id")
+
     try:
         query = supabase.table("ngm_board_items").select("*")
 
@@ -76,7 +83,21 @@ async def list_items(
 
         query = query.order("item_type").order("name")
         response = query.execute()
-        return {"items": response.data or []}
+
+        # Visibility filter
+        items = response.data or []
+        visible = []
+        for item in items:
+            vis = item.get("visibility", "public")
+            if vis == "public":
+                visible.append(item)
+            else:
+                owner = item.get("created_by")
+                collabs = item.get("collaborators") or []
+                if user_id and (user_id == owner or user_id in collabs):
+                    visible.append(item)
+
+        return {"items": visible}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing items: {str(e)}")
@@ -84,10 +105,28 @@ async def list_items(
 
 @router.get("/all")
 async def list_all_items(current_user: dict = Depends(get_current_user)):
-    """Get ALL items regardless of folder. Used for initial load / migration."""
+    """Get ALL items regardless of folder. Used for initial load.
+    Filters out private items that don't belong to the current user."""
+    user_id = current_user.get("user_id")
+
     try:
         response = supabase.table("ngm_board_items").select("*").order("item_type").order("name").execute()
-        return {"items": response.data or []}
+        items = response.data or []
+
+        # Server-side visibility filter: hide private items the user can't see
+        visible = []
+        for item in items:
+            vis = item.get("visibility", "public")
+            if vis == "public":
+                visible.append(item)
+            else:
+                # Private: only creator or collaborator can see
+                owner = item.get("created_by")
+                collabs = item.get("collaborators") or []
+                if user_id and (user_id == owner or user_id in collabs):
+                    visible.append(item)
+
+        return {"items": visible}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing all items: {str(e)}")
 
@@ -118,6 +157,10 @@ async def create_item(item: ItemCreate, current_user: dict = Depends(get_current
         raise HTTPException(status_code=400, detail="board_type must be 'process' or 'freeform'")
 
     try:
+        visibility = item.visibility or "public"
+        if visibility not in ("public", "private"):
+            raise HTTPException(status_code=400, detail="visibility must be 'public' or 'private'")
+
         row = {
             "id": item.id,
             "item_type": item.item_type,
@@ -125,6 +168,8 @@ async def create_item(item: ItemCreate, current_user: dict = Depends(get_current
             "folder_id": item.folder_id,
             "created_by": user_id,
             "updated_by": user_id,
+            "visibility": visibility,
+            "collaborators": item.collaborators or [],
         }
 
         if item.item_type == "board":
@@ -162,10 +207,20 @@ async def create_item(item: ItemCreate, current_user: dict = Depends(get_current
 
 @router.patch("/{item_id}")
 async def update_item(item_id: str, update: ItemUpdate, current_user: dict = Depends(get_current_user)):
-    """Update an item's metadata (name, folder, etc.)."""
+    """Update an item's metadata (name, folder, etc.).
+    Visibility and collaborators can only be changed by the creator."""
     user_id = current_user.get("user_id")
 
     try:
+        # Ownership check for protected fields (visibility, collaborators)
+        if update.visibility is not None or update.collaborators is not None:
+            item_resp = supabase.table("ngm_board_items").select("created_by").eq("id", item_id).execute()
+            if not item_resp.data:
+                raise HTTPException(status_code=404, detail=f"Item not found: {item_id}")
+            owner = item_resp.data[0].get("created_by")
+            if owner and owner != user_id:
+                raise HTTPException(status_code=403, detail="Only the creator can change visibility or collaborators")
+
         data = {"updated_by": user_id}
 
         if update.name is not None:
@@ -178,6 +233,12 @@ async def update_item(item_id: str, update: ItemUpdate, current_user: dict = Dep
             data["cols"] = max(1, min(update.cols, 26))
         if update.rows is not None:
             data["rows"] = max(1, min(update.rows, 500))
+        if update.visibility is not None:
+            if update.visibility not in ("public", "private"):
+                raise HTTPException(status_code=400, detail="visibility must be 'public' or 'private'")
+            data["visibility"] = update.visibility
+        if update.collaborators is not None:
+            data["collaborators"] = update.collaborators
 
         response = supabase.table("ngm_board_items").update(data).eq("id", item_id).execute()
 
@@ -195,18 +256,24 @@ async def update_item(item_id: str, update: ItemUpdate, current_user: dict = Dep
 @router.delete("/{item_id}")
 async def delete_item(item_id: str, current_user: dict = Depends(get_current_user)):
     """
-    Delete an item. If it's a folder, children are moved to the parent folder
+    Delete an item. Only the creator can delete.
+    If it's a folder, children are moved to the parent folder
     (handled by ON DELETE SET NULL on folder_id FK).
     """
     user_id = current_user.get("user_id")
 
     try:
-        # Fetch item first (for audit metadata)
+        # Fetch item first (for audit metadata + ownership check)
         item_resp = supabase.table("ngm_board_items").select("*").eq("id", item_id).execute()
         if not item_resp.data:
             raise HTTPException(status_code=404, detail=f"Item not found: {item_id}")
 
         item = item_resp.data[0]
+
+        # Ownership check: only creator can delete
+        owner = item.get("created_by")
+        if owner and owner != user_id:
+            raise HTTPException(status_code=403, detail="Only the creator can delete this item")
 
         # Set updated_by before delete so the trigger captures it
         supabase.table("ngm_board_items").update({"updated_by": user_id}).eq("id", item_id).execute()
