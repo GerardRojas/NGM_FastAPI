@@ -33,6 +33,7 @@ class CreateUserRequest(BaseModel):
     password: str
     user_rol: str | int           # FK a tabla rols (id o clave)
     user_seniority: str | None = None  # opcional
+    user_token: str               # token del usuario solicitante
 
 
 # ====== HELPERS ======
@@ -49,10 +50,67 @@ def make_access_token(user_id: str, username: str, role: str | None) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 
+def decode_access_token(token: str) -> dict:
+    """Decode and validate JWT token."""
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+
+def validate_team_edit_permission(user_token: str) -> dict:
+    """
+    Validate requester session and team module edit permission.
+    Returns minimal requester info on success.
+    """
+    decoded = decode_access_token(user_token)
+    requester_id = decoded.get("sub")
+
+    if not requester_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    # Validate active session/user existence and fetch role permissions in one query.
+    try:
+        response = (
+            supabase.table("users")
+            .select(
+                "user_id, user_rol, rols!users_user_rol_fkey(rol_id, role_permissions(module_key, can_edit))"
+            )
+            .eq("user_id", requester_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        logger.error("Error validating requester on /auth/create_user: %r", e)
+        raise HTTPException(status_code=500, detail="Error validating requester session")
+
+    user_data = response.data
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Requester session is not active")
+
+    role_data = user_data.get("rols") or {}
+    perms = role_data.get("role_permissions") or []
+    team_perm = next((p for p in perms if p.get("module_key") == "team"), None)
+
+    if not team_perm or not team_perm.get("can_edit", False):
+        raise HTTPException(
+            status_code=403,
+            detail="User does not have edit permission for team module",
+        )
+
+    return {"user_id": requester_id, "user_rol": user_data.get("user_rol")}
+
+
 # ====== ENDPOINT: Crear usuario (para ti / admin) ======
 
 @router.post("/create_user")
 def create_user(payload: CreateUserRequest):
+    validate_team_edit_permission(payload.user_token)
+
     hashed = hash_password(payload.password)
 
     data_to_insert = {
@@ -205,14 +263,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     """
     token = credentials.credentials
 
-    try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
+    decoded = decode_access_token(token)
 
     user_id = decoded.get("sub")
     username = decoded.get("username")
