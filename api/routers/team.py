@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field
 
+from api.auth import require_module_permission
 from api.supabase_client import supabase
 from utils.auth import hash_password
 
@@ -121,7 +122,9 @@ class RoleUpdate(BaseModel):
 
 
 @router.get("/meta")
-async def team_meta() -> Dict[str, Any]:
+async def team_meta(
+    current_user: dict = Depends(require_module_permission("team", "view")),
+) -> Dict[str, Any]:
     """
     Para poblar dropdowns en el frontend.
     Runs all 4 lookups in parallel (~4x faster than sequential).
@@ -152,8 +155,30 @@ async def team_meta() -> Dict[str, Any]:
     }
 
 
+@router.get("/seniorities")
+def list_seniorities(
+    current_user: dict = Depends(require_module_permission("team", "view")),
+) -> List[Dict[str, Any]]:
+    """Lista de seniorities para administración."""
+    try:
+        res = (
+            supabase
+            .table("users_seniority")
+            .select("id, user_seniority_name")
+            .order("user_seniority_name")
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase seniorities query failed: {e}")
+
+    seniorities = res.data or []
+    return [{"id": s["id"], "name": s["user_seniority_name"]} for s in seniorities]
+
+
 @router.get("/rols")
-def list_roles() -> List[Dict[str, Any]]:
+def list_roles(
+    current_user: dict = Depends(require_module_permission("team", "view")),
+) -> List[Dict[str, Any]]:
     """Lista roles para administración."""
     try:
         res = supabase.table("rols").select("rol_id, rol_name").order("rol_name").execute()
@@ -165,7 +190,10 @@ def list_roles() -> List[Dict[str, Any]]:
 
 
 @router.post("/rols")
-def create_role(payload: RoleCreate) -> Dict[str, Any]:
+def create_role(
+    payload: RoleCreate,
+    current_user: dict = Depends(require_module_permission("team", "edit")),
+) -> Dict[str, Any]:
     """Crea un nuevo rol."""
     name = payload.rol_name.strip()
     if not name:
@@ -187,7 +215,11 @@ def create_role(payload: RoleCreate) -> Dict[str, Any]:
 
 
 @router.patch("/rols/{rol_id}")
-def update_role(rol_id: str, payload: RoleUpdate) -> Dict[str, Any]:
+def update_role(
+    rol_id: str,
+    payload: RoleUpdate,
+    current_user: dict = Depends(require_module_permission("team", "edit")),
+) -> Dict[str, Any]:
     """Renombra un rol existente."""
     name = payload.rol_name.strip()
     if not name:
@@ -209,7 +241,10 @@ def update_role(rol_id: str, payload: RoleUpdate) -> Dict[str, Any]:
 
 
 @router.delete("/rols/{rol_id}")
-def delete_role(rol_id: str) -> Dict[str, Any]:
+def delete_role(
+    rol_id: str,
+    current_user: dict = Depends(require_module_permission("team", "edit")),
+) -> Dict[str, Any]:
     """Borra un rol. Si hay users apuntando a este rol, la FK puede impedir el borrado."""
     try:
         res = supabase.table("rols").delete().eq("rol_id", rol_id).execute()
@@ -225,6 +260,7 @@ def delete_role(rol_id: str) -> Dict[str, Any]:
 @router.get("/users")
 def list_team_users(
     q: Optional[str] = Query(default=None, description="Search by user_name"),
+    current_user: dict = Depends(require_module_permission("team", "view")),
 ) -> List[Dict[str, Any]]:
     try:
         qry = supabase.table("users").select(SELECT_CLAUSE)
@@ -244,7 +280,10 @@ def list_team_users(
 
 
 @router.post("/users")
-def create_user(payload: UserCreate) -> Dict[str, Any]:
+def create_user(
+    payload: UserCreate,
+    current_user: dict = Depends(require_module_permission("team", "edit")),
+) -> Dict[str, Any]:
     data = payload.model_dump()
 
     insert_obj: Dict[str, Any] = {
@@ -283,7 +322,11 @@ def create_user(payload: UserCreate) -> Dict[str, Any]:
 
 
 @router.patch("/users/{user_id}")
-def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
+def update_user(
+    user_id: str,
+    payload: UserUpdate,
+    current_user: dict = Depends(require_module_permission("team", "edit")),
+) -> Dict[str, Any]:
     data = payload.model_dump(exclude_unset=True)
 
     update_obj: Dict[str, Any] = {}
@@ -332,7 +375,10 @@ def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
 
 
 @router.delete("/users/{user_id}")
-def delete_user(user_id: str) -> Dict[str, Any]:
+def delete_user(
+    user_id: str,
+    current_user: dict = Depends(require_module_permission("team", "edit")),
+) -> Dict[str, Any]:
     try:
         # delete returns deleted rows in data (often)
         res = supabase.table("users").delete().eq("user_id", user_id).execute()

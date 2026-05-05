@@ -1,9 +1,10 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
+from api.auth import require_module_permission
 from api.supabase_client import supabase
 from api.services.vault_service import create_default_folders
 
@@ -60,7 +61,10 @@ def extract_rel_value(row: dict, rel_name: str, field: str):
 # ====== ENDPOINTS ======
 
 @router.post("/", status_code=201)
-def create_project(payload: ProjectCreate):
+def create_project(
+    payload: ProjectCreate,
+    current_user: dict = Depends(require_module_permission("projects", "edit")),
+):
     try:
         data = payload.dict()
 
@@ -106,7 +110,10 @@ def create_project(payload: ProjectCreate):
 
 
 @router.get("")
-def list_projects(limit: int = 100):
+def list_projects(
+    limit: int = 100,
+    current_user: dict = Depends(require_module_permission("projects", "view")),
+):
     """
     Devuelve lista de proyectos desde 'projects',
     incluyendo:
@@ -160,7 +167,9 @@ def list_projects(limit: int = 100):
 
 
 @router.get("/meta")
-def get_projects_meta():
+def get_projects_meta(
+    current_user: dict = Depends(require_module_permission("projects", "view")),
+):
     """
     Devuelve catálogos básicos para la UI de Projects:
       - companies: company_id + name  (mapeado desde companies.id)

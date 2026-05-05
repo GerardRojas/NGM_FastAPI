@@ -8,11 +8,16 @@ import logging
 from typing import Optional
 
 # ========================================
-# Cargar .env desde la raíz del proyecto
+# Cargar variables de entorno desde la raíz del proyecto
+# Prioridad local: .env.local sobrescribe .env cuando existe.
 # ========================================
 BASE_DIR = Path(__file__).resolve().parent.parent  # .../NGM_API
 env_path = BASE_DIR / ".env"
+env_local_path = BASE_DIR / ".env.local"
+
 load_dotenv(env_path)
+if env_local_path.exists():
+    load_dotenv(env_local_path, override=True)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

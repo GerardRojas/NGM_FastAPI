@@ -7,13 +7,43 @@ from typing import Dict, Any, List, Optional
 import logging
 import traceback
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, field_validator
+from api.auth import get_current_user, require_module_permission
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
+MY_WORK_MODULE_KEY = "my_work"
+
+
+def _has_module_permission(current_user: Dict[str, Any], module_key: str, action: str) -> bool:
+    perms = current_user.get("permissions") or []
+    perm = next((p for p in perms if p.get("module_key") == module_key), None)
+    if not perm:
+        return False
+
+    action_map = {
+        "view": perm.get("can_view", False),
+        "edit": perm.get("can_edit", False),
+        "delete": perm.get("can_delete", False),
+    }
+    return bool(action_map.get(action, False))
+
+
+def _ensure_self_or_my_work_permission(current_user: Dict[str, Any], target_user_id: str, action: str) -> None:
+    current_user_id = str(current_user.get("user_id") or "")
+    if current_user_id == str(target_user_id):
+        return
+
+    if _has_module_permission(current_user, MY_WORK_MODULE_KEY, action):
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"User does not have {action} permission for {MY_WORK_MODULE_KEY} module",
+    )
 
 
 # ====== MODELOS ======
@@ -1758,7 +1788,12 @@ class WorkloadSettings(BaseModel):
 
 
 @router.get("/my-work/{user_id}")
-def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: int = 6) -> Dict[str, Any]:
+def get_my_work_data(
+    user_id: str,
+    hours_per_day: float = 8.0,
+    days_per_week: int = 6,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
     Devuelve las tareas del usuario para la página My Work con cálculo de workload.
 
@@ -1776,6 +1811,8 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
     logger.info(f"[MY-WORK] GET /pipeline/my-work/{user_id}")
 
     try:
+        _ensure_self_or_my_work_permission(current_user, user_id, action="view")
+
         from datetime import datetime, timedelta
 
         # 1. Obtener status IDs para filtrar
@@ -1964,7 +2001,11 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
 
 
 @router.get("/my-work/team-overview")
-def get_team_workload_overview(hours_per_day: float = 8.0, days_per_week: int = 6) -> Dict[str, Any]:
+def get_team_workload_overview(
+    hours_per_day: float = 8.0,
+    days_per_week: int = 6,
+    current_user: Dict[str, Any] = Depends(require_module_permission(MY_WORK_MODULE_KEY, "view")),
+) -> Dict[str, Any]:
     """
     Devuelve resumen de carga de trabajo de todo el equipo.
     Solo accesible por Coordination/Management roles.
@@ -2629,7 +2670,10 @@ class ScheduleTaskRequest(BaseModel):
 
 
 @router.get("/workload/user/{user_id}")
-def get_user_workload(user_id: str) -> Dict[str, Any]:
+def get_user_workload(
+    user_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
     Get detailed workload information for a user including:
     - Current task queue
@@ -2640,6 +2684,8 @@ def get_user_workload(user_id: str) -> Dict[str, Any]:
     logger.info(f"[WORKLOAD] GET /workload/user/{user_id}")
 
     try:
+        _ensure_self_or_my_work_permission(current_user, user_id, action="view")
+
         from datetime import datetime, timedelta
 
         # Get user info
@@ -2836,7 +2882,9 @@ def get_user_workload(user_id: str) -> Dict[str, Any]:
 
 
 @router.get("/workload/team")
-def get_team_workload() -> Dict[str, Any]:
+def get_team_workload(
+    current_user: Dict[str, Any] = Depends(require_module_permission(MY_WORK_MODULE_KEY, "view")),
+) -> Dict[str, Any]:
     """
     Get workload overview for all team members.
     Useful for coordination to identify bottlenecks and balance work.
@@ -2956,13 +3004,19 @@ def get_team_workload() -> Dict[str, Any]:
 
 
 @router.put("/workload/capacity/{user_id}")
-def update_user_capacity(user_id: str, data: UserCapacityUpdate) -> Dict[str, Any]:
+def update_user_capacity(
+    user_id: str,
+    data: UserCapacityUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
     Update user capacity settings.
     """
     logger.info(f"[WORKLOAD] PUT /workload/capacity/{user_id}")
 
     try:
+        _ensure_self_or_my_work_permission(current_user, user_id, action="edit")
+
         # Check if settings exist
         existing = supabase.table("user_capacity_settings").select("setting_id").eq(
             "user_id", user_id
@@ -3004,7 +3058,10 @@ def update_user_capacity(user_id: str, data: UserCapacityUpdate) -> Dict[str, An
 
 
 @router.post("/workload/schedule-task")
-def schedule_task(data: ScheduleTaskRequest) -> Dict[str, Any]:
+def schedule_task(
+    data: ScheduleTaskRequest,
+    current_user: Dict[str, Any] = Depends(require_module_permission(MY_WORK_MODULE_KEY, "edit")),
+) -> Dict[str, Any]:
     """
     Schedule a task based on owner's workload.
     Creates auto-dependencies if owner is busy.
@@ -3154,7 +3211,10 @@ def schedule_task(data: ScheduleTaskRequest) -> Dict[str, Any]:
 
 
 @router.post("/workload/recalculate/{user_id}")
-def recalculate_user_schedule(user_id: str) -> Dict[str, Any]:
+def recalculate_user_schedule(
+    user_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
     Recalculate all scheduled dates for a user's tasks.
     Called after task completion or priority changes.
@@ -3162,6 +3222,8 @@ def recalculate_user_schedule(user_id: str) -> Dict[str, Any]:
     logger.info(f"[WORKLOAD] POST /workload/recalculate/{user_id}")
 
     try:
+        _ensure_self_or_my_work_permission(current_user, user_id, action="edit")
+
         from datetime import datetime, timedelta
 
         # Get user capacity
@@ -3269,7 +3331,11 @@ def recalculate_user_schedule(user_id: str) -> Dict[str, Any]:
 
 
 @router.get("/workload/next-available/{user_id}")
-def get_next_available_slot(user_id: str, estimated_hours: float = 2.0) -> Dict[str, Any]:
+def get_next_available_slot(
+    user_id: str,
+    estimated_hours: float = 2.0,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
     Get the next available time slot for a user.
     Useful for showing when a new task could realistically start.
@@ -3277,6 +3343,8 @@ def get_next_available_slot(user_id: str, estimated_hours: float = 2.0) -> Dict[
     logger.info(f"[WORKLOAD] GET /workload/next-available/{user_id}")
 
     try:
+        _ensure_self_or_my_work_permission(current_user, user_id, action="view")
+
         from datetime import datetime, timedelta
 
         # Get user capacity

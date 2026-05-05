@@ -3,11 +3,12 @@ Andrew Mismatch Reconciliation Router
 Endpoints for triggering and configuring Andrew's bill reconciliation protocol.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timezone
 
+from api.auth import require_module_permission
 from api.supabase_client import supabase
 
 router = APIRouter(prefix="/andrew", tags=["andrew"])
@@ -36,6 +37,7 @@ async def reconcile_bill(
     bill_id: str = Query(..., description="The bill_id to reconcile"),
     project_id: str = Query(..., description="The project UUID"),
     source: str = Query("manual", description="Trigger source: daneel or manual"),
+    current_user: dict = Depends(require_module_permission("expenses", "edit")),
 ):
     """
     Trigger Andrew's mismatch reconciliation protocol for a specific bill.
@@ -61,7 +63,9 @@ async def reconcile_bill(
 # ================================
 
 @router.get("/mismatch-config")
-async def get_mismatch_config():
+async def get_mismatch_config(
+    current_user: dict = Depends(require_module_permission("expenses", "view")),
+):
     """Get Andrew mismatch reconciliation config."""
     try:
         from api.services.andrew_mismatch_protocol import _load_mismatch_config
@@ -71,7 +75,10 @@ async def get_mismatch_config():
 
 
 @router.put("/mismatch-config")
-async def update_mismatch_config(payload: MismatchConfigUpdate):
+async def update_mismatch_config(
+    payload: MismatchConfigUpdate,
+    current_user: dict = Depends(require_module_permission("expenses", "edit")),
+):
     """Update Andrew mismatch reconciliation config."""
     import json
     try:
@@ -102,7 +109,9 @@ async def update_mismatch_config(payload: MismatchConfigUpdate):
 # ================================
 
 @router.post("/follow-up-check")
-async def run_follow_up_check():
+async def run_follow_up_check(
+    current_user: dict = Depends(require_module_permission("expenses", "edit")),
+):
     """
     Check for receipts awaiting human response and send follow-ups.
     Should be called periodically (e.g., every 6 hours via cron/scheduler).
@@ -128,7 +137,9 @@ async def run_follow_up_check():
 
 
 @router.get("/pending-receipts-status")
-async def get_pending_receipts_status():
+async def get_pending_receipts_status(
+    current_user: dict = Depends(require_module_permission("expenses", "view")),
+):
     """
     Get summary of receipts currently awaiting human response.
     Shows how long each has been waiting and what's needed.

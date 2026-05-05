@@ -197,7 +197,10 @@ async def health_check():
 # ================================
 
 @router.post("/web-chat", response_model=BotResponse)
-async def web_chat(message: WebChatMessage):
+async def web_chat(
+    message: WebChatMessage,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Endpoint para el chat web de NGM HUB usando OpenAI Assistants API.
 
@@ -229,9 +232,9 @@ async def web_chat(message: WebChatMessage):
 
         session_id = message.session_id or "web_default"
         context = {
-            "user_name": message.user_name,
+            "user_name": message.user_name or current_user.get("username"),
             "user_email": message.user_email,
-            "user_role": message.user_role,  # Rol para control de permisos
+            "user_role": current_user.get("role") or message.user_role,  # Rol para control de permisos
             "space_name": "NGM HUB Web",
             "space_id": session_id,
             "is_mention": True,
@@ -264,7 +267,7 @@ async def web_chat(message: WebChatMessage):
                 session_id=session_id,
                 message=text,
                 personality_level=personality_level,
-                user_name=message.user_name,
+                user_name=message.user_name or current_user.get("username"),
                 thread_id=message.thread_id
             )
 
@@ -298,7 +301,10 @@ async def web_chat(message: WebChatMessage):
 
 
 @router.post("/clear-thread")
-async def clear_conversation(session_id: str):
+async def clear_conversation(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Limpia el thread de conversación y crea uno nuevo.
     Útil cuando el usuario quiere empezar de cero.
@@ -836,7 +842,10 @@ class FilterInterpretResponse(BaseModel):
 
 
 @router.post("/interpret-filter", response_model=FilterInterpretResponse)
-async def interpret_filter_command(request: FilterInterpretRequest):
+async def interpret_filter_command(
+    request: FilterInterpretRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Use GPT to interpret a natural language expense filter command.
     Returns the detected action and parameters.
@@ -996,7 +1005,11 @@ If no semantic match is found, return: {{"matches": [], "reasoning": "no match"}
 
 
 @router.get("/search-accounts")
-async def search_accounts(query: str, limit: int = 5):
+async def search_accounts(
+    query: str,
+    limit: int = 5,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Search for accounts using hybrid fuzzy + semantic matching.
     Returns best matches for natural language account queries.

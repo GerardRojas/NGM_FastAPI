@@ -62,10 +62,61 @@ def decode_access_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Could not validate credentials")
 
 
-def validate_team_edit_permission(user_token: str) -> dict:
+def _action_allowed(perm: dict, action: str) -> bool:
+    action_map = {
+        "view": perm.get("can_view", False),
+        "edit": perm.get("can_edit", False),
+        "delete": perm.get("can_delete", False),
+    }
+    return bool(action_map.get(action, False))
+
+
+def _load_active_user_with_permissions(user_id: str) -> dict:
+    """Load active user and role permissions in a single query."""
+    try:
+        response = (
+            supabase.table("users")
+            .select(
+                "user_id, user_name, user_rol, rols!users_user_rol_fkey(rol_name, role_permissions(module_key, can_view, can_edit, can_delete))"
+            )
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+        )
+    except Exception as e:
+        logger.error("Error loading active user context: %r", e)
+        raise HTTPException(status_code=500, detail="Error validating requester session")
+
+    user_data = response.data
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Requester session is not active")
+
+    rols_data = user_data.get("rols") or {}
+    permissions = rols_data.get("role_permissions") or []
+
+    return {
+        "user_id": user_data.get("user_id"),
+        "username": user_data.get("user_name"),
+        "role": rols_data.get("rol_name"),
+        "user_rol": user_data.get("user_rol"),
+        "permissions": permissions,
+    }
+
+
+def _assert_module_permission(user_context: dict, module_key: str, action: str) -> None:
+    perms = user_context.get("permissions") or []
+    perm = next((p for p in perms if p.get("module_key") == module_key), None)
+    if not perm or not _action_allowed(perm, action):
+        raise HTTPException(
+            status_code=403,
+            detail=f"User does not have {action} permission for {module_key} module",
+        )
+
+
+def validate_permission_from_token(user_token: str, module_key: str, action: str = "view") -> dict:
     """
-    Validate requester session and team module edit permission.
-    Returns minimal requester info on success.
+    Validate requester token, active session, and required module permission.
+    Returns requester context on success.
     """
     decoded = decode_access_token(user_token)
     requester_id = decoded.get("sub")
@@ -73,43 +124,24 @@ def validate_team_edit_permission(user_token: str) -> dict:
     if not requester_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    # Validate active session/user existence and fetch role permissions in one query.
-    try:
-        response = (
-            supabase.table("users")
-            .select(
-                "user_id, user_rol, rols!users_user_rol_fkey(rol_id, role_permissions(module_key, can_edit))"
-            )
-            .eq("user_id", requester_id)
-            .single()
-            .execute()
-        )
-    except Exception as e:
-        logger.error("Error validating requester on /auth/create_user: %r", e)
-        raise HTTPException(status_code=500, detail="Error validating requester session")
+    user_context = _load_active_user_with_permissions(requester_id)
+    _assert_module_permission(user_context, module_key=module_key, action=action)
+    return user_context
 
-    user_data = response.data
-    if not user_data:
-        raise HTTPException(status_code=401, detail="Requester session is not active")
 
-    role_data = user_data.get("rols") or {}
-    perms = role_data.get("role_permissions") or []
-    team_perm = next((p for p in perms if p.get("module_key") == "team"), None)
-
-    if not team_perm or not team_perm.get("can_edit", False):
-        raise HTTPException(
-            status_code=403,
-            detail="User does not have edit permission for team module",
-        )
-
-    return {"user_id": requester_id, "user_rol": user_data.get("user_rol")}
+def require_module_permission(module_key: str, action: str = "view"):
+    """Dependency factory for module permission checks."""
+    def _dependency(current_user: dict = Depends(get_current_user)) -> dict:
+        _assert_module_permission(current_user, module_key=module_key, action=action)
+        return current_user
+    return _dependency
 
 
 # ====== ENDPOINT: Crear usuario (para ti / admin) ======
 
 @router.post("/create_user")
 def create_user(payload: CreateUserRequest):
-    validate_team_edit_permission(payload.user_token)
+    validate_permission_from_token(payload.user_token, module_key="team", action="edit")
 
     hashed = hash_password(payload.password)
 
@@ -240,15 +272,17 @@ def me(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Missing bearer token")
 
     token = authorization.split(" ", 1)[1].strip()
-    try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    decoded = decode_access_token(token)
+    user_id = decoded.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    user_context = _load_active_user_with_permissions(str(user_id))
 
     return {
-        "user_name": decoded.get("username"),
-        "user_role": decoded.get("role"),
-        "user_id": decoded.get("sub"),
+        "user_name": user_context.get("username"),
+        "user_role": user_context.get("role"),
+        "user_id": user_context.get("user_id"),
     }
 
 
@@ -267,13 +301,13 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
     user_id = decoded.get("sub")
     username = decoded.get("username")
-    role = decoded.get("role")
 
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    return {
-        "user_id": user_id,
-        "username": username,
-        "role": role,
-    }
+    user_context = _load_active_user_with_permissions(str(user_id))
+
+    if username and not user_context.get("username"):
+        user_context["username"] = username
+
+    return user_context
