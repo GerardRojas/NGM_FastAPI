@@ -8,6 +8,7 @@ All authorized users share the same state.
 """
 
 import re
+import logging
 from fastapi import APIRouter, HTTPException, Query, Depends
 from api.auth import get_current_user
 from pydantic import BaseModel
@@ -16,6 +17,7 @@ from typing import Optional, Union, List, Any
 from api.supabase_client import supabase
 
 router = APIRouter(prefix="/process-manager", tags=["NGM Board State"])
+logger = logging.getLogger(__name__)
 
 
 # ========================================
@@ -72,7 +74,10 @@ VALID_STATE_KEYS = STATIC_STATE_KEYS
 # ========================================
 
 @router.get("/state/{state_key}")
-async def get_process_manager_state(state_key: str, current_user: dict = Depends(get_current_user)):
+async def get_process_manager_state(
+    state_key: str,
+    current_user: dict = Depends(get_current_user)
+):
     """
     Get a specific state from the process manager shared state.
     Valid keys: node_positions, custom_modules, flow_positions, draft_states, module_connections
@@ -105,7 +110,11 @@ async def get_process_manager_state(state_key: str, current_user: dict = Depends
 
 
 @router.put("/state/{state_key}")
-async def update_process_manager_state(state_key: str, update: ProcessManagerStateUpdate, current_user: dict = Depends(get_current_user)):
+async def update_process_manager_state(
+    state_key: str,
+    update: ProcessManagerStateUpdate,
+    current_user: dict = Depends(get_current_user)
+):
     """
     Update a specific state in the process manager shared state.
     Creates the entry if it doesn't exist (upsert behavior).
@@ -118,11 +127,45 @@ async def update_process_manager_state(state_key: str, update: ProcessManagerSta
         )
 
     try:
+        user_id = current_user.get("user_id")
+        if not user_id:
+            logger.warning("[process-manager] missing user_id for state update: state_key=%s", state_key)
+        else:
+            # Avoid FK violations on updated_by when token user_id is not present in users table.
+            try:
+                exists_resp = (
+                    supabase.table("users")
+                    .select("user_id")
+                    .eq("user_id", user_id)
+                    .limit(1)
+                    .execute()
+                )
+                if not exists_resp.data:
+                    logger.warning(
+                        "[process-manager] user_id from token not found in users table; omitting updated_by. user_id=%s state_key=%s",
+                        user_id,
+                        state_key,
+                    )
+                    user_id = None
+            except Exception as e:
+                # If we can't verify, fail safe by omitting updated_by rather than 500ing on FK.
+                logger.warning(
+                    "[process-manager] error verifying user exists; omitting updated_by. user_id=%s state_key=%s err=%r",
+                    user_id,
+                    state_key,
+                    e,
+                )
+                user_id = None
         # Try to update existing
-        response = supabase.table("process_manager_state").update({
-            "state_data": update.state_data,
-            "updated_by": update.updated_by
-        }).eq("state_key", state_key).execute()
+        update_payload = {"state_data": update.state_data}
+        if user_id is not None:
+            update_payload["updated_by"] = user_id
+        response = (
+            supabase.table("process_manager_state")
+            .update(update_payload)
+            .eq("state_key", state_key)
+            .execute()
+        )
 
         if response.data and len(response.data) > 0:
             return {
@@ -132,22 +175,41 @@ async def update_process_manager_state(state_key: str, update: ProcessManagerSta
             }
         else:
             # Insert if not exists
-            insert_response = supabase.table("process_manager_state").insert({
+            insert_payload = {
                 "state_key": state_key,
                 "state_data": update.state_data,
-                "updated_by": update.updated_by
-            }).execute()
+            }
+            if user_id is not None:
+                insert_payload["updated_by"] = user_id
+            insert_response = supabase.table("process_manager_state").insert(insert_payload).execute()
             return {
                 "message": "State created",
                 "state_key": state_key,
                 "updated_at": insert_response.data[0].get("updated_at") if insert_response.data else None
             }
     except Exception as e:
+        try:
+            state_summary = {
+                "type": type(update.state_data).__name__,
+                "len": len(update.state_data) if isinstance(update.state_data, list) else None,
+                "keys": list(update.state_data.keys())[:20] if isinstance(update.state_data, dict) else None,
+            }
+        except Exception:
+            state_summary = {"type": None, "len": None, "keys": None}
+
+        logger.exception(
+            "[process-manager] error updating state: state_key=%s user_id=%s state_data=%s",
+            state_key,
+            current_user.get("user_id"),
+            state_summary,
+        )
         raise HTTPException(status_code=500, detail=f"Error updating state: {str(e)}")
 
 
 @router.get("/state")
-async def get_all_process_manager_states(current_user: dict = Depends(get_current_user)):
+async def get_all_process_manager_states(
+    current_user: dict = Depends(get_current_user)
+):
     """
     Get all process manager states.
     Returns all state keys with their data.
@@ -198,7 +260,11 @@ async def get_process_manager_history(
 
 
 @router.post("/history/{state_key}/restore/{history_id}")
-async def restore_from_history(state_key: str, history_id: str, current_user: dict = Depends(get_current_user)):
+async def restore_from_history(
+    state_key: str,
+    history_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     """
     Restore a state from a specific history entry.
     Useful for recovering from accidental changes.
@@ -223,7 +289,7 @@ async def restore_from_history(state_key: str, history_id: str, current_user: di
         # Update the current state with the historical data
         update_response = supabase.table("process_manager_state").update({
             "state_data": history_entry["state_data"],
-            "updated_by": None  # System restore
+            "updated_by": current_user.get("user_id")
         }).eq("state_key", state_key).execute()
 
         return {

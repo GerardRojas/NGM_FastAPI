@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field
 
-from api.auth import require_module_permission
+from api.auth import get_current_user
 from api.supabase_client import supabase
 from utils.auth import hash_password
 
@@ -79,7 +79,7 @@ class UserCreate(BaseModel):
     status_id: Optional[str] = None
 
     user_photo: Optional[str] = None
-    avatar_color: Optional[int] = Field(default=None, ge=0, le=360)
+    avatar_color: Optional[str] = Field(default=None)
     is_external: Optional[bool] = False
 
     user_phone_number: Optional[str] = None
@@ -100,7 +100,7 @@ class UserUpdate(BaseModel):
     status_id: Optional[str] = None
 
     user_photo: Optional[str] = None
-    avatar_color: Optional[int] = Field(default=None, ge=0, le=360)
+    avatar_color: Optional[str] = Field(default=None)
     is_external: Optional[bool] = None
 
     user_phone_number: Optional[str] = None
@@ -123,7 +123,7 @@ class RoleUpdate(BaseModel):
 
 @router.get("/meta")
 async def team_meta(
-    current_user: dict = Depends(require_module_permission("team", "view")),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Para poblar dropdowns en el frontend.
@@ -157,7 +157,7 @@ async def team_meta(
 
 @router.get("/seniorities")
 def list_seniorities(
-    current_user: dict = Depends(require_module_permission("team", "view")),
+    current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """Lista de seniorities para administración."""
     try:
@@ -177,7 +177,7 @@ def list_seniorities(
 
 @router.get("/rols")
 def list_roles(
-    current_user: dict = Depends(require_module_permission("team", "view")),
+    current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """Lista roles para administración."""
     try:
@@ -192,7 +192,7 @@ def list_roles(
 @router.post("/rols")
 def create_role(
     payload: RoleCreate,
-    current_user: dict = Depends(require_module_permission("team", "edit")),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Crea un nuevo rol."""
     name = payload.rol_name.strip()
@@ -218,7 +218,7 @@ def create_role(
 def update_role(
     rol_id: str,
     payload: RoleUpdate,
-    current_user: dict = Depends(require_module_permission("team", "edit")),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Renombra un rol existente."""
     name = payload.rol_name.strip()
@@ -243,7 +243,7 @@ def update_role(
 @router.delete("/rols/{rol_id}")
 def delete_role(
     rol_id: str,
-    current_user: dict = Depends(require_module_permission("team", "edit")),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Borra un rol. Si hay users apuntando a este rol, la FK puede impedir el borrado."""
     try:
@@ -260,7 +260,7 @@ def delete_role(
 @router.get("/users")
 def list_team_users(
     q: Optional[str] = Query(default=None, description="Search by user_name"),
-    current_user: dict = Depends(require_module_permission("team", "view")),
+    current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     try:
         qry = supabase.table("users").select(SELECT_CLAUSE)
@@ -282,7 +282,7 @@ def list_team_users(
 @router.post("/users")
 def create_user(
     payload: UserCreate,
-    current_user: dict = Depends(require_module_permission("team", "edit")),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     data = payload.model_dump()
 
@@ -325,7 +325,7 @@ def create_user(
 def update_user(
     user_id: str,
     payload: UserUpdate,
-    current_user: dict = Depends(require_module_permission("team", "edit")),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     data = payload.model_dump(exclude_unset=True)
 
@@ -377,7 +377,7 @@ def update_user(
 @router.delete("/users/{user_id}")
 def delete_user(
     user_id: str,
-    current_user: dict = Depends(require_module_permission("team", "edit")),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     try:
         # delete returns deleted rows in data (often)

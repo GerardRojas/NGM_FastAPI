@@ -9,18 +9,29 @@ import traceback
 
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, field_validator
-from api.auth import get_current_user, require_module_permission
+from api.auth import get_current_user
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/pipeline", tags=["pipeline"])
-MY_WORK_MODULE_KEY = "my_work"
+router = APIRouter(
+    prefix="/pipeline",
+    tags=["pipeline"],
+    dependencies=[Depends(get_current_user)],
+)
+MY_WORK_MODULE_SLUG = "my_work"
 
 
-def _has_module_permission(current_user: Dict[str, Any], module_key: str, action: str) -> bool:
+def _has_module_permission(current_user: Dict[str, Any], module_slug: str, action: str) -> bool:
     perms = current_user.get("permissions") or []
-    perm = next((p for p in perms if p.get("module_key") == module_key), None)
+    requested_slug = str(module_slug).strip().strip("/")
+    perm = next(
+        (
+            p for p in perms
+            if str(p.get("slug") or "").strip().strip("/") == requested_slug
+        ),
+        None,
+    )
     if not perm:
         return False
 
@@ -37,12 +48,12 @@ def _ensure_self_or_my_work_permission(current_user: Dict[str, Any], target_user
     if current_user_id == str(target_user_id):
         return
 
-    if _has_module_permission(current_user, MY_WORK_MODULE_KEY, action):
+    if _has_module_permission(current_user, MY_WORK_MODULE_SLUG, action):
         return
 
     raise HTTPException(
         status_code=403,
-        detail=f"User does not have {action} permission for {MY_WORK_MODULE_KEY} module",
+        detail=f"User does not have {action} permission for {MY_WORK_MODULE_SLUG} module",
     )
 
 
@@ -2004,7 +2015,7 @@ def get_my_work_data(
 def get_team_workload_overview(
     hours_per_day: float = 8.0,
     days_per_week: int = 6,
-    current_user: Dict[str, Any] = Depends(require_module_permission(MY_WORK_MODULE_KEY, "view")),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Devuelve resumen de carga de trabajo de todo el equipo.
@@ -2883,7 +2894,7 @@ def get_user_workload(
 
 @router.get("/workload/team")
 def get_team_workload(
-    current_user: Dict[str, Any] = Depends(require_module_permission(MY_WORK_MODULE_KEY, "view")),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Get workload overview for all team members.
@@ -3060,7 +3071,7 @@ def update_user_capacity(
 @router.post("/workload/schedule-task")
 def schedule_task(
     data: ScheduleTaskRequest,
-    current_user: Dict[str, Any] = Depends(require_module_permission(MY_WORK_MODULE_KEY, "edit")),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Schedule a task based on owner's workload.

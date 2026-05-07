@@ -1,12 +1,17 @@
 """
 Router para gestion de Companies (Empresas)
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+from api.auth import get_current_user
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/companies", tags=["companies"])
+router = APIRouter(
+    prefix="/companies",
+    tags=["companies"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 # ========================================
@@ -16,7 +21,7 @@ router = APIRouter(prefix="/companies", tags=["companies"])
 class CompanyCreate(BaseModel):
     name: str = Field(..., min_length=1)
     description: Optional[str] = None
-    avatar_color: Optional[int] = Field(default=None, ge=0, le=360)
+    avatar_color: Optional[str] = Field(default=None)
     phone: Optional[str] = None
     email: Optional[str] = None
     address: Optional[str] = None
@@ -26,7 +31,7 @@ class CompanyCreate(BaseModel):
 class CompanyUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1)
     description: Optional[str] = None
-    avatar_color: Optional[int] = Field(default=None, ge=0, le=360)
+    avatar_color: Optional[str] = Field(default=None)
     phone: Optional[str] = None
     email: Optional[str] = None
     address: Optional[str] = None

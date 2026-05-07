@@ -57,6 +57,25 @@ class BulkMoveRequest(BaseModel):
 
 
 # ========================================
+# Access helpers
+# ========================================
+
+def _can_user_view_item(item: dict, user_id: Optional[str]) -> bool:
+    vis = item.get("visibility", "public")
+    if vis == "public":
+        return True
+
+    owner = item.get("created_by")
+    collabs = item.get("collaborators") or []
+    return bool(user_id and (user_id == owner or user_id in collabs))
+
+
+def _assert_user_can_view_item(item: dict, user_id: Optional[str]) -> None:
+    if not _can_user_view_item(item, user_id):
+        raise HTTPException(status_code=403, detail="You do not have access to this item")
+
+
+# ========================================
 # ITEMS: CRUD
 # ========================================
 
@@ -104,7 +123,9 @@ async def list_items(
 
 
 @router.get("/all")
-async def list_all_items(current_user: dict = Depends(get_current_user)):
+async def list_all_items(
+    current_user: dict = Depends(get_current_user)
+):
     """Get ALL items regardless of folder. Used for initial load.
     Filters out private items that don't belong to the current user."""
     user_id = current_user.get("user_id")
@@ -116,15 +137,8 @@ async def list_all_items(current_user: dict = Depends(get_current_user)):
         # Server-side visibility filter: hide private items the user can't see
         visible = []
         for item in items:
-            vis = item.get("visibility", "public")
-            if vis == "public":
+            if _can_user_view_item(item, user_id):
                 visible.append(item)
-            else:
-                # Private: only creator or collaborator can see
-                owner = item.get("created_by")
-                collabs = item.get("collaborators") or []
-                if user_id and (user_id == owner or user_id in collabs):
-                    visible.append(item)
 
         return {"items": visible}
     except Exception as e:
@@ -132,13 +146,19 @@ async def list_all_items(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/{item_id}")
-async def get_item(item_id: str, current_user: dict = Depends(get_current_user)):
+async def get_item(
+    item_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     """Get a single item by ID."""
+    user_id = current_user.get("user_id")
     try:
         response = supabase.table("ngm_board_items").select("*").eq("id", item_id).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail=f"Item not found: {item_id}")
-        return response.data[0]
+        item = response.data[0]
+        _assert_user_can_view_item(item, user_id)
+        return item
     except HTTPException:
         raise
     except Exception as e:
@@ -146,7 +166,10 @@ async def get_item(item_id: str, current_user: dict = Depends(get_current_user))
 
 
 @router.post("/")
-async def create_item(item: ItemCreate, current_user: dict = Depends(get_current_user)):
+async def create_item(
+    item: ItemCreate,
+    current_user: dict = Depends(get_current_user)
+):
     """Create a new board, table, or folder."""
     user_id = current_user.get("user_id")
 
@@ -206,18 +229,25 @@ async def create_item(item: ItemCreate, current_user: dict = Depends(get_current
 
 
 @router.patch("/{item_id}")
-async def update_item(item_id: str, update: ItemUpdate, current_user: dict = Depends(get_current_user)):
+async def update_item(
+    item_id: str,
+    update: ItemUpdate,
+    current_user: dict = Depends(get_current_user)
+):
     """Update an item's metadata (name, folder, etc.).
     Visibility and collaborators can only be changed by the creator."""
     user_id = current_user.get("user_id")
 
     try:
+        item_resp = supabase.table("ngm_board_items").select("created_by, visibility, collaborators").eq("id", item_id).execute()
+        if not item_resp.data:
+            raise HTTPException(status_code=404, detail=f"Item not found: {item_id}")
+        item = item_resp.data[0]
+        _assert_user_can_view_item(item, user_id)
+
         # Ownership check for protected fields (visibility, collaborators)
         if update.visibility is not None or update.collaborators is not None:
-            item_resp = supabase.table("ngm_board_items").select("created_by").eq("id", item_id).execute()
-            if not item_resp.data:
-                raise HTTPException(status_code=404, detail=f"Item not found: {item_id}")
-            owner = item_resp.data[0].get("created_by")
+            owner = item.get("created_by")
             if owner and owner != user_id:
                 raise HTTPException(status_code=403, detail="Only the creator can change visibility or collaborators")
 
@@ -254,7 +284,10 @@ async def update_item(item_id: str, update: ItemUpdate, current_user: dict = Dep
 
 
 @router.delete("/{item_id}")
-async def delete_item(item_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_item(
+    item_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     """
     Delete an item. Only the creator can delete.
     If it's a folder, children are moved to the parent folder
@@ -290,12 +323,20 @@ async def delete_item(item_id: str, current_user: dict = Depends(get_current_use
 
 
 @router.post("/bulk-move")
-async def bulk_move_items(req: BulkMoveRequest, current_user: dict = Depends(get_current_user)):
+async def bulk_move_items(
+    req: BulkMoveRequest,
+    current_user: dict = Depends(get_current_user)
+):
     """Move multiple items to a folder (or root)."""
     user_id = current_user.get("user_id")
 
     try:
         for item_id in req.item_ids:
+            item_resp = supabase.table("ngm_board_items").select("id, visibility, created_by, collaborators").eq("id", item_id).execute()
+            if not item_resp.data:
+                raise HTTPException(status_code=404, detail=f"Item not found: {item_id}")
+            _assert_user_can_view_item(item_resp.data[0], user_id)
+
             supabase.table("ngm_board_items").update({
                 "folder_id": req.folder_id,
                 "updated_by": user_id,
@@ -303,6 +344,8 @@ async def bulk_move_items(req: BulkMoveRequest, current_user: dict = Depends(get
 
         return {"message": f"Moved {len(req.item_ids)} items", "folder_id": req.folder_id}
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error moving items: {str(e)}")
 
@@ -312,9 +355,18 @@ async def bulk_move_items(req: BulkMoveRequest, current_user: dict = Depends(get
 # ========================================
 
 @router.get("/{table_id}/data")
-async def get_table_data(table_id: str, current_user: dict = Depends(get_current_user)):
+async def get_table_data(
+    table_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     """Get cell data and column headers for a table."""
+    user_id = current_user.get("user_id")
     try:
+        item_resp = supabase.table("ngm_board_items").select("*").eq("id", table_id).eq("item_type", "table").execute()
+        if not item_resp.data:
+            raise HTTPException(status_code=404, detail=f"Table not found: {table_id}")
+        _assert_user_can_view_item(item_resp.data[0], user_id)
+
         response = supabase.table("ngm_board_table_data").select("*").eq("table_id", table_id).execute()
 
         if not response.data:
@@ -336,16 +388,27 @@ async def get_table_data(table_id: str, current_user: dict = Depends(get_current
             "updated_by": row.get("updated_by"),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching table data: {str(e)}")
 
 
 @router.put("/{table_id}/data")
-async def update_table_data(table_id: str, update: TableDataUpdate, current_user: dict = Depends(get_current_user)):
+async def update_table_data(
+    table_id: str,
+    update: TableDataUpdate,
+    current_user: dict = Depends(get_current_user)
+):
     """Update cell data and/or column headers for a table."""
     user_id = current_user.get("user_id")
 
     try:
+        item_resp = supabase.table("ngm_board_items").select("*").eq("id", table_id).eq("item_type", "table").execute()
+        if not item_resp.data:
+            raise HTTPException(status_code=404, detail=f"Table not found: {table_id}")
+        _assert_user_can_view_item(item_resp.data[0], user_id)
+
         data = {"updated_by": user_id}
 
         if update.cell_data is not None:
@@ -391,6 +454,8 @@ async def update_table_data(table_id: str, update: TableDataUpdate, current_user
                 "updated_at": insert_resp.data[0].get("updated_at") if insert_resp.data else None,
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating table data: {str(e)}")
 
@@ -406,7 +471,12 @@ async def get_item_history(
     current_user: dict = Depends(get_current_user)
 ):
     """Get audit history for an item."""
+    user_id = current_user.get("user_id")
     try:
+        item_resp = supabase.table("ngm_board_items").select("*").eq("id", item_id).execute()
+        if item_resp.data:
+            _assert_user_can_view_item(item_resp.data[0], user_id)
+
         response = (
             supabase.table("ngm_board_history")
             .select("*")
@@ -416,6 +486,8 @@ async def get_item_history(
             .execute()
         )
         return {"history": response.data or []}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching history: {str(e)}")
 
@@ -425,7 +497,9 @@ async def get_item_history(
 # ========================================
 
 @router.post("/migrate-from-legacy")
-async def migrate_from_legacy(current_user: dict = Depends(get_current_user)):
+async def migrate_from_legacy(
+    current_user: dict = Depends(get_current_user)
+):
     """
     One-time migration: reads boards_registry and tables_registry from
     process_manager_state and imports them into ngm_board_items.

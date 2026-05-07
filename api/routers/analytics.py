@@ -685,11 +685,22 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="No role assigned to user")
 
     try:
+        menu_item_resp = (
+            supabase.table("menu_items")
+            .select("id")
+            .eq("slug", "project_kpis")
+            .limit(1)
+            .execute()
+        )
+        if not menu_item_resp.data:
+            raise HTTPException(status_code=500, detail="Missing menu_items slug: project_kpis")
+        menu_item_id = menu_item_resp.data[0].get("id")
+
         perm_resp = (
             supabase.table("role_permissions")
             .select("can_view")
             .eq("rol_id", user_role_id)
-            .eq("module_key", "project_kpis")
+            .eq("menu_item_id", menu_item_id)
             .eq("can_view", True)
             .limit(1)
             .execute()

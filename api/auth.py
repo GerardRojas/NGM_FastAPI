@@ -2,7 +2,7 @@
 
 import os
 import logging
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from postgrest.exceptions import APIError
@@ -71,13 +71,22 @@ def _action_allowed(perm: dict, action: str) -> bool:
     return bool(action_map.get(action, False))
 
 
+def _normalize_slug(value: str | None) -> str | None:
+    if value is None:
+        return None
+    out = str(value).strip().strip("/")
+    if out.endswith(".html"):
+        out = out[:-5]
+    return out or None
+
+
 def _load_active_user_with_permissions(user_id: str) -> dict:
     """Load active user and role permissions in a single query."""
     try:
         response = (
             supabase.table("users")
             .select(
-                "user_id, user_name, user_rol, rols!users_user_rol_fkey(rol_name, role_permissions(module_key, can_view, can_edit, can_delete))"
+                "user_id, user_name, user_rol, rols!users_user_rol_fkey(rol_name, role_permissions(menu_item_id, can_view, can_edit, can_delete))"
             )
             .eq("user_id", user_id)
             .single()
@@ -94,26 +103,187 @@ def _load_active_user_with_permissions(user_id: str) -> dict:
     rols_data = user_data.get("rols") or {}
     permissions = rols_data.get("role_permissions") or []
 
+    # Enrich permissions with module slug from menu_items (source of truth).
+    menu_item_ids = list({p.get("menu_item_id") for p in permissions if p.get("menu_item_id") is not None})
+    menu_slug_by_id = {}
+    if menu_item_ids:
+        try:
+            menu_resp = (
+                supabase.table("menu_items")
+                .select("id, slug")
+                .in_("id", menu_item_ids)
+                .execute()
+            )
+            menu_slug_by_id = {
+                row.get("id"): _normalize_slug(row.get("slug"))
+                for row in (menu_resp.data or [])
+            }
+        except Exception as e:
+            logger.warning("Error loading menu slug mapping for permissions: %r", e)
+
+    enriched_permissions = []
+    for p in permissions:
+        slug = menu_slug_by_id.get(p.get("menu_item_id"))
+        enriched_permissions.append({
+            **p,
+            # Compatibility aliases for existing checks/callers:
+            "slug": slug,
+            "module_key": slug,
+            "module_url": slug,
+        })
+
     return {
         "user_id": user_data.get("user_id"),
         "username": user_data.get("user_name"),
         "role": rols_data.get("rol_name"),
         "user_rol": user_data.get("user_rol"),
-        "permissions": permissions,
+        "permissions": enriched_permissions,
     }
 
 
-def _assert_module_permission(user_context: dict, module_key: str, action: str) -> None:
-    perms = user_context.get("permissions") or []
-    perm = next((p for p in perms if p.get("module_key") == module_key), None)
-    if not perm or not _action_allowed(perm, action):
+def _assert_module_permission(user_context: dict, module_slug: str, action: str) -> None:
+    """
+    Permission check must be driven by DB state (menu_items + role_permissions).
+    We intentionally do not trust/require any locally-cached permission list.
+    This matches the logic of GET /permissions/user/{user_id}.
+    """
+
+    requested = _normalize_slug(module_slug)
+    if not requested:
+        raise HTTPException(status_code=400, detail="Missing module slug")
+
+    user_id = str(user_context.get("user_id") or "")
+    rol_id = user_context.get("user_rol")
+
+    # Resolve role from DB if missing/invalid in token context.
+    if not rol_id and user_id:
+        try:
+            user_row = (
+                supabase.table("users")
+                .select("user_rol")
+                .eq("user_id", user_id)
+                .single()
+                .execute()
+            )
+            rol_id = user_row.data.get("user_rol") if user_row.data else None
+        except Exception as e:
+            logger.error("[auth/permission-check] error loading user role: %r", e)
+            raise HTTPException(status_code=500, detail="Error validating requester session")
+
+    # If role doesn't exist, treat as no-permission.
+    if not rol_id:
+        logger.warning(
+            "[auth/permission-check] DENIED user_id=%s requested_slug=%s action=%s reason=no_role",
+            user_id,
+            requested,
+            action,
+        )
         raise HTTPException(
             status_code=403,
-            detail=f"User does not have {action} permission for {module_key} module",
+            detail=f"User does not have {action} permission for {module_slug} module",
+        )
+
+    # Validate role is valid in DB (no local role lists).
+    try:
+        role_resp = (
+            supabase.table("rols")
+            .select("rol_id")
+            .eq("rol_id", rol_id)
+            .limit(1)
+            .execute()
+        )
+        role_exists = bool(role_resp.data)
+    except Exception as e:
+        logger.error("[auth/permission-check] error validating role: %r", e)
+        raise HTTPException(status_code=500, detail="Error validating requester session")
+
+    if not role_exists:
+        logger.warning(
+            "[auth/permission-check] DENIED user_id=%s role_id=%s requested_slug=%s action=%s reason=invalid_role",
+            user_id,
+            rol_id,
+            requested,
+            action,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"User does not have {action} permission for {module_slug} module",
+        )
+
+    # Resolve menu_item_id from slug (source of truth).
+    try:
+        menu_item_resp = (
+            supabase.table("menu_items")
+            .select("id")
+            .eq("slug", requested)
+            .limit(1)
+            .execute()
+        )
+        menu_item_id = menu_item_resp.data[0].get("id") if menu_item_resp.data else None
+    except Exception as e:
+        logger.error("[auth/permission-check] error loading menu item: %r", e)
+        raise HTTPException(status_code=500, detail="Error validating requester session")
+
+    if not menu_item_id:
+        logger.warning(
+            "[auth/permission-check] DENIED user_id=%s role_id=%s requested_slug=%s action=%s reason=slug_not_in_menu_items",
+            user_id,
+            rol_id,
+            requested,
+            action,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"User does not have {action} permission for {module_slug} module",
+        )
+
+    # Check role_permissions for this role + menu_item_id.
+    action_column = {
+        "view": "can_view",
+        "edit": "can_edit",
+        "delete": "can_delete",
+    }.get(action, "can_view")
+
+    try:
+        perm_resp = (
+            supabase.table("role_permissions")
+            .select(f"id, {action_column}, can_view, can_edit, can_delete")
+            .eq("rol_id", rol_id)
+            .eq("menu_item_id", menu_item_id)
+            .limit(1)
+            .execute()
+        )
+        perm_row = perm_resp.data[0] if perm_resp.data else None
+    except Exception as e:
+        logger.error("[auth/permission-check] error loading role_permissions: %r", e)
+        raise HTTPException(status_code=500, detail="Error validating requester session")
+
+    logger.info(
+        "[auth/permission-check] user_id=%s role_id=%s requested_slug=%s action=%s menu_item_id=%s perm=%s",
+        user_id,
+        rol_id,
+        requested,
+        action,
+        menu_item_id,
+        perm_row,
+    )
+
+    if not perm_row or not bool(perm_row.get(action_column, False)):
+        logger.warning(
+            "[auth/permission-check] DENIED user_id=%s role_id=%s requested_slug=%s action=%s reason=%s",
+            user_id,
+            rol_id,
+            requested,
+            action,
+            "no_role_permission_row" if not perm_row else "action_not_allowed",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"User does not have {action} permission for {module_slug} module",
         )
 
 
-def validate_permission_from_token(user_token: str, module_key: str, action: str = "view") -> dict:
+def validate_permission_from_token(user_token: str, module_slug: str, action: str = "view") -> dict:
     """
     Validate requester token, active session, and required module permission.
     Returns requester context on success.
@@ -125,14 +295,45 @@ def validate_permission_from_token(user_token: str, module_key: str, action: str
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
     user_context = _load_active_user_with_permissions(requester_id)
-    _assert_module_permission(user_context, module_key=module_key, action=action)
+    _assert_module_permission(user_context, module_slug=module_slug, action=action)
     return user_context
 
 
-def require_module_permission(module_key: str, action: str = "view"):
+def require_module_permission(module_slug: str, action: str = "view"):
     """Dependency factory for module permission checks."""
     def _dependency(current_user: dict = Depends(get_current_user)) -> dict:
-        _assert_module_permission(current_user, module_key=module_key, action=action)
+        _assert_module_permission(current_user, module_slug=module_slug, action=action)
+        return current_user
+    return _dependency
+
+
+def _request_module_slug(request: Request) -> str | None:
+    """
+    Derive module slug from the request path.
+    Example: /board-items/all -> board-items
+    """
+    path = (request.url.path or "").strip()
+    if not path:
+        return None
+    # Remove leading slash and pick first segment.
+    path = path.lstrip("/")
+    first = path.split("/", 1)[0].strip()
+    return _normalize_slug(first)
+
+
+def require_request_permission(action: str = "view"):
+    """
+    Dependency factory for permission checks without hardcoded module slugs.
+    The module slug is derived from the request URL path (first segment).
+    """
+    def _dependency(
+        request: Request,
+        current_user: dict = Depends(get_current_user),
+    ) -> dict:
+        module_slug = _request_module_slug(request)
+        if not module_slug:
+            raise HTTPException(status_code=400, detail="Missing module slug in request path")
+        _assert_module_permission(current_user, module_slug=module_slug, action=action)
         return current_user
     return _dependency
 
@@ -141,7 +342,7 @@ def require_module_permission(module_key: str, action: str = "view"):
 
 @router.post("/create_user")
 def create_user(payload: CreateUserRequest):
-    validate_permission_from_token(payload.user_token, module_key="team", action="edit")
+    validate_permission_from_token(payload.user_token, module_slug="team-management", action="edit")
 
     hashed = hash_password(payload.password)
 

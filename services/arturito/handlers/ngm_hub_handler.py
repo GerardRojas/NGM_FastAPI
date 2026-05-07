@@ -73,9 +73,8 @@ def _fuzzy_find(query: str, candidates: dict[str, any], threshold: float = 0.55)
 # -----------------------------------------------------------------------------
 # PERMISSION CHECKING
 # -----------------------------------------------------------------------------
-# Adapted to work with NGM Hub's role_permissions schema:
-# role_permissions(rol_id, module_key, module_name, module_url, can_view, can_edit, can_delete)
-# Joined with rols(rol_id, rol_name)
+# role_permissions now links to modules through menu_item_id.
+# Module source of truth: menu_items(slug).
 
 async def check_user_permission(
     user_id: str,
@@ -114,7 +113,7 @@ async def check_user_permission(
 
         # Parse permission string
         parts = permission.split(":")
-        module_key = parts[0] if len(parts) > 0 else ""
+        module_slug = parts[0] if len(parts) > 0 else ""
         action = parts[1] if len(parts) > 1 else "view"
 
         # Map action to column name
@@ -125,11 +124,15 @@ async def check_user_permission(
         }
         column = action_column_map.get(action, "can_view")
 
-        # Query role_permissions for this user's role and module
+        # Resolve menu_item_id from slug
+        menu_item_resp = db_client.table("menu_items").select("id").eq("slug", module_slug).limit(1).execute()
+        menu_item_id = menu_item_resp.data[0]["id"] if menu_item_resp.data else None
+
+        # Query role_permissions for this user's role and menu item
         if rol_id:
             perm_result = db_client.table("role_permissions").select(
-                f"module_key, {column}"
-            ).eq("rol_id", rol_id).eq("module_key", module_key).single().execute()
+                f"menu_item_id, {column}"
+            ).eq("rol_id", rol_id).eq("menu_item_id", menu_item_id).single().execute()
 
             if perm_result.data:
                 has_perm = perm_result.data.get(column, False)
@@ -159,7 +162,7 @@ async def get_users_with_permission(
     try:
         # Parse permission string
         parts = permission.split(":")
-        module_key = parts[0] if len(parts) > 0 else ""
+        module_slug = parts[0] if len(parts) > 0 else ""
         action = parts[1] if len(parts) > 1 else "edit"
 
         # Map action to column name
@@ -170,10 +173,17 @@ async def get_users_with_permission(
         }
         column = action_column_map.get(action, "can_edit")
 
+        # Resolve menu_item_id from slug
+        menu_item_resp = db_client.table("menu_items").select("id").eq("slug", module_slug).limit(1).execute()
+        menu_item_id = menu_item_resp.data[0]["id"] if menu_item_resp.data else None
+        if not menu_item_id:
+            helper_roles = HELPER_ROLES.get(permission, ["CEO", "COO"])
+            return [{"role": role} for role in helper_roles]
+
         # Get role IDs that have this permission
         perm_result = db_client.table("role_permissions").select(
             "rol_id"
-        ).eq("module_key", module_key).eq(column, True).execute()
+        ).eq("menu_item_id", menu_item_id).eq(column, True).execute()
 
         if not perm_result.data:
             # Fallback to helper roles

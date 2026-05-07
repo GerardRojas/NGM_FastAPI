@@ -4,13 +4,17 @@ import uuid
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
-from api.auth import require_module_permission
+from api.auth import get_current_user
 from api.supabase_client import supabase
 from api.services.vault_service import create_default_folders
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/projects", tags=["Projects"])
+router = APIRouter(
+    prefix="/projects",
+    tags=["Projects"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 # ====== MODELOS ======
@@ -63,7 +67,7 @@ def extract_rel_value(row: dict, rel_name: str, field: str):
 @router.post("/", status_code=201)
 def create_project(
     payload: ProjectCreate,
-    current_user: dict = Depends(require_module_permission("projects", "edit")),
+    current_user: dict = Depends(get_current_user),
 ):
     try:
         data = payload.dict()
@@ -112,7 +116,7 @@ def create_project(
 @router.get("")
 def list_projects(
     limit: int = 100,
-    current_user: dict = Depends(require_module_permission("projects", "view")),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Devuelve lista de proyectos desde 'projects',
@@ -168,7 +172,7 @@ def list_projects(
 
 @router.get("/meta")
 def get_projects_meta(
-    current_user: dict = Depends(require_module_permission("projects", "view")),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Devuelve catálogos básicos para la UI de Projects:

@@ -8,18 +8,21 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en el entorno")
 
-# Shared httpx client with higher keepalive to handle bulk concurrent requests.
-# Default httpx limits: max_connections=100, max_keepalive=20.
-# Under bulk operations (40+ concurrent PATCH), low keepalive forces too many
-# fresh socket opens → Errno 11 "Resource temporarily unavailable".
+# Shared httpx client with tuned pooling for concurrent requests.
+# NOTE:
+# - We intentionally keep HTTP/1.1 (http2=False) because some upstream
+#   disconnects may surface as RemoteProtocolError with HTTP/2 streams.
+# - Transport retries help with transient connect-level failures.
+_transport = httpx.HTTPTransport(retries=2)
 _http_client = httpx.Client(
+    transport=_transport,
     limits=httpx.Limits(
         max_connections=100,
         max_keepalive_connections=40,
-        keepalive_expiry=30,
+        keepalive_expiry=10,
     ),
     timeout=httpx.Timeout(120.0),
-    http2=True,
+    http2=False,
     follow_redirects=True,
 )
 
