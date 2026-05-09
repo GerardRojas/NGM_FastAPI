@@ -511,4 +511,5 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     if username and not user_context.get("username"):
         user_context["username"] = username
 
+    user_context["token"] = token
     return user_context

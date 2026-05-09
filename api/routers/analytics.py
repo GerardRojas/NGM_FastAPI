@@ -24,8 +24,13 @@ _PAGE_SIZE = 1000
 # Helpers
 # ============================================================
 
-def _paginated_fetch(table: str, select: str, filters: dict,
-                     neq_filters: dict | None = None) -> list[dict]:
+def _paginated_fetch(
+    table: str,
+    select: str,
+    filters: dict,
+    neq_filters: dict | None = None,
+    user_token: str | None = None,
+) -> list[dict]:
     """
     Fetch all rows from *table* with pagination to bypass the
     Supabase 1000-row default limit.
@@ -85,6 +90,8 @@ async def project_health(
     tasks, vendor breakdown, monthly spend, and Daneel stats.
     """
 
+    user_token = current_user.get("token")
+
     # --- Project name ---
     project_name = "Unknown Project"
     try:
@@ -121,6 +128,7 @@ async def project_health(
         "expense_id, Amount, status, auth_status, txn_type, vendor_id, TxnDate, account_id",
         {"project": project_id},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     # Separate authorized vs pending
@@ -337,12 +345,15 @@ async def cost_trends(
     line / area charts.
     """
 
+    user_token = current_user.get("token")
+
     # Fetch authorized expenses (paginated)
     expenses = _paginated_fetch(
         "expenses_manual_COGS",
         "Amount, TxnDate",
         {"project": project_id, "auth_status": True},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     month_agg: dict[str, float] = defaultdict(float)
@@ -385,6 +396,7 @@ async def budget_vs_actual(
     Budget variance analysis by account with projection and EAC.
     """
     budget_year = year or date.today().year
+    user_token = current_user.get("token")
 
     # --- Accounts catalog ---
     accounts_map: dict[str, str] = {}  # account_id -> Name
@@ -422,6 +434,7 @@ async def budget_vs_actual(
         "Amount, TxnDate, account_id",
         {"project": project_id, "auth_status": True},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     actual_by_account: dict[str, float] = defaultdict(float)
@@ -567,6 +580,7 @@ async def expense_timeline(
     plus budget data grouped by category. Frontend aggregates by day/week/month.
     """
     budget_year = year or date.today().year
+    user_token = current_user.get("token")
 
     # --- Accounts catalog with AccountCategory ---
     accounts_map: dict[str, dict] = {}  # account_id -> {name, category}
@@ -590,6 +604,7 @@ async def expense_timeline(
         "Amount, TxnDate, account_id",
         {"project": project_id, "auth_status": True},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     expenses: list[dict] = []
@@ -676,45 +691,9 @@ async def expense_timeline(
 async def executive_kpis(current_user: dict = Depends(get_current_user)):
     """
     Multi-project KPI aggregation for the executive dashboard.
-    Requires the `project_kpis` permission (can_view) on the caller's role.
     """
 
-    # --- Permission check ---
-    user_role_id = current_user.get("user_rol")
-    if not user_role_id:
-        raise HTTPException(status_code=403, detail="No role assigned to user")
-
-    try:
-        menu_item_resp = (
-            supabase.table("menu_items")
-            .select("id")
-            .eq("slug", "project_kpis")
-            .limit(1)
-            .execute()
-        )
-        if not menu_item_resp.data:
-            raise HTTPException(status_code=500, detail="Missing menu_items slug: project_kpis")
-        menu_item_id = menu_item_resp.data[0].get("id")
-
-        perm_resp = (
-            supabase.table("role_permissions")
-            .select("can_view")
-            .eq("rol_id", user_role_id)
-            .eq("menu_item_id", menu_item_id)
-            .eq("can_view", True)
-            .limit(1)
-            .execute()
-        )
-        if not (perm_resp.data):
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have permission to view executive KPIs",
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("[analytics:executive_kpis] permission check: %s", exc)
-        raise HTTPException(status_code=500, detail="Permission check failed")
+    user_token = current_user.get("token")
 
     # --- Active projects ---
     active_projects: list[dict] = []
@@ -742,6 +721,7 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
         "expense_id, Amount, project, vendor_id, TxnDate, auth_status, status",
         {"auth_status": True},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     # Group expenses by project
@@ -1015,6 +995,8 @@ async def health_all(current_user: dict = Depends(get_current_user)):
     using the same UI.
     """
 
+    user_token = current_user.get("token")
+
     # --- Active projects ---
     active_project_ids: list[str] = []
     try:
@@ -1059,6 +1041,7 @@ async def health_all(current_user: dict = Depends(get_current_user)):
         "expense_id, Amount, status, auth_status, txn_type, vendor_id, TxnDate",
         {},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     # Separate authorized vs pending
@@ -1270,6 +1253,8 @@ async def vendors_summary(current_user: dict = Depends(get_current_user)):
     and concentration percentages across all projects.
     """
 
+    user_token = current_user.get("token")
+
     # --- Vendors catalog ---
     vendors: list[dict] = []
     try:
@@ -1289,6 +1274,7 @@ async def vendors_summary(current_user: dict = Depends(get_current_user)):
         "Amount, vendor_id, project, TxnDate",
         {"auth_status": True},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     # --- Aggregate by vendor ---
@@ -1409,6 +1395,8 @@ async def vendor_scorecard(
     category analysis with price-change detection, and concentration risk.
     """
 
+    user_token = current_user.get("token")
+
     # --- Vendor name ---
     vendor_name = "Unknown Vendor"
     try:
@@ -1435,6 +1423,7 @@ async def vendor_scorecard(
         "expense_id, Amount, project, TxnDate, txn_type, auth_status",
         {"vendor_id": vendor_id, "auth_status": True},
         neq_filters={"status": "review"},
+        user_token=user_token,
     )
 
     total_amount = sum(_safe_float(e.get("Amount")) for e in vendor_expenses)
@@ -1575,6 +1564,7 @@ async def vendor_scorecard(
             "Amount",
             {"auth_status": True},
             neq_filters={"status": "review"},
+            user_token=user_token,
         )
         total_all_spend = sum(_safe_float(e.get("Amount")) for e in all_auth_expenses)
     except Exception as exc:
@@ -1622,6 +1612,8 @@ async def expense_intelligence(
     payment-method breakdowns, totals, and statistical anomaly detection.
     """
     try:
+        user_token = current_user.get("token")
+
         # --- Fetch authorized expenses (paginated) ---
         filters: dict = {"status": "auth"}
         if project_id:
@@ -1631,6 +1623,7 @@ async def expense_intelligence(
             "expenses_manual_COGS",
             "expense_id, TxnDate, Amount, vendor_id, txn_type, payment_type, status, account_id, LineDescription",
             filters,
+            user_token=user_token,
         )
 
         # --- Lookup tables ---
@@ -1873,6 +1866,8 @@ async def budget_health(
     burn rates, account-level variance, and overall summary.
     """
     try:
+        user_token = current_user.get("token")
+
         # --- Active budgets ---
         bud_query = (
             supabase.table("budgets_qbo")
@@ -1921,6 +1916,7 @@ async def budget_health(
             "expenses_manual_COGS",
             "project, Amount, TxnDate, account_id",
             expense_filters,
+            user_token=user_token,
         )
 
         # Group expenses by project
@@ -2134,6 +2130,8 @@ async def project_scorecard(
     status, and composite health score (0-10) for every project.
     """
     try:
+        user_token = current_user.get("token")
+
         # --- All projects with status ---
         projects_raw: list[dict] = []
         try:
@@ -2179,6 +2177,7 @@ async def project_scorecard(
             "expenses_manual_COGS",
             "project, Amount",
             {"status": "auth"},
+            user_token=user_token,
         )
 
         spent_by_project: dict[str, float] = defaultdict(float)

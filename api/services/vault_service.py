@@ -140,6 +140,7 @@ def create_folder(
     parent_id: Optional[str],
     project_id: Optional[str],
     user_id: str,
+    user_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a virtual folder."""
     row = {
@@ -226,7 +227,10 @@ def save_to_project_folder(
         return None
 
 
-def get_folder_tree(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_folder_tree(
+    project_id: Optional[str] = None,
+    user_token: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
     Get all folders as a flat list with child-item counts (frontend builds tree).
     Filtered by project_id (None = global).
@@ -272,7 +276,7 @@ def get_folder_tree(project_id: Optional[str] = None) -> List[Dict[str, Any]]:
     return folders
 
 
-def get_breadcrumb(folder_id: str) -> List[Dict[str, str]]:
+def get_breadcrumb(folder_id: str, user_token: Optional[str] = None) -> List[Dict[str, str]]:
     """
     Return breadcrumb path from root to *folder_id* (inclusive).
     Each entry: {id, name}.  First element is the topmost ancestor.
@@ -313,6 +317,7 @@ def list_files(
     include_children: bool = False,
     limit: int = 60,
     offset: int = 0,
+    user_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     List files/folders in a given parent folder with pagination.
@@ -366,7 +371,7 @@ def list_files(
     }
 
 
-def get_file(file_id: str) -> Optional[Dict[str, Any]]:
+def get_file(file_id: str, user_token: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Get single file/folder metadata."""
     result = (
         supabase.table("vault_files")
@@ -389,6 +394,7 @@ def upload_file(
     parent_id: Optional[str],
     project_id: Optional[str],
     user_id: str,
+    user_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Upload a file and create v1."""
     _ensure_bucket()
@@ -445,7 +451,12 @@ def upload_file(
 # Chunked Upload (for > 50MB files)
 # ============================================
 
-def store_chunk(upload_id: str, chunk_index: int, chunk_data: bytes) -> Dict[str, Any]:
+def store_chunk(
+    upload_id: str,
+    chunk_index: int,
+    chunk_data: bytes,
+    user_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Store a single chunk to temp directory."""
     upload_dir = os.path.join(CHUNK_TEMP_DIR, upload_id)
     os.makedirs(upload_dir, exist_ok=True)
@@ -465,6 +476,7 @@ def assemble_chunks(
     parent_id: Optional[str],
     project_id: Optional[str],
     user_id: str,
+    user_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble chunks into a complete file, upload to storage, create records."""
     _ensure_bucket()
@@ -546,7 +558,7 @@ def assemble_chunks(
 # Versioning
 # ============================================
 
-def list_versions(file_id: str) -> List[Dict[str, Any]]:
+def list_versions(file_id: str, user_token: Optional[str] = None) -> List[Dict[str, Any]]:
     """Get all versions of a file, newest first."""
     result = (
         supabase.table("vault_file_versions")
@@ -565,6 +577,7 @@ def create_version(
     content_type: str,
     user_id: str,
     comment: Optional[str] = None,
+    user_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Upload a new version of an existing file."""
     _ensure_bucket()
@@ -614,7 +627,12 @@ def create_version(
     return version_result.data[0] if version_result.data else version_row
 
 
-def restore_version(file_id: str, version_id: str, user_id: str) -> Dict[str, Any]:
+def restore_version(
+    file_id: str,
+    version_id: str,
+    user_id: str,
+    user_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Restore an old version as a new version (copies the old version's file)."""
     # Get the version to restore
     version_result = (
@@ -680,7 +698,7 @@ def restore_version(file_id: str, version_id: str, user_id: str) -> Dict[str, An
 # File Operations (move, rename, delete, duplicate)
 # ============================================
 
-def rename_file(file_id: str, new_name: str) -> Dict[str, Any]:
+def rename_file(file_id: str, new_name: str, user_token: Optional[str] = None) -> Dict[str, Any]:
     """Rename a file or folder."""
     result = (
         supabase.table("vault_files")
@@ -692,7 +710,11 @@ def rename_file(file_id: str, new_name: str) -> Dict[str, Any]:
     return result.data[0] if result.data else {}
 
 
-def move_file(file_id: str, new_parent_id: Optional[str]) -> Dict[str, Any]:
+def move_file(
+    file_id: str,
+    new_parent_id: Optional[str],
+    user_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Move a file or folder to a different parent."""
     update = {"parent_id": new_parent_id}
     result = (
@@ -705,7 +727,7 @@ def move_file(file_id: str, new_parent_id: Optional[str]) -> Dict[str, Any]:
     return result.data[0] if result.data else {}
 
 
-def soft_delete(file_id: str) -> Dict[str, Any]:
+def soft_delete(file_id: str, user_token: Optional[str] = None) -> Dict[str, Any]:
     """
     Soft-delete a file or folder.
     For folders, collects all descendant IDs iteratively then batch-updates.
@@ -747,7 +769,11 @@ def soft_delete(file_id: str) -> Dict[str, Any]:
     return root
 
 
-def duplicate_file(file_id: str, user_id: str) -> Dict[str, Any]:
+def duplicate_file(
+    file_id: str,
+    user_id: str,
+    user_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Duplicate a file (creates a new file record pointing to the same storage)."""
     file_rec = get_file(file_id)
     if not file_rec:
@@ -780,7 +806,11 @@ def duplicate_file(file_id: str, user_id: str) -> Dict[str, Any]:
 # Download
 # ============================================
 
-def get_download_url(file_id: str, version_id: Optional[str] = None) -> str:
+def get_download_url(
+    file_id: str,
+    version_id: Optional[str] = None,
+    user_token: Optional[str] = None,
+) -> str:
     """Get public URL for downloading a file (optionally a specific version)."""
     if version_id:
         version_result = (
@@ -814,6 +844,7 @@ def search_files(
     is_folder: Optional[bool] = None,
     limit: int = 50,
     offset: int = 0,
+    user_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Search files by name, type, date range, project. Returns paginated results."""
     q = (
@@ -847,7 +878,10 @@ def search_files(
     }
 
 
-def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
+def check_receipt_status(
+    file_hashes: List[str],
+    user_token: Optional[str] = None,
+) -> Dict[str, str]:
     """
     Cross-reference vault file hashes with pending_receipts and expenses to determine
     which receipts have been fully authorized.
@@ -949,7 +983,11 @@ def check_receipt_status(file_hashes: List[str]) -> Dict[str, str]:
         return {}
 
 
-def detect_duplicates(file_hash: str, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def detect_duplicates(
+    file_hash: str,
+    project_id: Optional[str] = None,
+    user_token: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Find files with the same hash (potential duplicates)."""
     q = (
         supabase.table("vault_files")

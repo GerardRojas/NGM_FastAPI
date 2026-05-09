@@ -90,6 +90,7 @@ async def api_create_folder(
             parent_id=body.parent_id,
             project_id=body.project_id,
             user_id=current_user["user_id"],
+            user_token=current_user.get("token"),
         )
         return result
     except Exception as e:
@@ -107,7 +108,7 @@ async def api_get_folder_tree(
     try:
         # __none__ is a sentinel value to explicitly query project_id IS NULL
         effective_id = None if project_id == "__none__" else project_id
-        return get_folder_tree(effective_id)
+        return get_folder_tree(effective_id, user_token=current_user.get("token"))
     except Exception as e:
         logger.error("[Vault] Get tree error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -120,7 +121,7 @@ async def api_get_breadcrumb(
 ):
     """Get breadcrumb path from root to folder_id (inclusive)."""
     try:
-        return get_breadcrumb(folder_id)
+        return get_breadcrumb(folder_id, user_token=current_user.get("token"))
     except Exception as e:
         logger.error("[Vault] Breadcrumb error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -138,8 +139,13 @@ async def api_list_files(
 ):
     """List files/folders in a parent folder (paginated)."""
     try:
-        return list_files(parent_id=parent_id, project_id=project_id,
-                          limit=limit, offset=offset)
+        return list_files(
+            parent_id=parent_id,
+            project_id=project_id,
+            limit=limit,
+            offset=offset,
+            user_token=current_user.get("token"),
+        )
     except Exception as e:
         logger.error("[Vault] List files error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -152,7 +158,7 @@ async def api_get_file(
 ):
     """Get single file/folder metadata."""
     try:
-        result = get_file(file_id)
+        result = get_file(file_id, user_token=current_user.get("token"))
         if not result:
             raise HTTPException(status_code=404, detail="File not found")
         return result
@@ -198,6 +204,7 @@ async def api_upload_file(
             parent_id=parent_id,
             project_id=project_id,
             user_id=current_user["user_id"],
+            user_token=current_user.get("token"),
         )
         return result
     except HTTPException:
@@ -224,7 +231,7 @@ async def api_upload_chunk(
     chunk_data = None
     try:
         chunk_data = await file.read()
-        result = store_chunk(upload_id, chunk_index, chunk_data)
+        result = store_chunk(upload_id, chunk_index, chunk_data, user_token=current_user.get("token"))
         result["total_chunks"] = total_chunks
         return result
     except Exception as e:
@@ -254,6 +261,7 @@ async def api_upload_complete(
             parent_id=parent_id,
             project_id=project_id,
             user_id=current_user["user_id"],
+            user_token=current_user.get("token"),
         )
         return result
     except FileNotFoundError as e:
@@ -272,7 +280,7 @@ async def api_list_versions(
 ):
     """Get version history for a file."""
     try:
-        return list_versions(file_id)
+        return list_versions(file_id, user_token=current_user.get("token"))
     except Exception as e:
         logger.error("[Vault] List versions error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -299,6 +307,7 @@ async def api_create_version(
             content_type=file.content_type or "application/octet-stream",
             user_id=current_user["user_id"],
             comment=comment,
+            user_token=current_user.get("token"),
         )
         return result
     except ValueError as e:
@@ -319,7 +328,12 @@ async def api_restore_version(
 ):
     """Restore an old version as the current version."""
     try:
-        result = restore_version(file_id, version_id, current_user["user_id"])
+        result = restore_version(
+            file_id=file_id,
+            version_id=version_id,
+            user_id=current_user["user_id"],
+            user_token=current_user.get("token"),
+        )
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -340,9 +354,9 @@ async def api_update_file(
     try:
         result = {}
         if body.name is not None:
-            result = rename_file(file_id, body.name)
+            result = rename_file(file_id, body.name, user_token=current_user.get("token"))
         if body.parent_id is not None:
-            result = move_file(file_id, body.parent_id)
+            result = move_file(file_id, body.parent_id, user_token=current_user.get("token"))
         if not result:
             raise HTTPException(status_code=400, detail="No updates provided")
         return result
@@ -360,7 +374,7 @@ async def api_delete_file(
 ):
     """Soft-delete a file or folder (recursive for folders)."""
     try:
-        result = soft_delete(file_id)
+        result = soft_delete(file_id, user_token=current_user.get("token"))
         return {"deleted": True, "file": result}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -376,7 +390,7 @@ async def api_duplicate_file(
 ):
     """Duplicate a file."""
     try:
-        result = duplicate_file(file_id, current_user["user_id"])
+        result = duplicate_file(file_id, current_user["user_id"], user_token=current_user.get("token"))
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -395,7 +409,7 @@ async def api_download_file(
 ):
     """Get download URL for a file (optionally a specific version)."""
     try:
-        url = get_download_url(file_id, version_id)
+        url = get_download_url(file_id, version_id, user_token=current_user.get("token"))
         return {"url": url}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -422,6 +436,7 @@ async def api_search_files(
             is_folder=body.is_folder,
             limit=body.limit,
             offset=body.offset,
+            user_token=current_user.get("token"),
         )
         return results
     except Exception as e:
@@ -439,7 +454,7 @@ async def api_receipt_status(
         hash_list = [h.strip() for h in hashes.split(",") if h.strip()]
         if not hash_list:
             return {}
-        return check_receipt_status(hash_list)
+        return check_receipt_status(hash_list, user_token=current_user.get("token"))
     except Exception as e:
         logger.error("[Vault] Receipt status error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -453,7 +468,7 @@ async def api_detect_duplicates(
 ):
     """Find files with the same hash."""
     try:
-        return detect_duplicates(file_hash, project_id)
+        return detect_duplicates(file_hash, project_id, user_token=current_user.get("token"))
     except Exception as e:
         logger.error("[Vault] Duplicates error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
