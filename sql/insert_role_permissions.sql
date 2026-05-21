@@ -200,6 +200,7 @@ CROSS JOIN (
     ('projects', 'Projects', 'projects.html', 'true', 'true', 'true'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'true', 'true'),
     ('accounts', 'Accounts', 'accounts.html', 'true', 'true', 'true'),
+    ('budgets', 'Budgets', 'budgets.html', 'true', 'false', 'false'),
     ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
     ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
@@ -230,6 +231,7 @@ CROSS JOIN (
     ('projects', 'Projects', 'projects.html', 'true', 'true', 'true'),
     ('vendors', 'Vendors', 'vendors.html', 'true', 'true', 'true'),
     ('accounts', 'Accounts', 'accounts.html', 'true', 'true', 'true'),
+    ('budgets', 'Budgets', 'budgets.html', 'true', 'false', 'false'),
     ('messages', 'Messages', 'messages.html', 'true', 'true', 'false'),
     ('arturito', 'Arturito', 'arturito.html', 'true', 'false', 'false')
 ) AS module(key, name, url, can_view, can_edit, can_delete)
