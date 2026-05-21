@@ -69,6 +69,17 @@ class EstimateSaveRequest(BaseModel):
     concepts_snapshot: Optional[List[Dict[str, Any]]] = None
     concept_materials_snapshot: Optional[List[Dict[str, Any]]] = None
     created_from_template: Optional[str] = None
+    # Branch metadata (git-like variants). Defaults keep non-branch saves on "main".
+    branch_name: Optional[str] = None
+    branch_description: Optional[str] = None
+    parent_id: Optional[str] = None
+    root_id: Optional[str] = None
+
+
+class EstimateBranchRequest(BaseModel):
+    """Request body for creating a branch of an estimate"""
+    branch_name: str
+    branch_description: Optional[str] = None
 
 
 class TemplateSaveRequest(BaseModel):
@@ -121,6 +132,49 @@ def generate_template_id(template_name: str) -> str:
     safe_name = safe_name[:30]
     timestamp = int(datetime.now().timestamp() * 1000)
     return f"{safe_name}-{timestamp}"
+
+
+# ============================================
+# ESTIMATES INDEX (branches / fast listing)
+# ============================================
+
+def _compute_estimate_totals(categories, overhead):
+    """Sum category totals + overhead amount from an estimate payload."""
+    subtotal = 0.0
+    for cat in categories or []:
+        tc = cat.get("total_cost") if isinstance(cat, dict) else None
+        if isinstance(tc, (int, float)):
+            subtotal += tc
+    overhead_amount = 0.0
+    if isinstance(overhead, dict):
+        try:
+            overhead_amount = float(overhead.get("amount") or 0)
+        except (TypeError, ValueError):
+            overhead_amount = 0.0
+    return subtotal, overhead_amount, subtotal + overhead_amount
+
+
+def _upsert_estimate_index(estimate_id, project_name, project, categories, overhead,
+                           branch_name=None, branch_of=None, root_id=None):
+    """Mirror estimate metadata into the `estimates` index table (best-effort).
+    Never raises — the bucket file is the source of truth."""
+    try:
+        subtotal, overhead_amount, total = _compute_estimate_totals(categories, overhead)
+        proj = project if isinstance(project, dict) else {}
+        row = {
+            "id": estimate_id,
+            "project_name": project_name or "Untitled",
+            "project_type": proj.get("project_type"),
+            "subtotal": subtotal,
+            "overhead_amount": overhead_amount,
+            "total": total,
+            "branch_name": branch_name or "main",
+            "branch_of": branch_of,
+            "root_id": root_id or estimate_id,
+        }
+        supabase.table("estimates").upsert(row, on_conflict="id").execute()
+    except Exception as e:
+        logger.warning("[ESTIMATOR] estimates index upsert failed for %s: %s", estimate_id, e)
 
 
 
@@ -255,6 +309,11 @@ async def save_estimate(request: EstimateSaveRequest):
         # Generate or use provided ID
         estimate_id = request.estimate_id or generate_estimate_id(request.project_name)
 
+        # Branch metadata (defaults keep ordinary estimates on "main")
+        branch_name = request.branch_name or "main"
+        root_id = request.root_id or estimate_id
+        parent_id = request.parent_id
+
         # Prepare main estimate data
         estimate_data = {
             "estimate_id": estimate_id,
@@ -263,6 +322,10 @@ async def save_estimate(request: EstimateSaveRequest):
             "categories": request.categories,
             "overhead": request.overhead or {"percentage": 0, "amount": 0},
             "created_from_template": request.created_from_template,
+            "branch_name": branch_name,
+            "branch_description": request.branch_description or "",
+            "parent_id": parent_id,
+            "root_id": root_id,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
             "version": "1.0"
@@ -303,14 +366,121 @@ async def save_estimate(request: EstimateSaveRequest):
                 file_options={"content-type": "application/json", "upsert": "true"}
             )
 
+        # Mirror metadata into the estimates index (best-effort)
+        _upsert_estimate_index(
+            estimate_id, request.project_name, request.project, request.categories,
+            request.overhead, branch_name=branch_name, branch_of=parent_id, root_id=root_id
+        )
+
         return {
             "success": True,
             "estimate_id": estimate_id,
+            "branch_name": branch_name,
+            "root_id": root_id,
             "message": "Estimate saved successfully"
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving estimate: {str(e)}")
+
+
+@router.post("/estimates/{estimate_id}/branch")
+async def branch_estimate(estimate_id: str, request: EstimateBranchRequest):
+    """
+    Clone an estimate into a new folder (a "branch"). Copies estimate.ngm and
+    all sibling files, rewriting branch metadata (parent_id, root_id, branch_name).
+    """
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+
+        # 1. Load source estimate.ngm
+        blob = supabase.storage.from_(ESTIMATES_BUCKET).download(f"{estimate_id}/estimate.ngm")
+        if not blob:
+            raise HTTPException(status_code=404, detail=f"Estimate not found: {estimate_id}")
+        src = json.loads(blob.decode("utf-8"))
+
+        # 2. Mint new id + rewrite branch metadata
+        base_name = src.get("project_name") or estimate_id
+        new_id = generate_estimate_id(f"{base_name}-{request.branch_name}")
+        now = datetime.now().isoformat()
+        root_id = src.get("root_id") or estimate_id
+
+        new_estimate = dict(src)
+        new_estimate["estimate_id"] = new_id
+        new_estimate["parent_id"] = estimate_id
+        new_estimate["root_id"] = root_id
+        new_estimate["branch_name"] = request.branch_name
+        new_estimate["branch_description"] = request.branch_description or ""
+        new_estimate["created_at"] = now
+        new_estimate["updated_at"] = now
+
+        supabase.storage.from_(ESTIMATES_BUCKET).upload(
+            path=f"{new_id}/estimate.ngm",
+            file=json.dumps(new_estimate, indent=2).encode("utf-8"),
+            file_options={"content-type": "application/json", "upsert": "true"},
+        )
+
+        # 3. Copy sibling files (snapshots, etc.)
+        copied = 0
+        for f in (supabase.storage.from_(ESTIMATES_BUCKET).list(estimate_id) or []):
+            name = f.get("name", "")
+            if not name or name == "estimate.ngm" or "." not in name:
+                continue  # skip the rewritten main file and any subfolders
+            try:
+                fblob = supabase.storage.from_(ESTIMATES_BUCKET).download(f"{estimate_id}/{name}")
+                if not fblob:
+                    continue
+                ext = name.rsplit(".", 1)[-1].lower()
+                ctype = {
+                    "json": "application/json", "ngm": "application/json",
+                    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                }.get(ext, "application/octet-stream")
+                supabase.storage.from_(ESTIMATES_BUCKET).upload(
+                    path=f"{new_id}/{name}", file=fblob,
+                    file_options={"content-type": ctype, "upsert": "true"},
+                )
+                copied += 1
+            except Exception as e:
+                logger.warning("[ESTIMATOR] branch copy failed for %s: %s", name, e)
+
+        # 4. Index parent first (FK target), then the new branch (best-effort)
+        _upsert_estimate_index(
+            estimate_id, src.get("project_name"), src.get("project"), src.get("categories"),
+            src.get("overhead"), branch_name=src.get("branch_name") or "main",
+            branch_of=src.get("parent_id"), root_id=root_id
+        )
+        _upsert_estimate_index(
+            new_id, src.get("project_name"), src.get("project"), src.get("categories"),
+            src.get("overhead"), branch_name=request.branch_name, branch_of=estimate_id, root_id=root_id
+        )
+
+        return {
+            "success": True,
+            "estimate_id": new_id,
+            "parent_id": estimate_id,
+            "root_id": root_id,
+            "branch_name": request.branch_name,
+            "files_copied": copied,
+            "message": "Branch created",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating branch: {str(e)}")
+
+
+@router.get("/estimates/{root_id}/branches")
+async def list_estimate_branches(root_id: str):
+    """List all estimates sharing a root (the branch tree) from the index table."""
+    try:
+        resp = supabase.table("estimates").select(
+            "id, project_name, branch_name, branch_of, root_id, subtotal, total, created_at, updated_at"
+        ).or_(f"root_id.eq.{root_id},id.eq.{root_id}").eq("archived", False).execute()
+        rows = resp.data or []
+        return {"branches": rows, "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing branches: {str(e)}")
 
 
 @router.delete("/estimates/{estimate_id}")
@@ -330,6 +500,12 @@ async def delete_estimate(estimate_id: str):
         # Delete all files in the folder
         file_paths = [f"{estimate_id}/{f['name']}" for f in files]
         supabase.storage.from_(ESTIMATES_BUCKET).remove(file_paths)
+
+        # Remove from the estimates index (best-effort)
+        try:
+            supabase.table("estimates").delete().eq("id", estimate_id).execute()
+        except Exception as e:
+            logger.warning("[ESTIMATOR] estimates index delete failed for %s: %s", estimate_id, e)
 
         return {
             "success": True,
