@@ -4,10 +4,67 @@ Router para gestión de permisos basados en roles
 from fastapi import APIRouter, HTTPException
 from typing import List, Dict, Any
 from pydantic import BaseModel
+import logging
 
 from api.supabase_client import supabase
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/permissions", tags=["permissions"])
+
+
+def _build_user_menu(rol_id):
+    """Build the React menu[] from role_permissions.menu_item_id -> menu_items -> menu_categories.
+    Defensive: returns [] if the menu tables/column don't exist yet, so the vanilla hub
+    and any pre-migration DB keep working untouched."""
+    if not rol_id:
+        return []
+    try:
+        rp = (supabase.table("role_permissions")
+              .select("menu_item_id, module_name, can_view, can_edit, can_delete")
+              .eq("rol_id", rol_id).execute().data) or []
+        item_ids = [p["menu_item_id"] for p in rp if p.get("menu_item_id")]
+        if not item_ids:
+            return []
+        items = (supabase.table("menu_items")
+                 .select("id, slug, item_name, icon_type, icon_text, category_id, item_order:order")
+                 .in_("id", item_ids).execute().data) or []
+        items_by_id = {i["id"]: i for i in items}
+        cat_ids = list({i.get("category_id") for i in items if i.get("category_id")})
+        cats = {}
+        if cat_ids:
+            cd = (supabase.table("menu_categories")
+                  .select("id, name, category_order:order")
+                  .in_("id", cat_ids).execute().data) or []
+            cats = {c["id"]: c for c in cd}
+        menu = []
+        for p in rp:
+            mi = items_by_id.get(p.get("menu_item_id"))
+            if not mi:
+                continue
+            cat = cats.get(mi.get("category_id")) or {}
+            slug = (mi.get("slug") or "").strip("/")
+            menu.append({
+                "menu_item_id": mi["id"],
+                "slug": slug,
+                "item_name": mi.get("item_name"),
+                "icon_type": mi.get("icon_type"),
+                "icon_text": mi.get("icon_text"),
+                "category_id": mi.get("category_id"),
+                "category_name": cat.get("name"),
+                "category_order": cat.get("category_order"),
+                "item_order": mi.get("item_order"),
+                "module_key": slug,
+                "module_name": mi.get("item_name") or p.get("module_name"),
+                "module_url": slug,
+                "can_view": p.get("can_view", False),
+                "can_edit": p.get("can_edit", False),
+                "can_delete": p.get("can_delete", False),
+            })
+        menu.sort(key=lambda m: ((m.get("category_order") or 0), (m.get("item_order") or 0)))
+        return menu
+    except Exception as e:
+        logger.warning("[PERMISSIONS] menu build skipped (menu tables/column missing?): %s", e)
+        return []
 
 
 # ========================================
@@ -49,23 +106,31 @@ async def get_permissions_by_user(user_id: str):
     """
     try:
         response = supabase.table("users").select(
-            "user_rol, rols!users_user_rol_fkey(rol_id, role_permissions(id, module_key, module_name, module_url, can_view, can_edit, can_delete))"
+            "user_rol, rols!users_user_rol_fkey(rol_id, rol_name, role_permissions(id, module_key, module_name, module_url, can_view, can_edit, can_delete))"
         ).eq("user_id", user_id).single().execute()
 
         if not response.data:
             raise HTTPException(status_code=404, detail="User not found")
 
         rol_id = response.data.get("user_rol")
-        if not rol_id:
-            return {"user_id": user_id, "rol_id": None, "permissions": []}
-
         rols_data = response.data.get("rols") or {}
+        rol_name = rols_data.get("rol_name")
+
+        if not rol_id:
+            return {"user_id": user_id, "rol_id": None, "rol_name": rol_name,
+                    "permissions": [], "menu": [], "rows": []}
+
         permissions = rols_data.get("role_permissions") or []
 
+        # permissions[] keeps its exact legacy shape (vanilla hub depends on module_key).
+        # menu[] is built additively for the React hub; empty if the menu tables aren't present.
         return {
             "user_id": user_id,
             "rol_id": rol_id,
-            "permissions": permissions
+            "rol_name": rol_name,
+            "permissions": permissions,
+            "menu": _build_user_menu(rol_id),
+            "rows": []
         }
     except HTTPException:
         raise
@@ -106,16 +171,19 @@ async def list_all_modules():
 
 
 @router.get("/check")
-async def check_permission(user_id: str, module_key: str, action: str = "view"):
+async def check_permission(user_id: str, module_key: str = None, slug: str = None, action: str = "view"):
     """
     Verifica si un usuario tiene un permiso específico para un módulo.
-    Single query via nested embed: users → rols → role_permissions.
+    Acepta `module_key` (hub vanilla) o `slug` (hub React) — ambos como la misma clave.
 
     Args:
         user_id: ID del usuario
-        module_key: Identificador del módulo (e.g., 'expenses', 'projects')
+        module_key / slug: Identificador del módulo (e.g., 'expenses', 'projects')
         action: Tipo de permiso ('view', 'edit', 'delete')
     """
+    key = module_key or slug
+    if not key:
+        raise HTTPException(status_code=422, detail="module_key or slug is required")
     try:
         response = supabase.table("users").select(
             "user_rol, rols!users_user_rol_fkey(rol_id, role_permissions(module_key, can_view, can_edit, can_delete))"
@@ -131,7 +199,7 @@ async def check_permission(user_id: str, module_key: str, action: str = "view"):
         # Filtrar el permiso específico del módulo solicitado
         rols_data = response.data.get("rols") or {}
         all_perms = rols_data.get("role_permissions") or []
-        perm = next((p for p in all_perms if p.get("module_key") == module_key), None)
+        perm = next((p for p in all_perms if p.get("module_key") == key), None)
 
         if not perm:
             return {"has_permission": False, "reason": "No permission record found for this role and module"}
@@ -147,7 +215,8 @@ async def check_permission(user_id: str, module_key: str, action: str = "view"):
         return {
             "has_permission": has_permission,
             "user_id": user_id,
-            "module_key": module_key,
+            "module_key": key,
+            "slug": slug,
             "action": action,
             "permissions": perm
         }
