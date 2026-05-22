@@ -130,7 +130,8 @@ CREATE TRIGGER trigger_concepts_updated_at
     EXECUTE FUNCTION update_concepts_updated_at();
 
 -- ========================================
--- 5. FUNCION PARA CALCULAR COSTO DEL CONCEPTO
+-- 5. FUNCION PARA CALCULAR COSTO DE MATERIALES (suma cruda)
+-- Usada por las vistas como "total_material_cost".
 -- ========================================
 CREATE OR REPLACE FUNCTION calculate_concept_cost(p_concept_id uuid)
 RETURNS numeric AS $$
@@ -150,15 +151,54 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ========================================
+-- 5b. FUNCION PARA CALCULAR EL COSTO TOTAL DEL CONCEPTO
+-- Replica EXACTA de recalculate_concept_cost() en api/routers/concepts.py:
+--   1. materials_cost       = SUM(qty * effective_cost)   [calculate_concept_cost]
+--   2. materials_with_waste = materials_cost * (1 + waste_percent / 100)
+--   3. subtotal             = materials_with_waste + base_cost + labor_cost
+--   4. total                = round(subtotal * (1 + overhead_percentage / 100), 2)
+-- Esta es la que alimenta concepts.calculated_cost (la columna cacheada).
+-- ========================================
+CREATE OR REPLACE FUNCTION calculate_concept_total(p_concept_id uuid)
+RETURNS numeric AS $$
+DECLARE
+    v_materials numeric := 0;
+    v_waste     numeric := 0;
+    v_overhead  numeric := 0;
+    v_base      numeric := 0;
+    v_labor     numeric := 0;
+    v_subtotal  numeric := 0;
+BEGIN
+    -- 1. Costo crudo de materiales (reusa la suma de line items)
+    v_materials := calculate_concept_cost(p_concept_id);
+
+    -- Inputs a nivel concepto
+    SELECT COALESCE(waste_percent, 0),
+           COALESCE(overhead_percentage, 0),
+           COALESCE(base_cost, 0),
+           COALESCE(labor_cost, 0)
+    INTO v_waste, v_overhead, v_base, v_labor
+    FROM public.concepts
+    WHERE id = p_concept_id;
+
+    -- 2-3. waste sobre materiales, luego + base + labor
+    v_subtotal := (v_materials * (1 + v_waste / 100.0)) + v_base + v_labor;
+
+    -- 4. overhead sobre el subtotal completo
+    RETURN round(v_subtotal * (1 + v_overhead / 100.0), 2);
+END;
+$$ LANGUAGE plpgsql;
+
+-- ========================================
 -- 6. TRIGGER PARA ACTUALIZAR calculated_cost
 -- Cuando se modifican los materiales del concepto
 -- ========================================
 CREATE OR REPLACE FUNCTION update_concept_calculated_cost()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Actualizar el costo calculado del concepto
+    -- Actualizar el costo calculado del concepto (formula completa)
     UPDATE public.concepts
-    SET calculated_cost = calculate_concept_cost(
+    SET calculated_cost = calculate_concept_total(
         CASE
             WHEN TG_OP = 'DELETE' THEN OLD.concept_id
             ELSE NEW.concept_id

@@ -299,6 +299,12 @@ async def update_material(material_id: str, material: MaterialUpdate):
 
         response = supabase.table("materials").update(update_data).eq('"ID"', material_id).execute()
 
+        # Keep dependent concepts consistent: when the unit price changes, the
+        # cached calculated_cost of every concept that contains this material is
+        # now stale. Recalculate those concepts. (Other fields don't affect cost.)
+        if "price_numeric" in update_data:
+            await _propagate_material_price_to_concepts(material_id)
+
         return {"message": "Material updated successfully", "data": response.data[0] if response.data else None}
     except HTTPException:
         raise
@@ -369,9 +375,63 @@ async def bulk_create_materials(materials: List[MaterialCreate]):
 
         response = supabase.table("materials").upsert(insert_data).execute()
 
+        # Propagate price changes to dependent concepts (upsert may have changed
+        # prices of existing materials). Dedup concepts so each recalcs once.
+        changed_ids = [d["ID"] for d in insert_data if "price_numeric" in d]
+        if changed_ids:
+            await _propagate_material_price_to_concepts(changed_ids)
+
         return {
             "message": f"{len(insert_data)} materials created/updated successfully",
             "count": len(response.data) if response.data else 0
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error bulk creating materials: {str(e)}")
+
+
+# ========================================
+# Consistency Helpers
+# ========================================
+
+async def _propagate_material_price_to_concepts(material_ids):
+    """
+    Recalculate the cached calculated_cost of every concept that contains any
+    of the given material(s). Called after a material's unit price changes so
+    concept costs stay consistent with the materials they're built from.
+
+    Lines that use unit_cost_override are unaffected by the material price, but
+    we still recalc the whole concept (cheap, idempotent) so the stored value
+    always matches the current breakdown.
+
+    Accepts a single material_id (str) or a list of ids.
+    """
+    # Lazy import avoids any import-order coupling between the routers.
+    from api.routers.concepts import recalculate_concept_cost
+
+    if isinstance(material_ids, str):
+        material_ids = [material_ids]
+    if not material_ids:
+        return
+
+    try:
+        links = (
+            supabase.table("concept_materials")
+            .select("concept_id")
+            .in_("material_id", material_ids)
+            .execute()
+        )
+        concept_ids = list({
+            l["concept_id"] for l in (links.data or []) if l.get("concept_id")
+        })
+
+        for concept_id in concept_ids:
+            await recalculate_concept_cost(concept_id)
+
+        if concept_ids:
+            logger.info(
+                "Material price change propagated to %d concept(s) for material(s) %s",
+                len(concept_ids), material_ids
+            )
+    except Exception as e:
+        # Don't fail the material update if propagation hiccups; log for follow-up.
+        logger.error("Error propagating material price to concepts: %s", e)
