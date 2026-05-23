@@ -28,6 +28,7 @@ from api.routers.debug_supabase import router as debug_supabase_router
 from api.routers.team import router as team_router
 from api.routers.companies import router as companies_router
 from api.routers.expenses import router as expenses_router
+from api.routers.general_expenses import router as general_expenses_router
 from api.routers.vendors import router as vendors_router
 from api.routers.accounts import router as accounts_router
 from api.routers.permissions import router as permissions_router
@@ -110,6 +111,9 @@ from api.routers.invoice_links import router as invoice_links_router
 # ========= COMMENTS: Cross-module cell commenting with @mentions ==========
 from api.routers.comments import router as comments_router
 
+# ========= PHOTO ANNOTATIONS: NGM Cam non-destructive markup ==========
+from api.routers.photo_annotations import router as photo_annotations_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -168,6 +172,7 @@ app.include_router(team_router)
 app.include_router(companies_router)
 
 app.include_router(expenses_router)
+app.include_router(general_expenses_router)
 
 # Reconciliations (vincular gastos manuales con facturas QBO)
 app.include_router(reconciliations_router)
@@ -268,6 +273,9 @@ app.include_router(invoice_links_router)
 
 # Comments (cross-module cell commenting with @mentions)
 app.include_router(comments_router)
+
+# Photo Annotations (NGM Cam non-destructive markup)
+app.include_router(photo_annotations_router)
 
 _mem_logger = logging.getLogger("memory")
 
