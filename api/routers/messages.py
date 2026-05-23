@@ -462,12 +462,21 @@ async def send_message_notifications(
     sender_avatar_color: str,
     channel_type: str,
     project_id: str = None,
-    channel_id: str = None
+    channel_id: str = None,
+    metadata: dict = None,
 ):
     """Background task to send push notifications for mentions and DM/group messages."""
 
-    # Build URL for notification click
-    if channel_type.startswith("project_") and project_id:
+    # Build URL for notification click.
+    # NGM Cam photo comments (channel_type=project_photos) deep-link into the
+    # NGM Cam page (to the tagged photo), NOT the Messages page — photo tags
+    # live only inside NGM Cam.
+    if channel_type == "project_photos" and project_id:
+        photo_file_id = (metadata or {}).get("photo_file_id")
+        message_url = f"/ngm-cam?project={project_id}"
+        if photo_file_id:
+            message_url += f"&photo={photo_file_id}"
+    elif channel_type.startswith("project_") and project_id:
         message_url = f"/messages.html?project={project_id}&channel={channel_type}"
     elif channel_id:
         message_url = f"/messages.html?channel={channel_id}"
@@ -673,7 +682,8 @@ def create_message(
                 sender_avatar_color=sender_avatar_color,
                 channel_type=payload.channel_type,
                 project_id=payload.project_id,
-                channel_id=payload.channel_id
+                channel_id=payload.channel_id,
+                metadata=payload.metadata,
             )
         except Exception as bg_err:
             logger.warning("[Messages] Background task setup error (non-blocking): %s", bg_err)
@@ -1269,11 +1279,20 @@ def search_messages(
 def get_my_mentions(
     unread_only: bool = Query(False),
     limit: int = Query(20, ge=1, le=100),
+    channel_type: Optional[str] = Query(
+        None,
+        description="Filter to a single channel_type (e.g. project_photos for the NGM Cam inbox). "
+                    "When omitted, project_photos mentions are excluded so photo tags stay inside NGM Cam.",
+    ),
     current_user: dict = Depends(get_current_user)
 ):
     """
     Get messages where current user was mentioned.
     Returns a flattened format for easy dashboard display.
+
+    Photo tags (channel_type=project_photos) live exclusively in NGM Cam:
+    they are excluded from the default Messages mentions inbox and are only
+    returned when the caller explicitly requests channel_type=project_photos.
     """
     try:
         user_id = current_user["user_id"]
@@ -1296,6 +1315,13 @@ def get_my_mentions(
             .ilike("content", search_pattern) \
             .neq("user_id", user_id) \
             .or_("is_deleted.is.null,is_deleted.eq.false")
+
+        # Scope by channel_type: explicit filter wins; otherwise keep photo tags
+        # out of the default (Messages) mentions inbox.
+        if channel_type:
+            query = query.eq("channel_type", channel_type)
+        else:
+            query = query.neq("channel_type", "project_photos")
 
         # Fetch extra rows since Python-side regex may filter some out
         result = query.order("created_at", desc=True).limit(limit * 2).execute()
