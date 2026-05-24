@@ -4,13 +4,39 @@ Supports comments on any cell/row in any page with @mentions.
 Only the creator can delete their own comments.
 """
 
+import logging
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from api.supabase_client import supabase
 from api.auth import get_current_user
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/comments", tags=["Comments"])
+
+# Maps a comment's `module` to the React route that shows that record, so a
+# notification can deep-link straight to where the user was tagged. Falls back
+# to /<module>. Covers board/spreadsheet modules plus estimator & vault.
+_MODULE_ROUTES = {
+    "expenses": "/expenses",
+    "budgets": "/budgets",
+    "budget_monitor": "/budget-monitor",
+    "pipeline": "/pipeline-manager",
+    "accounts": "/accounts",
+    "vendors": "/vendors",
+    "estimator": "/estimator",
+    "estimator_database": "/estimator-database",
+    "vault": "/vault",
+}
+
+
+def _comment_deep_link(module: str, record_id: str, column_key: Optional[str]) -> str:
+    base = _MODULE_ROUTES.get((module or "").lower(), f"/{module}")
+    link = f"{base}?record={record_id}"
+    if column_key:
+        link += f"&col={column_key}"
+    return link
 
 
 # ====== PYDANTIC MODELS ======
@@ -119,8 +145,31 @@ def create_comment(
         if not res.data:
             raise HTTPException(status_code=500, detail="Insert failed")
 
-        # Re-fetch with user join
         comment_id = res.data[0]["id"]
+
+        # In-app notifications feed: one per @mentioned user (dashboard widget).
+        if payload.mentions:
+            try:
+                from api.services.notifications_feed import create_notifications
+                create_notifications(
+                    payload.mentions,
+                    type="mention_comment",
+                    module=payload.module,
+                    actor_id=user_id,
+                    reference_type="comment",
+                    reference_id=comment_id,
+                    deep_link=_comment_deep_link(payload.module, payload.record_id, payload.column_key),
+                    preview=payload.body,
+                    context={
+                        "module": payload.module,
+                        "record_id": payload.record_id,
+                        "column_key": payload.column_key,
+                    },
+                )
+            except Exception as notif_err:
+                logger.debug("[Comments] notifications feed insert failed: %s", notif_err)
+
+        # Re-fetch with user join
         fetched = (
             supabase.table("cell_comments")
             .select("*, users!cell_comments_created_by_fkey(user_id, user_name, user_photo, avatar_color)")
