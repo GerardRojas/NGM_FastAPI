@@ -71,6 +71,43 @@ def _round2(val: float) -> float:
     return round(val, 2)
 
 
+def _user_has_permission(current_user: dict, module_key: str) -> bool:
+    """Return True if the caller's role has can_view on *module_key*."""
+    user_role_id = current_user.get("user_rol")
+    if not user_role_id:
+        return False
+    try:
+        resp = (
+            supabase.table("role_permissions")
+            .select("can_view")
+            .eq("rol_id", user_role_id)
+            .eq("module_key", module_key)
+            .eq("can_view", True)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as exc:
+        logger.error("[analytics] permission check %s: %s", module_key, exc)
+        return False
+
+
+def _name_map(table: str, id_col: str, name_col: str, ids: set) -> dict:
+    """Resolve a set of ids to display names via a single table fetch."""
+    if not ids:
+        return {}
+    out: dict = {}
+    try:
+        resp = supabase.table(table).select(f"{id_col}, {name_col}").execute()
+        for row in (resp.data or []):
+            rid = str(row.get(id_col, ""))
+            if rid in ids:
+                out[rid] = row.get(name_col) or ""
+    except Exception as exc:
+        logger.warning("[analytics] name_map %s: %s", table, exc)
+    return out
+
+
 # ============================================================
 # 1. GET /analytics/projects/{project_id}/health
 # ============================================================
@@ -680,30 +717,22 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
     """
 
     # --- Permission check ---
-    user_role_id = current_user.get("user_rol")
-    if not user_role_id:
+    if not current_user.get("user_rol"):
         raise HTTPException(status_code=403, detail="No role assigned to user")
-
-    try:
-        perm_resp = (
-            supabase.table("role_permissions")
-            .select("can_view")
-            .eq("rol_id", user_role_id)
-            .eq("module_key", "project_kpis")
-            .eq("can_view", True)
-            .limit(1)
-            .execute()
+    if not _user_has_permission(current_user, "project_kpis"):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to view executive KPIs",
         )
-        if not (perm_resp.data):
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have permission to view executive KPIs",
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("[analytics:executive_kpis] permission check: %s", exc)
-        raise HTTPException(status_code=500, detail="Permission check failed")
+
+    return _compute_executive_kpis()
+
+
+def _compute_executive_kpis() -> dict:
+    """
+    Core multi-project financial aggregation, decoupled from the route so it can
+    be reused (e.g. by the Operations Dashboard). Performs no permission check.
+    """
 
     # --- Active projects ---
     active_projects: list[dict] = []
@@ -2365,3 +2394,176 @@ async def project_scorecard(
     except Exception as exc:
         logger.error("[analytics:project-scorecard] %s", exc)
         raise HTTPException(status_code=500, detail="Failed to compute project scorecard")
+
+
+# ============================================================
+# 10. GET /analytics/operations-dashboard
+# ============================================================
+
+_DONE_STATUS_NAMES = {"done", "completed", "good to go"}
+
+
+def _compute_task_overview() -> dict:
+    """
+    Global task progress for the Operations Dashboard:
+    - by_status: task counts grouped by status name
+    - overdue: overdue, not-done tasks (owner + project names resolved)
+    - completed_this_week / created_this_week: 7-day throughput
+    """
+    from datetime import datetime, timedelta
+
+    status_map: dict = {}
+    try:
+        st_resp = supabase.table("tasks_status").select("task_status_id, task_status").execute()
+        status_map = {
+            s["task_status_id"]: (s.get("task_status") or "").lower()
+            for s in (st_resp.data or [])
+        }
+    except Exception as exc:
+        logger.warning("[analytics:ops-dashboard] status fetch: %s", exc)
+
+    all_tasks = _paginated_fetch(
+        "tasks",
+        "task_id, task_description, project_id, Owner_id, task_status, deadline, due_date, created_at",
+        {},
+    )
+
+    today = datetime.utcnow().date()
+    week_ago = today - timedelta(days=7)
+
+    by_status: dict = defaultdict(int)
+    overdue_raw: list[dict] = []
+    created_this_week = 0
+
+    for t in all_tasks:
+        sname = status_map.get(t.get("task_status"), "other")
+        by_status[sname] += 1
+
+        created = str(t.get("created_at") or "")
+        if len(created) >= 10:
+            try:
+                if datetime.fromisoformat(created[:10]).date() >= week_ago:
+                    created_this_week += 1
+            except Exception:
+                pass
+
+        if sname not in _DONE_STATUS_NAMES:
+            deadline_str = t.get("deadline") or t.get("due_date")
+            if deadline_str:
+                try:
+                    dl = datetime.fromisoformat(str(deadline_str).replace("Z", "")).date()
+                    if dl < today:
+                        overdue_raw.append({**t, "_deadline": dl})
+                except Exception:
+                    pass
+
+    owner_ids = {str(t.get("Owner_id")) for t in overdue_raw if t.get("Owner_id")}
+    project_ids = {str(t.get("project_id")) for t in overdue_raw if t.get("project_id")}
+    user_name_map = _name_map("users", "user_id", "user_name", owner_ids)
+    project_name_map = _name_map("projects", "project_id", "project_name", project_ids)
+
+    overdue = []
+    for t in sorted(overdue_raw, key=lambda x: x["_deadline"]):
+        overdue.append({
+            "task_id": str(t.get("task_id", "")),
+            "description": t.get("task_description") or "Untitled",
+            "project_name": project_name_map.get(str(t.get("project_id")), "No Project"),
+            "owner_name": user_name_map.get(str(t.get("Owner_id")), "Unassigned"),
+            "days_overdue": (today - t["_deadline"]).days,
+        })
+
+    # Completed this week: approval events in the workflow log (this is how the
+    # pipeline marks a task done after review).
+    completed_this_week = 0
+    try:
+        cw_resp = (
+            supabase.table("task_workflow_log")
+            .select("log_id, performed_at")
+            .eq("event_type", "approved")
+            .gte("performed_at", week_ago.isoformat())
+            .execute()
+        )
+        completed_this_week = len(cw_resp.data or [])
+    except Exception as exc:
+        logger.warning("[analytics:ops-dashboard] completed_this_week: %s", exc)
+
+    return {
+        "by_status": dict(by_status),
+        "overdue": overdue[:50],
+        "overdue_count": len(overdue),
+        "completed_this_week": completed_this_week,
+        "created_this_week": created_this_week,
+    }
+
+
+@router.get("/operations-dashboard")
+async def operations_dashboard(current_user: dict = Depends(get_current_user)):
+    """
+    Single aggregation for the weekly Operations Dashboard meeting view:
+    financial KPIs + per-project status (gated by `project_kpis`), task progress,
+    team workload, and overdue items. Task/team data is returned for any
+    authenticated user; financial fields are omitted without `project_kpis`.
+    """
+    from datetime import date
+
+    if not current_user.get("user_rol"):
+        raise HTTPException(status_code=403, detail="No role assigned to user")
+
+    can_view_financials = _user_has_permission(current_user, "project_kpis")
+
+    kpis = {
+        "active_projects": 0,
+        "total_budget": 0.0,
+        "total_spend": 0.0,
+        "avg_margin_pct": 0.0,
+        "daneel_auth_rate": 0.0,
+    }
+    projects: list[dict] = []
+    spend_trend: list[dict] = []
+    top_vendors: list[dict] = []
+
+    if can_view_financials:
+        try:
+            ek = _compute_executive_kpis()
+            kpis = {
+                "active_projects": ek.get("active_projects", 0),
+                "total_budget": ek.get("total_budget", 0.0),
+                "total_spend": ek.get("total_spend", 0.0),
+                "avg_margin_pct": ek.get("avg_margin_pct", 0.0),
+                "daneel_auth_rate": ek.get("daneel_auth_rate", 0.0),
+            }
+            projects = ek.get("projects", [])
+            spend_trend = ek.get("monthly_spend_total", [])
+            top_vendors = ek.get("top_vendors", [])
+        except Exception as exc:
+            logger.error("[analytics:ops-dashboard] executive kpis: %s", exc)
+
+    tasks = _compute_task_overview()
+
+    team: list[dict] = []
+    try:
+        from api.routers.pipeline import get_team_workload
+        wl = get_team_workload() or {}
+        for m in (wl.get("team") or []):
+            team.append({
+                "user_id": str(m.get("user_id", "")),
+                "user_name": m.get("user_name"),
+                "avatar_color": m.get("avatar_color"),
+                "utilization_percent": m.get("utilization_percent", 0),
+                "tasks_count": m.get("tasks_count", 0),
+                "overdue_count": m.get("overdue_count", 0),
+                "status": m.get("status", "normal"),
+            })
+    except Exception as exc:
+        logger.error("[analytics:ops-dashboard] team workload: %s", exc)
+
+    return {
+        "as_of": date.today().isoformat(),
+        "can_view_financials": can_view_financials,
+        "kpis": kpis,
+        "projects": projects,
+        "tasks": tasks,
+        "team": team,
+        "spend_trend": spend_trend,
+        "top_vendors": top_vendors,
+    }
