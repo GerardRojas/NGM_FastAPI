@@ -83,10 +83,37 @@ def _load_list(key: Optional[str]) -> List[str]:
         return []
 
 
-def _get_user(user_id: str) -> Optional[Dict[str, Any]]:
+def _rol_name(rol_id: Optional[str]) -> str:
+    """Resolve a rols.rol_id (UUID) to its rol_name. Cached per process."""
+    if not rol_id:
+        return ""
+    cached = _ROL_NAME_CACHE.get(rol_id)
+    if cached is not None:
+        return cached
     try:
-        r = supabase.table("users").select("user_id, user_name, role").eq("user_id", user_id).execute()
-        return r.data[0] if r.data else None
+        r = supabase.table("rols").select("rol_name").eq("rol_id", rol_id).execute()
+        name = (r.data[0].get("rol_name") if r.data else "") or ""
+    except Exception as e:
+        logger.debug("[AgentAccess] rol lookup failed: %s", e)
+        name = ""
+    _ROL_NAME_CACHE[rol_id] = name
+    return name
+
+
+_ROL_NAME_CACHE: Dict[str, str] = {}
+
+
+def _get_user(user_id: str) -> Optional[Dict[str, Any]]:
+    # The users table stores the role as user_rol (a rols.rol_id UUID), not a
+    # role name. Resolve it to rol_name so the allow-lists below (which match on
+    # names like "CEO"/"COO") work.
+    try:
+        r = supabase.table("users").select("user_id, user_name, user_rol").eq("user_id", user_id).execute()
+        if not r.data:
+            return None
+        user = r.data[0]
+        user["role"] = _rol_name(user.get("user_rol"))
+        return user
     except Exception as e:
         logger.debug("[AgentAccess] user lookup failed: %s", e)
         return None
