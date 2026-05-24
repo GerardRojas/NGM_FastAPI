@@ -61,6 +61,7 @@ logger.info("[ESTIMATOR] TEMPLATES_DIR = %s", TEMPLATES_DIR)
 class EstimateSaveRequest(BaseModel):
     """Request body for saving an estimate"""
     estimate_id: Optional[str] = None  # If None, generates new ID
+    branch_id: Optional[str] = None    # If None, saves the main branch
     project_name: str
     project: Dict[str, Any]
     categories: List[Dict[str, Any]]
@@ -69,6 +70,16 @@ class EstimateSaveRequest(BaseModel):
     concepts_snapshot: Optional[List[Dict[str, Any]]] = None
     concept_materials_snapshot: Optional[List[Dict[str, Any]]] = None
     created_from_template: Optional[str] = None
+
+
+class BranchCreateRequest(BaseModel):
+    """Request body for creating a new branch (variation) of an estimate."""
+    name: str
+    based_on: Optional[str] = None  # branch_id to copy from; defaults to main
+
+
+class BranchRenameRequest(BaseModel):
+    name: str
 
 
 class TemplateSaveRequest(BaseModel):
@@ -122,6 +133,171 @@ def generate_template_id(template_name: str) -> str:
     timestamp = int(datetime.now().timestamp() * 1000)
     return f"{safe_name}-{timestamp}"
 
+
+# ============================================
+# ESTIMATE METADATA HELPERS
+# ============================================
+
+def _to_num(value: Any) -> Optional[float]:
+    """Coerce a value to float, stripping $/commas. Returns None if not numeric."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace("$", "").replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _first(row: Dict[str, Any], keys: List[str]) -> Any:
+    """First defined/non-empty value among the given keys (legacy field fallbacks)."""
+    for key in keys:
+        val = row.get(key)
+        if val is not None and val != "":
+            return val
+    return None
+
+
+def compute_grand_total(data: Dict[str, Any]) -> Optional[float]:
+    """Resolve an estimate's grand total, mirroring the frontend rollup
+    (services.ts normalizeEstimate): stored value wins, else subtotal + overhead.
+    """
+    # Subtotal: stored, else sum of category rollups.
+    subtotal = _to_num(data.get("subtotal"))
+    if subtotal is None:
+        subtotal = 0.0
+        for cat in (data.get("categories") or []):
+            cat_total = _to_num(cat.get("total_cost") if isinstance(cat, dict) else None)
+            if cat_total is not None:
+                subtotal += cat_total
+                continue
+            for sub in (cat.get("subcategories") or []):
+                sub_total = _to_num(sub.get("total_cost"))
+                if sub_total is not None:
+                    subtotal += sub_total
+                    continue
+                for item in (sub.get("items") or []):
+                    subtotal += _to_num(_first(item, ["total", "total_cost", "subtotal"])) or 0.0
+
+    # Overhead amount: itemized (sum of items) or flat amount.
+    overhead = data.get("overhead") or {}
+    if isinstance(overhead.get("items"), list):
+        oh_amount = sum((_to_num(it.get("amount")) or 0.0) for it in overhead["items"])
+    else:
+        oh_amount = _to_num(overhead.get("amount")) or 0.0
+
+    stored_grand = _to_num(_first(data, ["grand_total", "total"]))
+    return stored_grand if stored_grand is not None else round(subtotal + oh_amount, 2)
+
+
+def extract_estimate_meta(estimate_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a board-card summary from an estimate.ngm payload."""
+    project = data.get("project")
+    project_label = None
+    if isinstance(project, dict):
+        project_label = _first(project, ["client", "name", "address", "project_name"])
+    elif isinstance(project, str):
+        project_label = project
+    return {
+        "id": estimate_id,
+        "name": str(_first(data, ["project_name"]) or estimate_id),
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+        "grand_total": compute_grand_total(data),
+        "project": project_label,
+    }
+
+
+# ============================================
+# BRANCH HELPERS
+# ============================================
+# An estimate folder holds variations ("branches") of the same project, e.g.
+# "Sin appliances". Each branch is a full independent copy:
+#   {estimate_id}/branches/{branch_id}.ngm   (canonical per-branch content)
+#   {estimate_id}/branches.json              (manifest: which branch is main + card metadata)
+#   {estimate_id}/estimate.ngm               (mirror of the MAIN branch, for legacy HTML reads)
+
+MAIN_BRANCH_ID = "main"
+
+
+def _branch_path(estimate_id: str, branch_id: str) -> str:
+    return f"{estimate_id}/branches/{branch_id}.ngm"
+
+
+def _manifest_path(estimate_id: str) -> str:
+    return f"{estimate_id}/branches.json"
+
+
+def _download_json(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        blob = supabase.storage.from_(ESTIMATES_BUCKET).download(path)
+        if blob:
+            return json.loads(blob.decode("utf-8"))
+    except Exception as exc:
+        logger.debug("[ESTIMATOR] download miss %s: %s", path, exc)
+    return None
+
+
+def _upload_json(path: str, data: Any) -> None:
+    payload = json.dumps(data, indent=2).encode("utf-8")
+    supabase.storage.from_(ESTIMATES_BUCKET).upload(
+        path=path,
+        file=payload,
+        file_options={"content-type": "application/json", "upsert": "true"},
+    )
+
+
+def generate_branch_id(name: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in (name or "branch").lower())[:30]
+    return f"{safe}-{int(datetime.now().timestamp() * 1000)}"
+
+
+def find_branch(manifest: Dict[str, Any], branch_id: str) -> Optional[Dict[str, Any]]:
+    for b in manifest.get("branches", []):
+        if b.get("id") == branch_id:
+            return b
+    return None
+
+
+def ensure_manifest(estimate_id: str) -> Dict[str, Any]:
+    """Return the branches manifest, lazily migrating legacy estimates that
+    predate branching into a single 'main' branch."""
+    manifest = _download_json(_manifest_path(estimate_id))
+    if manifest and isinstance(manifest.get("branches"), list) and manifest["branches"]:
+        return manifest
+
+    data = _download_json(f"{estimate_id}/estimate.ngm") or {}
+    now_iso = datetime.now().isoformat()
+    created = data.get("created_at") or now_iso
+    updated = data.get("updated_at") or now_iso
+    meta = extract_estimate_meta(estimate_id, data)
+    manifest = {
+        "main_branch_id": MAIN_BRANCH_ID,
+        "project_name": meta["name"],
+        "project": meta["project"],
+        "created_at": created,
+        "updated_at": updated,
+        "branches": [{
+            "id": MAIN_BRANCH_ID,
+            "name": "Main",
+            "created_at": created,
+            "updated_at": updated,
+            "grand_total": meta["grand_total"],
+            "based_on": None,
+        }],
+    }
+    _upload_json(_manifest_path(estimate_id), manifest)
+    return manifest
+
+
+def read_branch_content(estimate_id: str, branch_id: str, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Load a branch's .ngm. The main branch falls back to the root estimate.ngm
+    when no per-branch file exists yet (legacy / lazily-migrated estimates)."""
+    data = _download_json(_branch_path(estimate_id, branch_id))
+    if data is None and branch_id == manifest.get("main_branch_id"):
+        data = _download_json(f"{estimate_id}/estimate.ngm")
+    return data
 
 
 # ============================================
@@ -193,17 +369,45 @@ async def list_estimates():
 
         files = supabase.storage.from_(ESTIMATES_BUCKET).list()
 
-        # Filter for folders (estimates) - folders have no extension in name
+        # Filter for folders (estimates) - folders have no extension in name.
+        # Prefer the lightweight branches.json for board metadata (dates, grand
+        # total, project, branch count); fall back to opening estimate.ngm for
+        # legacy estimates not yet migrated. Folder metadata is unreliable for
+        # pseudo-folders, so it's only the last resort.
         estimates = []
         for item in files or []:
             name = item.get("name", "")
-            if name and "." not in name:
-                estimates.append({
-                    "id": name,
-                    "name": name,
-                    "created_at": item.get("created_at"),
-                    "updated_at": item.get("updated_at")
-                })
+            if not name or "." in name:
+                continue
+            summary = {
+                "id": name,
+                "name": name,
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+                "grand_total": None,
+                "project": None,
+                "branch_count": 1,
+            }
+            try:
+                manifest = _download_json(_manifest_path(name))
+                if manifest and isinstance(manifest.get("branches"), list) and manifest["branches"]:
+                    main = find_branch(manifest, manifest.get("main_branch_id")) or manifest["branches"][0]
+                    summary.update({
+                        "name": manifest.get("project_name") or name,
+                        "created_at": manifest.get("created_at") or summary["created_at"],
+                        "updated_at": manifest.get("updated_at") or summary["updated_at"],
+                        "grand_total": main.get("grand_total"),
+                        "project": manifest.get("project"),
+                        "branch_count": len(manifest["branches"]),
+                    })
+                else:
+                    data = _download_json(f"{name}/estimate.ngm")
+                    if data:
+                        summary.update(extract_estimate_meta(name, data))
+                        summary["id"] = name  # keep folder id as the canonical key
+            except Exception as _exc:
+                logger.debug("[ESTIMATOR] list meta skip for %s: %s", name, _exc)
+            estimates.append(summary)
 
         return {"estimates": estimates, "count": len(estimates)}
 
@@ -254,27 +458,67 @@ async def save_estimate(request: EstimateSaveRequest):
 
         # Generate or use provided ID
         estimate_id = request.estimate_id or generate_estimate_id(request.project_name)
+        is_new = not request.estimate_id
 
-        # Prepare main estimate data
+        now_iso = datetime.now().isoformat()
+
+        # Resolve which branch this save targets. Brand-new estimates skip the
+        # manifest read (nothing exists yet) and write the main branch.
+        manifest = None if is_new else _download_json(_manifest_path(estimate_id))
+        main_id = (manifest or {}).get("main_branch_id", MAIN_BRANCH_ID)
+        branch_id = request.branch_id or main_id
+        is_main = branch_id == main_id
+
+        # Preserve the original creation date on updates (only set it once),
+        # per branch. The main branch falls back to the root estimate.ngm.
+        prior = _download_json(_branch_path(estimate_id, branch_id))
+        if prior is None and is_main:
+            prior = _download_json(f"{estimate_id}/estimate.ngm")
+        created_at = (prior or {}).get("created_at") or now_iso
+
+        # Prepare estimate data
         estimate_data = {
             "estimate_id": estimate_id,
+            "branch_id": branch_id,
             "project_name": request.project_name,
             "project": request.project,
             "categories": request.categories,
             "overhead": request.overhead or {"percentage": 0, "amount": 0},
             "created_from_template": request.created_from_template,
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat(),
+            "created_at": created_at,
+            "updated_at": now_iso,
             "version": "1.0"
         }
 
-        # Upload main estimate file
-        estimate_json = json.dumps(estimate_data, indent=2)
-        supabase.storage.from_(ESTIMATES_BUCKET).upload(
-            path=f"{estimate_id}/estimate.ngm",
-            file=estimate_json.encode("utf-8"),
-            file_options={"content-type": "application/json", "upsert": "true"}
-        )
+        # Write the canonical per-branch file, and mirror the main branch to the
+        # root estimate.ngm so legacy HTML clients keep reading it.
+        _upload_json(_branch_path(estimate_id, branch_id), estimate_data)
+        if is_main:
+            _upload_json(f"{estimate_id}/estimate.ngm", estimate_data)
+
+        # Refresh the manifest entry for this branch (+ folder metadata from main).
+        grand_total = compute_grand_total(estimate_data)
+        if manifest is None:
+            manifest = {"main_branch_id": main_id, "branches": []}
+        if is_main:
+            meta = extract_estimate_meta(estimate_id, estimate_data)
+            manifest["project_name"] = meta["name"]
+            manifest["project"] = meta["project"]
+            manifest["created_at"] = manifest.get("created_at") or created_at
+            manifest["updated_at"] = now_iso
+        entry = find_branch(manifest, branch_id)
+        if entry is None:
+            entry = {
+                "id": branch_id,
+                "name": "Main" if is_main else branch_id,
+                "based_on": None,
+                "created_at": created_at,
+            }
+            manifest["branches"].append(entry)
+        entry["grand_total"] = grand_total
+        entry["created_at"] = entry.get("created_at") or created_at
+        entry["updated_at"] = now_iso
+        _upload_json(_manifest_path(estimate_id), manifest)
 
         # Upload materials snapshot if provided (JSON format)
         if request.materials_snapshot:
@@ -306,6 +550,7 @@ async def save_estimate(request: EstimateSaveRequest):
         return {
             "success": True,
             "estimate_id": estimate_id,
+            "branch_id": branch_id,
             "message": "Estimate saved successfully"
         }
 
@@ -327,8 +572,16 @@ async def delete_estimate(estimate_id: str):
         if not files:
             raise HTTPException(status_code=404, detail=f"Estimate not found: {estimate_id}")
 
-        # Delete all files in the folder
+        # Delete top-level files in the folder
         file_paths = [f"{estimate_id}/{f['name']}" for f in files]
+
+        # Also delete nested per-branch files under branches/
+        try:
+            branch_files = supabase.storage.from_(ESTIMATES_BUCKET).list(f"{estimate_id}/branches")
+            file_paths += [f"{estimate_id}/branches/{f['name']}" for f in (branch_files or [])]
+        except Exception as _exc:
+            logger.debug("[ESTIMATOR] no branches subfolder for %s: %s", estimate_id, _exc)
+
         supabase.storage.from_(ESTIMATES_BUCKET).remove(file_paths)
 
         return {
@@ -341,6 +594,165 @@ async def delete_estimate(estimate_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting estimate: {str(e)}")
+
+
+# ============================================
+# BRANCH ENDPOINTS
+# ============================================
+
+@router.get("/estimates/{estimate_id}/branches")
+async def get_branches(estimate_id: str):
+    """List the branches (variations) of an estimate. Lazily migrates legacy
+    estimates into a single 'main' branch."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        return ensure_manifest(estimate_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing branches: {str(e)}")
+
+
+@router.get("/estimates/{estimate_id}/branches/{branch_id}")
+async def get_branch(estimate_id: str, branch_id: str):
+    """Load a specific branch's estimate content (.ngm)."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+        if not find_branch(manifest, branch_id):
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+        data = read_branch_content(estimate_id, branch_id, manifest)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"Branch content not found: {branch_id}")
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading branch: {str(e)}")
+
+
+@router.post("/estimates/{estimate_id}/branches")
+async def create_branch(estimate_id: str, request: BranchCreateRequest):
+    """Create a new branch as a full independent copy of an existing one
+    (defaults to copying the main branch)."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+
+        source_id = request.based_on or manifest["main_branch_id"]
+        if not find_branch(manifest, source_id):
+            raise HTTPException(status_code=404, detail=f"Source branch not found: {source_id}")
+        source = read_branch_content(estimate_id, source_id, manifest)
+        if source is None:
+            raise HTTPException(status_code=404, detail=f"Source branch content not found: {source_id}")
+
+        branch_id = generate_branch_id(request.name)
+        now_iso = datetime.now().isoformat()
+
+        new_data = dict(source)
+        new_data["estimate_id"] = estimate_id
+        new_data["branch_id"] = branch_id
+        new_data["branch_name"] = request.name
+        new_data["created_at"] = now_iso
+        new_data["updated_at"] = now_iso
+        _upload_json(_branch_path(estimate_id, branch_id), new_data)
+
+        manifest["branches"].append({
+            "id": branch_id,
+            "name": request.name,
+            "based_on": source_id,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "grand_total": compute_grand_total(new_data),
+        })
+        _upload_json(_manifest_path(estimate_id), manifest)
+
+        return {"success": True, "branch_id": branch_id, "manifest": manifest}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating branch: {str(e)}")
+
+
+@router.patch("/estimates/{estimate_id}/branches/{branch_id}")
+async def rename_branch(estimate_id: str, branch_id: str, request: BranchRenameRequest):
+    """Rename a branch."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+        entry = find_branch(manifest, branch_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+        entry["name"] = request.name
+        entry["updated_at"] = datetime.now().isoformat()
+        _upload_json(_manifest_path(estimate_id), manifest)
+        return {"success": True, "manifest": manifest}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error renaming branch: {str(e)}")
+
+
+@router.post("/estimates/{estimate_id}/branches/{branch_id}/set-main")
+async def set_main_branch(estimate_id: str, branch_id: str):
+    """Promote a branch to be the main one. Mirrors its content to the root
+    estimate.ngm (legacy reads) and records it in the manifest."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+        if not find_branch(manifest, branch_id):
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+
+        old_main = manifest.get("main_branch_id")
+        data = read_branch_content(estimate_id, branch_id, manifest)
+        if data is None:
+            raise HTTPException(status_code=404, detail=f"Branch content not found: {branch_id}")
+
+        # Guarantee the outgoing main keeps its own per-branch file.
+        if old_main and old_main != branch_id:
+            old_data = read_branch_content(estimate_id, old_main, manifest)
+            if old_data is not None:
+                _upload_json(_branch_path(estimate_id, old_main), old_data)
+
+        # Mirror the new main to the root estimate.ngm.
+        _upload_json(f"{estimate_id}/estimate.ngm", data)
+
+        manifest["main_branch_id"] = branch_id
+        meta = extract_estimate_meta(estimate_id, data)
+        manifest["project_name"] = meta["name"]
+        manifest["project"] = meta["project"]
+        manifest["updated_at"] = datetime.now().isoformat()
+        _upload_json(_manifest_path(estimate_id), manifest)
+
+        return {"success": True, "manifest": manifest}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error promoting branch: {str(e)}")
+
+
+@router.delete("/estimates/{estimate_id}/branches/{branch_id}")
+async def delete_branch(estimate_id: str, branch_id: str):
+    """Delete a branch. The main branch cannot be deleted (promote another first)."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+        if branch_id == manifest.get("main_branch_id"):
+            raise HTTPException(status_code=400, detail="Cannot delete the main branch. Set another branch as main first.")
+        if not find_branch(manifest, branch_id):
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+
+        try:
+            supabase.storage.from_(ESTIMATES_BUCKET).remove([_branch_path(estimate_id, branch_id)])
+        except Exception as _exc:
+            logger.debug("[ESTIMATOR] branch file remove note %s: %s", branch_id, _exc)
+
+        manifest["branches"] = [b for b in manifest["branches"] if b.get("id") != branch_id]
+        _upload_json(_manifest_path(estimate_id), manifest)
+
+        return {"success": True, "manifest": manifest}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting branch: {str(e)}")
 
 
 # ============================================
