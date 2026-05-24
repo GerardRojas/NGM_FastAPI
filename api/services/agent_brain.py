@@ -267,6 +267,7 @@ async def invoke_brain(
                 user_name,
                 attachments=attachments,
                 user_text=user_text,
+                user_id=user_id,
             )
         elif action == "cross_agent":
             await _handle_cross_agent(
@@ -638,6 +639,7 @@ async def _execute_function_call(
     user_name: str,
     attachments: Optional[list] = None,
     user_text: str = "",
+    user_id: str = "",
 ) -> None:
     """Execute a registered function. Post ack if long-running."""
     fn_name = decision.get("function", "")
@@ -654,6 +656,25 @@ async def _execute_function_call(
         return
 
     tag = f"[AgentBrain:{agent_name}]"
+
+    # RBAC: only authorized operators may run commands. Covers BOTH chat
+    # @mentions and the operator modal (both flow through here). Hari keeps its
+    # own per-handler instructor check, so it is not gated again here.
+    if agent_name in ("daneel", "andrew"):
+        try:
+            from api.services.agent_access import check_agent_operator_permission
+            perm = check_agent_operator_permission(agent_name, user_id)
+        except Exception as perm_err:
+            logger.error("%s RBAC check error: %s", tag, perm_err)
+            perm = {"allowed": True, "reason": ""}  # fail-open on lookup error
+        if not perm.get("allowed"):
+            logger.info("%s Command '%s' denied for user %s (%s)", tag, fn_name, user_id, perm.get("reason"))
+            await _post_response(
+                agent_name, project_id, channel_type, channel_id,
+                await _personalize(agent_name, f"I can only take commands from authorized roles. {perm.get('reason', '')}".strip()),
+                metadata={"agent_brain": True, "permission_denied": True},
+            )
+            return
 
     # Post acknowledgment for long-running functions
     # Skip if handler posts its own ack (e.g. process_receipt)
@@ -692,6 +713,12 @@ async def _execute_function_call(
         fn_ms = int((time.monotonic() - t_fn) * 1000)
         logger.info("%s Function %s completed in %dms", tag, fn_name, fn_ms)
 
+        # Analytics: record the command execution (best-effort, never blocks).
+        _log_agent_command(
+            agent_name, fn_name, user_id, user_name, project_id,
+            channel_type, status="ok", latency_ms=fn_ms,
+        )
+
         # Format result into readable text
         result_text = _format_result(agent_name, fn_name, result)
 
@@ -709,12 +736,44 @@ async def _execute_function_call(
 
     except Exception as e:
         logger.error("%s Function %s failed: %s\n%s", tag, fn_name, e, traceback.format_exc())
+        _log_agent_command(
+            agent_name, fn_name, user_id, user_name, project_id,
+            channel_type, status="error", error=str(e),
+        )
         error_msg = f"I ran into a problem executing {fn_name}: {str(e)[:100]}"
         await _post_response(
             agent_name, project_id, channel_type, channel_id,
             await _personalize(agent_name, error_msg),
             metadata={"agent_brain": True, "error": str(e)},
         )
+
+
+def _log_agent_command(
+    agent_name: str,
+    fn_name: str,
+    user_id: str,
+    user_name: str,
+    project_id: Optional[str],
+    channel_type: str,
+    status: str = "ok",
+    latency_ms: int = 0,
+    error: Optional[str] = None,
+) -> None:
+    """Best-effort wrapper around the activity logger (Agent Hub analytics)."""
+    try:
+        from api.helpers.agent_activity import log_agent_activity, source_from_channel
+        log_agent_activity(
+            agent_name, fn_name,
+            user_id=user_id or None,
+            user_name=user_name or None,
+            project_id=project_id,
+            source=source_from_channel(channel_type),
+            status=status,
+            latency_ms=latency_ms,
+            error=error,
+        )
+    except Exception:
+        pass
 
 
 async def _handle_free_chat(

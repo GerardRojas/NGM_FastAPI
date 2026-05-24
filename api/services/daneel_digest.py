@@ -31,6 +31,7 @@ def flush_digest(project_id: Optional[str] = None) -> dict:
     from api.supabase_client import supabase as sb
     from api.services.daneel_auto_auth import (
         load_auto_auth_config, _load_lookups, _resolve_mentions,
+        _resolve_operator_user_ids,
     )
     from api.services.daneel_smart_layer import craft_digest_message
 
@@ -65,6 +66,9 @@ def flush_digest(project_id: Optional[str] = None) -> dict:
         sb, cfg, "daneel_bookkeeping_users", "daneel_bookkeeping_role")
     escalation_mentions = _resolve_mentions(
         sb, cfg, "daneel_accounting_mgr_users", "daneel_accounting_mgr_role")
+    # Daneel reports the consolidated digest PRIVATELY to his operators (managers).
+    # Falls back to the public project channel only when none are configured.
+    operator_user_ids = _resolve_operator_user_ids(cfg)
 
     # Resolve project names
     proj_names: dict = {}
@@ -119,17 +123,29 @@ def flush_digest(project_id: Optional[str] = None) -> dict:
                 for r in proj_reports
             )
 
-            post_daneel_message(
-                content=msg,
-                project_id=pid,
-                channel_type="project_general",
-                metadata={
-                    "type": "auto_auth_digest",
-                    "authorized": total_auth,
-                    "flagged": total_flagged,
-                    "reports_count": len(proj_reports),
-                },
-            )
+            digest_meta = {
+                "type": "auto_auth_digest",
+                "authorized": total_auth,
+                "flagged": total_flagged,
+                "reports_count": len(proj_reports),
+                "project_id": pid,
+            }
+            if operator_user_ids:
+                from api.helpers.daneel_messenger import post_daneel_operator_report
+                post_daneel_operator_report(
+                    content=msg,
+                    operator_user_ids=operator_user_ids,
+                    metadata=digest_meta,
+                )
+            else:
+                # No operator configured — keep the report visible publicly.
+                logger.info("[DaneelDigest] No operator configured; posting digest to public channel")
+                post_daneel_message(
+                    content=msg,
+                    project_id=pid,
+                    channel_type="project_general",
+                    metadata=digest_meta,
+                )
             messages_sent += 1
 
         # Mark all reports as digested (even empty ones)

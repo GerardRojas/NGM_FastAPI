@@ -1092,6 +1092,19 @@ def _resolve_mentions(sb, cfg: dict, key_users: str, key_role: str) -> str:
     return mentions
 
 
+def _resolve_operator_user_ids(cfg: dict) -> list:
+    """User_ids of Daneel's operators/superiors (accounting managers) who receive
+    his PRIVATE reports. Routine activity is DM'd to them instead of flooding the
+    public project channel. Returns [] when unconfigured."""
+    import json as _json
+    raw = cfg.get("daneel_accounting_mgr_users")
+    try:
+        ids = _json.loads(raw) if isinstance(raw, str) else raw
+        return [str(i) for i in ids if i] if isinstance(ids, list) else []
+    except Exception:
+        return []
+
+
 # ============================================================================
 # Andrew mismatch protocol trigger
 # ============================================================================
@@ -1894,14 +1907,15 @@ async def trigger_auto_auth_for_bill(
         vname = vendor_name or lookups["vendors"].get(first_vendor_id, "Unknown")
         calc_total = total_amount or sum(float(e.get("Amount") or 0) for e in expenses)
 
-        # 4. Post "reviewing" message
-        post_daneel_message(
+        # 4. Report progress PRIVATELY to Daneel's operators (not the public
+        #    project channel). Escalations/alerts below stay public.
+        from api.helpers.daneel_messenger import post_daneel_operator_report
+        post_daneel_operator_report(
             content=f"Reviewing **{len(expenses)}** expenses from **{vname}** (${calc_total:,.2f})...",
-            project_id=project_id,
-            channel_type="project_general",
-            metadata={"type": "auto_auth_bill_review", "bill_id": bill_id, "count": len(expenses)},
+            operator_user_ids=_resolve_operator_user_ids(cfg),
+            metadata={"type": "auto_auth_bill_review", "bill_id": bill_id, "count": len(expenses), "project_id": project_id},
         )
-        logger.info(f"{tag} Posted reviewing message | bill={bill_id}")
+        logger.info(f"{tag} Posted reviewing report to operators | bill={bill_id}")
 
         # 5. Receipt hash check ONCE per bill
         hash_collision = False
@@ -2109,14 +2123,15 @@ async def trigger_auto_auth_check(expense_id: str, project_id: str):
         bills_result = sb.table("bills").select("bill_id, receipt_url, status, split_projects").execute()
         bills_map = {normalize_bill_id(b["bill_id"]): b for b in (bills_result.data or [])}
 
-        # Post ACK message so humans know auto-auth is active
+        # Report progress PRIVATELY to Daneel's operators so humans know auto-auth
+        # is active, without narrating in the public project channel.
         vname = lookups["vendors"].get(expense.get("vendor_id"), "Unknown")
         amt = f"${float(expense.get('Amount') or 0):,.2f}"
-        post_daneel_message(
+        from api.helpers.daneel_messenger import post_daneel_operator_report
+        post_daneel_operator_report(
             content=f"Reviewing expense from **{vname}** ({amt})...",
-            project_id=project_id,
-            channel_type="project_general",
-            metadata={"type": "auto_auth_check", "expense_id": expense_id},
+            operator_user_ids=_resolve_operator_user_ids(cfg),
+            metadata={"type": "auto_auth_check", "expense_id": expense_id, "project_id": project_id},
         )
 
         # Build checks trail for this expense

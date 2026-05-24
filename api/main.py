@@ -99,6 +99,9 @@ from api.routers.reporting import router as reporting_router
 # ========= ANALYTICS: Project dashboards, KPIs, vendor intelligence ==========
 from api.routers.analytics import router as analytics_router
 
+# ========= AGENT HUB: Agent usage analytics (global + per-user) ==========
+from api.routers.agent_hub import router as agent_hub_router
+
 # ========= TIMELINE: Phase & milestone management for projects ==========
 from api.routers.timeline import router as timeline_router
 
@@ -261,6 +264,9 @@ app.include_router(reporting_router)
 
 # Analytics (Project dashboards, KPIs, vendor intelligence, cost trends)
 app.include_router(analytics_router)
+
+# Agent Hub (agent usage analytics: global, per-user, per-agent capabilities)
+app.include_router(agent_hub_router)
 
 # Timeline (Phase & milestone CRUD for project timelines)
 app.include_router(timeline_router)

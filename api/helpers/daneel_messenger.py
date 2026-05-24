@@ -108,3 +108,74 @@ def post_daneel_message(
         # Never let bot message failures break the main pipeline
         logger.error("[DaneelMessenger] ERROR posting message: %s", e)
         return None
+
+
+def get_or_create_daneel_dm(user_id: str) -> Optional[str]:
+    """Find-or-create a direct (DM) channel between Daneel and `user_id`.
+
+    Returns the channel_id, or None on failure. Used to deliver Daneel's
+    private operator reports: a human orchestrates Daneel, so routine activity
+    and diagnostics are reported here instead of the public project channel.
+    Mirrors the dedup logic of POST /messages/channels (exact member-set match).
+    """
+    _ensure_bot_user_exists()
+    if not user_id:
+        return None
+    try:
+        members = {str(user_id), DANEEL_BOT_USER_ID}
+
+        existing = supabase.table("channels").select("id").eq("type", "direct").execute()
+        for ch in (existing.data or []):
+            mres = supabase.table("channel_members") \
+                .select("user_id").eq("channel_id", ch["id"]).execute()
+            ids = {str(m["user_id"]) for m in (mres.data or [])}
+            if ids == members:
+                return ch["id"]
+
+        created = supabase.table("channels").insert({
+            "type": "direct",
+            "created_by": DANEEL_BOT_USER_ID,
+        }).execute()
+        if not created.data:
+            logger.warning("[DaneelMessenger] Failed to create DM channel for user %s", user_id)
+            return None
+
+        channel_id = created.data[0]["id"]
+        supabase.table("channel_members").insert([
+            {"channel_id": channel_id, "user_id": DANEEL_BOT_USER_ID, "role": "member"},
+            {"channel_id": channel_id, "user_id": str(user_id), "role": "member"},
+        ]).execute()
+        return channel_id
+
+    except Exception as e:
+        logger.error("[DaneelMessenger] get_or_create_daneel_dm error: %s", e)
+        return None
+
+
+def post_daneel_operator_report(
+    content: str,
+    operator_user_ids,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Post a PRIVATE report to each operator's Daneel DM. Returns DMs delivered.
+
+    Operators are Daneel's "superiors" (e.g. accounting managers, or the human
+    who triggered a run). Routine activity/diagnostics go here so Daneel no
+    longer narrates everything in the public project channel; only alerts and
+    escalations are posted publicly (via post_daneel_message).
+    """
+    sent = 0
+    for uid in (operator_user_ids or []):
+        channel_id = get_or_create_daneel_dm(str(uid))
+        if not channel_id:
+            continue
+        meta = dict(metadata or {})
+        meta["operator_report"] = True
+        if post_daneel_message(
+            content=content,
+            channel_type="direct",
+            channel_id=channel_id,
+            metadata=meta,
+        ):
+            sent += 1
+    return sent
