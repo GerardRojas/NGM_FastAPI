@@ -464,6 +464,7 @@ async def send_message_notifications(
     project_id: str = None,
     channel_id: str = None,
     metadata: dict = None,
+    message_id: str = None,
 ):
     """Background task to send push notifications for mentions and DM/group messages."""
 
@@ -497,6 +498,47 @@ async def send_message_notifications(
             message_url=message_url,
             avatar_color=sender_avatar_color
         )
+
+        # In-app notifications feed (dashboard Mentions widget). Deep-link uses
+        # React routes; photo-channel mentions point at the NGM Cam photo.
+        try:
+            from api.services.notifications_feed import create_notifications
+            is_photo = channel_type == "project_photos"
+            if is_photo and project_id:
+                deep_link = f"/ngm-cam?project={project_id}"
+                pf = (metadata or {}).get("photo_file_id")
+                if pf:
+                    deep_link += f"&photo={pf}"
+            elif channel_type.startswith("project_") and project_id:
+                deep_link = f"/messages?project={project_id}&channel={channel_type}"
+                if message_id:
+                    deep_link += f"&message={message_id}"
+            elif channel_id:
+                deep_link = f"/messages?channel={channel_id}"
+                if message_id:
+                    deep_link += f"&message={message_id}"
+            else:
+                deep_link = "/messages"
+
+            create_notifications(
+                mentioned_user_ids,
+                type="mention_photo" if is_photo else "mention_message",
+                module="ngm_cam" if is_photo else "messages",
+                actor_id=sender_user_id,
+                actor_name=sender_name,
+                reference_type="message",
+                reference_id=message_id,
+                deep_link=deep_link,
+                preview=content,
+                context={
+                    "channel_name": channel_name,
+                    "channel_type": channel_type,
+                    "project_id": project_id,
+                    "channel_id": channel_id,
+                },
+            )
+        except Exception as notif_err:
+            logger.debug("[Messages] notifications feed insert failed: %s", notif_err)
 
     # --- Phase 2: DM / Group notifications ---
     if channel_type in ("direct", "group") and channel_id:
@@ -569,6 +611,72 @@ def get_messages(
             messages.append(msg)
 
         return {"messages": messages}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.get("/broadcast-feed")
+def get_broadcast_feed(
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Aggregated, read-only news feed: the most recent top-level messages across
+    every broadcast channel visible to the current user, newest first. Powers
+    the dashboard News widget. Each item carries its source channel name and
+    reactions so the widget can render and react in-place (reactions are shared
+    with the Messages view via the same message_reactions table).
+    """
+    try:
+        user_role = current_user.get("role") or ""
+
+        # Resolve which broadcast channels this user may read. Mirrors the
+        # visibility rule in get_channels: CEO/COO see all; empty read_roles
+        # means everyone; otherwise the user's role must be listed.
+        broadcast_res = supabase.table("channels") \
+            .select("id, name, read_roles") \
+            .eq("type", "broadcast") \
+            .execute()
+
+        channel_names: Dict[str, Optional[str]] = {}
+        for bc in (broadcast_res.data or []):
+            read_roles = bc.get("read_roles") or []
+            if user_role in ("CEO", "COO") or not read_roles or user_role in read_roles:
+                channel_names[str(bc["id"])] = bc.get("name")
+
+        if not channel_names:
+            return {"items": []}
+
+        rows = supabase.table("messages") \
+            .select("*, users!user_id(user_name, avatar_color)") \
+            .eq("channel_type", "broadcast") \
+            .in_("channel_id", list(channel_names.keys())) \
+            .is_("reply_to_id", "null") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+
+        items = []
+        for row in (rows.data or []):
+            if row.get("is_deleted"):
+                continue
+            msg = normalize_message(row)
+            cid = msg.get("channel_id")
+            items.append({
+                "id": msg["id"],
+                "content": msg["content"],
+                "channel_id": cid,
+                "channel_name": channel_names.get(cid),
+                "sender_name": msg["user_name"],
+                "avatar_color": msg["avatar_color"],
+                "created_at": msg["created_at"],
+                "reactions": get_reactions_for_message(row["id"]),
+            })
+
+        return {"items": items}
 
     except HTTPException:
         raise
@@ -684,6 +792,7 @@ def create_message(
                 project_id=payload.project_id,
                 channel_id=payload.channel_id,
                 metadata=payload.metadata,
+                message_id=message_id,
             )
         except Exception as bg_err:
             logger.warning("[Messages] Background task setup error (non-blocking): %s", bg_err)
@@ -897,7 +1006,14 @@ def toggle_reaction(
         user_id = current_user["user_id"]
 
         if payload.action == "add":
-            # Try to insert (will fail if already exists due to unique constraint)
+            # Single-reaction policy: a user may have at most one reaction per
+            # message. Clear any previous reaction by this user before adding the
+            # new one so switching reactions replaces rather than accumulates.
+            supabase.table("message_reactions") \
+                .delete() \
+                .eq("message_id", message_id) \
+                .eq("user_id", user_id) \
+                .execute()
             try:
                 supabase.table("message_reactions").insert({
                     "message_id": message_id,
@@ -905,7 +1021,7 @@ def toggle_reaction(
                     "emoji": payload.emoji,
                 }).execute()
             except Exception:
-                # Already exists, ignore
+                # Already exists (race), ignore
                 pass
         else:
             # Remove reaction
@@ -921,6 +1037,19 @@ def toggle_reaction(
 
         return {"reactions": reactions}
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.get("/{message_id}/reactions")
+def get_reactions(
+    message_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Current reactions for a single message. Used by clients to refetch after
+    a realtime message_reactions change without reloading the whole thread."""
+    try:
+        return {"reactions": get_reactions_for_message(message_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
