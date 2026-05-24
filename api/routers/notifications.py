@@ -214,3 +214,83 @@ async def send_test_notification(
     except Exception as e:
         print(f"[Notifications] Error sending test: {repr(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+# ============================================================================
+# In-app notifications feed (unified mentions/tags) — see notifications_feed.py
+# ============================================================================
+
+@router.get("/inbox")
+def get_inbox(
+    limit: int = 30,
+    current_user: dict = Depends(get_current_user),
+):
+    """Recipient's feed: all unread + recently-read (within 2 days), newest first,
+    plus the unread count. Read items linger dimmed before the cleanup drops them."""
+    user_id = current_user.get("user_id")
+    try:
+        # Unread + read in the last 2 days. Two queries keep it simple & index-friendly.
+        from datetime import datetime, timezone, timedelta
+        recent_read_cutoff = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+
+        unread = (
+            supabase.table("notifications")
+            .select("*")
+            .eq("user_id", user_id)
+            .is_("read_at", "null")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        ).data or []
+
+        read_recent = (
+            supabase.table("notifications")
+            .select("*")
+            .eq("user_id", user_id)
+            .not_.is_("read_at", "null")
+            .gte("read_at", recent_read_cutoff)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        ).data or []
+
+        items = sorted(unread + read_recent, key=lambda r: r.get("created_at") or "", reverse=True)[:limit]
+        return {"items": items, "unread_count": len(unread)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error loading inbox: {e}")
+
+
+@router.post("/inbox/{notification_id}/read")
+def mark_inbox_read(
+    notification_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Mark one notification read (only if it belongs to the caller and is unread)."""
+    user_id = current_user.get("user_id")
+    try:
+        from datetime import datetime, timezone
+        supabase.table("notifications").update({"read_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("id", notification_id).eq("user_id", user_id).is_("read_at", "null").execute()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking read: {e}")
+
+
+@router.post("/inbox/read-all")
+def mark_inbox_read_all(current_user: dict = Depends(get_current_user)):
+    """Mark all of the caller's unread notifications as read."""
+    user_id = current_user.get("user_id")
+    try:
+        from datetime import datetime, timezone
+        supabase.table("notifications").update({"read_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("user_id", user_id).is_("read_at", "null").execute()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking all read: {e}")
+
+
+@router.post("/inbox/cleanup")
+def cleanup_inbox():
+    """Delete stale notifications (unread > 30d, read > 7d). Designed for a cron job."""
+    from api.services.notifications_feed import cleanup_notifications
+    return {"deleted": cleanup_notifications()}
