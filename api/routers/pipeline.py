@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 import logging
 import traceback
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel, field_validator
 from api.supabase_client import supabase
 
@@ -2189,6 +2189,65 @@ def get_attachments_bucket_info():
             "bucket": None,
             "message": "Bucket not found. Call /attachments/init to create it."
         }
+
+
+@router.post("/tasks/{task_id}/attachments")
+async def upload_task_attachments(
+    task_id: str,
+    files: List[UploadFile] = File(...),
+) -> Dict[str, Any]:
+    """
+    Upload one or more files for a task to the `task-attachments` bucket.
+
+    Used by the dashboard "Send to Review" flow: the owner attaches deliverables,
+    which are uploaded here and the returned public URLs are passed to
+    /tasks/{id}/send-to-review as `attachments` (and surfaced to the reviewer via
+    the workflow history). Bucket is public, so URLs are directly viewable.
+
+    Returns:
+        - urls: List of public URLs, in upload order.
+    """
+    import uuid
+    import re
+
+    logger.info(f"[PIPELINE] POST /pipeline/tasks/{task_id}/attachments ({len(files)} file(s))")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    ensure_attachments_bucket()
+
+    urls: List[str] = []
+    try:
+        for upload in files:
+            content = await upload.read()
+            if not content:
+                continue
+            raw_name = upload.filename or "file"
+            # Keep a readable name but strip path/odd chars for a safe object key.
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name.rsplit("/", 1)[-1])[:120] or "file"
+            object_path = f"{task_id}/{uuid.uuid4().hex}-{safe_name}"
+
+            supabase.storage.from_(TASK_ATTACHMENTS_BUCKET).upload(
+                path=object_path,
+                file=content,
+                file_options={
+                    "content-type": upload.content_type or "application/octet-stream",
+                    "upsert": "true",
+                },
+            )
+            urls.append(supabase.storage.from_(TASK_ATTACHMENTS_BUCKET).get_public_url(object_path))
+
+        if not urls:
+            raise HTTPException(status_code=400, detail="All provided files were empty")
+
+        return {"success": True, "urls": urls}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[PIPELINE] ERROR in POST /pipeline/tasks/{task_id}/attachments: {repr(e)}")
+        logger.debug(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Upload error: {e}") from e
 
 
 # ====== AUTOMATION SETTINGS ENDPOINTS ======
