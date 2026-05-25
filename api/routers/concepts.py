@@ -89,6 +89,8 @@ class ConceptMaterialAdd(BaseModel):
     unit_cost_override: Optional[float] = None
     notes: Optional[str] = None
     sort_order: Optional[int] = 0
+    # Categories re-arch: per-line override; NULL inherits the material's cost_type.
+    cost_type: Optional[str] = None
 
     @field_validator("quantity")
     @classmethod
@@ -115,6 +117,7 @@ class ConceptMaterialUpdate(BaseModel):
     unit_cost_override: Optional[float] = None
     notes: Optional[str] = None
     sort_order: Optional[int] = None
+    cost_type: Optional[str] = None
 
 
 # ========================================
@@ -261,7 +264,7 @@ async def get_concept(concept_id: str):
         materials_map = {}
         if material_ids:
             mat_batch = supabase.table("materials").select(
-                '"ID", "Short Description", "Full Description", "Brand", "Image", "Price", price_numeric, "Unit"'
+                '"ID", "Short Description", "Full Description", "Brand", "Image", "Price", price_numeric, "Unit", cost_type'
             ).in_('"ID"', material_ids).execute()
             for m in (mat_batch.data or []):
                 materials_map[m["ID"]] = m
@@ -279,6 +282,8 @@ async def get_concept(concept_id: str):
                 "unit_cost_override": cm["unit_cost_override"],
                 "notes": cm["notes"],
                 "sort_order": cm["sort_order"],
+                # cost_type: per-line override, else inherit the material's.
+                "cost_type": cm.get("cost_type") or mat_info.get("cost_type"),
                 # Info del material
                 "material_name": mat_info.get("Short Description"),
                 "material_full_description": mat_info.get("Full Description"),
@@ -519,7 +524,9 @@ async def sync_concept_materials(concept_id: str, payload: ConceptMaterialSync):
                     "unit_cost_override": mat.unit_cost_override,
                     "notes": mat.notes,
                     "sort_order": mat.sort_order or i,
+                    "cost_type": mat.cost_type,
                 }
+                insert_data = {k: v for k, v in insert_data.items() if v is not None}
                 resp = supabase.table("concept_materials").insert(insert_data).execute()
                 if resp.data:
                     inserted.append(resp.data[0])
@@ -561,7 +568,7 @@ async def get_concept_materials(concept_id: str):
         mat_map = {}
         if mat_ids:
             mat_batch = supabase.table("materials").select(
-                '"ID", "Short Description", "Brand", "Image", price_numeric, "Unit"'
+                '"ID", "Short Description", "Brand", "Image", price_numeric, "Unit", cost_type'
             ).in_('"ID"', mat_ids).execute()
             for m in (mat_batch.data or []):
                 mat_map[m["ID"]] = m
@@ -576,6 +583,7 @@ async def get_concept_materials(concept_id: str):
 
             materials.append({
                 **cm,
+                "cost_type": cm.get("cost_type") or mat_info.get("cost_type"),
                 "material_name": mat_info.get("Short Description"),
                 "material_brand": mat_info.get("Brand"),
                 "material_image": mat_info.get("Image"),
@@ -626,7 +634,9 @@ async def add_material_to_concept(concept_id: str, material: ConceptMaterialAdd)
             "unit_cost_override": material.unit_cost_override,
             "notes": material.notes,
             "sort_order": material.sort_order or 0,
+            "cost_type": material.cost_type,
         }
+        insert_data = {k: v for k, v in insert_data.items() if v is not None}
 
         response = supabase.table("concept_materials").insert(insert_data).execute()
 
@@ -662,6 +672,8 @@ async def update_concept_material(concept_id: str, material_entry_id: str, mater
             update_data["notes"] = material.notes
         if material.sort_order is not None:
             update_data["sort_order"] = material.sort_order
+        if material.cost_type is not None:
+            update_data["cost_type"] = material.cost_type
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")

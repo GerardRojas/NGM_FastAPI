@@ -32,6 +32,8 @@ from api.routers.expenses import router as expenses_router
 from api.routers.general_expenses import router as general_expenses_router
 from api.routers.vendors import router as vendors_router
 from api.routers.accounts import router as accounts_router
+from api.routers.qbo_cost_codes import router as qbo_cost_codes_router
+from api.routers.categories import router as categories_router
 from api.routers.permissions import router as permissions_router
 from api.routers.budgets import router as budgets_router
 from api.routers.payment_methods import router as payment_methods_router
@@ -118,6 +120,18 @@ from api.routers.comments import router as comments_router
 # ========= PHOTO ANNOTATIONS: NGM Cam non-destructive markup ==========
 from api.routers.photo_annotations import router as photo_annotations_router
 
+# ========= PHOTO TAGS: NGM Cam global tag catalog + assignments ==========
+from api.routers.photo_tags import router as photo_tags_router
+
+# ========= PROJECT PLANS: git-style plan/submittal tracking ==========
+from api.routers.project_plans import router as project_plans_router
+
+# ========= CLIENT PORTAL: hardened client-facing read API ==========
+from api.routers.portal import router as portal_router
+
+# ========= NGM CONNECT: internal curation + client-access control ==========
+from api.routers.connect import router as connect_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -193,6 +207,8 @@ app.include_router(budgets_router)
 # Vendors, Accounts & Payment Methods (catálogos de expenses)
 app.include_router(vendors_router)
 app.include_router(accounts_router)
+app.include_router(qbo_cost_codes_router)
+app.include_router(categories_router)
 app.include_router(payment_methods_router)
 
 # Bills (metadata de facturas/recibos)
@@ -286,6 +302,18 @@ app.include_router(comments_router)
 
 # Photo Annotations (NGM Cam non-destructive markup)
 app.include_router(photo_annotations_router)
+
+# Photo Tags (NGM Cam global tag catalog + per-photo assignments)
+app.include_router(photo_tags_router)
+
+# Project Plans (git-style plan/submittal tracking — planos)
+app.include_router(project_plans_router)
+
+# Client Portal (hardened client-facing read API)
+app.include_router(portal_router)
+
+# NGM Connect (internal curation + client-access control)
+app.include_router(connect_router)
 
 _mem_logger = logging.getLogger("memory")
 

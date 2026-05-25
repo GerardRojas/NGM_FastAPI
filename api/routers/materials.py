@@ -31,6 +31,8 @@ class MaterialCreate(BaseModel):
     category_id: Optional[str] = None
     class_id: Optional[str] = None
     unit_id: Optional[str] = None
+    # Categories re-arch: material | labor | external_service
+    cost_type: Optional[str] = "material"
 
 
 class MaterialUpdate(BaseModel):
@@ -46,6 +48,7 @@ class MaterialUpdate(BaseModel):
     category_id: Optional[str] = None
     class_id: Optional[str] = None
     unit_id: Optional[str] = None
+    cost_type: Optional[str] = None
 
 
 class MaterialResponse(BaseModel):
@@ -60,6 +63,7 @@ class MaterialResponse(BaseModel):
     category_id: Optional[str] = None
     class_id: Optional[str] = None
     unit_id: Optional[str] = None
+    cost_type: Optional[str] = None
     # Joined data
     vendor_name: Optional[str] = None
     category_name: Optional[str] = None
@@ -144,6 +148,7 @@ async def list_materials(
                 "category_id": m.get("category_id"),
                 "class_id": m.get("class_id"),
                 "unit_id": m.get("unit_id"),
+                "cost_type": m.get("cost_type"),
                 "updated_at": m.get("updated_at"),
                 # Nombres de relaciones
                 "vendor_name": m.get("Vendors", {}).get("vendor_name") if m.get("Vendors") else None,
@@ -202,6 +207,7 @@ async def get_material(material_id: str):
             "category_id": m.get("category_id"),
             "class_id": m.get("class_id"),
             "unit_id": m.get("unit_id"),
+            "cost_type": m.get("cost_type"),
             "updated_at": m.get("updated_at"),
             "vendor_name": m.get("Vendors", {}).get("vendor_name") if m.get("Vendors") else None,
             "category_name": m.get("material_categories", {}).get("name") if m.get("material_categories") else None,
@@ -240,6 +246,7 @@ async def create_material(material: MaterialCreate):
             "category_id": material.category_id,
             "class_id": material.class_id,
             "unit_id": material.unit_id,
+            "cost_type": material.cost_type or "material",
         }
 
         # Remover None values
@@ -293,6 +300,8 @@ async def update_material(material_id: str, material: MaterialUpdate):
             update_data["class_id"] = material.class_id
         if material.unit_id is not None:
             update_data["unit_id"] = material.unit_id
+        if material.cost_type is not None:
+            update_data["cost_type"] = material.cost_type
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -362,6 +371,7 @@ async def bulk_create_materials(materials: List[MaterialCreate]):
                 "category_id": m.category_id,
                 "class_id": m.class_id,
                 "unit_id": m.unit_id,
+                "cost_type": m.cost_type or "material",
             }
             # Remover None values
             data = {k: v for k, v in data.items() if v is not None}

@@ -49,6 +49,41 @@ def _bg_insert(table_name: str, data, label: str = ""):
         logger.error("[BG %s] Insert into %s failed: %s", label, table_name, exc)
 
 
+def _load_account_overlay() -> dict:
+    """account_id -> {subcategory_id, cost_type} from the categories overlay.
+    Fetched fresh (small table) so remaps in the Categories UI take effect."""
+    try:
+        rows, start = [], 0
+        while True:
+            b = supabase.table("account_category_map").select(
+                "account_id, subcategory_id, cost_type").range(start, start + 999).execute().data or []
+            rows += b
+            if len(b) < 1000:
+                break
+            start += 1000
+        return {r["account_id"]: r for r in rows}
+    except Exception as exc:
+        logger.warning("[EXPENSES] account overlay unavailable: %s", exc)
+        return {}
+
+
+def _dual_write_classification(data: dict, overlay: Optional[dict] = None) -> None:
+    """Categories re-arch dual-write: derive subcategory_id + cost_type from the
+    expense's account_id so the new fine classification stays in sync. Only fills
+    values the caller didn't set; no-op when account_id is absent/unmapped."""
+    account_id = data.get("account_id")
+    if not account_id:
+        return
+    ov = overlay if overlay is not None else _load_account_overlay()
+    m = ov.get(account_id)
+    if not m:
+        return
+    if data.get("subcategory_id") is None:
+        data["subcategory_id"] = m.get("subcategory_id")
+    if data.get("cost_type") is None:
+        data["cost_type"] = m.get("cost_type")
+
+
 # ====== MODELOS ======
 
 class ExpenseStatusEnum(str, Enum):
@@ -119,7 +154,8 @@ class ExpenseCreate(BaseModel):
     bill_id: Optional[str] = Field(None, max_length=500)  # Invoice/Bill number (TEXT)
     vendor_id: Optional[str] = None  # UUID del vendor
     payment_type: Optional[str] = None  # UUID del método de pago
-    Amount: Optional[float] = None
+    Amount: Optional[float] = None  # Total cost (base + tax) — canonical, what reports sum
+    tax_amount: Optional[float] = None  # Sales tax portion of Amount (base = Amount - tax_amount)
     LineDescription: Optional[str] = Field(None, max_length=5000)
     TxnId_QBO: Optional[str] = None
     LineUID: Optional[str] = None
@@ -140,7 +176,7 @@ class ExpenseCreate(BaseModel):
                 raise ValueError(f'project must be a valid UUID, got: {repr(v)}')
         return v
 
-    @field_validator('Amount', mode='before')
+    @field_validator('Amount', 'tax_amount', mode='before')
     @classmethod
     def validate_amount(cls, v):
         return _validate_amount(v)
@@ -174,7 +210,8 @@ class ExpenseUpdate(BaseModel):
     bill_id: Optional[str] = Field(None, max_length=500)
     vendor_id: Optional[str] = None
     payment_type: Optional[str] = None
-    Amount: Optional[float] = None
+    Amount: Optional[float] = None  # Total cost (base + tax)
+    tax_amount: Optional[float] = None  # Sales tax portion of Amount
     LineDescription: Optional[str] = Field(None, max_length=5000)
     TxnId_QBO: Optional[str] = None
     LineUID: Optional[str] = None
@@ -187,7 +224,7 @@ class ExpenseUpdate(BaseModel):
     status: Optional[ExpenseStatusEnum] = None
     status_reason: Optional[str] = Field(None, max_length=1000)
 
-    @field_validator('Amount', mode='before')
+    @field_validator('Amount', 'tax_amount', mode='before')
     @classmethod
     def validate_amount(cls, v):
         return _validate_amount(v)
@@ -297,6 +334,9 @@ def create_expense(payload: ExpenseCreate, background_tasks: BackgroundTasks, cu
             if not txn.data:
                 raise HTTPException(status_code=400, detail="Invalid txn_type")
 
+        # Dual-write the new fine classification (subcategory_id + cost_type).
+        _dual_write_classification(data)
+
         # Insertar gasto
         res = supabase.table("expenses_manual_COGS").insert(data).execute()
 
@@ -346,12 +386,14 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
             if not project.data:
                 raise HTTPException(status_code=400, detail=f"Invalid project: {project_id}")
 
-        # Preparar datos para inserción bulk
+        # Preparar datos para inserción bulk (overlay cargado una vez para el lote)
+        overlay = _load_account_overlay()
         for idx, exp in enumerate(payload.expenses):
             try:
                 data = exp.model_dump(exclude_none=True)
                 # Safety net: remove any remaining empty strings (prevents UUID parse errors)
                 data = {k: v for k, v in data.items() if not (isinstance(v, str) and v.strip() == '')}
+                _dual_write_classification(data, overlay)
                 expenses_data.append(data)
             except Exception as e:
                 failed.append({
@@ -1250,6 +1292,12 @@ def update_expense(expense_id: str, payload: ExpenseUpdate, current_user: dict =
         if uid:
             data["updated_by"] = uid
 
+        # Re-derive subcategory_id + cost_type when the account changes (dual-write).
+        if "account_id" in data:
+            data["subcategory_id"] = None
+            data["cost_type"] = None
+            _dual_write_classification(data)
+
         # Actualizar
         res = supabase.table("expenses_manual_COGS").update(data).eq("expense_id", expense_id).execute()
 
@@ -1392,6 +1440,12 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
         # Set updated_by so DB triggers (log_category_correction, etc.) know who made the change
         if user_id:
             data["updated_by"] = user_id
+
+        # Re-derive subcategory_id + cost_type when the account changes (dual-write).
+        if "account_id" in data:
+            data["subcategory_id"] = None
+            data["cost_type"] = None
+            _dual_write_classification(data)
 
         # Actualizar (retry on Errno 11)
         res = _retry_transient(

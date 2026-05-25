@@ -14,11 +14,11 @@ import re
 import time
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks, File, UploadFile
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from uuid import UUID
-from api.supabase_client import supabase
+from uuid import UUID, uuid4
+from api.supabase_client import supabase, SUPABASE_URL
 from api.auth import get_current_user
 from api.services.firebase_notifications import notify_mentioned_users, notify_message_recipients
 from api.services.agent_personas import is_bot_user, AGENT_PERSONAS, BOT_USER_IDS
@@ -33,13 +33,21 @@ _unread_cache: Dict[str, dict] = {}
 _UNREAD_CACHE_TTL = 30  # seconds
 _UNREAD_CACHE_MAX = 100  # max entries to prevent unbounded growth
 
+# Chat attachments live in the existing public 'vault' bucket under a dedicated
+# prefix (no new bucket / RLS needed; writes use the service-role client).
+MESSAGE_ATTACHMENTS_BUCKET = "vault"
+MESSAGE_ATTACHMENTS_PREFIX = "message-attachments"
+MESSAGE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # 25MB
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PYDANTIC MODELS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MessageCreate(BaseModel):
-    content: str = Field(..., min_length=1)
+    # Allow empty content when the message carries attachments (image-only posts);
+    # create_message guards that at least one of content/attachments is present.
+    content: str = Field(default="")
     channel_type: str = Field(..., pattern="^(project_general|project_accounting|project_receipts|project_photos|custom|direct|group|broadcast)$")
     channel_id: Optional[str] = None  # For custom/direct/group/broadcast channels
     project_id: Optional[str] = None  # For project channels
@@ -695,6 +703,10 @@ def create_message(
         user_id = current_user["user_id"]
         user_role = current_user.get("role") or ""
 
+        # A message must carry text or at least one attachment.
+        if not (payload.content or "").strip() and not payload.attachments:
+            raise HTTPException(status_code=400, detail="Message must have content or an attachment.")
+
         # Broadcast channels: check write permission
         if payload.channel_type == "broadcast" and payload.channel_id:
             if user_role not in ("CEO", "COO"):
@@ -883,6 +895,51 @@ def create_message(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ATTACHMENTS ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/upload", status_code=201)
+async def upload_message_attachment(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upload a single chat attachment to the 'vault' bucket and return its public
+    URL + metadata. The client then includes the returned object in the message's
+    `attachments` array on POST /messages (which persists it to message_attachments)."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(content) > MESSAGE_ATTACHMENT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="File too large. Maximum size is 25MB.")
+
+    ext = ""
+    if file.filename and "." in file.filename:
+        ext = "." + file.filename.rsplit(".", 1)[-1].lower()
+    content_type = file.content_type or "application/octet-stream"
+    object_path = f"{MESSAGE_ATTACHMENTS_PREFIX}/{uuid4().hex}{ext}"
+
+    try:
+        supabase.storage.from_(MESSAGE_ATTACHMENTS_BUCKET).upload(
+            path=object_path,
+            file=content,
+            file_options={"content-type": content_type, "upsert": "true"},
+        )
+    except Exception as e:
+        logger.error("[Messages] Attachment upload error: %s", e)
+        raise HTTPException(status_code=500, detail="Attachment upload failed.")
+
+    url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{MESSAGE_ATTACHMENTS_BUCKET}/{object_path}"
+    is_image = content_type.startswith("image/")
+    return {
+        "name": file.filename or "file",
+        "type": content_type,
+        "size": len(content),
+        "url": url,
+        "thumbnail_url": url if is_image else None,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

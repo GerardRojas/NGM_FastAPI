@@ -8,7 +8,7 @@ import csv
 import io
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Query
@@ -96,6 +96,14 @@ class ReorderItem(BaseModel):
 
 class ReorderPayload(BaseModel):
     items: List[ReorderItem]
+
+
+class ImportEstimatePayload(BaseModel):
+    estimate_id: str
+    branch_id: Optional[str] = None
+    start_date: Optional[str] = None        # YYYY-MM-DD; defaults to today
+    default_duration_days: Optional[int] = 5  # length of each subcategory task
+    mode: str = "replace"                    # replace | append
 
 
 # ================================
@@ -1114,4 +1122,182 @@ async def import_timeline(
         "message": f"Timeline imported successfully ({action})",
         "phases_imported": len(inserted_phases),
         "milestones_imported": len(inserted_milestones),
+    }
+
+
+def _estimate_name(node: dict, fallback: str) -> str:
+    """Pick a human label from an estimate category/subcategory node."""
+    for key in ("name", "category", "subcategory", "title", "label"):
+        val = node.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return fallback
+
+
+@router.post("/projects/{project_id}/import-estimate")
+async def import_estimate_timeline(
+    project_id: str,
+    payload: ImportEstimatePayload,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Build a project timeline from an estimate's categories and subcategories.
+
+    Each estimate category becomes a summary phase; each of its subcategories
+    becomes a task phase under it. Tasks are scheduled back-to-back starting
+    from `start_date`, each lasting `default_duration_days`; a category summary
+    spans its children. Mode 'replace' clears the existing timeline first.
+    """
+    mode = payload.mode if payload.mode in ("replace", "append") else "replace"
+
+    # ── Load the estimate (branch-aware), reusing the estimator helpers ──
+    try:
+        from api.routers.estimator import (
+            _download_json,
+            ensure_manifest,
+            read_branch_content,
+        )
+    except Exception as exc:  # pragma: no cover - import wiring
+        logger.error("Could not load estimator helpers: %s", exc)
+        raise HTTPException(status_code=500, detail="Estimator module unavailable")
+
+    estimate_id = (payload.estimate_id or "").strip()
+    if not estimate_id:
+        raise HTTPException(status_code=400, detail="estimate_id is required")
+
+    data: Optional[dict] = None
+    try:
+        if payload.branch_id:
+            manifest = ensure_manifest(estimate_id)
+            data = read_branch_content(estimate_id, payload.branch_id, manifest)
+        if not data:
+            data = _download_json(f"{estimate_id}/estimate.ngm")
+    except Exception as exc:
+        logger.error("Error reading estimate %s: %s", estimate_id, exc)
+        raise HTTPException(status_code=500, detail=f"Error reading estimate: {exc}")
+
+    if not data:
+        raise HTTPException(status_code=404, detail="Estimate not found")
+
+    categories = data.get("categories") or []
+    if not categories:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected estimate has no categories to import.",
+        )
+
+    # ── Resolve schedule parameters ────────────────────────────────────
+    try:
+        start = (
+            datetime.strptime(payload.start_date, "%Y-%m-%d").date()
+            if payload.start_date
+            else datetime.utcnow().date()
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="start_date must be YYYY-MM-DD")
+
+    dur = payload.default_duration_days or 5
+    if dur < 1:
+        dur = 1
+
+    # ── Build phases: category summary + subcategory tasks ─────────────
+    phases: list[dict] = []
+    phase_parent_indices: list[int | None] = []
+    cursor = start
+    order = 0
+
+    for ci, cat in enumerate(categories):
+        color = PHASE_COLORS[ci % len(PHASE_COLORS)]
+        subs = cat.get("subcategories") or []
+        cat_index = len(phases)
+        cat_start = cursor
+
+        # Reserve the category row; its dates are filled after its children.
+        phases.append({
+            "project_id": project_id,
+            "phase_name": _estimate_name(cat, f"Category {ci + 1}"),
+            "phase_type": "summary" if subs else "task",
+            "status": "pending",
+            "progress_pct": 0,
+            "color": color,
+            "sort_order": order,
+            "phase_order": order,
+            "wbs_number": str(ci + 1),
+            "start_date": cat_start.isoformat(),
+            "end_date": (cat_start + timedelta(days=dur)).isoformat(),
+            "duration_days": dur,
+        })
+        phase_parent_indices.append(None)
+        order += 1
+
+        for si, sub in enumerate(subs):
+            s = cursor
+            e = cursor + timedelta(days=dur)
+            phases.append({
+                "project_id": project_id,
+                "phase_name": _estimate_name(sub, f"Subcategory {si + 1}"),
+                "phase_type": "task",
+                "status": "pending",
+                "progress_pct": 0,
+                "color": color,
+                "sort_order": order,
+                "phase_order": order,
+                "wbs_number": f"{ci + 1}.{si + 1}",
+                "start_date": s.isoformat(),
+                "end_date": e.isoformat(),
+                "duration_days": dur,
+            })
+            phase_parent_indices.append(cat_index)
+            order += 1
+            cursor = e
+
+        # A category with subcategories spans them; a leaf category keeps its
+        # own one-block duration (cursor already advanced past it).
+        if subs:
+            phases[cat_index]["start_date"] = cat_start.isoformat()
+            phases[cat_index]["end_date"] = cursor.isoformat()
+            phases[cat_index]["duration_days"] = (cursor - cat_start).days
+        else:
+            cursor = cat_start + timedelta(days=dur)
+
+    # ── Replace mode: clear existing timeline ──────────────────────────
+    try:
+        if mode == "replace":
+            try:
+                supabase.table("phase_dependencies").delete().eq("project_id", project_id).execute()
+            except Exception:
+                pass  # table may not exist pre-migration
+            supabase.table("project_milestones").delete().eq("project_id", project_id).execute()
+            supabase.table("project_phases").delete().eq("project_id", project_id).execute()
+    except Exception as exc:
+        logger.error("Error clearing timeline for project %s: %s", project_id, exc)
+        raise HTTPException(status_code=500, detail=f"Error clearing existing timeline data: {exc}")
+
+    # ── Insert phases, then link parents (need the real UUIDs) ─────────
+    try:
+        result = supabase.table("project_phases").insert(phases).execute()
+        inserted_phases = result.data or []
+    except Exception as exc:
+        logger.error("Error inserting estimate phases for project %s: %s", project_id, exc)
+        raise HTTPException(status_code=500, detail=f"Error inserting phases: {exc}")
+
+    if inserted_phases:
+        for idx, parent_idx in enumerate(phase_parent_indices):
+            if parent_idx is None or parent_idx >= len(inserted_phases):
+                continue
+            child_id = inserted_phases[idx].get("phase_id")
+            parent_id = inserted_phases[parent_idx].get("phase_id")
+            if child_id and parent_id:
+                try:
+                    supabase.table("project_phases").update(
+                        {"parent_phase_id": parent_id}
+                    ).eq("phase_id", child_id).execute()
+                except Exception as exc:
+                    logger.warning("Failed to set parent for phase %s: %s", child_id, exc)
+
+    action = "replaced" if mode == "replace" else "appended"
+    return {
+        "message": f"Timeline built from estimate ({action})",
+        "phases_imported": len(inserted_phases),
+        "milestones_imported": 0,
     }

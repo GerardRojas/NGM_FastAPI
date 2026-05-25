@@ -186,12 +186,13 @@ def _fetch_latest_photos(project_id: str) -> Optional[List[Dict]]:
                 seen[key] = {
                     "id": f["id"],
                     "name": f["name"],
+                    "bucket_path": f["bucket_path"],
                     "thumbnail_url": (
-                        f"{SUPABASE_URL}/storage/v1/object/public/vault/"
+                        f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/vault/"
                         f"{f['bucket_path']}?width=200&height=200&resize=cover"
                     ),
                     "full_url": (
-                        f"{SUPABASE_URL}/storage/v1/object/public/vault/{f['bucket_path']}"
+                        f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/vault/{f['bucket_path']}"
                     ),
                     "milestone": ms,
                     "date": parsed.get("date"),

@@ -109,9 +109,10 @@ def handle_budget_vs_actuals(
         budgets = fetch_budgets(project_id)
         expenses = fetch_expenses(project_id)
         accounts = fetch_accounts()
+        overlay = fetch_account_overlay()
 
-        # 3. Procesar reporte
-        report_data = process_report_data(budgets, expenses, accounts)
+        # 3. Procesar reporte (con jerarquía Category -> tipo)
+        report_data = process_report_data(budgets, expenses, accounts, overlay)
 
         # 4. Generar PDF y subir a Storage
         if not REPORTLAB_AVAILABLE:
@@ -428,12 +429,104 @@ def fetch_accounts() -> List[Dict[str, Any]]:
         return []
 
 
+# Category re-arch hierarchy: account_id -> {category, cost_type}.
+TYPE_ORDER = ["material", "labor", "external_service", "change_order", "other_expenses"]
+TYPE_LABEL = {
+    "material": "Material", "labor": "Labor", "external_service": "External Service",
+    "change_order": "Change Order", "other_expenses": "Other Expenses",
+}
+UNCATEGORIZED = "Uncategorized"
+
+
+def fetch_account_overlay() -> Dict[str, Dict[str, str]]:
+    """account_id -> {category, cost_type} from the categories overlay
+    (account_category_map -> subcategories -> categories). Empty dict if the
+    overlay isn't there, so the report falls back to the flat account view."""
+    def _all(table: str, cols: str) -> List[Dict[str, Any]]:
+        rows, start = [], 0
+        while True:
+            b = supabase.table(table).select(cols).range(start, start + 999).execute().data or []
+            rows += b
+            if len(b) < 1000:
+                break
+            start += 1000
+        return rows
+    try:
+        subs = {s["id"]: s for s in _all("subcategories", "id, category_id, name")}
+        cats = {c["id"]: c.get("name") for c in _all("categories", "id, name")}
+        out: Dict[str, Dict[str, str]] = {}
+        for m in _all("account_category_map", "account_id, subcategory_id, cost_type"):
+            sub = subs.get(m["subcategory_id"]) or {}
+            cat = cats.get(sub.get("category_id"))
+            if cat:
+                out[m["account_id"]] = {"category": cat, "cost_type": m["cost_type"]}
+        return out
+    except Exception as e:
+        logger.warning("[BVA] account overlay unavailable: %s", e)
+        return {}
+
+
+def _build_categories(
+    budgets_by_id: Dict[str, float],
+    expenses_by_id: Dict[str, float],
+    id_name: Dict[str, str],
+    overlay: Dict[str, Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Group account-id sums into Category -> cost_type lines. Unmapped accounts
+    fall under 'Uncategorized' (by name) so totals always reconcile."""
+    groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for key in set(list(budgets_by_id) + list(expenses_by_id)):
+        ov = overlay.get(key)
+        if ov:
+            category = ov["category"]
+            ctype = ov["cost_type"]
+            line_key = ctype or "_"
+            label = TYPE_LABEL.get(ctype, ctype or "—")
+        else:
+            category = UNCATEGORIZED
+            ctype = ""
+            label = id_name.get(key, "Unknown Account")
+            line_key = f"acct:{label}"
+        line = groups.setdefault(category, {}).setdefault(
+            line_key, {"label": label, "cost_type": ctype, "budget": 0.0, "actual": 0.0})
+        line["budget"] += budgets_by_id.get(key, 0.0)
+        line["actual"] += expenses_by_id.get(key, 0.0)
+
+    cats: List[Dict[str, Any]] = []
+    for name, lines in groups.items():
+        line_list = []
+        for a in lines.values():
+            b, ac = a["budget"], a["actual"]
+            line_list.append({
+                "label": a["label"], "cost_type": a["cost_type"],
+                "budget": round(b, 2), "actual": round(ac, 2),
+                "balance": round(b - ac, 2),
+                "percent_of_budget": round((ac / b * 100) if b > 0 else 0, 2),
+            })
+        line_list.sort(key=lambda l: (
+            TYPE_ORDER.index(l["cost_type"]) if l["cost_type"] in TYPE_ORDER else 99,
+            l["label"].lower()))
+        b = sum(l["budget"] for l in line_list)
+        ac = sum(l["actual"] for l in line_list)
+        cats.append({
+            "name": name, "budget": round(b, 2), "actual": round(ac, 2),
+            "balance": round(b - ac, 2),
+            "percent_of_budget": round((ac / b * 100) if b > 0 else 0, 2),
+            "lines": line_list,
+        })
+    cats.sort(key=lambda c: (c["name"] == UNCATEGORIZED, c["name"].lower()))
+    return cats
+
+
 def process_report_data(
     budgets: List[Dict[str, Any]],
     expenses: List[Dict[str, Any]],
-    accounts: List[Dict[str, Any]]
+    accounts: List[Dict[str, Any]],
+    overlay: Optional[Dict[str, Dict[str, str]]] = None
 ) -> Dict[str, Any]:
-    """Procesa datos y genera el reporte comparativo."""
+    """Procesa datos y genera el reporte comparativo. Si `overlay` viene, agrega
+    también la jerarquía Category -> material/labor/external_service en
+    report_data['categories'] (rows/totals se conservan para los fallbacks)."""
 
     def get_account_name(account_id: str, account_name: str = None) -> str:
         if account_name:
@@ -450,11 +543,23 @@ def process_report_data(
                 return acc.get("AcctNum") or 99999
         return 99999
 
+    # account-id-keyed sums for the hierarchy (key = account_id, or name fallback)
+    budgets_by_id: Dict[str, float] = {}
+    expenses_by_id: Dict[str, float] = {}
+    id_name: Dict[str, str] = {}
+
+    def _key(account_id, name):
+        return str(account_id) if account_id else f"name:{name}"
+
     # Agrupar budgets por cuenta
     budgets_by_account = {}
     for budget in budgets:
         account_name = get_account_name(budget.get("account_id"), budget.get("account_name"))
-        budgets_by_account[account_name] = budgets_by_account.get(account_name, 0) + float(budget.get("amount_sum") or 0)
+        amount = float(budget.get("amount_sum") or 0)
+        budgets_by_account[account_name] = budgets_by_account.get(account_name, 0) + amount
+        k = _key(budget.get("account_id"), account_name)
+        budgets_by_id[k] = budgets_by_id.get(k, 0) + amount
+        id_name[k] = account_name
 
     # Agrupar expenses por cuenta
     expenses_by_account = {}
@@ -462,6 +567,9 @@ def process_report_data(
         account_name = get_account_name(expense.get("account_id"), expense.get("account_name"))
         amount = float(expense.get("Amount") or expense.get("amount") or 0)
         expenses_by_account[account_name] = expenses_by_account.get(account_name, 0) + amount
+        k = _key(expense.get("account_id"), account_name)
+        expenses_by_id[k] = expenses_by_id.get(k, 0) + amount
+        id_name[k] = account_name
 
     # Construir filas
     all_accounts = set(list(budgets_by_account.keys()) + list(expenses_by_account.keys()))
@@ -490,8 +598,11 @@ def process_report_data(
     total_balance = total_budget - total_actual
     total_percent = (total_actual / total_budget * 100) if total_budget > 0 else 0
 
+    categories = _build_categories(budgets_by_id, expenses_by_id, id_name, overlay) if overlay else []
+
     return {
         "rows": rows,
+        "categories": categories,
         "totals": {
             "budget": round(total_budget, 2),
             "actual": round(total_actual, 2),
@@ -596,38 +707,53 @@ def generate_bva_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[st
 
     # Tabla de datos
     rows = report_data["rows"]
+    categories = report_data.get("categories") or []
     totals = report_data["totals"]
+
+    def _bal(v: float) -> str:
+        return f"(${abs(v):,.2f})" if v < 0 else f"${v:,.2f}"
 
     # Headers de la tabla
     table_data = [
         ["ACCOUNT", "ACTUAL", "BUDGET", "% OF BUDGET", "BALANCE"]
     ]
+    cat_row_idx = []   # bold category header rows
+    neg_rows = []      # data rows with a negative balance (red balance cell)
 
-    # Filas de datos
-    for row in rows:
-        balance_display = f"${row['balance']:,.2f}"
-        if row['balance'] < 0:
-            balance_display = f"(${abs(row['balance']):,.2f})"
-
-        table_data.append([
-            row["account"],
-            f"${row['actual']:,.2f}",
-            f"${row['budget']:,.2f}",
-            f"{row['percent_of_budget']:.2f}%",
-            balance_display
-        ])
+    if categories:
+        # Hierarchical: Category header + indented material/labor/service lines.
+        for cat in categories:
+            if cat["balance"] < 0:
+                neg_rows.append(len(table_data))
+            cat_row_idx.append(len(table_data))
+            table_data.append([
+                cat["name"], f"${cat['actual']:,.2f}", f"${cat['budget']:,.2f}",
+                f"{cat['percent_of_budget']:.2f}%", _bal(cat["balance"]),
+            ])
+            for line in cat["lines"]:
+                if line["balance"] < 0:
+                    neg_rows.append(len(table_data))
+                table_data.append([
+                    f"     {line['label']}", f"${line['actual']:,.2f}", f"${line['budget']:,.2f}",
+                    f"{line['percent_of_budget']:.2f}%", _bal(line["balance"]),
+                ])
+    else:
+        # Fallback: flat account rows (overlay unavailable).
+        for row in rows:
+            if row["balance"] < 0:
+                neg_rows.append(len(table_data))
+            table_data.append([
+                row["account"], f"${row['actual']:,.2f}", f"${row['budget']:,.2f}",
+                f"{row['percent_of_budget']:.2f}%", _bal(row["balance"]),
+            ])
 
     # Fila de totales
-    total_balance_display = f"${totals['balance']:,.2f}"
-    if totals['balance'] < 0:
-        total_balance_display = f"(${abs(totals['balance']):,.2f})"
-
     table_data.append([
         "TOTAL",
         f"${totals['actual']:,.2f}",
         f"${totals['budget']:,.2f}",
         f"{totals['percent_of_budget']:.2f}%",
-        total_balance_display
+        _bal(totals["balance"])
     ])
 
     # Crear tabla
@@ -670,10 +796,14 @@ def generate_bva_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[st
         ('TOPPADDING', (0, -1), (-1, -1), 10),
     ])
 
+    # Category header rows: bold + a light band so the indented lines read as children.
+    for ci in cat_row_idx:
+        table_style.add('FONTNAME', (0, ci), (-1, ci), 'Helvetica-Bold')
+        table_style.add('BACKGROUND', (0, ci), (-1, ci), colors.Color(0.97, 0.97, 0.97))
+
     # Colorear balances negativos en rojo
-    for i, row in enumerate(rows, start=1):
-        if row["balance"] < 0:
-            table_style.add('TEXTCOLOR', (4, i), (4, i), colors.Color(0.86, 0.15, 0.15))
+    for ri in neg_rows:
+        table_style.add('TEXTCOLOR', (4, ri), (4, ri), colors.Color(0.86, 0.15, 0.15))
 
     if totals["balance"] < 0:
         table_style.add('TEXTCOLOR', (4, -1), (4, -1), colors.Color(0.86, 0.15, 0.15))

@@ -34,3 +34,11 @@ logs/
 dist/
 build/
 *.egg-info/
+
+# Categories re-arch local data dumps (real financial data — never commit)
+account_map.csv
+accounts_overrides.csv
+accounts_unparseable.csv
+grouping.csv
+subcategories_review.csv
+backups/

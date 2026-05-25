@@ -35,14 +35,30 @@ class CreateUserRequest(BaseModel):
     user_seniority: str | None = None  # opcional
 
 
+class AcceptInviteRequest(BaseModel):
+    token: str
+    password: str
+    display_name: str | None = None
+
+
 # ====== HELPERS ======
 
-def make_access_token(user_id: str, username: str, role: str | None) -> str:
+def make_access_token(
+    user_id: str,
+    username: str,
+    role: str | None,
+    account_type: str = "internal",
+    client_id: str | None = None,
+) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "username": username,
         "role": role,
+        # External-client support: the /portal router resolves its entire data
+        # scope from these two claims alone (never from request params).
+        "account_type": account_type or "internal",
+        "client_id": str(client_id) if client_id else None,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp()),
     }
@@ -147,6 +163,8 @@ def login(payload: LoginRequest):
         user_id=str(user.get("user_id")),
         username=user.get("user_name"),
         role=role_name,
+        account_type=user.get("account_type") or "internal",
+        client_id=user.get("client_id"),
     )
 
     # 5) Respuesta OK
@@ -172,6 +190,105 @@ def login(payload: LoginRequest):
             # Labels legibles
             "role": role_name,
             "seniority": seniority_name,
+        },
+    }
+
+
+# ====== CLIENT PORTAL: magic-link invitation onboarding ======
+
+def _decode_invite(token: str) -> dict:
+    """Decode + validate a client_invite JWT and its DB row (status/expiry)."""
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="This invitation has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid invitation link")
+    if decoded.get("type") != "client_invite":
+        raise HTTPException(status_code=400, detail="Invalid invitation link")
+
+    res = supabase.table("client_invites").select("*").eq("token", token).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    invite = res.data[0]
+    if invite["status"] == "accepted":
+        raise HTTPException(status_code=400, detail="This invitation has already been used")
+    if invite["status"] == "revoked":
+        raise HTTPException(status_code=400, detail="This invitation has been revoked")
+    return invite
+
+
+@router.get("/invite/verify")
+def verify_invite(token: str):
+    """Public: validate an invite and return who it's for (powers the accept page)."""
+    invite = _decode_invite(token)
+    client_name = None
+    try:
+        c = supabase.table("clients").select("client_name").eq("client_id", invite["client_id"]).single().execute()
+        client_name = (c.data or {}).get("client_name")
+    except Exception:
+        pass
+    return {
+        "valid": True,
+        "email": invite["email"],
+        "client_id": invite["client_id"],
+        "client_name": client_name,
+    }
+
+
+@router.post("/invite/accept")
+def accept_invite(payload: AcceptInviteRequest):
+    """
+    Public: accept a magic-link invitation. Provisions a client account
+    (account_type='client', linked to the client) and auto-logs the user in.
+    """
+    invite = _decode_invite(payload.token)
+    if len(payload.password or "") < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    email = invite["email"]
+    # Don't hijack an existing account — the email/username must be free.
+    existing = supabase.table("users").select("user_id").eq("user_name", email).execute()
+    if existing.data:
+        raise HTTPException(status_code=409, detail="An account already exists for this email")
+
+    try:
+        created = supabase.table("users").insert({
+            "user_name": email,
+            "password_hash": hash_password(payload.password),
+            "account_type": "client",
+            "client_id": invite["client_id"],
+            "is_external": True,
+        }).execute()
+    except Exception as e:
+        logger.error("Error provisioning client account: %r", e)
+        raise HTTPException(status_code=500, detail="Could not create client account")
+
+    user = created.data[0] if created.data else None
+    if not user:
+        raise HTTPException(status_code=500, detail="Account not returned after creation")
+
+    supabase.table("client_invites").update({
+        "status": "accepted",
+        "accepted_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", invite["id"]).execute()
+
+    access_token = make_access_token(
+        user_id=str(user.get("user_id")),
+        username=email,
+        role=None,
+        account_type="client",
+        client_id=invite["client_id"],
+    )
+    return {
+        "message": "Invitation accepted",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "user_id": user.get("user_id"),
+            "user_name": email,
+            "account_type": "client",
+            "client_id": invite["client_id"],
         },
     }
 
@@ -225,4 +342,36 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         "user_id": user_id,
         "username": username,
         "role": role,
+        "account_type": decoded.get("account_type") or "internal",
+        "client_id": decoded.get("client_id"),
+    }
+
+
+# ====== DEPENDENCIES: account-type gates (client portal) ======
+
+def require_internal(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Guard for internal-only endpoints: rejects external client accounts.
+    Defense-in-depth — clients should never reach the internal API surface.
+    """
+    if (current_user.get("account_type") or "internal") == "client":
+        raise HTTPException(status_code=403, detail="Internal access only")
+    return current_user
+
+
+def get_current_client(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Dependency for the /portal router: requires an external client account and
+    exposes its client_id. The portal resolves all data scope from this — never
+    from request parameters — so a client can only ever see their own data.
+    """
+    if (current_user.get("account_type") or "internal") != "client":
+        raise HTTPException(status_code=403, detail="Client portal access only")
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=403, detail="Client account is not linked to a client")
+    return {
+        "user_id": current_user.get("user_id"),
+        "username": current_user.get("username"),
+        "client_id": client_id,
     }

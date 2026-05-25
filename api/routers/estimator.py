@@ -159,26 +159,33 @@ def _first(row: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 
+def compute_subtotal(data: Dict[str, Any]) -> float:
+    """Construction cost (before overhead): stored value wins, else the sum of
+    category rollups. Mirrors services.ts normalizeEstimate."""
+    subtotal = _to_num(data.get("subtotal"))
+    if subtotal is not None:
+        return subtotal
+    subtotal = 0.0
+    for cat in (data.get("categories") or []):
+        cat_total = _to_num(cat.get("total_cost") if isinstance(cat, dict) else None)
+        if cat_total is not None:
+            subtotal += cat_total
+            continue
+        for sub in (cat.get("subcategories") or []):
+            sub_total = _to_num(sub.get("total_cost"))
+            if sub_total is not None:
+                subtotal += sub_total
+                continue
+            for item in (sub.get("items") or []):
+                subtotal += _to_num(_first(item, ["total", "total_cost", "subtotal"])) or 0.0
+    return round(subtotal, 2)
+
+
 def compute_grand_total(data: Dict[str, Any]) -> Optional[float]:
     """Resolve an estimate's grand total, mirroring the frontend rollup
     (services.ts normalizeEstimate): stored value wins, else subtotal + overhead.
     """
-    # Subtotal: stored, else sum of category rollups.
-    subtotal = _to_num(data.get("subtotal"))
-    if subtotal is None:
-        subtotal = 0.0
-        for cat in (data.get("categories") or []):
-            cat_total = _to_num(cat.get("total_cost") if isinstance(cat, dict) else None)
-            if cat_total is not None:
-                subtotal += cat_total
-                continue
-            for sub in (cat.get("subcategories") or []):
-                sub_total = _to_num(sub.get("total_cost"))
-                if sub_total is not None:
-                    subtotal += sub_total
-                    continue
-                for item in (sub.get("items") or []):
-                    subtotal += _to_num(_first(item, ["total", "total_cost", "subtotal"])) or 0.0
+    subtotal = compute_subtotal(data)
 
     # Overhead amount: itemized (sum of items) or flat amount.
     overhead = data.get("overhead") or {}
@@ -195,8 +202,10 @@ def extract_estimate_meta(estimate_id: str, data: Dict[str, Any]) -> Dict[str, A
     """Build a board-card summary from an estimate.ngm payload."""
     project = data.get("project")
     project_label = None
+    project_type = None
     if isinstance(project, dict):
         project_label = _first(project, ["client", "name", "address", "project_name"])
+        project_type = _first(project, ["project_type", "construction_type"])
     elif isinstance(project, str):
         project_label = project
     return {
@@ -204,8 +213,10 @@ def extract_estimate_meta(estimate_id: str, data: Dict[str, Any]) -> Dict[str, A
         "name": str(_first(data, ["project_name"]) or estimate_id),
         "created_at": data.get("created_at"),
         "updated_at": data.get("updated_at"),
+        "subtotal": compute_subtotal(data),
         "grand_total": compute_grand_total(data),
         "project": project_label,
+        "project_type": project_type,
     }
 
 
@@ -276,6 +287,8 @@ def ensure_manifest(estimate_id: str) -> Dict[str, Any]:
         "main_branch_id": MAIN_BRANCH_ID,
         "project_name": meta["name"],
         "project": meta["project"],
+        "project_type": meta["project_type"],
+        "subtotal": meta["subtotal"],
         "created_at": created,
         "updated_at": updated,
         "branches": [{
@@ -384,8 +397,10 @@ async def list_estimates():
                 "name": name,
                 "created_at": item.get("created_at"),
                 "updated_at": item.get("updated_at"),
+                "subtotal": None,
                 "grand_total": None,
                 "project": None,
+                "project_type": None,
                 "branch_count": 1,
             }
             try:
@@ -396,8 +411,10 @@ async def list_estimates():
                         "name": manifest.get("project_name") or name,
                         "created_at": manifest.get("created_at") or summary["created_at"],
                         "updated_at": manifest.get("updated_at") or summary["updated_at"],
+                        "subtotal": manifest.get("subtotal"),
                         "grand_total": main.get("grand_total"),
                         "project": manifest.get("project"),
+                        "project_type": manifest.get("project_type"),
                         "branch_count": len(manifest["branches"]),
                     })
                 else:
@@ -504,6 +521,8 @@ async def save_estimate(request: EstimateSaveRequest):
             meta = extract_estimate_meta(estimate_id, estimate_data)
             manifest["project_name"] = meta["name"]
             manifest["project"] = meta["project"]
+            manifest["project_type"] = meta["project_type"]
+            manifest["subtotal"] = meta["subtotal"]
             manifest["created_at"] = manifest.get("created_at") or created_at
             manifest["updated_at"] = now_iso
         entry = find_branch(manifest, branch_id)
@@ -719,6 +738,8 @@ async def set_main_branch(estimate_id: str, branch_id: str):
         meta = extract_estimate_meta(estimate_id, data)
         manifest["project_name"] = meta["name"]
         manifest["project"] = meta["project"]
+        manifest["project_type"] = meta["project_type"]
+        manifest["subtotal"] = meta["subtotal"]
         manifest["updated_at"] = datetime.now().isoformat()
         _upload_json(_manifest_path(estimate_id), manifest)
 

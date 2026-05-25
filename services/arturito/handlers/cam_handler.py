@@ -303,16 +303,17 @@ def handle_cam_photo_search(
             continue
 
         thumb_url = (
-            f"{SUPABASE_URL}/storage/v1/object/public/vault/"
+            f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/vault/"
             f"{f['bucket_path']}?width=200&height=200&resize=cover"
         )
         full_url = (
-            f"{SUPABASE_URL}/storage/v1/object/public/vault/{f['bucket_path']}"
+            f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/vault/{f['bucket_path']}"
         )
 
         matched.append({
             "id": f["id"],
             "name": f["name"],
+            "bucket_path": f.get("bucket_path", ""),
             "thumbnail_url": thumb_url,
             "full_url": full_url,
             "milestone": parsed["milestone"],

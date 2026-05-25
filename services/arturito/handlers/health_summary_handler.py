@@ -300,7 +300,7 @@ def _fetch_recent_photos(project_id: str, limit: int = 6) -> List[Dict[str, Any]
         if not files:
             return []
 
-        base = f"{SUPABASE_URL}/storage/v1/object/public/vault/"
+        base = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/vault/"
         result = []
         for f in files:
             bp = f.get("bucket_path", "")
@@ -319,6 +319,7 @@ def _fetch_recent_photos(project_id: str, limit: int = 6) -> List[Dict[str, Any]
             result.append({
                 "id": f["id"],
                 "name": f.get("name", ""),
+                "bucket_path": bp,
                 "url": url,
                 "thumbnail_url": thumb,
                 "milestone": milestone,
