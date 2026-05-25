@@ -24,6 +24,7 @@ from api.schema import router as schema_router
 from api.routers.projects import router as projects_router
 from api.routers.pipeline import router as pipeline_router
 from api.routers.estimator import router as estimator_router
+from api.routers.sheet_templates import router as sheet_templates_router
 from api.routers.debug_supabase import router as debug_supabase_router
 from api.routers.team import router as team_router
 from api.routers.companies import router as companies_router
@@ -166,6 +167,9 @@ app.include_router(pipeline_router)
 
 # Cotizador – Base Structure (.ngm generator)
 app.include_router(estimator_router)
+
+# Budget Sheet Manager (export templates for the Estimator)
+app.include_router(sheet_templates_router)
 
 app.include_router(debug_supabase_router)
 
