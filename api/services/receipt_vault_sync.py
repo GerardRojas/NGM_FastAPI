@@ -1,0 +1,212 @@
+# api/services/receipt_vault_sync.py
+# ============================================================================
+# Bill receipt -> Vault "Receipts" folder sync
+# ----------------------------------------------------------------------------
+# A bill's receipt image (bills.receipt_url) is shared by all its line-item
+# expenses. This copies it ONCE into the bill's project Vault "Receipts" folder
+# and tags the vault_files row with source_bill_id, so there is exactly one
+# vault file per bill (enforced by uq_vault_files_project_bill from
+# sql/receipts_to_vault_phase0.sql). Idempotent and safe to re-run.
+# ============================================================================
+
+import logging
+from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
+
+from api.supabase_client import supabase
+from api.services import vault_service
+
+logger = logging.getLogger(__name__)
+
+# Buckets a receipt_url may live in (same set the expenses router validates against).
+_KNOWN_BUCKETS = ("expenses-receipts", "pending-expenses", "vault")
+
+_MIME_BY_EXT = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _parse_storage_url(url: str):
+    """Return (bucket, object_path) for a Supabase public storage URL, else None.
+    Mirrors expenses._validate_storage_url's marker parsing; path is URL-decoded."""
+    if not url or not isinstance(url, str):
+        return None
+    clean = url.split("#")[0]
+    for bucket in _KNOWN_BUCKETS:
+        marker = f"/object/public/{bucket}/"
+        if marker in clean:
+            path = clean.split(marker, 1)[1].split("?")[0]
+            return bucket, unquote(path)
+    return None
+
+
+def _mime_from_path(path: str) -> str:
+    lower = path.lower()
+    for ext, mime in _MIME_BY_EXT.items():
+        if lower.endswith(ext):
+            return mime
+    return "application/octet-stream"
+
+
+def _ext_from_path(path: str) -> str:
+    name = path.rsplit("/", 1)[-1]
+    dot = name.rfind(".")
+    return name[dot:] if dot != -1 else ""
+
+
+def _dominant_project_for_bill(bill_id: str) -> Optional[str]:
+    """The project a bill belongs to = the most common project across its
+    line-item expenses (bills have no project_id of their own)."""
+    rows = (
+        supabase.table("expenses_manual_COGS")
+        .select("project")
+        .eq("bill_id", bill_id)
+        .execute()
+        .data
+    ) or []
+    counts: Dict[str, int] = {}
+    for r in rows:
+        pid = r.get("project")
+        if pid:
+            counts[pid] = counts.get(pid, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def sync_bill_receipt_to_vault(bill_id: str) -> Dict[str, Any]:
+    """Ensure the bill's receipt exists once in its project's Vault Receipts folder.
+    Returns {status: created|updated|exists|skipped|error, ...}. Never raises."""
+    try:
+        bill_rows = (
+            supabase.table("bills")
+            .select("bill_id, receipt_url")
+            .eq("bill_id", bill_id)
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+        if not bill_rows:
+            return {"status": "skipped", "bill_id": bill_id, "reason": "bill not found"}
+
+        receipt_url = (bill_rows[0].get("receipt_url") or "").strip()
+        if not receipt_url:
+            return {"status": "skipped", "bill_id": bill_id, "reason": "no receipt_url"}
+
+        project_id = _dominant_project_for_bill(bill_id)
+        if not project_id:
+            return {"status": "skipped", "bill_id": bill_id, "reason": "no project (no expenses)"}
+
+        parsed = _parse_storage_url(receipt_url)
+        if not parsed:
+            return {"status": "error", "bill_id": bill_id, "reason": "unrecognized receipt_url"}
+        bucket, object_path = parsed
+
+        try:
+            data = supabase.storage.from_(bucket).download(object_path)
+        except Exception as e:
+            return {"status": "error", "bill_id": bill_id, "reason": f"download failed: {e}"}
+        if not data:
+            return {"status": "error", "bill_id": bill_id, "reason": "empty file"}
+
+        file_hash = vault_service._compute_hash(data)
+        mime = _mime_from_path(object_path)
+        ext = _ext_from_path(object_path)
+        filename = f"Bill {bill_id}{ext}".strip()
+
+        # Already synced for this (project, bill)?
+        existing = (
+            supabase.table("vault_files")
+            .select("id, file_hash")
+            .eq("project_id", project_id)
+            .eq("source_bill_id", bill_id)
+            .eq("is_deleted", False)
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+
+        if existing:
+            vf = existing[0]
+            if vf.get("file_hash") == file_hash:
+                return {"status": "exists", "bill_id": bill_id, "vault_file_id": vf["id"]}
+            # Receipt image changed -> add a new version on the same vault file.
+            vault_service.create_version(
+                file_id=vf["id"],
+                file_content=data,
+                filename=filename,
+                content_type=mime,
+                user_id=None,
+                comment="Updated from bill receipt",
+            )
+            return {"status": "updated", "bill_id": bill_id, "vault_file_id": vf["id"]}
+
+        # New: drop it into the project's Receipts folder, then tag the bill.
+        rec = vault_service.save_to_project_folder(
+            project_id=project_id,
+            folder_name="Receipts",
+            file_content=data,
+            filename=filename,
+            content_type=mime,
+        )
+        if not rec or not rec.get("id"):
+            return {"status": "error", "bill_id": bill_id, "reason": "vault upload failed"}
+
+        supabase.table("vault_files").update(
+            {"source_bill_id": bill_id}
+        ).eq("id", rec["id"]).execute()
+
+        return {
+            "status": "created",
+            "bill_id": bill_id,
+            "project_id": project_id,
+            "vault_file_id": rec["id"],
+        }
+    except Exception as e:
+        logger.warning("[receipt-vault-sync] %s failed: %s", bill_id, e)
+        return {"status": "error", "bill_id": bill_id, "reason": str(e)}
+
+
+def backfill_bill_receipts_to_vault(project_id: Optional[str] = None) -> Dict[str, Any]:
+    """Sync every bill that has a receipt_url. Optionally scope to one project
+    (matched by the bill's expenses). Returns per-status counts + details."""
+    bills = (
+        supabase.table("bills")
+        .select("bill_id, receipt_url")
+        .not_.is_("receipt_url", "null")
+        .execute()
+        .data
+    ) or []
+
+    allowed_bill_ids: Optional[set] = None
+    if project_id:
+        exp = (
+            supabase.table("expenses_manual_COGS")
+            .select("bill_id")
+            .eq("project", project_id)
+            .not_.is_("bill_id", "null")
+            .execute()
+            .data
+        ) or []
+        allowed_bill_ids = {(e.get("bill_id") or "").strip() for e in exp if e.get("bill_id")}
+
+    summary = {"created": 0, "updated": 0, "exists": 0, "skipped": 0, "error": 0}
+    errors: List[Dict[str, Any]] = []
+    for b in bills:
+        bid = (b.get("bill_id") or "").strip()
+        if not bid:
+            continue
+        if allowed_bill_ids is not None and bid not in allowed_bill_ids:
+            continue
+        res = sync_bill_receipt_to_vault(bid)
+        status = res.get("status", "error")
+        summary[status] = summary.get(status, 0) + 1
+        if status == "error":
+            errors.append(res)
+
+    return {"summary": summary, "errors": errors[:50]}

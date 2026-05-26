@@ -301,3 +301,38 @@ async def mark_bill_split(bill_id: str, split_projects: List[int] = None):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error marking bill as split: {str(e)}")
+
+
+# ========================================
+# Receipt -> Vault sync (one file per bill in the project's Receipts folder)
+# ========================================
+
+@router.post("/sync-receipts")
+async def sync_all_bill_receipts(project: Optional[str] = Query(None)):
+    """
+    Backfill: copy every bill's receipt into its project's Vault "Receipts" folder
+    (one file per bill, deduped). Optionally scope to a single project UUID.
+    """
+    from api.services.receipt_vault_sync import backfill_bill_receipts_to_vault
+    try:
+        return backfill_bill_receipts_to_vault(project)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error syncing receipts to vault: {str(e)}")
+
+
+@router.post("/{bill_id}/sync-receipt")
+async def sync_bill_receipt(bill_id: str):
+    """
+    Sync a single bill's receipt into its project's Vault "Receipts" folder.
+    Idempotent: creates the file once per bill, updates it if the image changed.
+    """
+    from api.services.receipt_vault_sync import sync_bill_receipt_to_vault
+    try:
+        result = sync_bill_receipt_to_vault(bill_id)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=502, detail=result.get("reason", "sync failed"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error syncing bill receipt to vault: {str(e)}")
