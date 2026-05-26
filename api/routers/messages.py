@@ -87,6 +87,7 @@ class ChannelCreate(BaseModel):
     member_ids: List[str] = []
     write_roles: List[str] = []  # Role names that can write (CEO/COO always can)
     read_roles: List[str] = []   # Role names that can see channel (empty = everyone, CEO/COO always can)
+    color: Optional[int] = Field(default=None, ge=0, le=360)  # Avatar hue (0-359); NULL = hashed fallback
 
 
 class ReactionToggle(BaseModel):
@@ -146,6 +147,7 @@ def normalize_channel(row: Dict[str, Any]) -> Dict[str, Any]:
         "type": row.get("type", ""),
         "created_by": str(row["created_by"]) if row.get("created_by") else None,
         "created_at": row.get("created_at", ""),
+        "color": row.get("color"),
         "unread_count": row.get("unread_count", 0),
         "members": row.get("members", []),
     }
@@ -1274,7 +1276,7 @@ def create_channel(
                 raise HTTPException(status_code=400, detail="Name required for group channels")
 
             existing = supabase.table("channels") \
-                .select("id, type, name, description, created_by, created_at") \
+                .select("id, type, name, description, created_by, created_at, color") \
                 .eq("type", "group") \
                 .eq("name", payload.name) \
                 .execute()
@@ -1321,7 +1323,7 @@ def create_channel(
 
             # Find existing DM channels where the current user is a member
             existing_channels = supabase.table("channels") \
-                .select("id, type, name, description, created_by, created_at") \
+                .select("id, type, name, description, created_by, created_at, color") \
                 .eq("type", "direct") \
                 .execute()
 
@@ -1358,7 +1360,7 @@ def create_channel(
                 raise HTTPException(status_code=400, detail="At least one write role required for broadcast channels")
 
             existing = supabase.table("channels") \
-                .select("id, type, name, description, created_by, created_at, write_roles, read_roles") \
+                .select("id, type, name, description, created_by, created_at, write_roles, read_roles, color") \
                 .eq("type", "broadcast") \
                 .eq("name", payload.name) \
                 .execute()
@@ -1374,6 +1376,11 @@ def create_channel(
             "description": payload.description,
             "created_by": user_id,
         }
+
+        # Optional channel color (avatar hue). DMs derive color from the other
+        # member's avatar, so a stored color only applies to non-direct channels.
+        if payload.color is not None and payload.type != "direct":
+            channel_data["color"] = payload.color
 
         # Broadcast-specific fields
         if payload.type == "broadcast":
