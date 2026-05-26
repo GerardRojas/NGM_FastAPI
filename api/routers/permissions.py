@@ -74,11 +74,36 @@ def _build_user_menu(rol_id):
 @router.get("/roles")
 async def list_all_roles():
     """
-    Lista todos los roles disponibles
+    Lista todos los roles disponibles, con el conteo de modulos por permiso
+    (can_view / can_edit / can_delete) que consume el hub de Roles Management.
     """
     try:
-        response = supabase.table("rols").select("rol_id, rol_name").order("rol_name").execute()
-        return {"data": response.data or []}
+        roles = (supabase.table("rols")
+                 .select("rol_id, rol_name").order("rol_name").execute().data) or []
+
+        # Conteo por rol agregado desde role_permissions (1 query, no N).
+        perms = (supabase.table("role_permissions")
+                 .select("rol_id, can_view, can_edit, can_delete").execute().data) or []
+        counts: Dict[str, Dict[str, int]] = {}
+        for p in perms:
+            rid = p.get("rol_id")
+            if not rid:
+                continue
+            c = counts.setdefault(rid, {"view": 0, "edit": 0, "delete": 0})
+            if p.get("can_view"):
+                c["view"] += 1
+            if p.get("can_edit"):
+                c["edit"] += 1
+            if p.get("can_delete"):
+                c["delete"] += 1
+
+        for r in roles:
+            c = counts.get(r["rol_id"], {"view": 0, "edit": 0, "delete": 0})
+            r["modules_can_view_count"] = c["view"]
+            r["modules_can_edit_count"] = c["edit"]
+            r["modules_can_delete_count"] = c["delete"]
+
+        return {"data": roles}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching roles: {str(e)}")
 
