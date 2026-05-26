@@ -344,15 +344,19 @@ async def set_bill_receipt(bill_id: str, body: BillReceiptSet):
     Returns the vault sync result inline so the UI can confirm.
     """
     try:
-        existing = supabase.table("bills").select("bill_id").eq("bill_id", bill_id).execute()
-        if not existing.data:
-            raise HTTPException(status_code=404, detail="Bill not found")
-
         url = (body.receipt_url or "").strip()
         if not url:
             raise HTTPException(status_code=400, detail="receipt_url is required")
 
-        supabase.table("bills").update({"receipt_url": url}).eq("bill_id", bill_id).execute()
+        existing = supabase.table("bills").select("bill_id").eq("bill_id", bill_id).execute()
+        if existing.data:
+            supabase.table("bills").update({"receipt_url": url}).eq("bill_id", bill_id).execute()
+        else:
+            # The bill_id exists on expenses but has no bills row yet — register it
+            # so the receipt has somewhere to live (status defaults to open).
+            supabase.table("bills").insert(
+                {"bill_id": bill_id, "status": "open", "receipt_url": url}
+            ).execute()
 
         # Sync inline (not background) so the caller gets the confirmation.
         sync = sync_bill_receipt_to_vault(bill_id)
