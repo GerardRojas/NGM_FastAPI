@@ -344,7 +344,7 @@ def list_files(
     # Fetch paginated data
     data_query = _base_query(
         "id, name, is_folder, parent_id, project_id, bucket_path, "
-        "mime_type, size_bytes, file_hash, uploaded_by, created_at, updated_at"
+        "mime_type, size_bytes, file_hash, uploaded_by, created_at, updated_at, source_bill_id"
     )
     data_result = (
         data_query

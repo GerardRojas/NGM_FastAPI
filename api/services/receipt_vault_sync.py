@@ -59,9 +59,9 @@ def _ext_from_path(path: str) -> str:
     return name[dot:] if dot != -1 else ""
 
 
-def _dominant_project_for_bill(bill_id: str) -> Optional[str]:
-    """The project a bill belongs to = the most common project across its
-    line-item expenses (bills have no project_id of their own)."""
+def _projects_for_bill(bill_id: str) -> Dict[str, int]:
+    """Distinct projects (with line-item counts) a bill's expenses belong to.
+    Bills have no project_id of their own, so this is derived from the expenses."""
     rows = (
         supabase.table("expenses_manual_COGS")
         .select("project")
@@ -74,18 +74,65 @@ def _dominant_project_for_bill(bill_id: str) -> Optional[str]:
         pid = r.get("project")
         if pid:
             counts[pid] = counts.get(pid, 0) + 1
+    return counts
+
+
+def _target_projects_for_bill(bill_id: str, status: Optional[str]) -> List[str]:
+    """Which project Receipts folders the receipt should land in. Split bills fan
+    out to every project their expenses touch; others use the dominant project."""
+    counts = _projects_for_bill(bill_id)
     if not counts:
-        return None
-    return max(counts, key=counts.get)
+        return []
+    if (status or "").strip().lower() == "split":
+        return list(counts.keys())
+    return [max(counts, key=counts.get)]
+
+
+def _sync_one_project(project_id: str, bill_id: str, data: bytes,
+                      file_hash: str, mime: str, filename: str) -> Dict[str, Any]:
+    """Ensure exactly one vault file for (project, bill). create / update / exists."""
+    existing = (
+        supabase.table("vault_files")
+        .select("id, file_hash")
+        .eq("project_id", project_id)
+        .eq("source_bill_id", bill_id)
+        .eq("is_deleted", False)
+        .limit(1)
+        .execute()
+        .data
+    ) or []
+
+    if existing:
+        vf = existing[0]
+        if vf.get("file_hash") == file_hash:
+            return {"project_id": project_id, "status": "exists", "vault_file_id": vf["id"]}
+        # Receipt image changed -> add a new version on the same vault file.
+        vault_service.create_version(
+            file_id=vf["id"], file_content=data, filename=filename,
+            content_type=mime, user_id=None, comment="Updated from bill receipt",
+        )
+        return {"project_id": project_id, "status": "updated", "vault_file_id": vf["id"]}
+
+    rec = vault_service.save_to_project_folder(
+        project_id=project_id, folder_name="Receipts",
+        file_content=data, filename=filename, content_type=mime,
+    )
+    if not rec or not rec.get("id"):
+        return {"project_id": project_id, "status": "error", "reason": "vault upload failed"}
+    supabase.table("vault_files").update(
+        {"source_bill_id": bill_id}
+    ).eq("id", rec["id"]).execute()
+    return {"project_id": project_id, "status": "created", "vault_file_id": rec["id"]}
 
 
 def sync_bill_receipt_to_vault(bill_id: str) -> Dict[str, Any]:
-    """Ensure the bill's receipt exists once in its project's Vault Receipts folder.
-    Returns {status: created|updated|exists|skipped|error, ...}. Never raises."""
+    """Ensure the bill's receipt exists once per target-project Vault Receipts
+    folder. Split bills fan out to every project they touch. Never raises.
+    Returns {status: created|updated|exists|skipped|error, projects: [...]}."""
     try:
         bill_rows = (
             supabase.table("bills")
-            .select("bill_id, receipt_url")
+            .select("bill_id, receipt_url, status")
             .eq("bill_id", bill_id)
             .limit(1)
             .execute()
@@ -98,8 +145,8 @@ def sync_bill_receipt_to_vault(bill_id: str) -> Dict[str, Any]:
         if not receipt_url:
             return {"status": "skipped", "bill_id": bill_id, "reason": "no receipt_url"}
 
-        project_id = _dominant_project_for_bill(bill_id)
-        if not project_id:
+        targets = _target_projects_for_bill(bill_id, bill_rows[0].get("status"))
+        if not targets:
             return {"status": "skipped", "bill_id": bill_id, "reason": "no project (no expenses)"}
 
         parsed = _parse_storage_url(receipt_url)
@@ -119,54 +166,21 @@ def sync_bill_receipt_to_vault(bill_id: str) -> Dict[str, Any]:
         ext = _ext_from_path(object_path)
         filename = f"Bill {bill_id}{ext}".strip()
 
-        # Already synced for this (project, bill)?
-        existing = (
-            supabase.table("vault_files")
-            .select("id, file_hash")
-            .eq("project_id", project_id)
-            .eq("source_bill_id", bill_id)
-            .eq("is_deleted", False)
-            .limit(1)
-            .execute()
-            .data
-        ) or []
-
-        if existing:
-            vf = existing[0]
-            if vf.get("file_hash") == file_hash:
-                return {"status": "exists", "bill_id": bill_id, "vault_file_id": vf["id"]}
-            # Receipt image changed -> add a new version on the same vault file.
-            vault_service.create_version(
-                file_id=vf["id"],
-                file_content=data,
-                filename=filename,
-                content_type=mime,
-                user_id=None,
-                comment="Updated from bill receipt",
-            )
-            return {"status": "updated", "bill_id": bill_id, "vault_file_id": vf["id"]}
-
-        # New: drop it into the project's Receipts folder, then tag the bill.
-        rec = vault_service.save_to_project_folder(
-            project_id=project_id,
-            folder_name="Receipts",
-            file_content=data,
-            filename=filename,
-            content_type=mime,
-        )
-        if not rec or not rec.get("id"):
-            return {"status": "error", "bill_id": bill_id, "reason": "vault upload failed"}
-
-        supabase.table("vault_files").update(
-            {"source_bill_id": bill_id}
-        ).eq("id", rec["id"]).execute()
-
-        return {
-            "status": "created",
-            "bill_id": bill_id,
-            "project_id": project_id,
-            "vault_file_id": rec["id"],
-        }
+        results = [
+            _sync_one_project(pid, bill_id, data, file_hash, mime, filename)
+            for pid in targets
+        ]
+        statuses = [r["status"] for r in results]
+        # Roll up to one status for the caller (worst-/most-notable-first).
+        if any(s == "error" for s in statuses):
+            overall = "error"
+        elif any(s == "created" for s in statuses):
+            overall = "created"
+        elif any(s == "updated" for s in statuses):
+            overall = "updated"
+        else:
+            overall = "exists"
+        return {"status": overall, "bill_id": bill_id, "projects": results}
     except Exception as e:
         logger.warning("[receipt-vault-sync] %s failed: %s", bill_id, e)
         return {"status": "error", "bill_id": bill_id, "reason": str(e)}
