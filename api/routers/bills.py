@@ -2,11 +2,15 @@
 Router para gestión de Bills (Facturas/Recibos)
 Tabla: bills
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional, List
 
 from api.supabase_client import supabase
+from api.services.receipt_vault_sync import (
+    sync_bill_receipt_to_vault,
+    backfill_bill_receipts_to_vault,
+)
 
 router = APIRouter(prefix="/bills", tags=["bills"])
 
@@ -34,6 +38,10 @@ class BillUpdate(BaseModel):
     split_projects: Optional[List[int]] = None
     receipt_url: Optional[str] = None
     notes: Optional[str] = None
+
+
+class BillReceiptSet(BaseModel):
+    receipt_url: str
 
 
 # ========================================
@@ -104,7 +112,7 @@ async def get_bill_expenses(
 
 
 @router.post("")
-async def create_bill(bill: BillCreate):
+async def create_bill(bill: BillCreate, background_tasks: BackgroundTasks):
     """
     Crea un nuevo bill
     """
@@ -138,6 +146,10 @@ async def create_bill(bill: BillCreate):
 
         response = supabase.table("bills").insert(insert_data).execute()
 
+        # Mirror the receipt into the project's Vault Receipts folder (one per bill).
+        if bill.receipt_url:
+            background_tasks.add_task(sync_bill_receipt_to_vault, bill.bill_id)
+
         return {"message": "Bill created successfully", "data": response.data[0] if response.data else None}
     except HTTPException:
         raise
@@ -146,7 +158,7 @@ async def create_bill(bill: BillCreate):
 
 
 @router.patch("/{bill_id}")
-async def update_bill(bill_id: str, bill: BillUpdate):
+async def update_bill(bill_id: str, bill: BillUpdate, background_tasks: BackgroundTasks):
     """
     Actualiza un bill existente (actualización parcial)
     """
@@ -184,6 +196,10 @@ async def update_bill(bill_id: str, bill: BillUpdate):
             raise HTTPException(status_code=400, detail="No fields to update")
 
         response = supabase.table("bills").update(update_data).eq("bill_id", bill_id).execute()
+
+        # Re-sync the Vault receipt when a (non-empty) receipt_url was set/changed.
+        if "receipt_url" in sent and (bill.receipt_url or "").strip():
+            background_tasks.add_task(sync_bill_receipt_to_vault, bill_id)
 
         return {"message": "Bill updated successfully", "data": response.data[0] if response.data else None}
     except HTTPException:
@@ -313,11 +329,38 @@ async def sync_all_bill_receipts(project: Optional[str] = Query(None)):
     Backfill: copy every bill's receipt into its project's Vault "Receipts" folder
     (one file per bill, deduped). Optionally scope to a single project UUID.
     """
-    from api.services.receipt_vault_sync import backfill_bill_receipts_to_vault
     try:
         return backfill_bill_receipts_to_vault(project)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error syncing receipts to vault: {str(e)}")
+
+
+@router.post("/{bill_id}/receipt")
+async def set_bill_receipt(bill_id: str, body: BillReceiptSet):
+    """
+    Attach a receipt image to a bill: store it on bills.receipt_url and mirror it
+    into the project's Vault Receipts folder (one file per bill). This is the
+    single entry point the frontend uses to attach a receipt at the bill level.
+    Returns the vault sync result inline so the UI can confirm.
+    """
+    try:
+        existing = supabase.table("bills").select("bill_id").eq("bill_id", bill_id).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Bill not found")
+
+        url = (body.receipt_url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="receipt_url is required")
+
+        supabase.table("bills").update({"receipt_url": url}).eq("bill_id", bill_id).execute()
+
+        # Sync inline (not background) so the caller gets the confirmation.
+        sync = sync_bill_receipt_to_vault(bill_id)
+        return {"message": "Receipt attached to bill", "receipt_url": url, "vault_sync": sync}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error attaching receipt to bill: {str(e)}")
 
 
 @router.post("/{bill_id}/sync-receipt")
@@ -326,7 +369,6 @@ async def sync_bill_receipt(bill_id: str):
     Sync a single bill's receipt into its project's Vault "Receipts" folder.
     Idempotent: creates the file once per bill, updates it if the image changed.
     """
-    from api.services.receipt_vault_sync import sync_bill_receipt_to_vault
     try:
         result = sync_bill_receipt_to_vault(bill_id)
         if result.get("status") == "error":
