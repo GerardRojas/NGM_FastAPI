@@ -2,7 +2,7 @@
 Router para gestión de permisos basados en roles
 """
 from fastapi import APIRouter, HTTPException
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 import logging
 
@@ -261,6 +261,7 @@ class PermissionUpdate(BaseModel):
     can_view: bool
     can_edit: bool
     can_delete: bool
+    menu_item_id: Optional[str] = None
 
 
 class BatchPermissionUpdate(BaseModel):
@@ -280,14 +281,29 @@ async def batch_update_permissions(data: BatchPermissionUpdate):
     (N llamadas HTTP → 1).  Los roles CEO y COO están protegidos.
     """
     try:
-        # Roles protegidos
+        # Roles protegidos. rol_id es bigint en la DB pero llega como string en
+        # el payload, así que comparamos como string (antes nunca matcheaba y la
+        # protección de CEO/COO quedaba sin efecto).
         PROTECTED_ROLES = ['CEO', 'COO']
 
         protected_roles_response = supabase.table("rols").select("rol_id, rol_name").execute()
         protected_rol_ids = {
-            r["rol_id"] for r in protected_roles_response.data
+            str(r["rol_id"]) for r in (protected_roles_response.data or [])
             if r["rol_name"] in PROTECTED_ROLES
         }
+
+        # Filas existentes de los roles tocados. batch-update SOLO debe cambiar
+        # los flags can_*: nunca debe pisar el module_name/module_url curado ni,
+        # sobre todo, el menu_item_id que enlaza la fila al sidebar.
+        rol_ids = list({u.rol_id for u in data.updates})
+        existing_by_key: Dict[Any, Dict[str, Any]] = {}
+        if rol_ids:
+            existing_rows = (supabase.table("role_permissions")
+                             .select("rol_id, module_key, module_name, module_url, menu_item_id")
+                             .in_("rol_id", rol_ids).execute().data) or []
+            existing_by_key = {
+                (str(r["rol_id"]), r["module_key"]): r for r in existing_rows
+            }
 
         # Separar protegidos de permitidos
         upsert_rows = []
@@ -295,7 +311,7 @@ async def batch_update_permissions(data: BatchPermissionUpdate):
         protected_blocked = 0
 
         for update in data.updates:
-            if update.rol_id in protected_rol_ids:
+            if str(update.rol_id) in protected_rol_ids:
                 protected_blocked += 1
                 failed_updates.append({
                     "rol_id": update.rol_id,
@@ -304,11 +320,32 @@ async def batch_update_permissions(data: BatchPermissionUpdate):
                 })
                 continue
 
+            prior = existing_by_key.get((str(update.rol_id), update.module_key))
+            if prior:
+                # Preservar metadata y enlace de menú; sólo cambian los flags.
+                menu_item_id = prior.get("menu_item_id")
+                module_name = prior.get("module_name") or update.module_key.replace("_", " ").title()
+                module_url = prior.get("module_url") or f"{update.module_key}.html"
+            else:
+                # Fila nueva: derivar metadata y resolver el menu_item_id por slug
+                # para que el módulo pueda aparecer en el sidebar (no quede huérfano).
+                menu_item_id = update.menu_item_id
+                if not menu_item_id:
+                    mi = (supabase.table("menu_items").select("id")
+                          .eq("slug", update.module_key).limit(1).execute().data) or []
+                    menu_item_id = mi[0]["id"] if mi else None
+                module_name = update.module_key.replace("_", " ").title()
+                module_url = f"{update.module_key}.html"
+
+            # Todas las filas llevan las MISMAS claves: PostgREST arma el SET del
+            # upsert con la unión de columnas, así que menu_item_id debe ir siempre
+            # (con su valor previo) o se nullificaría el enlace de menú en el update.
             upsert_rows.append({
                 "rol_id": update.rol_id,
                 "module_key": update.module_key,
-                "module_name": update.module_key.replace("_", " ").title(),
-                "module_url": f"{update.module_key}.html",
+                "module_name": module_name,
+                "module_url": module_url,
+                "menu_item_id": menu_item_id,
                 "can_view": update.can_view,
                 "can_edit": update.can_edit,
                 "can_delete": update.can_delete,
