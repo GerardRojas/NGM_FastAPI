@@ -78,6 +78,12 @@ from api.routers.adu_calculator import router as adu_calculator_router
 # ========= TAKEOFF: Plan Measurements ==========
 from api.routers.takeoff import router as takeoff_router
 
+# ========= FEASIBILITY: Real-estate development feasibility (GIS lookup) ==========
+from api.routers.feasibility import router as feasibility_router
+
+# ========= FIX & FLIP: Fix-and-flip calculator saved deals ==========
+from api.routers.fix_flip import router as fix_flip_router
+
 # ========= DANEEL AUTO-AUTH: Automated Expense Authorization ==========
 from api.routers.daneel_auto_auth import router as daneel_auto_auth_router
 from api.routers.andrew_mismatch import router as andrew_mismatch_router
@@ -320,6 +326,12 @@ app.include_router(connect_router)
 
 # Responsibilities (unified role/user duties -> pipeline tasks -> My Work)
 app.include_router(responsibilities_router)
+
+# Feasibility (real-estate development feasibility: parcel + zoning GIS lookup)
+app.include_router(feasibility_router)
+
+# Fix & Flip (fix-and-flip calculator saved deals)
+app.include_router(fix_flip_router)
 
 _mem_logger = logging.getLogger("memory")
 
