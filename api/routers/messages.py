@@ -420,24 +420,61 @@ async def _run_agent_brain(
         logger.info("[Messages] _run_agent_brain START | agent=%s user=%s project=%s channel=%s",
                      agent_name, user_name, project_id, channel_type)
 
-        # Immediate ack for Andrew + file attachments (before GPT routing)
-        has_receipt_attachment = False
+        # Collect receipt/invoice attachments (PDF/image) on this message.
+        receipt_atts = []
         if agent_name == "andrew" and attachments:
             for att in attachments:
                 att_type = (att.get("type") or "").lower()
                 att_name = (att.get("name") or "").lower()
                 if att_type in _RECEIPT_TYPES or att_name.endswith(_RECEIPT_EXTS):
-                    has_receipt_attachment = True
-                    _post_to_channel(
-                        f"Got it! Processing **{att.get('name', 'receipt')}**...",
-                        metadata={
-                            "agent_message": True,
-                            "receipt_status": "processing",
-                            "processing_started": True,
-                        },
-                    )
-                    logger.info("[Messages] Immediate ack posted for %s", att.get('name'))
-                    break
+                    receipt_atts.append({
+                        "name": att.get("name") or "invoice",
+                        "url": att.get("url") or "",
+                        "type": att.get("type") or "",
+                        "size": att.get("size") or 0,
+                    })
+
+        # In the agent console (a direct channel), invoices aren't processed
+        # immediately — Andrew confirms first ("process these N?"). The user's
+        # confirmation triggers the batch (POST /pending-receipts/process-from-chat)
+        # from the client. This keeps the round-trip isolated to the console and
+        # leaves project-channel receipt handling untouched.
+        if agent_name == "andrew" and receipt_atts and channel_type == "direct":
+            if not project_id:
+                _post_to_channel(
+                    "Select a project first, then resend the invoice(s) and I'll process them.",
+                    metadata={"agent_message": True},
+                )
+                return
+            n = len(receipt_atts)
+            names = "\n".join(f"- {a['name']}" for a in receipt_atts)
+            noun = "invoice" if n == 1 else "invoices"
+            _post_to_channel(
+                f"I see **{n}** {noun}:\n{names}\n\nWant me to scan and categorize "
+                f"{'it' if n == 1 else 'them'}? Confirm below.",
+                metadata={
+                    "agent_message": True,
+                    "bulk_confirm": True,
+                    "bulk_attachments": receipt_atts,
+                    "bulk_project_id": project_id,
+                },
+            )
+            logger.info("[Messages] Posted bulk-confirm for %d invoice(s) in console", n)
+            return
+
+        # Immediate ack for Andrew + file attachments in project channels.
+        has_receipt_attachment = False
+        if receipt_atts:
+            has_receipt_attachment = True
+            _post_to_channel(
+                f"Got it! Processing **{receipt_atts[0]['name']}**...",
+                metadata={
+                    "agent_message": True,
+                    "receipt_status": "processing",
+                    "processing_started": True,
+                },
+            )
+            logger.info("[Messages] Immediate ack posted for %s", receipt_atts[0]["name"])
 
         logger.info("[Messages] Importing agent_brain...")
         from api.services.agent_brain import invoke_brain
