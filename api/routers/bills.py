@@ -44,6 +44,12 @@ class BillReceiptSet(BaseModel):
     receipt_url: str
 
 
+class BillReceiptAttach(BaseModel):
+    # bill_id in the body (not the URL path) so bill numbers with "/" work.
+    bill_id: str
+    receipt_url: str
+
+
 # ========================================
 # Endpoints
 # ========================================
@@ -335,32 +341,69 @@ async def sync_all_bill_receipts(project: Optional[str] = Query(None)):
         raise HTTPException(status_code=500, detail=f"Error syncing receipts to vault: {str(e)}")
 
 
-@router.post("/{bill_id}/receipt")
-async def set_bill_receipt(bill_id: str, body: BillReceiptSet):
+def _attach_receipt_and_sync(bill_id: str, receipt_url: str):
+    """Store the receipt on the bill (registering the bill if missing) and mirror
+    it into the project's Vault Receipts folder. Shared by the path- and
+    body-based attach endpoints."""
+    url = (receipt_url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="receipt_url is required")
+
+    existing = supabase.table("bills").select("bill_id").eq("bill_id", bill_id).execute()
+    if existing.data:
+        supabase.table("bills").update({"receipt_url": url}).eq("bill_id", bill_id).execute()
+    else:
+        # bill_id exists on expenses but has no bills row yet — register it.
+        supabase.table("bills").insert(
+            {"bill_id": bill_id, "status": "open", "receipt_url": url}
+        ).execute()
+
+    # Sync inline (not background) so the caller gets the confirmation.
+    sync = sync_bill_receipt_to_vault(bill_id)
+    return {"message": "Receipt attached to bill", "receipt_url": url, "vault_sync": sync}
+
+
+@router.post("/receipt")
+async def attach_bill_receipt(body: BillReceiptAttach):
     """
-    Attach a receipt image to a bill: store it on bills.receipt_url and mirror it
-    into the project's Vault Receipts folder (one file per bill). This is the
-    single entry point the frontend uses to attach a receipt at the bill level.
-    Returns the vault sync result inline so the UI can confirm.
+    Attach a receipt at the bill level, taking bill_id from the BODY so bill
+    numbers containing "/" (e.g. "CHU/083710") work — those can't be sent in the
+    URL path. Preferred entry point for the frontend.
     """
     try:
-        url = (body.receipt_url or "").strip()
-        if not url:
-            raise HTTPException(status_code=400, detail="receipt_url is required")
+        bid = (body.bill_id or "").strip()
+        if not bid:
+            raise HTTPException(status_code=400, detail="bill_id is required")
+        return _attach_receipt_and_sync(bid, body.receipt_url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error attaching receipt to bill: {str(e)}")
 
-        existing = supabase.table("bills").select("bill_id").eq("bill_id", bill_id).execute()
-        if existing.data:
-            supabase.table("bills").update({"receipt_url": url}).eq("bill_id", bill_id).execute()
-        else:
-            # The bill_id exists on expenses but has no bills row yet — register it
-            # so the receipt has somewhere to live (status defaults to open).
-            supabase.table("bills").insert(
-                {"bill_id": bill_id, "status": "open", "receipt_url": url}
-            ).execute()
 
-        # Sync inline (not background) so the caller gets the confirmation.
-        sync = sync_bill_receipt_to_vault(bill_id)
-        return {"message": "Receipt attached to bill", "receipt_url": url, "vault_sync": sync}
+@router.post("/sync-receipt")
+async def sync_bill_receipt_by_query(bill_id: str = Query(...)):
+    """
+    Sync one bill's receipt into Vault, taking bill_id from a query param so
+    bill numbers with "/" work (the path-based variant 404s on encoded slashes).
+    """
+    try:
+        result = sync_bill_receipt_to_vault(bill_id)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=502, detail=result.get("reason", "sync failed"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error syncing bill receipt to vault: {str(e)}")
+
+
+@router.post("/{bill_id}/receipt")
+async def set_bill_receipt(bill_id: str, body: BillReceiptSet):
+    """Attach a receipt by bill_id in the URL path (kept for back-compat; use
+    POST /bills/receipt for bill_ids that may contain '/')."""
+    try:
+        return _attach_receipt_and_sync(bill_id, body.receipt_url)
     except HTTPException:
         raise
     except Exception as e:
@@ -369,10 +412,8 @@ async def set_bill_receipt(bill_id: str, body: BillReceiptSet):
 
 @router.post("/{bill_id}/sync-receipt")
 async def sync_bill_receipt(bill_id: str):
-    """
-    Sync a single bill's receipt into its project's Vault "Receipts" folder.
-    Idempotent: creates the file once per bill, updates it if the image changed.
-    """
+    """Sync one bill by bill_id in the URL path (kept for back-compat; use
+    POST /bills/sync-receipt?bill_id= for bill_ids that may contain '/')."""
     try:
         result = sync_bill_receipt_to_vault(bill_id)
         if result.get("status") == "error":
