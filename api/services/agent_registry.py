@@ -100,6 +100,23 @@ ANDREW_FUNCTIONS: List[Dict[str, Any]] = [
         "long_running": False,
     },
     {
+        "name": "review_expenses",
+        "description": (
+            "Review and summarize the expenses for a project. Shows how many expenses "
+            "are pending authorization (with the dollar total), how many are flagged for "
+            "review, the authorized total, top vendors, and items missing a receipt or "
+            "bill number. USE THIS when the user asks to review, summarize, or check the "
+            "expenses/spending of a project. Examples: 'review the expenses for this project', "
+            "'how are the expenses looking on Oak Ave?', 'revisar los gastos del proyecto'."
+        ),
+        "parameters": [
+            {"name": "project_id", "type": "string", "required": False,
+             "description": "Project ID. Defaults to current channel project."},
+        ],
+        "handler": "_builtin:review_expenses",
+        "long_running": True,
+    },
+    {
         "name": "review_bill",
         "description": (
             "Look up and review a bill, invoice, or check by its number or reference. "

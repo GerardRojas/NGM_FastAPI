@@ -1081,6 +1081,96 @@ async def _builtin_check_budget(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+async def _builtin_review_expenses(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Manager-facing expense summary for a project: pending vs authorized,
+    top vendors, and data gaps (missing receipt/bill)."""
+    from api.supabase_client import supabase as sb
+
+    project_id = params.get("project_id")
+    if not project_id:
+        return {"error": "project_id is required"}
+
+    try:
+        proj = sb.table("projects") \
+            .select("project_name") \
+            .eq("project_id", project_id) \
+            .single() \
+            .execute()
+        project_name = proj.data.get("project_name", "Unknown") if proj.data else "Unknown"
+
+        expenses = sb.table("expenses_manual_COGS") \
+            .select("Amount, status, auth_status, vendor_id, bill_id, receipt_url") \
+            .eq("project", project_id) \
+            .execute()
+
+        rows = expenses.data or []
+        if not rows:
+            return {"project": project_name, "message": f"No expenses logged for {project_name} yet."}
+
+        def _status(row: Dict[str, Any]) -> str:
+            raw = str(row.get("status") or "").strip().lower()
+            if raw in ("pending", "auth", "review"):
+                return raw
+            # Legacy fallback: auth_status boolean.
+            return "auth" if row.get("auth_status") in (True, "true", 1) else "pending"
+
+        pending_count = 0
+        review_count = 0
+        pending_total = 0.0
+        authorized_total = 0.0
+        total_amount = 0.0
+        missing_receipt = missing_bill = 0
+        by_vendor: Dict[str, float] = {}
+
+        for r in rows:
+            amt = float(r.get("Amount") or 0)
+            total_amount += amt
+            st = _status(r)
+            if st == "pending":
+                pending_count += 1
+                pending_total += amt
+            elif st == "review":
+                review_count += 1
+            elif st == "auth":
+                authorized_total += amt
+            if not (r.get("receipt_url") or "").strip():
+                missing_receipt += 1
+            if not (str(r.get("bill_id") or "").strip()):
+                missing_bill += 1
+            vid = r.get("vendor_id") or "unknown"
+            by_vendor[vid] = by_vendor.get(vid, 0) + amt
+
+        # Resolve top vendor names.
+        top = sorted(by_vendor.items(), key=lambda x: -x[1])[:5]
+        top_vendors = []
+        for vid, amt in top:
+            name = "Uncategorized"
+            if vid and vid != "unknown":
+                try:
+                    v = sb.table("vendors").select("vendor_name").eq("id", vid).single().execute()
+                    if v.data:
+                        name = v.data.get("vendor_name") or name
+                except Exception as _exc:
+                    logger.debug("Suppressed vendor lookup: %s", _exc)
+            top_vendors.append({"vendor": name, "amount": round(amt, 2)})
+
+        return {
+            "project": project_name,
+            "total_expenses": len(rows),
+            "total_amount": round(total_amount, 2),
+            "pending_count": pending_count,
+            "pending_total": round(pending_total, 2),
+            "review_count": review_count,
+            "authorized_total": round(authorized_total, 2),
+            "missing_receipt": missing_receipt,
+            "missing_bill": missing_bill,
+            "top_vendors": top_vendors,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 async def _builtin_check_duplicates(params: Dict[str, Any]) -> Dict[str, Any]:
     """Scan for duplicate expenses in the project (excludes dismissed pairs)."""
     from api.supabase_client import supabase as sb
@@ -2538,6 +2628,7 @@ _BUILTIN_HANDLERS = {
     "check_receipt_status": _builtin_check_receipt_status,
     "explain_categorization": _builtin_explain_categorization,
     "check_budget": _builtin_check_budget,
+    "review_expenses": _builtin_review_expenses,
     "check_duplicates": _builtin_check_duplicates,
     "expense_health_report": _builtin_expense_health_report,
     "reprocess_pending": _builtin_reprocess_pending,
@@ -2601,6 +2692,28 @@ def _format_result(agent_name: str, fn_name: str, result: Any) -> str:
             lines.append("\n**Breakdown by account:**")
             for item in breakdown:
                 lines.append(f"- {item['account']}: ${item['spent']:,.2f}")
+        return "\n".join(lines)
+
+    if fn_name == "review_expenses":
+        lines = [
+            f"**{result.get('project', '?')} - Expense Review**\n",
+            f"- Total logged: {result.get('total_expenses', 0)} expenses "
+            f"(${result.get('total_amount', 0):,.2f})",
+            f"- Pending authorization: {result.get('pending_count', 0)} "
+            f"(${result.get('pending_total', 0):,.2f})",
+            f"- Flagged for review: {result.get('review_count', 0)}",
+            f"- Authorized: ${result.get('authorized_total', 0):,.2f}",
+        ]
+        if result.get("missing_receipt") or result.get("missing_bill"):
+            lines.append(
+                f"- Data gaps: {result.get('missing_receipt', 0)} missing receipt, "
+                f"{result.get('missing_bill', 0)} missing bill #"
+            )
+        vendors = result.get("top_vendors", [])
+        if vendors:
+            lines.append("\n**Top vendors:**")
+            for v in vendors:
+                lines.append(f"- {v['vendor']}: ${v['amount']:,.2f}")
         return "\n".join(lines)
 
     if fn_name == "check_duplicates":
