@@ -187,6 +187,42 @@ class VaultBatchRequest(BaseModel):
     project_id: str
 
 
+class ChatAttachment(BaseModel):
+    """One invoice attached in an agent chat (already uploaded to storage)."""
+    name: str
+    url: str
+    type: Optional[str] = None
+    size: Optional[int] = 0
+
+
+class ChatBatchRequest(BaseModel):
+    """Batch process invoices attached in Andrew's chat console."""
+    attachments: List[ChatAttachment]
+    project_id: str
+
+
+class CheckAllocation(BaseModel):
+    """A slice of a check's total assigned to one project, with its resolved
+    category (account_id) and a short description used to infer it."""
+    project_id: str
+    amount: float
+    account_id: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ProcessCheckRequest(BaseModel):
+    """A manually-entered check (no OCR): the user provides the total and the
+    per-project amounts directly. Common for a single payroll check that spans
+    several projects. Creates one expense per allocation, with the check image
+    as the receipt."""
+    file_url: str
+    file_name: Optional[str] = "check"
+    description: Optional[str] = None
+    txn_date: Optional[str] = None
+    allocations: List[CheckAllocation]
+    created_by: Optional[str] = None
+
+
 # ====== HELPERS ======
 
 # ====== ENDPOINTS ======
@@ -709,6 +745,176 @@ async def process_from_vault(
     }
 
 
+@router.post("/process-from-chat")
+async def process_from_chat(
+    payload: ChatBatchRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Bridge invoices attached in Andrew's chat console to the receipt pipeline.
+    Mirrors process-from-vault, but sources files from chat attachment URLs (the
+    files are already uploaded to the 'vault' bucket by /messages/upload, so no
+    vault_files row is needed). Reuses _process_vault_batch / _agent_process_receipt_core.
+    """
+    batch_id = str(uuid.uuid4())
+    results = []
+    queued_receipt_ids = []
+
+    for att in payload.attachments:
+        name = att.name or "invoice"
+        try:
+            # Resolve the mime type (fall back to the file extension).
+            mime = (att.type or "").lower()
+            if mime not in ALLOWED_RECEIPT_MIMES:
+                lname = name.lower()
+                if lname.endswith(".pdf"):
+                    mime = "application/pdf"
+                elif lname.endswith((".jpg", ".jpeg")):
+                    mime = "image/jpeg"
+                elif lname.endswith(".png"):
+                    mime = "image/png"
+                elif lname.endswith(".webp"):
+                    mime = "image/webp"
+                elif lname.endswith(".gif"):
+                    mime = "image/gif"
+
+            if mime not in ALLOWED_RECEIPT_MIMES:
+                results.append({"name": name, "status": "skipped", "message": f"Unsupported type: {att.type}"})
+                continue
+            if not att.url:
+                results.append({"name": name, "status": "error", "message": "Missing file URL"})
+                continue
+
+            receipt_id = str(uuid.uuid4())
+            receipt_data = {
+                "id": receipt_id,
+                "project_id": payload.project_id,
+                "file_name": name,
+                "file_url": att.url,
+                "file_type": mime,
+                "file_size": att.size or 0,
+                "thumbnail_url": f"{att.url}?width=200&height=200&resize=contain" if mime.startswith("image/") else None,
+                "status": "pending",
+                "uploaded_by": current_user.get("user_id", current_user.get("uid")),
+                "batch_id": batch_id,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            supabase.table("pending_receipts").insert(receipt_data).execute()
+            queued_receipt_ids.append(receipt_id)
+            results.append({"name": name, "receipt_id": receipt_id, "status": "queued"})
+
+        except Exception as e:
+            logger.error(f"[ChatBatch] Error queueing {name}: {e}")
+            results.append({"name": name, "status": "error", "message": str(e)})
+
+    if queued_receipt_ids:
+        background_tasks.add_task(
+            _process_vault_batch,
+            batch_id,
+            queued_receipt_ids,
+            payload.project_id,
+        )
+
+    return {
+        "batch_id": batch_id,
+        "total": len(payload.attachments),
+        "queued": len(queued_receipt_ids),
+        "results": results,
+    }
+
+
+@router.post("/process-check")
+def process_check(payload: ProcessCheckRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    """
+    Create expenses from a manually-entered check, split across one or more
+    projects by amount (no OCR). The /check flow in Andrew's console collects the
+    image, the total, and the per-project amounts, then calls this. Each
+    allocation becomes its own expense with the check image as the receipt.
+    """
+    allocations = [a for a in (payload.allocations or []) if a.project_id and a.amount is not None]
+    if not allocations:
+        raise HTTPException(status_code=400, detail="At least one project allocation is required")
+
+    # Resolve the "Check" payment method if the catalog has one (best-effort).
+    payment_id = None
+    try:
+        pm = supabase.table("paymet_methods").select("id, payment_method_name").execute()
+        for p in (pm.data or []):
+            if (p.get("payment_method_name") or "").strip().lower() == "check":
+                payment_id = p["id"]
+                break
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
+
+    created_by = payload.created_by or current_user.get("user_id") or current_user.get("uid")
+    description = payload.description or f"Check: {payload.file_name or 'check'}"
+
+    created = []
+    by_project: dict = {}
+    for alloc in allocations:
+        expense_data = {
+            "project": alloc.project_id,
+            "Amount": alloc.amount,
+            "TxnDate": payload.txn_date,
+            "LineDescription": (alloc.description or "").strip() or description,
+            "account_id": alloc.account_id,
+            "payment_type": payment_id,
+            "created_by": created_by,
+            "receipt_url": payload.file_url,
+            "auth_status": False,
+        }
+        expense_data = {k: v for k, v in expense_data.items() if v is not None}
+        try:
+            res = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
+            if res.data:
+                exp = res.data[0]
+                created.append(exp)
+                by_project.setdefault(alloc.project_id, []).append(exp)
+        except Exception as e:
+            logger.error(f"[Check] Failed to create expense for project {alloc.project_id}: {e}")
+
+    if not created:
+        raise HTTPException(status_code=500, detail="Failed to create check expenses")
+
+    # Daneel auto-auth per created expense.
+    try:
+        from api.services.daneel_auto_auth import trigger_auto_auth_check
+        for pid, exps in by_project.items():
+            for e in exps:
+                eid = e.get("expense_id")
+                if eid:
+                    background_tasks.add_task(trigger_auto_auth_check, eid, pid)
+    except Exception as _exc:
+        logger.debug("Suppressed: %s", _exc)
+
+    # Record a note in each project's receipts channel (team visibility).
+    total = sum(a.amount for a in allocations)
+    for pid, exps in by_project.items():
+        amt = sum(float(e.get("Amount") or 0) for e in exps)
+        post_andrew_message(
+            content=(
+                f"Check logged: **${amt:,.2f}** ({len(exps)} expense(s)) — part of a "
+                f"${total:,.2f} check split across {len(by_project)} project(s)."
+                if len(by_project) > 1 else
+                f"Check logged: **${amt:,.2f}** ({len(exps)} expense(s))."
+            ),
+            project_id=pid,
+            metadata={
+                "agent_message": True,
+                "check_expense": True,
+                "receipt_status": "linked",
+            },
+        )
+
+    return {
+        "created": len(created),
+        "projects": len(by_project),
+        "expense_ids": [e.get("expense_id") for e in created if e.get("expense_id")],
+    }
+
+
 async def _process_vault_batch(batch_id: str, receipt_ids: list, project_id: str):
     """Process a batch of vault receipts sequentially through Andrew's pipeline."""
     total = len(receipt_ids)
@@ -773,7 +979,7 @@ async def vault_batch_status(
 ):
     """Get processing status for a vault batch."""
     result = supabase.table("pending_receipts") \
-        .select("id, file_name, status, processing_error, vault_file_id, file_hash") \
+        .select("id, file_name, status, processing_error, vault_file_id, file_hash, vendor_name, amount, parsed_data") \
         .eq("batch_id", batch_id) \
         .execute()
 
@@ -5033,39 +5239,57 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                 return {"success": True, "state": "awaiting_item_selection"}
 
             elif action == "assign_items":
-                text = (payload.payload or {}).get("text", "")
+                payload_data = payload.payload or {}
+                text = payload_data.get("text", "")
+                structured = payload_data.get("assignments")
                 line_items = parsed_data.get("line_items", [])
                 num_items = len(line_items)
 
                 if not line_items:
                     raise HTTPException(status_code=400, detail="No line items available for assignment")
 
-                # Parse item-to-project assignments
-                assignments = _parse_item_assignments(text, num_items)
-                if not assignments:
-                    post_andrew_message(
-                        content="Didn't catch that. Use this format:\n**3, 4 to Sunset Heights, 7 to Oak Park**",
-                        project_id=project_id,
-                        metadata={
-                            "agent_message": True,
-                            "pending_receipt_id": receipt_id,
-                            "receipt_status": "ready",
-                            "receipt_flow_state": "awaiting_item_selection",
-                            "receipt_flow_active": True,
-                            "awaiting_text_input": True,
-                        }
-                    )
-                    return {"success": True, "state": "awaiting_item_selection", "error": "parse_error"}
-
-                # Resolve project names
                 assigned_indices = set()
                 project_assignments = []
 
-                for assignment in assignments:
-                    project = _resolve_project_by_name(assignment["project_query"])
-                    if not project:
+                if isinstance(structured, list) and structured:
+                    # Structured split from the console pickers: a list of
+                    # {index (1-based), project_id}. Items NOT listed stay with the
+                    # current project. Resolved by id (no fuzzy name matching).
+                    by_project = {}
+                    for a in structured:
+                        if not isinstance(a, dict):
+                            continue
+                        idx = a.get("index")
+                        pid = a.get("project_id")
+                        if not pid or not isinstance(idx, int) or idx < 1 or idx > num_items:
+                            continue
+                        if pid == project_id:
+                            continue  # same project -> stays here implicitly
+                        by_project.setdefault(pid, set()).add(idx)
+
+                    for pid, indices in by_project.items():
+                        proj = None
+                        try:
+                            pr = supabase.table("projects").select("project_id, project_name") \
+                                .eq("project_id", pid).single().execute()
+                            proj = pr.data
+                        except Exception as _exc:
+                            logger.debug("Suppressed: %s", _exc)
+                            proj = None
+                        if not proj:
+                            raise HTTPException(status_code=400, detail=f"Project not found: {pid}")
+                        project_assignments.append({
+                            "project_id": proj["project_id"],
+                            "project_name": proj.get("project_name") or "Project",
+                            "item_indices": sorted(indices),
+                        })
+                        assigned_indices.update(indices)
+                else:
+                    # Parse item-to-project assignments from free text
+                    assignments = _parse_item_assignments(text, num_items)
+                    if not assignments:
                         post_andrew_message(
-                            content=f'No project matching "{assignment["project_query"]}". Try again.',
+                            content="Didn't catch that. Use this format:\n**3, 4 to Sunset Heights, 7 to Oak Park**",
                             project_id=project_id,
                             metadata={
                                 "agent_message": True,
@@ -5076,14 +5300,34 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
                                 "awaiting_text_input": True,
                             }
                         )
-                        return {"success": True, "state": "awaiting_item_selection", "error": "project_not_found"}
+                        return {"success": True, "state": "awaiting_item_selection", "error": "parse_error"}
 
-                    project_assignments.append({
-                        "project_id": project["project_id"],
-                        "project_name": project["project_name"],
-                        "item_indices": assignment["item_indices"],
-                    })
-                    assigned_indices.update(assignment["item_indices"])
+                    for assignment in assignments:
+                        project = _resolve_project_by_name(assignment["project_query"])
+                        if not project:
+                            post_andrew_message(
+                                content=f'No project matching "{assignment["project_query"]}". Try again.',
+                                project_id=project_id,
+                                metadata={
+                                    "agent_message": True,
+                                    "pending_receipt_id": receipt_id,
+                                    "receipt_status": "ready",
+                                    "receipt_flow_state": "awaiting_item_selection",
+                                    "receipt_flow_active": True,
+                                    "awaiting_text_input": True,
+                                }
+                            )
+                            return {"success": True, "state": "awaiting_item_selection", "error": "project_not_found"}
+
+                        project_assignments.append({
+                            "project_id": project["project_id"],
+                            "project_name": project["project_name"],
+                            "item_indices": assignment["item_indices"],
+                        })
+                        assigned_indices.update(assignment["item_indices"])
+
+                if not project_assignments:
+                    raise HTTPException(status_code=400, detail="No valid item-to-project assignments")
 
                 # Remaining items (not assigned) stay with this project
                 this_project_indices = [i for i in range(1, num_items + 1) if i not in assigned_indices]
