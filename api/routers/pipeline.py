@@ -1019,6 +1019,90 @@ class AutomationsRunRequest(BaseModel):
 AUTOMATION_MARKER = "[AUTOMATED]"
 
 
+def _resolve_expense_managers_by_name() -> List[str]:
+    """Legacy fallback when no responsible role/user is configured.
+
+    Returns all Accounting Managers, else a single CEO/COO. Empty if none found.
+    """
+    roles_response = supabase.table("rols").select("rol_id").ilike(
+        "rol_name", "%accounting manager%"
+    ).execute()
+    if roles_response.data:
+        role_ids = [r["rol_id"] for r in roles_response.data]
+        users_response = supabase.table("users").select("user_id").in_(
+            "user_rol", role_ids
+        ).execute()
+        ids = [u["user_id"] for u in (users_response.data or []) if u.get("user_id")]
+        if ids:
+            return ids
+
+    roles_response = supabase.table("rols").select("rol_id").or_(
+        "rol_name.ilike.%CEO%,rol_name.ilike.%COO%"
+    ).execute()
+    if roles_response.data:
+        role_ids = [r["rol_id"] for r in roles_response.data]
+        users_response = supabase.table("users").select("user_id").in_(
+            "user_rol", role_ids
+        ).limit(1).execute()
+        ids = [u["user_id"] for u in (users_response.data or []) if u.get("user_id")]
+        if ids:
+            return ids
+
+    return []
+
+
+def _resolve_pending_expense_managers(settings: Dict[str, Any]) -> List[str]:
+    """Resolve the responsible manager user_ids for the pending-expenses automation.
+
+    - responsible_type == 'user': the configured default_manager_id (one user).
+    - responsible_type == 'role': every user whose user_rol == responsible_role_id
+      (one task per project, all of them as managers -> shows on each dashboard).
+    - unset / not found: name-based fallback (Accounting Manager -> CEO/COO).
+
+    Returns a list of user_id strings (may be empty).
+    """
+    responsible_type = (settings.get("responsible_type") or "role").strip().lower()
+    role_id = settings.get("responsible_role_id")
+    manager_id = settings.get("default_manager_id")
+
+    if responsible_type == "user" and manager_id:
+        return [manager_id]
+
+    if responsible_type == "role" and role_id is not None:
+        users_response = supabase.table("users").select("user_id").eq(
+            "user_rol", role_id
+        ).execute()
+        ids = [u["user_id"] for u in (users_response.data or []) if u.get("user_id")]
+        if ids:
+            return ids
+        logger.warning("[AUTOMATIONS] Responsible role %s has no users; falling back", role_id)
+
+    # A manager configured without a role still wins over the name fallback.
+    if manager_id:
+        return [manager_id]
+
+    return _resolve_expense_managers_by_name()
+
+
+def trigger_pending_expenses_automation() -> None:
+    """Background-task entrypoint, called after expense create/edit.
+
+    Runs the pending-expenses automation only when it is enabled in settings.
+    Idempotent (upserts one task per project, clears tasks for projects with no
+    remaining pending expenses) and never raises -- safe to fire-and-forget.
+    """
+    try:
+        settings_response = supabase.table("automation_settings").select(
+            "is_enabled"
+        ).eq("automation_type", "pending_expenses_auth").execute()
+        enabled = bool(settings_response.data and settings_response.data[0].get("is_enabled"))
+        if not enabled:
+            return
+        _run_pending_expenses_automation()
+    except Exception as e:  # never block the expense write path
+        logger.error("[AUTOMATIONS] trigger_pending_expenses_automation failed: %s", repr(e))
+
+
 @router.post("/automations/run")
 def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
     """
@@ -1047,6 +1131,10 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
                 tasks_updated += updated
             elif automation_id == "pending_health_check":
                 created, updated = _run_pending_health_check_automation()
+                tasks_created += created
+                tasks_updated += updated
+            elif automation_id == "manual_responsibilities":
+                created, updated = _run_manual_responsibilities()
                 tasks_created += created
                 tasks_updated += updated
             elif automation_id == "pending_invoices":
@@ -1195,53 +1283,22 @@ def _run_pending_expenses_automation() -> tuple:
         else:
             logger.warning("[AUTOMATIONS] WARNING: Bookkeeping department not found")
 
-        # 5. Encontrar un manager para autorizacion (Accounting Manager o CEO/COO)
-        expense_manager_id = None
-
-        # Primero buscar Accounting Manager
-        roles_response = supabase.table("rols").select("rol_id").ilike(
-            "rol_name", "%accounting manager%"
-        ).execute()
-
-        if roles_response.data:
-            role_ids = [r["rol_id"] for r in roles_response.data]
-            users_response = supabase.table("users").select("user_id").in_(
-                "user_rol", role_ids
-            ).limit(1).execute()
-
-            if users_response.data:
-                expense_manager_id = users_response.data[0]["user_id"]
-                logger.info(f"[AUTOMATIONS] Found Accounting Manager: {expense_manager_id}")
-
-        # Si no hay Accounting Manager, buscar CEO/COO
-        if not expense_manager_id:
-            roles_response = supabase.table("rols").select("rol_id").or_(
-                "rol_name.ilike.%CEO%,rol_name.ilike.%COO%"
-            ).execute()
-
-            if roles_response.data:
-                role_ids = [r["rol_id"] for r in roles_response.data]
-                users_response = supabase.table("users").select("user_id").in_(
-                    "user_rol", role_ids
-                ).limit(1).execute()
-
-                if users_response.data:
-                    expense_manager_id = users_response.data[0]["user_id"]
-                    logger.info(f"[AUTOMATIONS] Found CEO/COO as manager: {expense_manager_id}")
-
-        if not expense_manager_id:
-            logger.warning("[AUTOMATIONS] WARNING: No manager found for expense authorization")
-
-        # 6. Obtener configuracion de la automatizacion
+        # 5. Obtener configuracion de la automatizacion
         settings_response = supabase.table("automation_settings").select(
             "*"
         ).eq("automation_type", automation_type).execute()
 
         settings = settings_response.data[0] if settings_response.data else {}
         default_owner_id = settings.get("default_owner_id")
-        # Use settings manager if found, otherwise fallback to expense_manager_id
-        settings_manager_id = settings.get("default_manager_id") or expense_manager_id
         settings_department_id = settings.get("default_department_id") or bookkeeping_dept_id
+
+        # 6. Resolver quien es responsable -> lista de manager user_ids.
+        # responsible_type='role' -> todos los usuarios del rol (una tarea por
+        # proyecto, todos como managers). responsible_type='user' -> ese usuario.
+        # Sin configurar -> fallback por nombre (Accounting Manager -> CEO/COO).
+        responsible_manager_ids = _resolve_pending_expense_managers(settings)
+        if not responsible_manager_ids:
+            logger.warning("[AUTOMATIONS] WARNING: No manager resolved for expense authorization")
 
         # 7. Buscar tareas automatizadas existentes para estos proyectos
         existing_tasks_response = supabase.table("tasks").select(
@@ -1269,18 +1326,27 @@ def _run_pending_expenses_automation() -> tuple:
             ).eq("automation_type", automation_type).eq("project_id", project_id).execute()
 
             owner_id = default_owner_id
-            manager_id = settings_manager_id
+            manager_ids = list(responsible_manager_ids)
             if override_response.data:
                 override = override_response.data[0]
                 owner_id = override.get("owner_id") or default_owner_id
-                manager_id = override.get("manager_id") or settings_manager_id
+                # A project-level manager override pins the task to that single user.
+                if override.get("manager_id"):
+                    manager_ids = [override["manager_id"]]
+
+            # Legacy single-manager column keeps the first responsible user so old
+            # views still work; managers_ids[] is what my-tasks queries match on.
+            legacy_manager = manager_ids[0] if manager_ids else None
 
             if project_id in existing_tasks_map:
-                # Actualizar tarea existente
+                # Actualizar tarea existente (refresca conteo + responsables por si
+                # cambio la membresia del rol o la config).
                 existing_task = existing_tasks_map[project_id]
                 supabase.table("tasks").update({
                     "task_description": task_description,
                     "task_notes": task_notes,
+                    "managers_ids": manager_ids,
+                    "manager": legacy_manager,
                     "automation_metadata": {"count": count, "total": total},
                 }).eq("task_id", existing_task["task_id"]).execute()
 
@@ -1295,7 +1361,8 @@ def _run_pending_expenses_automation() -> tuple:
                     "Owner_id": owner_id,  # Puede ser None si no hay default
                     "task_status": not_started_status_id,
                     "task_department": settings_department_id,
-                    "manager": manager_id,
+                    "managers_ids": manager_ids,
+                    "manager": legacy_manager,
                     "automation_type": automation_type,
                     "is_automated": True,
                     "automation_metadata": {"count": count, "total": total},
@@ -1319,6 +1386,215 @@ def _run_pending_expenses_automation() -> tuple:
 
     except Exception as e:
         logger.error(f"[AUTOMATIONS] ERROR in pending_expenses_auth: {repr(e)}")
+        logger.debug(traceback.format_exc())
+        raise
+
+
+# =============================================================================
+# MANUAL RESPONSIBILITIES -> TASKS
+# -----------------------------------------------------------------------------
+# Turns admin-created rows in `responsibilities` into pipeline tasks that surface
+# in each owner's "My Work". One shared task per responsibility (role -> every
+# member as managers_ids; user -> Owner_id). Idempotent: tasks are keyed by
+# automation_type='manual_responsibility' + automation_source_id=responsibility_id.
+# =============================================================================
+MANUAL_RESPONSIBILITY_TYPE = "manual_responsibility"
+
+
+def _resolve_responsibility_assignees(resp: Dict[str, Any]) -> tuple:
+    """(owner_id, manager_ids) for a responsibility.
+
+    - responsible_type='user': owner_id=that user (so it shows in /my-work too).
+    - responsible_type='role': managers_ids=every member of the role (shared task).
+    """
+    rtype = (resp.get("responsible_type") or "role").strip().lower()
+    if rtype == "user" and resp.get("responsible_user_id"):
+        return resp["responsible_user_id"], []
+    if rtype == "role" and resp.get("responsible_role_id") is not None:
+        users = supabase.table("users").select("user_id").eq(
+            "user_rol", resp["responsible_role_id"]
+        ).execute()
+        ids = [u["user_id"] for u in (users.data or []) if u.get("user_id")]
+        return None, ids
+    return None, []
+
+
+def _responsibility_recurrence_due(recurrence: str, last_generated_at) -> bool:
+    """Whether a responsibility is due to (re)generate its task.
+
+    'none' generates exactly once (when never generated). The others re-generate
+    after the cadence interval has elapsed since last_generated_at.
+    """
+    from datetime import datetime, timedelta, timezone
+    if not last_generated_at:
+        return True
+    if recurrence == "none":
+        return False
+    try:
+        last = datetime.fromisoformat(str(last_generated_at).replace("Z", "+00:00"))
+    except Exception:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - last
+    intervals = {
+        "daily": timedelta(days=1),
+        "weekly": timedelta(days=7),
+        "monthly": timedelta(days=30),
+    }
+    return delta >= intervals.get(recurrence, timedelta.max)
+
+
+def _active_project_ids() -> List[str]:
+    """Project ids that are not in a closed/finished state (best-effort heuristic)."""
+    try:
+        rows = supabase.table("projects").select(
+            "project_id, project_status(status)"
+        ).execute().data or []
+    except Exception:
+        rows = supabase.table("projects").select("project_id").execute().data or []
+    closed_markers = ("complete", "done", "closed", "cancel", "archiv")
+    ids: List[str] = []
+    for p in rows:
+        rel = p.get("project_status")
+        status_name = ""
+        if isinstance(rel, dict):
+            status_name = (rel.get("status") or "").lower()
+        elif isinstance(rel, list) and rel:
+            status_name = (rel[0].get("status") or "").lower()
+        if not any(m in status_name for m in closed_markers):
+            ids.append(p["project_id"])
+    return ids
+
+
+def trigger_manual_responsibilities() -> None:
+    """Fire-and-forget entrypoint; never raises. Safe to call from any write path."""
+    try:
+        _run_manual_responsibilities()
+    except Exception as e:
+        logger.error("[AUTOMATIONS] trigger_manual_responsibilities failed: %s", repr(e))
+
+
+def _run_manual_responsibilities() -> tuple:
+    """Generate/refresh tasks for enabled manual responsibilities.
+
+    Returns (tasks_created, tasks_updated). Defensive: if the `responsibilities`
+    table is not migrated yet, returns (0, 0) without raising.
+    """
+    from datetime import datetime, timezone
+    logger.info("[AUTOMATIONS] Running manual_responsibilities...")
+
+    tasks_created = 0
+    tasks_updated = 0
+
+    try:
+        try:
+            rows = supabase.table("responsibilities").select("*").eq(
+                "is_enabled", True
+            ).execute().data or []
+        except Exception as e:
+            logger.warning("[AUTOMATIONS] responsibilities table read skipped (not migrated?): %s", e)
+            return (0, 0)
+
+        if not rows:
+            return (0, 0)
+
+        # "not started" status for new tasks.
+        status_response = supabase.table("tasks_status").select(
+            "task_status_id"
+        ).ilike("task_status", "not started").execute()
+        not_started_status_id = (
+            status_response.data[0]["task_status_id"] if status_response.data else None
+        )
+
+        for resp in rows:
+            rid = resp.get("responsibility_id")
+            recurrence = (resp.get("recurrence") or "none").strip().lower()
+            scope = (resp.get("project_scope") or "none").strip().lower()
+            due = _responsibility_recurrence_due(recurrence, resp.get("last_generated_at"))
+
+            owner_id, manager_ids = _resolve_responsibility_assignees(resp)
+            legacy_manager = manager_ids[0] if manager_ids else None
+
+            # Which projects this responsibility spawns tasks for.
+            if scope == "specific" and resp.get("project_id"):
+                target_projects: List[Optional[str]] = [resp["project_id"]]
+            elif scope == "all_active":
+                target_projects = list(_active_project_ids()) or [None]
+            else:
+                target_projects = [None]  # standalone task, no project
+
+            # Existing tasks for this responsibility, keyed by project_id.
+            existing = supabase.table("tasks").select("task_id, project_id").eq(
+                "automation_type", MANUAL_RESPONSIBILITY_TYPE
+            ).eq("automation_source_id", rid).execute().data or []
+            existing_by_project = {t.get("project_id"): t for t in existing}
+
+            # Project names for nicer descriptions.
+            names: Dict[str, str] = {}
+            proj_ids = [p for p in target_projects if p]
+            if proj_ids:
+                pr = supabase.table("projects").select(
+                    "project_id, project_name"
+                ).in_("project_id", proj_ids).execute().data or []
+                names = {p["project_id"]: p.get("project_name") for p in pr}
+
+            title = resp.get("title") or "Responsibility"
+            notes = f"{AUTOMATION_MARKER}:manual_responsibility"
+            if resp.get("description"):
+                notes += f" | {resp['description']}"
+
+            for pid in target_projects:
+                description = title if not pid else f"{title} — {names.get(pid, 'Project')}"
+                ex = existing_by_project.get(pid)
+
+                if ex and (recurrence == "none" or not due):
+                    # Standing or not-yet-due task: refresh assignment so role
+                    # membership / config changes propagate without duplicating.
+                    supabase.table("tasks").update({
+                        "task_description": description,
+                        "task_notes": notes,
+                        "managers_ids": manager_ids,
+                        "manager": legacy_manager,
+                        "Owner_id": owner_id,
+                        "task_department": resp.get("department_id"),
+                    }).eq("task_id", ex["task_id"]).execute()
+                    tasks_updated += 1
+                elif due:
+                    # First generation, or a recurring period came due -> new task.
+                    supabase.table("tasks").insert({
+                        "task_description": description,
+                        "task_notes": notes,
+                        "project_id": pid,
+                        "Owner_id": owner_id,
+                        "task_status": not_started_status_id,
+                        "task_department": resp.get("department_id"),
+                        "managers_ids": manager_ids,
+                        "manager": legacy_manager,
+                        "automation_type": MANUAL_RESPONSIBILITY_TYPE,
+                        "automation_source_id": rid,
+                        "is_automated": True,
+                        "automation_metadata": {
+                            "responsibility_id": rid,
+                            "priority": resp.get("priority"),
+                            "recurrence": recurrence,
+                        },
+                    }).execute()
+                    tasks_created += 1
+
+            if due:
+                supabase.table("responsibilities").update({
+                    "last_generated_at": datetime.now(timezone.utc).isoformat()
+                }).eq("responsibility_id", rid).execute()
+
+        logger.info(
+            "[AUTOMATIONS] manual_responsibilities done: %s created, %s updated",
+            tasks_created, tasks_updated,
+        )
+        return (tasks_created, tasks_updated)
+
+    except Exception as e:
+        logger.error("[AUTOMATIONS] ERROR in manual_responsibilities: %s", repr(e))
         logger.debug(traceback.format_exc())
         raise
 
@@ -1794,13 +2070,39 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
         if not valid_status_ids:
             return {"tasks": [], "workload": {}}
 
-        # 2. Obtener tareas del usuario con status válidos
-        query = supabase.table("tasks").select("*").eq("Owner_id", user_id)
-        query = query.in_("task_status", valid_status_ids)
-        tasks_response = query.order("deadline", desc=False).execute()
-        tasks = tasks_response.data or []
+        # 2. Obtener tareas del usuario (owner + manager) con status válidos.
+        #    Incluye tareas donde el usuario es manager (managers_ids[] o manager
+        #    legacy), no solo owner, para que las responsabilidades de rol-compartido
+        #    aparezcan en el widget de carga, no solo en el feed del dashboard.
+        tasks_by_id: Dict[str, Dict] = {}
 
-        logger.info(f"[MY-WORK] Found {len(tasks)} tasks for user")
+        def _collect(query_builder, role: str) -> None:
+            """Run a tasks query and merge rows by task_id (first role wins)."""
+            try:
+                rows = query_builder.in_("task_status", valid_status_ids).execute().data or []
+            except Exception as _exc:  # missing column on older DBs, etc.
+                logger.debug("[MY-WORK] query (%s) skipped: %s", role, _exc)
+                return
+            for row in rows:
+                tid = row.get("task_id")
+                if not tid:
+                    continue
+                if tid not in tasks_by_id:
+                    row["_role"] = role
+                    tasks_by_id[tid] = row
+
+        # Owner first so it wins the role label over manager when both match.
+        _collect(supabase.table("tasks").select("*").eq("Owner_id", user_id), "owner")
+        _collect(supabase.table("tasks").select("*").contains("managers_ids", [user_id]), "manager")
+        _collect(supabase.table("tasks").select("*").eq("manager", user_id), "manager")
+
+        # Sort by deadline ascending, tasks without a deadline last.
+        tasks = sorted(
+            tasks_by_id.values(),
+            key=lambda t: (t.get("deadline") is None, t.get("deadline") or ""),
+        )
+
+        logger.info(f"[MY-WORK] Found {len(tasks)} tasks for user (owner + manager)")
 
         if not tasks:
             return {
@@ -1898,6 +2200,7 @@ def get_my_work_data(user_id: str, hours_per_day: float = 8.0, days_per_week: in
                 "status_name": status_name_map.get(status_id),
                 "type_id": type_id,
                 "type_name": type_name,
+                "role": task.get("_role", "owner"),  # owner | manager
                 "is_automated": is_automated,
                 "due_date": task.get("due_date"),
                 "deadline": task.get("deadline"),
@@ -2260,6 +2563,10 @@ class AutomationSettingsUpdate(BaseModel):
     default_department_id: Optional[str] = None
     default_priority: Optional[int] = None
     config: Optional[Dict[str, Any]] = None
+    # Responsible party selection (pending_expenses_auth and similar).
+    # 'role' -> assign to every user in responsible_role_id; 'user' -> default_manager_id.
+    responsible_type: Optional[str] = None  # 'role' | 'user'
+    responsible_role_id: Optional[str] = None  # rols.rol_id (uuid)
 
 
 class AutomationOverrideCreate(BaseModel):
@@ -2300,16 +2607,30 @@ def get_automation_settings() -> Dict[str, Any]:
         ).execute()
         depts_map = {d["department_id"]: d for d in (depts_response.data or [])}
 
+        # Get roles (for responsible_role resolution) + member counts.
+        roles_response = supabase.table("rols").select("rol_id, rol_name").execute()
+        roles_map = {r["rol_id"]: r for r in (roles_response.data or [])}
+
+        # Count users per role so the UI can show "Accounting Manager (4 people)".
+        role_users_response = supabase.table("users").select("user_rol").execute()
+        role_counts: Dict[Any, int] = {}
+        for u in (role_users_response.data or []):
+            rid = u.get("user_rol")
+            if rid is not None:
+                role_counts[rid] = role_counts.get(rid, 0) + 1
+
         # Enrich settings with related data
         enriched = []
         for s in settings:
             owner_id = s.get("default_owner_id")
             manager_id = s.get("default_manager_id")
             dept_id = s.get("default_department_id")
+            role_id = s.get("responsible_role_id")
 
             owner_data = users_map.get(owner_id) if owner_id else None
             manager_data = users_map.get(manager_id) if manager_id else None
             dept_data = depts_map.get(dept_id) if dept_id else None
+            role_data = roles_map.get(role_id) if role_id is not None else None
 
             enriched.append({
                 **s,
@@ -2327,6 +2648,11 @@ def get_automation_settings() -> Dict[str, Any]:
                     "id": dept_id,
                     "name": dept_data["department_name"] if dept_data else None,
                 } if dept_id else None,
+                "responsible_role": {
+                    "id": role_id,
+                    "name": role_data["rol_name"] if role_data else None,
+                    "member_count": role_counts.get(role_id, 0),
+                } if role_id is not None else None,
             })
 
         return {"settings": enriched}

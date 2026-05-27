@@ -132,6 +132,9 @@ from api.routers.portal import router as portal_router
 # ========= NGM CONNECT: internal curation + client-access control ==========
 from api.routers.connect import router as connect_router
 
+# ========= RESPONSIBILITIES: unified role/user duties -> pipeline tasks =====
+from api.routers.responsibilities import router as responsibilities_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -314,6 +317,9 @@ app.include_router(portal_router)
 
 # NGM Connect (internal curation + client-access control)
 app.include_router(connect_router)
+
+# Responsibilities (unified role/user duties -> pipeline tasks -> My Work)
+app.include_router(responsibilities_router)
 
 _mem_logger = logging.getLogger("memory")
 
