@@ -1134,6 +1134,24 @@ def _estimate_name(node: dict, fallback: str) -> str:
     return fallback
 
 
+def _next_working_day(d):
+    """Advance to Monday if the date lands on a weekend (Sat=5, Sun=6)."""
+    while d.weekday() >= 5:
+        d = d + timedelta(days=1)
+    return d
+
+
+def _add_working_days(start, days: int):
+    """Date that is `days` working days after `start` (weekends skipped)."""
+    d = _next_working_day(start)
+    remaining = max(0, days)
+    while remaining > 0:
+        d = d + timedelta(days=1)
+        if d.weekday() < 5:
+            remaining -= 1
+    return d
+
+
 @router.post("/projects/{project_id}/import-estimate")
 async def import_estimate_timeline(
     project_id: str,
@@ -1201,16 +1219,18 @@ async def import_estimate_timeline(
         dur = 1
 
     # ── Build phases: category summary + subcategory tasks ─────────────
+    # Scheduled on working days only (weekends are skipped), so generated
+    # timelines never start a task on a Saturday/Sunday.
     phases: list[dict] = []
     phase_parent_indices: list[int | None] = []
-    cursor = start
+    cursor = _next_working_day(start)
     order = 0
 
     for ci, cat in enumerate(categories):
         color = PHASE_COLORS[ci % len(PHASE_COLORS)]
         subs = cat.get("subcategories") or []
         cat_index = len(phases)
-        cat_start = cursor
+        cat_start = _next_working_day(cursor)
 
         # Reserve the category row; its dates are filled after its children.
         phases.append({
@@ -1224,15 +1244,16 @@ async def import_estimate_timeline(
             "phase_order": order,
             "wbs_number": str(ci + 1),
             "start_date": cat_start.isoformat(),
-            "end_date": (cat_start + timedelta(days=dur)).isoformat(),
+            "end_date": _add_working_days(cat_start, dur).isoformat(),
             "duration_days": dur,
         })
         phase_parent_indices.append(None)
         order += 1
+        cursor = cat_start
 
         for si, sub in enumerate(subs):
-            s = cursor
-            e = cursor + timedelta(days=dur)
+            s = _next_working_day(cursor)
+            e = _add_working_days(s, dur)
             phases.append({
                 "project_id": project_id,
                 "phase_name": _estimate_name(sub, f"Subcategory {si + 1}"),
@@ -1258,7 +1279,7 @@ async def import_estimate_timeline(
             phases[cat_index]["end_date"] = cursor.isoformat()
             phases[cat_index]["duration_days"] = (cursor - cat_start).days
         else:
-            cursor = cat_start + timedelta(days=dur)
+            cursor = _add_working_days(cat_start, dur)
 
     # ── Replace mode: clear existing timeline ──────────────────────────
     try:
