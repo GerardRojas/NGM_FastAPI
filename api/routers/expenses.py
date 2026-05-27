@@ -348,6 +348,10 @@ def create_expense(payload: ExpenseCreate, background_tasks: BackgroundTasks, cu
             from api.services.daneel_auto_auth import trigger_auto_auth_check
             background_tasks.add_task(trigger_auto_auth_check, expense_id, project_id)
 
+        # Refresh the pending-expenses task for the responsible role/user (no-op if disabled)
+        from api.routers.pipeline import trigger_pending_expenses_automation
+        background_tasks.add_task(trigger_pending_expenses_automation)
+
         return {
             "message": "Expense created",
             "expense": created,
@@ -445,6 +449,10 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
         for exp in no_bill:
             background_tasks.add_task(trigger_auto_auth_check, exp["expense_id"], exp["project"])
 
+        # Refresh pending-expenses tasks once for the whole batch (no-op if disabled)
+        from api.routers.pipeline import trigger_pending_expenses_automation
+        background_tasks.add_task(trigger_pending_expenses_automation)
+
         return {
             "message": f"Batch insert completed: {len(created_expenses)} created",
             "created": created_expenses,
@@ -463,7 +471,7 @@ def create_expenses_batch(payload: ExpenseBatchCreate, background_tasks: Backgro
 
 
 @router.patch("/batch")
-def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+def update_expenses_batch(payload: ExpenseBatchUpdate, background_tasks: BackgroundTasks, user_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """
     Actualiza múltiples gastos en una sola operación.
     Cada update se procesa individualmente pero en una sola llamada HTTP.
@@ -480,6 +488,7 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
         updated = []
         failed = []
         status_logs = []
+        any_status_change = False
 
         for item in payload.updates:
             try:
@@ -487,6 +496,8 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                 update_data = item.data.model_dump(exclude_unset=True)
                 # Safety net: remove any remaining empty strings (prevents UUID parse errors)
                 update_data = {k: v for k, v in update_data.items() if not (isinstance(v, str) and v.strip() == '')}
+                if "status" in update_data or "auth_status" in update_data:
+                    any_status_change = True
 
                 # When de-authorizing (status→review), ensure auth_by is cleared.
                 # exclude_none=True drops auth_by=None, so re-add it explicitly.
@@ -575,6 +586,12 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, user_id: Optional[str] = 
                 supabase.table("expense_status_log").insert(status_logs).execute()
             except Exception as log_err:
                 print(f"[BATCH] Status log insert failed: {log_err}")
+
+        # When authorizations/flags changed, refresh the pending-expenses tasks so
+        # they clear (or update counts) for the responsible role/user. No-op if disabled.
+        if any_status_change:
+            from api.routers.pipeline import trigger_pending_expenses_automation
+            background_tasks.add_task(trigger_pending_expenses_automation)
 
         return {
             "message": f"Batch update completed: {len(updated)} updated, {len(failed)} failed",
@@ -1477,6 +1494,11 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
                 from api.services.budget_monitor import trigger_project_budget_check
                 background_tasks.add_task(trigger_project_budget_check, project_id)
 
+        # Refresh the pending-expenses task when status changed (no-op if disabled)
+        if status_changed:
+            from api.routers.pipeline import trigger_pending_expenses_automation
+            background_tasks.add_task(trigger_pending_expenses_automation)
+
         return {
             "message": "Expense updated successfully",
             "expense": updated_exp,
@@ -1652,6 +1674,10 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
             if project_id:
                 from api.services.budget_monitor import trigger_project_budget_check
                 background_tasks.add_task(trigger_project_budget_check, project_id)
+
+        # Refresh the pending-expenses task for the responsible role/user (no-op if disabled)
+        from api.routers.pipeline import trigger_pending_expenses_automation
+        background_tasks.add_task(trigger_pending_expenses_automation)
 
         return {
             "message": "Status updated successfully",
