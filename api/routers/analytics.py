@@ -92,6 +92,32 @@ def _user_has_permission(current_user: dict, module_key: str) -> bool:
         return False
 
 
+def _user_has_any_permission(current_user: dict, module_keys: list[str]) -> bool:
+    """Return True if the caller's role has can_view on ANY of *module_keys*.
+
+    Lets a single endpoint be reached via several equivalent permission keys —
+    e.g. the migrated React Analytics grants access through `analytics` /
+    `reporting`, while the legacy executive view used `project_kpis`.
+    """
+    user_role_id = current_user.get("user_rol")
+    if not user_role_id or not module_keys:
+        return False
+    try:
+        resp = (
+            supabase.table("role_permissions")
+            .select("can_view, module_key")
+            .eq("rol_id", user_role_id)
+            .in_("module_key", module_keys)
+            .eq("can_view", True)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as exc:
+        logger.error("[analytics] permission check %s: %s", module_keys, exc)
+        return False
+
+
 def _name_map(table: str, id_col: str, name_col: str, ids: set) -> dict:
     """Resolve a set of ids to display names via a single table fetch."""
     if not ids:
@@ -713,13 +739,14 @@ async def expense_timeline(
 async def executive_kpis(current_user: dict = Depends(get_current_user)):
     """
     Multi-project KPI aggregation for the executive dashboard.
-    Requires the `project_kpis` permission (can_view) on the caller's role.
+    Reachable by any role with can_view on `project_kpis`, `analytics`, or
+    `reporting` — the Analytics page powers its Overview tab from this endpoint.
     """
 
     # --- Permission check ---
     if not current_user.get("user_rol"):
         raise HTTPException(status_code=403, detail="No role assigned to user")
-    if not _user_has_permission(current_user, "project_kpis"):
+    if not _user_has_any_permission(current_user, ["project_kpis", "analytics", "reporting"]):
         raise HTTPException(
             status_code=403,
             detail="You do not have permission to view executive KPIs",
