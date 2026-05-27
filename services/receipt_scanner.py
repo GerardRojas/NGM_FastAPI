@@ -1960,7 +1960,48 @@ def auto_categorize_fast(
         except Exception as e:
             logger.warning(f"[FastCat][Rules] Error (marking unresolved): {e}")
 
-    # ── Unresolved items (no GPT fallback in fast mode) ────────
+    # ── Low-confidence ML suggestion fallback ──────────────────
+    # Nothing matched confidently above. Rather than leave these blank, ask the
+    # ML model for its best guess regardless of confidence and return it as a
+    # low-confidence SUGGESTION the user can keep or override. These are NOT
+    # cached (a guess must never become future "truth").
+    suggest_hits = 0
+    if remaining:
+        try:
+            from api.services.categorization_ml import get_ml_service
+
+            ml_service = get_ml_service()
+            ml_service.ensure_trained(supabase)
+
+            if ml_service.is_trained:
+                ml_suggestions = ml_service.predict_batch(
+                    remaining,
+                    construction_stage=stage,
+                    min_confidence=0.0,
+                    suggest_below_threshold=True,
+                )
+                still_remaining = []
+                for exp, ml_sugg in zip(remaining, ml_suggestions):
+                    if ml_sugg and ml_sugg.get("account_id"):
+                        suggest_hits += 1
+                        conf = ml_sugg["confidence"]
+                        categorizations.append({
+                            "rowIndex": exp["rowIndex"],
+                            "account_id": ml_sugg["account_id"],
+                            "account_name": ml_sugg["account_name"],
+                            "confidence": conf,
+                            "reasoning": f"Low-confidence suggestion ({conf}%) - please review",
+                            "warning": "Low confidence - review the suggested account",
+                            "source": "ml-suggested",
+                        })
+                    else:
+                        still_remaining.append(exp)
+                remaining = still_remaining
+                logger.info(f"[FastCat][Suggest] {suggest_hits} low-confidence suggestions offered")
+        except Exception as e:
+            logger.warning(f"[FastCat][Suggest] Error (marking unresolved): {e}")
+
+    # ── Truly unresolved items (no candidate at all) ───────────
     for exp in remaining:
         categorizations.append({
             "rowIndex": exp["rowIndex"],
@@ -1968,7 +2009,7 @@ def auto_categorize_fast(
             "account_name": None,
             "confidence": 0,
             "reasoning": "unresolved - review manually",
-            "warning": "No confident match found (fast mode, no AI fallback)",
+            "warning": "No match found - pick an account manually",
             "source": "unresolved",
         })
 
@@ -1982,6 +2023,7 @@ def auto_categorize_fast(
         "affinity_hits": affinity_hits,
         "ml_hits": ml_hits,
         "rule_hits": rule_hits,
+        "ml_suggested": suggest_hits,
         "unresolved": len(remaining),
         "total_items": len(expenses),
         "processing_time_ms": elapsed_ms,

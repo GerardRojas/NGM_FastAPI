@@ -510,11 +510,18 @@ class CategorizationMLService:
         items: list[dict],
         construction_stage: str = None,
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+        suggest_below_threshold: bool = False,
     ) -> list[Optional[dict]]:
         """Batch prediction for multiple items.
 
         Each item should have a "description" key.
         Returns a list of results (same order), None for items below threshold.
+
+        When ``suggest_below_threshold`` is True, items below ``min_confidence``
+        still return their top candidate (flagged ``"low_confidence": True``)
+        instead of None, so callers can offer it as a low-confidence suggestion
+        the user can keep or override. Only items with no candidate at all stay
+        None. Default (False) preserves the strict "None below threshold" contract.
 
         For efficiency, vectorizes all descriptions at once and runs a single
         k-NN query instead of N individual ones.
@@ -599,6 +606,17 @@ class CategorizationMLService:
                         "account_name": winner["account_name"],
                         "confidence": round(final_confidence, 1),
                         "source": "ml",
+                        "neighbors": neighbors,
+                    }
+                elif suggest_below_threshold:
+                    # Keep the top guess as a low-confidence suggestion so the
+                    # caller can pre-fill it for the user to review (not cached).
+                    results[orig_idx] = {
+                        "account_id": winner["account_id"],
+                        "account_name": winner["account_name"],
+                        "confidence": round(final_confidence, 1),
+                        "source": "ml",
+                        "low_confidence": True,
                         "neighbors": neighbors,
                     }
 
