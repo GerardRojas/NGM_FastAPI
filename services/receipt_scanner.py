@@ -297,6 +297,103 @@ def _fetch_lookup_data():
 
 # ====== PROMPTS ======
 
+# Shared prompt sections (identical across the vision and text prompts). Kept as
+# module constants so the tax/discount/validation rules live in ONE place — adding
+# a rule (e.g. discounts) used to require editing every prompt copy.
+_RULES_TAIL = """   FORBIDDEN DESCRIPTIONS (never use these as expense line items):
+   "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "Local Tax",
+   "HST", "GST", "PST", "VAT", "IVA", "Tax Amount", "Total Tax",
+   "Discount", "Discounts", "Coupon", "Rebate", "Markdown", "Savings", "You Saved"
+   If you catch yourself creating any of these, STOP and redistribute instead.
+
+   DISCOUNT HANDLING - If the receipt shows an invoice-level discount / coupon /
+   savings line (e.g. "Discounts -$10.00"), do NOT add it as a line item. Instead
+   REDUCE the real item amounts proportionally by their share of the subtotal so
+   the final amounts (after tax) sum to the GRAND TOTAL. A discount makes the total
+   SMALLER, so it is always a reduction, never a positive line item.
+
+   TAX-INCLUSIVE DETECTION - Use these criteria to determine if prices already include tax:
+   a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. In this case set tax_included=0 for all items and use the amounts as-is.
+   b) If the receipt shows a SUBTOTAL + TAX LINE + GRAND TOTAL structure, the line item prices are PRE-TAX. You MUST add the distributed tax to each item so the amounts sum to the GRAND TOTAL (not the subtotal).
+   c) If item prices already look like they include tax (e.g., the sum of line items already equals the grand total), do NOT add tax again. Set tax_included=0.
+   d) SELF-CHECK: After computing all amounts, verify SUM(all expense amounts) == GRAND TOTAL on receipt. If your sum equals the SUBTOTAL instead of the GRAND TOTAL, you forgot to distribute the tax - go back and fix it.
+
+6. FEES ARE LINE ITEMS (not distributed):
+   - These are NOT taxes and should be separate line items:
+     * DELIVERY & FREIGHT: "Outside Delivery", "Delivery Fee", "Delivery Charge", "Shipping", "Freight", "Freight Charge"
+       → Extract as separate line items with descriptions that clearly indicate delivery/freight service
+     * OTHER FEES: "Service Fee", "Convenience Fee", "Processing Fee", "Handling Fee", "Restocking Fee"
+       → Extract as separate line items with descriptive names
+     * ENVIRONMENTAL FEES: "CA LUMBER FEE", "Recycling Fee", "Environmental Charge", "Hazmat Fee"
+       → Extract with the exact fee name from the receipt
+     * SURCHARGES: "Fuel Surcharge", "Energy Surcharge"
+       → Extract as separate line items
+     * TIP/GRATUITY: "Tip", "Gratuity"
+       → Extract as separate line items
+   - Only actual TAX amounts (Sales Tax, VAT, GST, HST, IVA) get distributed across items
+   - IMPORTANT: Keep fee descriptions clear and specific (e.g., "Outside Delivery" not just "Fee")
+
+7. SINGLE TOTAL FALLBACK:
+   - If the receipt shows only ONE total with no itemization, create ONE expense with that total amount
+   - Use the vendor name or document title as the description
+
+8. Use the currency shown on the receipt (default to USD if not specified)"""
+
+
+_OUTPUT_SPEC = """VALIDATION - MANDATORY (do this BEFORE returning your response):
+1. Find the GRAND TOTAL / TOTAL DUE / AMOUNT DUE shown on the receipt - this is "invoice_total"
+2. Calculate the arithmetic sum of all your expense amounts - this is "calculated_sum"
+3. Compare them:
+   - If they match (within $0.02 tolerance), set "validation_passed" to true
+   - If they DON'T match, set "validation_passed" to false and include a "validation_warning" message
+4. The "invoice_total" must be the EXACT value printed on the receipt, not your calculation
+5. CRITICAL TAX SELF-CHECK: If calculated_sum equals the SUBTOTAL (pre-tax) instead of the GRAND TOTAL, you have NOT distributed the tax. Go back, recalculate each item's amount with its proportional tax share, and try again. The final amounts MUST sum to the GRAND TOTAL.
+6. If there is a tax line on the receipt, the sum of all "tax_included" values across items must equal the total tax amount shown on the receipt (within $0.02).
+
+Return ONLY valid JSON in this exact format:
+{
+  "expenses": [
+    {
+      "date": "2025-01-17",
+      "bill_id": "INV-12345",
+      "description": "Item name or description",
+      "vendor": "Exact vendor name from VENDORS list or Unknown",
+      "amount": 45.99,
+      "transaction_type": "Exact name from TRANSACTION TYPES list or Unknown",
+      "payment_method": "Exact name from PAYMENT METHODS list or Unknown",
+      "tax_included": 3.45
+    }
+  ],
+  "tax_summary": {
+    "total_tax_detected": 8.00,
+    "tax_label": "Sales Tax",
+    "subtotal": 100.00,
+    "grand_total": 108.00,
+    "distribution": [
+      {"description": "Item A", "original_amount": 60.00, "tax_added": 4.80, "final_amount": 64.80},
+      {"description": "Item B", "original_amount": 40.00, "tax_added": 3.20, "final_amount": 43.20}
+    ]
+  },
+  "validation": {
+    "invoice_total": 108.00,
+    "calculated_sum": 108.00,
+    "validation_passed": true,
+    "validation_warning": null
+  }
+}
+
+IMPORTANT:
+- NEVER create an expense line item for tax. "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions. If the receipt has a tax line, you MUST distribute it proportionally across the other items so their amounts sum to the GRAND TOTAL.
+- NEVER create an expense line item for a discount/coupon/savings. If the receipt has a discount line, REDUCE the real item amounts proportionally so the final amounts (with tax) sum to the GRAND TOTAL. The discount lowers the total — it is never a positive amount.
+- If NO tax was detected on the receipt, set "tax_summary" to null
+- The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
+- The "invoice_total" MUST be the exact total shown on the receipt/invoice document
+- If validation fails, explain in "validation_warning" why the numbers don't match (e.g., "Calculated sum $105.00 does not match invoice total $108.00 - possible missing item or rounding issue")
+- REMEMBER: Each expense "amount" should be the FINAL amount (with tax distributed). The sum of ALL "amount" fields = invoice_total.
+
+DO NOT include any text before or after the JSON. ONLY return the JSON object."""
+
+
 def _build_vision_prompt(vendors_list, txn_types_list, payment_methods_list, page_count_hint=""):
     """Build the main OCR prompt for vision mode."""
     return f"""You are an expert at extracting expense data from receipts, invoices, and bills.
@@ -370,91 +467,11 @@ IMPORTANT RULES:
    - Add "tax_included" field to each item showing the tax amount added to it
    - NOTE: Even if tax rate shows 0%, check for actual tax line amounts
 
-   FORBIDDEN DESCRIPTIONS (never use these as expense line items):
-   "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "Local Tax",
-   "HST", "GST", "PST", "VAT", "IVA", "Tax Amount", "Total Tax"
-   If you catch yourself creating any of these, STOP and redistribute instead.
-
-   TAX-INCLUSIVE DETECTION - Use these criteria to determine if prices already include tax:
-   a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. In this case set tax_included=0 for all items and use the amounts as-is.
-   b) If the receipt shows a SUBTOTAL + TAX LINE + GRAND TOTAL structure, the line item prices are PRE-TAX. You MUST add the distributed tax to each item so the amounts sum to the GRAND TOTAL (not the subtotal).
-   c) If item prices already look like they include tax (e.g., the sum of line items already equals the grand total), do NOT add tax again. Set tax_included=0.
-   d) SELF-CHECK: After computing all amounts, verify SUM(all expense amounts) == GRAND TOTAL on receipt. If your sum equals the SUBTOTAL instead of the GRAND TOTAL, you forgot to distribute the tax - go back and fix it.
-
-6. FEES ARE LINE ITEMS (not distributed):
-   - These are NOT taxes and should be separate line items:
-     * DELIVERY & FREIGHT: "Outside Delivery", "Delivery Fee", "Delivery Charge", "Shipping", "Freight", "Freight Charge"
-       → Extract as separate line items with descriptions that clearly indicate delivery/freight service
-     * OTHER FEES: "Service Fee", "Convenience Fee", "Processing Fee", "Handling Fee", "Restocking Fee"
-       → Extract as separate line items with descriptive names
-     * ENVIRONMENTAL FEES: "CA LUMBER FEE", "Recycling Fee", "Environmental Charge", "Hazmat Fee"
-       → Extract with the exact fee name from the receipt
-     * SURCHARGES: "Fuel Surcharge", "Energy Surcharge"
-       → Extract as separate line items
-     * TIP/GRATUITY: "Tip", "Gratuity"
-       → Extract as separate line items
-   - Only actual TAX amounts (Sales Tax, VAT, GST, HST, IVA) get distributed across items
-   - IMPORTANT: Keep fee descriptions clear and specific (e.g., "Outside Delivery" not just "Fee")
-
-7. SINGLE TOTAL FALLBACK:
-   - If the receipt shows only ONE total with no itemization, create ONE expense with that total amount
-   - Use the vendor name or document title as the description
-
-8. Use the currency shown on the receipt (default to USD if not specified)
+{_RULES_TAIL}
 
 9. CRITICAL: vendor, transaction_type, and payment_method MUST exactly match one from their respective lists, or use "Unknown"
 
-VALIDATION - MANDATORY (do this BEFORE returning your response):
-1. Find the GRAND TOTAL / TOTAL DUE / AMOUNT DUE shown on the receipt - this is "invoice_total"
-2. Calculate the arithmetic sum of all your expense amounts - this is "calculated_sum"
-3. Compare them:
-   - If they match (within $0.02 tolerance), set "validation_passed" to true
-   - If they DON'T match, set "validation_passed" to false and include a "validation_warning" message
-4. The "invoice_total" must be the EXACT value printed on the receipt, not your calculation
-5. CRITICAL TAX SELF-CHECK: If calculated_sum equals the SUBTOTAL (pre-tax) instead of the GRAND TOTAL, you have NOT distributed the tax. Go back, recalculate each item's amount with its proportional tax share, and try again. The final amounts MUST sum to the GRAND TOTAL.
-6. If there is a tax line on the receipt, the sum of all "tax_included" values across items must equal the total tax amount shown on the receipt (within $0.02).
-
-Return ONLY valid JSON in this exact format:
-{{
-  "expenses": [
-    {{
-      "date": "2025-01-17",
-      "bill_id": "INV-12345",
-      "description": "Item name or description",
-      "vendor": "Exact vendor name from VENDORS list or Unknown",
-      "amount": 45.99,
-      "transaction_type": "Exact name from TRANSACTION TYPES list or Unknown",
-      "payment_method": "Exact name from PAYMENT METHODS list or Unknown",
-      "tax_included": 3.45
-    }}
-  ],
-  "tax_summary": {{
-    "total_tax_detected": 8.00,
-    "tax_label": "Sales Tax",
-    "subtotal": 100.00,
-    "grand_total": 108.00,
-    "distribution": [
-      {{"description": "Item A", "original_amount": 60.00, "tax_added": 4.80, "final_amount": 64.80}},
-      {{"description": "Item B", "original_amount": 40.00, "tax_added": 3.20, "final_amount": 43.20}}
-    ]
-  }},
-  "validation": {{
-    "invoice_total": 108.00,
-    "calculated_sum": 108.00,
-    "validation_passed": true,
-    "validation_warning": null
-  }}
-}}
-
-IMPORTANT:
-- NEVER create an expense line item for tax. "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions. If the receipt has a tax line, you MUST distribute it proportionally across the other items so their amounts sum to the GRAND TOTAL.
-- If NO tax was detected on the receipt, set "tax_summary" to null
-- The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
-- The "invoice_total" MUST be the exact total shown on the receipt/invoice document
-- If validation fails, explain in "validation_warning" why the numbers don't match (e.g., "Calculated sum $105.00 does not match invoice total $108.00 - possible missing item or rounding issue")
-- REMEMBER: Each expense "amount" should be the FINAL amount (with tax distributed). The sum of ALL "amount" fields = invoice_total.
-
-DO NOT include any text before or after the JSON. ONLY return the JSON object."""
+{_OUTPUT_SPEC}"""
 
 
 def _build_text_prompt(vendors_list, txn_types_list, payment_methods_list, extracted_text):
@@ -535,91 +552,11 @@ IMPORTANT RULES:
    - Add "tax_included" field to each item showing the tax amount added to it
    - NOTE: Even if tax rate shows 0%, check for actual tax line amounts
 
-   FORBIDDEN DESCRIPTIONS (never use these as expense line items):
-   "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "Local Tax",
-   "HST", "GST", "PST", "VAT", "IVA", "Tax Amount", "Total Tax"
-   If you catch yourself creating any of these, STOP and redistribute instead.
-
-   TAX-INCLUSIVE DETECTION - Use these criteria to determine if prices already include tax:
-   a) If there is NO separate "Tax" / "Sales Tax" / "VAT" line on the receipt, prices are likely tax-inclusive. In this case set tax_included=0 for all items and use the amounts as-is.
-   b) If the receipt shows a SUBTOTAL + TAX LINE + GRAND TOTAL structure, the line item prices are PRE-TAX. You MUST add the distributed tax to each item so the amounts sum to the GRAND TOTAL (not the subtotal).
-   c) If item prices already look like they include tax (e.g., the sum of line items already equals the grand total), do NOT add tax again. Set tax_included=0.
-   d) SELF-CHECK: After computing all amounts, verify SUM(all expense amounts) == GRAND TOTAL on receipt. If your sum equals the SUBTOTAL instead of the GRAND TOTAL, you forgot to distribute the tax - go back and fix it.
-
-6. FEES ARE LINE ITEMS (not distributed):
-   - These are NOT taxes and should be separate line items:
-     * DELIVERY & FREIGHT: "Outside Delivery", "Delivery Fee", "Delivery Charge", "Shipping", "Freight", "Freight Charge"
-       → Extract as separate line items with descriptions that clearly indicate delivery/freight service
-     * OTHER FEES: "Service Fee", "Convenience Fee", "Processing Fee", "Handling Fee", "Restocking Fee"
-       → Extract as separate line items with descriptive names
-     * ENVIRONMENTAL FEES: "CA LUMBER FEE", "Recycling Fee", "Environmental Charge", "Hazmat Fee"
-       → Extract with the exact fee name from the receipt
-     * SURCHARGES: "Fuel Surcharge", "Energy Surcharge"
-       → Extract as separate line items
-     * TIP/GRATUITY: "Tip", "Gratuity"
-       → Extract as separate line items
-   - Only actual TAX amounts (Sales Tax, VAT, GST, HST, IVA) get distributed across items
-   - IMPORTANT: Keep fee descriptions clear and specific (e.g., "Outside Delivery" not just "Fee")
-
-7. SINGLE TOTAL FALLBACK:
-   - If the receipt shows only ONE total with no itemization, create ONE expense with that total amount
-   - Use the vendor name or document title as the description
-
-8. Use the currency shown on the receipt (default to USD if not specified)
+{_RULES_TAIL}
 
 9. CRITICAL: vendor, transaction_type, and payment_method MUST exactly match one from their respective lists. For payment_method, prefer "Debit" over "Unknown" when any card/electronic payment indicator is present.
 
-VALIDATION - MANDATORY (do this BEFORE returning your response):
-1. Find the GRAND TOTAL / TOTAL DUE / AMOUNT DUE shown on the receipt - this is "invoice_total"
-2. Calculate the arithmetic sum of all your expense amounts - this is "calculated_sum"
-3. Compare them:
-   - If they match (within $0.02 tolerance), set "validation_passed" to true
-   - If they DON'T match, set "validation_passed" to false and include a "validation_warning" message
-4. The "invoice_total" must be the EXACT value printed on the receipt, not your calculation
-5. CRITICAL TAX SELF-CHECK: If calculated_sum equals the SUBTOTAL (pre-tax) instead of the GRAND TOTAL, you have NOT distributed the tax. Go back, recalculate each item's amount with its proportional tax share, and try again. The final amounts MUST sum to the GRAND TOTAL.
-6. If there is a tax line on the receipt, the sum of all "tax_included" values across items must equal the total tax amount shown on the receipt (within $0.02).
-
-Return ONLY valid JSON in this exact format:
-{{
-  "expenses": [
-    {{
-      "date": "2025-01-17",
-      "bill_id": "INV-12345",
-      "description": "Item name or description",
-      "vendor": "Exact vendor name from VENDORS list or Unknown",
-      "amount": 45.99,
-      "transaction_type": "Exact name from TRANSACTION TYPES list or Unknown",
-      "payment_method": "Exact name from PAYMENT METHODS list or Unknown",
-      "tax_included": 3.45
-    }}
-  ],
-  "tax_summary": {{
-    "total_tax_detected": 8.00,
-    "tax_label": "Sales Tax",
-    "subtotal": 100.00,
-    "grand_total": 108.00,
-    "distribution": [
-      {{"description": "Item A", "original_amount": 60.00, "tax_added": 4.80, "final_amount": 64.80}},
-      {{"description": "Item B", "original_amount": 40.00, "tax_added": 3.20, "final_amount": 43.20}}
-    ]
-  }},
-  "validation": {{
-    "invoice_total": 108.00,
-    "calculated_sum": 108.00,
-    "validation_passed": true,
-    "validation_warning": null
-  }}
-}}
-
-IMPORTANT:
-- NEVER create an expense line item for tax. "Sales Tax", "Tax", "State Tax", "County Tax", "City Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions. If the receipt has a tax line, you MUST distribute it proportionally across the other items so their amounts sum to the GRAND TOTAL.
-- If NO tax was detected on the receipt, set "tax_summary" to null
-- The "tax_included" field in each expense should be the tax amount added to that specific item (0 if no tax was distributed to it, like for fees)
-- The "invoice_total" MUST be the exact total shown on the receipt/invoice document
-- If validation fails, explain in "validation_warning" why the numbers don't match (e.g., "Calculated sum $105.00 does not match invoice total $108.00 - possible missing item or rounding issue")
-- REMEMBER: Each expense "amount" should be the FINAL amount (with tax distributed). The sum of ALL "amount" fields = invoice_total.
-
-DO NOT include any text before or after the JSON. ONLY return the JSON object.
+{_OUTPUT_SPEC}
 
 --- RECEIPT TEXT START ---
 {extracted_text}
@@ -644,11 +581,12 @@ RULES:
 1. Use LINE TOTALS (extended amount), never unit prices. The line total is the largest dollar amount per item.
 2. Extract EVERY line item separately. Include: date (YYYY-MM-DD), bill_id (invoice/receipt number), description (with qty if shown), vendor, amount (number, no $), transaction_type, payment_method.
 3. TAX: If a separate tax line exists, distribute it proportionally across items by their share of the subtotal. Each item "amount" = pre-tax + proportional tax. Do NOT create a tax line item. Set tax_included per item. If no tax line, set tax_included=0.
-4. FEES (delivery, freight, environmental, surcharges, tips) are separate line items, NOT distributed like tax.
-5. Prefer "Debit" over "Unknown" for payment_method when any card/electronic indicator exists.
-6. If only one total with no itemization, create one expense with that total.
+4. DISCOUNT/COUPON/SAVINGS: If a discount line exists, do NOT create a line item for it. REDUCE the real item amounts proportionally so the final amounts (with tax) sum to the grand total. A discount lowers the total — never a positive line.
+5. FEES (delivery, freight, environmental, surcharges, tips) are separate line items, NOT distributed like tax.
+6. Prefer "Debit" over "Unknown" for payment_method when any card/electronic indicator exists.
+7. If only one total with no itemization, create one expense with that total.
 
-IMPORTANT: NEVER create an expense for "Sales Tax", "Tax", "State Tax", "HST", "GST", "VAT", or any tax. Distribute tax across items instead.
+IMPORTANT: NEVER create an expense for "Sales Tax", "Tax", "State Tax", "HST", "GST", "VAT", or any tax, NOR for a "Discount", "Coupon" or "Savings". Distribute tax across items, and subtract discounts proportionally from items, instead.
 
 VALIDATION (mandatory):
 - invoice_total = exact grand total printed on receipt
@@ -698,7 +636,11 @@ TAX RULES:
 - The sum of ALL "amount" fields MUST equal the invoice total (${invoice_total:.2f})
 - NEVER create a "Sales Tax" or "Tax" expense line item. Distribute tax across the real items instead.
 
-IMPORTANT: "Sales Tax", "Tax", "State Tax", "County Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions. If the OCR items include a tax line item, REMOVE it and redistribute its amount proportionally across the real product/service items. The final item amounts must sum to ${invoice_total:.2f}.
+DISCOUNT RULES:
+- If the receipt shows a discount/coupon/savings line, do NOT create a line item for it.
+- Instead REDUCE the real item amounts proportionally so the final amounts (with tax) sum to ${invoice_total:.2f}. A discount lowers the total — it is never a positive line item.
+
+IMPORTANT: "Sales Tax", "Tax", "State Tax", "County Tax", "HST", "GST", "VAT", "IVA" are FORBIDDEN as expense descriptions, and so are "Discount", "Coupon", "Savings". If the OCR items include a tax line item, REMOVE it and redistribute its amount proportionally across the real items. If they include a discount line item, REMOVE it and subtract its amount proportionally from the real items. The final item amounts must sum to ${invoice_total:.2f}.
 
 Return ONLY valid JSON in this exact format:
 {{

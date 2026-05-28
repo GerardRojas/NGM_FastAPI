@@ -44,6 +44,10 @@ _SKIP_PATTERNS = [
     r'\$/\s*(?:piece|each|unit|ft|yd|sq|lb|oz|gal|ton|hr|hour)',  # Unit price lines
     r'CHANGE\s+DUE', r'CASH\s+TENDERED', r'AMOUNT\s+TENDERED',
     r'CARD\s+ENDING', r'APPROVAL\s+CODE', r'AUTH\s+CODE',
+    # Discount / coupon / savings lines — handled as an invoice-level reduction in
+    # assemble_scan_result, never ingested as a (positive) line item.
+    r'\bDISCOUNTS?\b', r'\bCOUPONS?\b', r'\bREBATES?\b', r'\bMARKDOWNS?\b',
+    r'\bSAVINGS\b', r'\bSAVED\b', r'PROMO(?:TION)?(?:AL)?\s+DISCOUNT',
     r'THANK\s+YOU', r'HAVE\s+A\s+', r'RETURN\s+POLICY',
     r'SOLD\s+TO', r'SHIP\s+TO', r'BILL\s+TO',
     r'PAGE\s+\d', r'^-{3,}', r'^={3,}',
@@ -75,6 +79,22 @@ def _find_amounts(line: str) -> List[float]:
         return [_parse_amt(h) for h in hits]
     hits = _AMT_NOSIGN_RE.findall(line)
     return [_parse_amt(h) for h in hits]
+
+
+def _signed_line_amount(stripped: str, magnitude: float) -> float:
+    """Apply a negative sign to the rightmost amount when the line marks it as a
+    credit/return: -$X, ($X), or a trailing 'CR' / '-'. Otherwise positive.
+
+    Markers must sit right at the amount column (end of line) so a stray dash
+    elsewhere (e.g. "SAVE-10 $20.00", a phone number, a SKU) is not misread.
+    """
+    if re.search(r'\(\s*\$?\s*\d[\d,]*\.\d{2}\s*\)\s*$', stripped):
+        return -magnitude
+    if re.search(r'-\s*\$?\s*\d[\d,]*\.\d{2}\s*$', stripped):
+        return -magnitude
+    if re.search(r'\d[\d,]*\.\d{2}\s*(?:CR|-)\s*$', stripped, re.IGNORECASE):
+        return -magnitude
+    return magnitude
 
 
 # ── Extractors ──────────────────────────────────────────────────
@@ -330,6 +350,60 @@ def _extract_shipping(text: str) -> Optional[float]:
     return None
 
 
+# Invoice-level discount / coupon / savings lines. "savings" is included but the
+# value is only ever *applied* when the totals prove the items are gross (see
+# assemble_scan_result), so an informational "you saved" line on a net receipt is
+# captured here yet never double-subtracted.
+_DISCOUNT_RE = re.compile(
+    r'\b(?:discounts?|coupons?|rebates?|markdowns?|'
+    r'(?:instant\s+|member\s+|total\s+|order\s+|you\s+)?(?:savings|saved)|'
+    r'promo(?:tion)?(?:al)?\s+discount)\b',
+    re.IGNORECASE,
+)
+
+
+def _extract_discount(text: str) -> float:
+    """Sum invoice-level discount/coupon/savings amounts (returned positive).
+
+    Used as a *gate* (discount > 0) plus a fallback magnitude; the authoritative
+    reduction is derived from the grand total in assemble_scan_result.
+    """
+    total = 0.0
+    for line in text.split('\n'):
+        if not _DISCOUNT_RE.search(line):
+            continue
+        amts = _find_amounts(line)
+        if amts:
+            total += abs(amts[-1])
+    return round(total, 2) if total > 0 else 0.0
+
+
+def _resolve_discount_reduction(
+    discount: float,
+    gross_subtotal: float,
+    tax_amount: Optional[float],
+    grand_total: Optional[float],
+) -> float:
+    """How much to shave off the (gross) line items for an invoice-level discount.
+
+    The grand total is the anchor: if the gross items + tax overshoot the printed
+    total, that overshoot IS the discount, so we remove exactly that much. If they
+    don't overshoot, the items are already net and the discount is informational —
+    we remove nothing (prevents double-subtracting). With no grand total to anchor
+    against, fall back to the parsed discount, capped at the subtotal.
+    """
+    discount = discount or 0
+    if discount <= 0 or gross_subtotal <= 0:
+        return 0.0
+    tax = tax_amount or 0
+    if grand_total is not None:
+        overshoot = round(gross_subtotal + tax - grand_total, 2)
+        if overshoot <= 0.02:
+            return 0.0
+        return min(overshoot, gross_subtotal)
+    return min(discount, gross_subtotal)
+
+
 def _extract_line_items(
     text: str,
     grand_total: Optional[float],
@@ -342,14 +416,18 @@ def _extract_line_items(
     """
     items = []
 
-    # Known amounts to exclude (totals, subtotals, tax)
+    # Only the tax amount is excluded by value. Total/subtotal LINES are dropped by
+    # keyword (_SKIP_RE); excluding their *amounts* too would wrongly drop a real
+    # line item that happens to equal the (sub)total — e.g. a single-item receipt
+    # where the one item equals the grand total.
     known = set()
-    if grand_total:
-        known.add(grand_total)
-    if subtotal:
-        known.add(subtotal)
     if tax_amount:
         known.add(tax_amount)
+
+    # When the receipt has credits/returns (negative lines), the positive items can
+    # legitimately sum to MORE than the (net) grand total, so the "bigger than the
+    # total = a misread total" guard below must be disabled.
+    has_negatives = any(_signed_line_amount(ln.strip(), 1.0) < 0 for ln in text.split('\n'))
 
     for line in text.split('\n'):
         stripped = line.strip()
@@ -372,15 +450,22 @@ def _extract_line_items(
             continue
 
         # Line total = last amount (rightmost column in tabular layouts)
-        line_amount = amts[-1]
+        magnitude = amts[-1]
 
         # Skip known totals/subtotals/tax
-        if line_amount in known:
+        if magnitude in known:
             continue
 
-        # Skip if >= grand total (likely a missed total)
-        if grand_total and line_amount >= grand_total:
+        # Skip only amounts strictly GREATER than the grand total (a missed total
+        # line). An item exactly equal to the grand total is valid on a single-item,
+        # no-tax receipt, so it must NOT be dropped. Disabled when the receipt has
+        # returns/credits (gross items can exceed the net total).
+        if grand_total and not has_negatives and magnitude > grand_total:
             continue
+
+        # Returns / credits print the amount as a negative; keep the sign so the
+        # item reduces the total instead of inflating it.
+        line_amount = _signed_line_amount(stripped, magnitude)
 
         # Extract description: text before the first $ sign or first amount
         dollar_pos = stripped.find('$')
@@ -397,7 +482,7 @@ def _extract_line_items(
         desc = re.sub(r'\s{2,}', ' ', desc)           # collapse spaces
         desc = desc.strip()
 
-        if desc and line_amount > 0:
+        if desc and line_amount != 0:
             item = {'description': desc, 'amount': line_amount}
 
             # Try to detect quantity: "80 x ITEM" or "QTY: 3" at start
@@ -490,6 +575,7 @@ def extract_receipt_metadata(text: str) -> dict:
     subtotal = _extract_subtotal(text)
     tax_amount, tax_label = _extract_tax(text)
     shipping = _extract_shipping(text)
+    discount = _extract_discount(text)
     date = _extract_date(text)
     bill_id = _extract_bill_id(text)
     payment_hints = _extract_payment_hints(text)
@@ -503,6 +589,7 @@ def extract_receipt_metadata(text: str) -> dict:
         'tax_amount': tax_amount,
         'tax_label': tax_label,
         'shipping': shipping,
+        'discount': discount,
         'date': date,
         'bill_id': bill_id,
         'payment_hints': payment_hints,
@@ -722,6 +809,26 @@ def match_payment_method(hints: List[str], payment_methods_list: List[dict]) -> 
 
 # ── Result assembly (regex → scan_receipt output format) ────────
 
+def _validation_warning(calc_sum: float, invoice_total: float) -> Optional[str]:
+    """Actionable mismatch message: states the direction and the likeliest cause so
+    the user knows what to look for, not just that the numbers differ."""
+    delta = round(calc_sum - invoice_total, 2)
+    if abs(delta) <= 0.02:
+        return None
+    gap = f"${abs(delta):.2f}"
+    if delta > 0:
+        return (
+            f"Line items total ${calc_sum:.2f}, {gap} OVER the invoice total "
+            f"${invoice_total:.2f}. A discount/credit may not have been captured, an "
+            f"amount may be too high, or a total line was read as an item. Review the items."
+        )
+    return (
+        f"Line items total ${calc_sum:.2f}, {gap} UNDER the invoice total "
+        f"${invoice_total:.2f}. An item may be missing, or tax was not distributed "
+        f"onto the items. Review the items."
+    )
+
+
 def assemble_scan_result(
     metadata: dict,
     vendors_list: List[str],
@@ -766,12 +873,32 @@ def assemble_scan_result(
             'tax_included': 0,
         })
 
-    # Tax distribution (in code, not GPT)
     tax_amount = metadata.get('tax_amount') or 0
     tax_summary = None
     line_items = metadata.get('line_items', [])
     has_item_tax = metadata.get('item_level_tax', False)
 
+    # Invoice-level discount: shave the (gross) pre-tax line items down so they sum
+    # to the net subtotal *before* tax is distributed. Anchored to the grand total
+    # so already-net receipts (informational "you saved" lines) aren't reduced twice.
+    discount = metadata.get('discount') or 0
+    if discount > 0 and expenses and not has_item_tax:
+        gross_subtotal = sum(e['amount'] for e in expenses)
+        reduction = _resolve_discount_reduction(
+            discount, gross_subtotal, tax_amount, metadata.get('grand_total')
+        )
+        if reduction > 0:
+            applied = 0.0
+            for i, exp in enumerate(expenses):
+                if i == len(expenses) - 1:
+                    share = round(reduction - applied, 2)
+                else:
+                    share = round(reduction * (exp['amount'] / gross_subtotal), 2)
+                    applied += share
+                exp['discount_applied'] = share
+                exp['amount'] = round(exp['amount'] - share, 2)
+
+    # Tax distribution (in code, not GPT)
     if tax_amount > 0 and expenses:
         pre_tax_subtotal = sum(e['amount'] for e in expenses)
 
@@ -823,10 +950,7 @@ def assemble_scan_result(
         'invoice_total': invoice_total,
         'calculated_sum': calc_sum,
         'validation_passed': diff <= 0.02,
-        'validation_warning': (
-            None if diff <= 0.02
-            else f"Calculated sum ${calc_sum:.2f} does not match invoice total ${invoice_total:.2f}"
-        ),
+        'validation_warning': _validation_warning(calc_sum, invoice_total),
     }
 
     return {
@@ -981,6 +1105,7 @@ def _parse_home_depot(text: str) -> dict:
 
     if subtotal_parts:
         meta['subtotal'] = round(sum(subtotal_parts), 2)
+    meta['discount'] = _extract_discount(text)
 
     meta['items_sum'] = round(sum(i['amount'] for i in meta['line_items']), 2)
     meta['confidence'] = _compute_confidence(meta)
@@ -1179,6 +1304,7 @@ def _parse_home_depot_receipt(text: str) -> dict:
     # Net subtotal = receipt subtotal - discounts (for cross-validation)
     if receipt_subtotal is not None:
         meta['subtotal'] = round(receipt_subtotal - discount, 2)
+    meta['discount'] = round(discount, 2) if discount else 0.0
 
     meta['items_sum'] = round(sum(i['amount'] for i in meta['line_items']), 2)
     meta['confidence'] = _compute_confidence(meta)
