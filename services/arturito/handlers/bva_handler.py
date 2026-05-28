@@ -393,7 +393,14 @@ def fetch_budgets(project_id: str) -> List[Dict[str, Any]]:
 
 def fetch_expenses(project_id: str) -> List[Dict[str, Any]]:
     """Obtiene expenses autorizados del proyecto desde expenses_manual_COGS.
-    Pagina en bloques de 1000 para superar el límite default de Supabase."""
+    Pagina en bloques de 1000 para superar el límite default de Supabase.
+
+    Authorized = status == 'auth' (canonical definition, identical to the React
+    reports). This replaced the older `auth_status=true AND status<>'review'`
+    rule, which silently dropped legacy rows whose status was NULL and counted
+    `pending` rows the on-screen reports didn't — the source of P&L vs BVA
+    mismatches. Run NGM_API/sql/backfill_expense_status.sql before deploying so
+    legacy auth_status=true rows are migrated to status='auth'."""
     try:
         all_expenses: List[Dict[str, Any]] = []
         page_size = 1000
@@ -403,8 +410,7 @@ def fetch_expenses(project_id: str) -> List[Dict[str, Any]]:
                 supabase.table("expenses_manual_COGS")
                 .select("*")
                 .eq("project", project_id)
-                .eq("auth_status", True)
-                .neq("status", "review")
+                .eq("status", "auth")
                 .range(offset, offset + page_size - 1)
                 .execute()
             )
