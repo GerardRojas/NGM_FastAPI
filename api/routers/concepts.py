@@ -120,6 +120,39 @@ class ConceptMaterialUpdate(BaseModel):
     cost_type: Optional[str] = None
 
 
+# ----- Concept builder v2: typed lines (material | labor | percentage) -----
+class ConceptLineItem(BaseModel):
+    line_type: str                          # material | labor | percentage
+    sort_order: Optional[int] = 0
+    label: Optional[str] = None
+    material_id: Optional[str] = None        # material lines
+    unit: Optional[str] = None
+    quantity: Optional[float] = None         # material / labor
+    unit_cost: Optional[float] = None        # material override (NULL = material price) / labor manual cost
+    percent: Optional[float] = None          # percentage lines
+    applies_to: Optional[str] = None         # percentage: material | labor | both
+    cost_type: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("line_type")
+    @classmethod
+    def valid_line_type(cls, v):
+        if v not in ("material", "labor", "percentage"):
+            raise ValueError("line_type must be material, labor, or percentage")
+        return v
+
+    @field_validator("applies_to")
+    @classmethod
+    def valid_applies_to(cls, v):
+        if v is not None and v not in ("material", "labor", "both"):
+            raise ValueError("applies_to must be material, labor, or both")
+        return v
+
+
+class ConceptLinesSync(BaseModel):
+    lines: List[ConceptLineItem] = []
+
+
 # ========================================
 # CONCEPTS CRUD
 # ========================================
@@ -307,6 +340,31 @@ async def get_concept(concept_id: str):
         subtotal = materials_with_waste + base_cost + labor_cost
         total_with_overhead = round(subtotal * (1 + overhead_pct / 100), 2)
 
+        # Concept builder v2: typed lines (material | labor | percentage). Empty until
+        # the concept is migrated/saved via the lines endpoint; material lines resolve
+        # name/price/unit from materials_map (fetch any not already loaded).
+        lines_resp = supabase.table("concept_lines").select("*").eq("concept_id", concept_id).order("sort_order").execute()
+        missing_ids = list(set(
+            l["material_id"] for l in (lines_resp.data or [])
+            if l.get("line_type") == "material" and l.get("material_id") and l["material_id"] not in materials_map
+        ))
+        if missing_ids:
+            extra = supabase.table("materials").select(
+                '"ID", "Short Description", price_numeric, "Price", "Unit", cost_type'
+            ).in_('"ID"', missing_ids).execute()
+            for m in (extra.data or []):
+                materials_map[m["ID"]] = m
+        lines = []
+        for l in (lines_resp.data or []):
+            mi = materials_map.get(l.get("material_id"), {}) if l.get("line_type") == "material" else {}
+            lines.append({
+                **l,
+                "material_name": mi.get("Short Description"),
+                "material_price": mi.get("price_numeric") or mi.get("Price"),
+                "material_unit": mi.get("Unit"),
+                "cost_type": l.get("cost_type") or (mi.get("cost_type") if l.get("line_type") == "material" else None),
+            })
+
         return {
             "id": c["id"],
             "code": c["code"],
@@ -336,6 +394,8 @@ async def get_concept(concept_id: str):
             # Materiales
             "materials": materials,
             "materials_count": len(materials),
+            # Concept builder v2 typed lines (material | labor | percentage)
+            "lines": lines,
             "total_materials_cost": total_materials_cost,
             # Desglose de costos completo
             "cost_breakdown": {
@@ -545,6 +605,59 @@ async def sync_concept_materials(concept_id: str, payload: ConceptMaterialSync):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error syncing materials: {str(e)}")
+
+
+@router.put("/{concept_id}/lines")
+async def sync_concept_lines(concept_id: str, payload: ConceptLinesSync):
+    """
+    Concept builder v2: atomically replace a concept's typed lines (material /
+    labor / percentage) and recompute calculated_cost. The Opus-style replacement
+    for /materials/sync.
+    """
+    try:
+        concept = supabase.table("concepts").select("id").eq("id", concept_id).execute()
+        if not concept.data:
+            raise HTTPException(status_code=404, detail="Concept not found")
+
+        supabase.table("concept_lines").delete().eq("concept_id", concept_id).execute()
+
+        inserted = []
+        errors = []
+        for i, line in enumerate(payload.lines):
+            try:
+                insert_data = {
+                    "concept_id": concept_id,
+                    "line_type": line.line_type,
+                    "sort_order": line.sort_order if line.sort_order is not None else i,
+                    "label": line.label,
+                    "material_id": line.material_id,
+                    "unit": line.unit,
+                    "quantity": line.quantity,
+                    "unit_cost": line.unit_cost,
+                    "percent": line.percent,
+                    "applies_to": line.applies_to,
+                    "cost_type": line.cost_type,
+                    "notes": line.notes,
+                }
+                insert_data = {k: v for k, v in insert_data.items() if v is not None}
+                resp = supabase.table("concept_lines").insert(insert_data).execute()
+                if resp.data:
+                    inserted.append(resp.data[0])
+            except Exception as line_err:
+                errors.append({"line": i, "error": str(line_err)})
+
+        calculated_cost = await recalculate_concept_cost_from_lines(concept_id)
+
+        return {
+            "message": f"Synced {len(inserted)} lines" + (f" ({len(errors)} errors)" if errors else ""),
+            "inserted": len(inserted),
+            "errors": errors,
+            "calculated_cost": calculated_cost,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error syncing concept lines: {str(e)}")
 
 
 @router.get("/{concept_id}/materials")
@@ -782,4 +895,69 @@ async def recalculate_concept_cost(concept_id: str):
         return calculated_cost
     except Exception as e:
         logger.error("Error recalculating concept cost: %s", e)
+        return 0
+
+
+async def recalculate_concept_cost_from_lines(concept_id: str):
+    """
+    Concept builder v2: recompute calculated_cost from concept_lines.
+
+      materialSubtotal = SUM(material lines: qty * COALESCE(unit_cost, material.price_numeric, 0))
+      laborSubtotal    = SUM(labor lines:   qty * COALESCE(unit_cost, 0))
+      each % line       = (percent / 100) * base   where base is the material, labor, or
+                          material+labor subtotal per applies_to   (NON-compounding)
+      calculated_cost   = materialSubtotal + laborSubtotal + SUM(% lines)
+    """
+    try:
+        lines_resp = (
+            supabase.table("concept_lines")
+            .select("line_type, material_id, quantity, unit_cost, percent, applies_to")
+            .eq("concept_id", concept_id)
+            .execute()
+        )
+        lines = lines_resp.data or []
+
+        # Batch-fetch prices only for material lines without an explicit unit_cost.
+        need_price = list(set(
+            l["material_id"] for l in lines
+            if l.get("line_type") == "material" and l.get("material_id") and l.get("unit_cost") is None
+        ))
+        price_map = {}
+        if need_price:
+            mats = supabase.table("materials").select('"ID", price_numeric').in_('"ID"', need_price).execute()
+            for m in (mats.data or []):
+                price_map[m["ID"]] = float(m.get("price_numeric") or 0)
+
+        material_subtotal = 0.0
+        labor_subtotal = 0.0
+        for l in lines:
+            if l.get("line_type") == "material":
+                qty = float(l.get("quantity") or 0)
+                if l.get("unit_cost") is not None:
+                    cost = float(l["unit_cost"])
+                else:
+                    cost = price_map.get(l.get("material_id"), 0.0)
+                material_subtotal += qty * cost
+            elif l.get("line_type") == "labor":
+                labor_subtotal += float(l.get("quantity") or 0) * float(l.get("unit_cost") or 0)
+
+        pct_total = 0.0
+        for l in lines:
+            if l.get("line_type") != "percentage":
+                continue
+            pct = float(l.get("percent") or 0) / 100.0
+            applies = l.get("applies_to") or "both"
+            if applies == "material":
+                base = material_subtotal
+            elif applies == "labor":
+                base = labor_subtotal
+            else:
+                base = material_subtotal + labor_subtotal
+            pct_total += base * pct
+
+        calculated_cost = round(material_subtotal + labor_subtotal + pct_total, 2)
+        supabase.table("concepts").update({"calculated_cost": calculated_cost}).eq("id", concept_id).execute()
+        return calculated_cost
+    except Exception as e:
+        logger.error("Error recalculating concept cost from lines: %s", e)
         return 0
