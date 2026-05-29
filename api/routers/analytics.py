@@ -755,20 +755,25 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
     return _compute_executive_kpis()
 
 
-def _compute_executive_kpis() -> dict:
+def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
     """
     Core multi-project financial aggregation, decoupled from the route so it can
     be reused (e.g. by the Operations Dashboard). Performs no permission check.
+
+    When *project_id* is provided, all underlying fetches are scoped to that
+    single project; otherwise the aggregation is global (default).
     """
 
     # --- Active projects ---
     active_projects: list[dict] = []
     try:
-        proj_resp = (
+        proj_query = (
             supabase.table("projects")
             .select("project_id, project_name, project_status(status)")
-            .execute()
         )
+        if project_id:
+            proj_query = proj_query.eq("project_id", project_id)
+        proj_resp = proj_query.execute()
         for p in (proj_resp.data or []):
             ps = p.get("project_status") or {}
             if isinstance(ps, list):
@@ -782,10 +787,13 @@ def _compute_executive_kpis() -> dict:
         logger.error("[analytics:executive_kpis] projects fetch: %s", exc)
 
     # --- ALL authorized expenses (paginated) ---
+    ek_expense_filters: dict = {"auth_status": True}
+    if project_id:
+        ek_expense_filters["project"] = project_id
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
         "expense_id, Amount, project, vendor_id, TxnDate, auth_status, status",
-        {"auth_status": True},
+        ek_expense_filters,
         neq_filters={"status": "review"},
     )
 
@@ -801,10 +809,15 @@ def _compute_executive_kpis() -> dict:
     try:
         bud_offset = 0
         while True:
-            bud_resp = (
+            bud_query = (
                 supabase.table("budgets_qbo")
                 .select("ngm_project_id, amount_sum")
                 .eq("active", True)
+            )
+            if project_id:
+                bud_query = bud_query.eq("ngm_project_id", project_id)
+            bud_resp = (
+                bud_query
                 .range(bud_offset, bud_offset + _PAGE_SIZE - 1)
                 .execute()
             )
@@ -827,10 +840,15 @@ def _compute_executive_kpis() -> dict:
     try:
         pr_offset = 0
         while True:
-            pr_resp = (
+            pr_query = (
                 supabase.table("pending_receipts")
                 .select("project_id")
                 .is_("expense_id", "null")
+            )
+            if project_id:
+                pr_query = pr_query.eq("project_id", project_id)
+            pr_resp = (
+                pr_query
                 .range(pr_offset, pr_offset + _PAGE_SIZE - 1)
                 .execute()
             )
@@ -850,10 +868,15 @@ def _compute_executive_kpis() -> dict:
     try:
         pa_offset = 0
         while True:
-            pa_resp = (
+            pa_query = (
                 supabase.table("expenses_manual_COGS")
                 .select("project")
                 .eq("status", "pending")
+            )
+            if project_id:
+                pa_query = pa_query.eq("project", project_id)
+            pa_resp = (
+                pa_query
                 .range(pa_offset, pa_offset + _PAGE_SIZE - 1)
                 .execute()
             )
@@ -880,9 +903,14 @@ def _compute_executive_kpis() -> dict:
         tasks_offset = 0
         all_tasks: list[dict] = []
         while True:
-            t_resp = (
+            t_query = (
                 supabase.table("tasks")
                 .select("project_id, task_status")
+            )
+            if project_id:
+                t_query = t_query.eq("project_id", project_id)
+            t_resp = (
+                t_query
                 .range(tasks_offset, tasks_offset + _PAGE_SIZE - 1)
                 .execute()
             )
@@ -1309,7 +1337,10 @@ async def health_all(current_user: dict = Depends(get_current_user)):
 # ============================================================
 
 @router.get("/vendors/summary")
-async def vendors_summary(current_user: dict = Depends(get_current_user)):
+async def vendors_summary(
+    project_id: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
     """
     Enriched vendor listing with spend metrics, transaction counts,
     and concentration percentages across all projects.
@@ -1329,10 +1360,13 @@ async def vendors_summary(current_user: dict = Depends(get_current_user)):
         vendor_map[str(v.get("id", ""))] = v.get("vendor_name", "Unknown")
 
     # --- ALL authorized expenses (paginated) ---
+    expense_filters: dict = {"auth_status": True}
+    if project_id:
+        expense_filters["project"] = project_id
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
         "Amount, vendor_id, project, TxnDate",
-        {"auth_status": True},
+        expense_filters,
         neq_filters={"status": "review"},
     )
 
@@ -2172,6 +2206,7 @@ async def budget_health(
 
 @router.get("/project-scorecard")
 async def project_scorecard(
+    project_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -2182,11 +2217,13 @@ async def project_scorecard(
         # --- All projects with status ---
         projects_raw: list[dict] = []
         try:
-            proj_resp = (
+            proj_query = (
                 supabase.table("projects")
                 .select("project_id, project_name, project_status(status)")
-                .execute()
             )
+            if project_id:
+                proj_query = proj_query.eq("project_id", project_id)
+            proj_resp = proj_query.execute()
             projects_raw = proj_resp.data or []
         except Exception as exc:
             logger.error("[analytics:project-scorecard] projects fetch: %s", exc)
@@ -2197,10 +2234,15 @@ async def project_scorecard(
         bud_offset = 0
         while True:
             try:
-                bud_resp = (
+                bud_query = (
                     supabase.table("budgets_qbo")
                     .select("ngm_project_id, amount_sum")
                     .eq("active", True)
+                )
+                if project_id:
+                    bud_query = bud_query.eq("ngm_project_id", project_id)
+                bud_resp = (
+                    bud_query
                     .range(bud_offset, bud_offset + _PAGE_SIZE - 1)
                     .execute()
                 )
@@ -2220,10 +2262,13 @@ async def project_scorecard(
                 budget_by_project[pid] += _safe_float(b.get("amount_sum"))
 
         # --- All authorized expenses (paginated) ---
+        exp_filters: dict = {"status": "auth"}
+        if project_id:
+            exp_filters["project"] = project_id
         all_expenses = _paginated_fetch(
             "expenses_manual_COGS",
             "project, Amount",
-            {"status": "auth"},
+            exp_filters,
         )
 
         spent_by_project: dict[str, float] = defaultdict(float)
@@ -2237,9 +2282,14 @@ async def project_scorecard(
         try:
             ph_offset = 0
             while True:
-                ph_resp = (
+                ph_query = (
                     supabase.table("project_phases")
                     .select("project_id, status, progress_pct")
+                )
+                if project_id:
+                    ph_query = ph_query.eq("project_id", project_id)
+                ph_resp = (
+                    ph_query
                     .range(ph_offset, ph_offset + _PAGE_SIZE - 1)
                     .execute()
                 )
@@ -2262,9 +2312,14 @@ async def project_scorecard(
         try:
             ms_offset = 0
             while True:
-                ms_resp = (
+                ms_query = (
                     supabase.table("project_milestones")
                     .select("project_id, status, due_date")
+                )
+                if project_id:
+                    ms_query = ms_query.eq("project_id", project_id)
+                ms_resp = (
+                    ms_query
                     .range(ms_offset, ms_offset + _PAGE_SIZE - 1)
                     .execute()
                 )
@@ -2430,12 +2485,14 @@ async def project_scorecard(
 _DONE_STATUS_NAMES = {"done", "completed", "good to go"}
 
 
-def _compute_task_overview() -> dict:
+def _compute_task_overview(project_id: Optional[str] = None) -> dict:
     """
     Global task progress for the Operations Dashboard:
     - by_status: task counts grouped by status name
     - overdue: overdue, not-done tasks (owner + project names resolved)
     - completed_this_week / created_this_week: 7-day throughput
+
+    When *project_id* is provided, task aggregation is scoped to that project.
     """
     from datetime import datetime, timedelta
 
@@ -2449,10 +2506,13 @@ def _compute_task_overview() -> dict:
     except Exception as exc:
         logger.warning("[analytics:ops-dashboard] status fetch: %s", exc)
 
+    task_filters: dict = {}
+    if project_id:
+        task_filters["project_id"] = project_id
     all_tasks = _paginated_fetch(
         "tasks",
         "task_id, task_description, project_id, Owner_id, task_status, deadline, due_date, created_at",
-        {},
+        task_filters,
     )
 
     today = datetime.utcnow().date()
@@ -2524,7 +2584,10 @@ def _compute_task_overview() -> dict:
 
 
 @router.get("/operations-dashboard")
-async def operations_dashboard(current_user: dict = Depends(get_current_user)):
+async def operations_dashboard(
+    project_id: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
     """
     Single aggregation for the weekly Operations Dashboard meeting view:
     financial KPIs + per-project status (gated by `project_kpis`), task progress,
@@ -2551,7 +2614,7 @@ async def operations_dashboard(current_user: dict = Depends(get_current_user)):
 
     if can_view_financials:
         try:
-            ek = _compute_executive_kpis()
+            ek = _compute_executive_kpis(project_id=project_id)
             kpis = {
                 "active_projects": ek.get("active_projects", 0),
                 "total_budget": ek.get("total_budget", 0.0),
@@ -2565,7 +2628,7 @@ async def operations_dashboard(current_user: dict = Depends(get_current_user)):
         except Exception as exc:
             logger.error("[analytics:ops-dashboard] executive kpis: %s", exc)
 
-    tasks = _compute_task_overview()
+    tasks = _compute_task_overview(project_id=project_id)
 
     team: list[dict] = []
     try:
