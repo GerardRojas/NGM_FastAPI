@@ -28,6 +28,9 @@ CREATE INDEX IF NOT EXISTS idx_budgets_qbo_subcat_costtype
 -- 2. Backfill (pass 1): rows whose account_id matches an internal account
 --    directly — works for estimator-saved budgets (they ship the internal
 --    accounts.account_id from the picker).
+--    `budgets_qbo.account_id` is text (it also stores QBO ids in another id
+--    space), while `account_category_map.account_id` is uuid — cast both sides
+--    to text so the comparison is safe and never errors on non-UUID QBO ids.
 UPDATE budgets_qbo b
 SET
   subcategory_id = m.subcategory_id,
@@ -36,7 +39,7 @@ SET
 FROM account_category_map m
 JOIN subcategories sub ON sub.id = m.subcategory_id
 WHERE b.account_id IS NOT NULL
-  AND b.account_id = m.account_id
+  AND b.account_id = m.account_id::text
   AND b.subcategory_id IS NULL;
 
 -- 3. Backfill (pass 2): name-based fallback for QBO-imported budgets, whose
@@ -74,7 +77,7 @@ DECLARE
 BEGIN
   SELECT COUNT(*) INTO total FROM budgets_qbo;
   SELECT COUNT(*) INTO classified FROM budgets_qbo WHERE subcategory_id IS NOT NULL;
-  SELECT COUNT(*) INTO by_id FROM budgets_qbo b JOIN account_category_map m ON m.account_id = b.account_id WHERE b.subcategory_id IS NOT NULL;
+  SELECT COUNT(*) INTO by_id FROM budgets_qbo b JOIN account_category_map m ON m.account_id::text = b.account_id WHERE b.subcategory_id IS NOT NULL;
   by_name := classified - by_id;
   RAISE NOTICE 'budgets_qbo: % total, % classified (% via account_id, % via account_name).', total, classified, by_id, by_name;
 END $$;
