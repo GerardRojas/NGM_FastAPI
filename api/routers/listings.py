@@ -120,7 +120,9 @@ async def search_listings(payload: ListingSearch, current_user: dict = Depends(g
     """Search active for-sale listings for a market. Proxies RentCast; falls back
     to demo data when RENTCAST_API_KEY is not configured."""
     api_key = os.getenv("RENTCAST_API_KEY")
-    limit = max(1, min(payload.limit or 50, 200))
+    # RentCast returns up to 500 records per call and bills the same 1 request
+    # regardless of how many come back, so we let a single search pull the full 500.
+    limit = max(1, min(payload.limit or 50, 500))
 
     if not api_key:
         rows = _filter(_DEMO_LISTINGS, payload)[:limit]
