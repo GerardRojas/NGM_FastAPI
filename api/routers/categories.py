@@ -8,8 +8,35 @@ accounts existentes). Gestión gráfica que reemplaza los ~200 accounts planos.
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 from api.supabase_client import supabase
+
+# Single source of truth for the cost_type enum values defined in
+# categories_rearch_phase1.sql. Used to validate user-supplied chip selections.
+_COST_TYPES = {"material", "labor", "external_service", "change_order", "other_expenses"}
+
+
+def _normalize_allowed_cost_types(value):
+    """Validate + dedupe + sort the cost_type chips coming from the UI."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise HTTPException(status_code=400, detail="allowed_cost_types must be an array")
+    out = []
+    seen = set()
+    for v in value:
+        if not isinstance(v, str):
+            raise HTTPException(status_code=400, detail=f"allowed_cost_types contains a non-string: {v!r}")
+        s = v.strip()
+        if not s:
+            continue
+        if s not in _COST_TYPES:
+            raise HTTPException(status_code=400, detail=f"Unknown cost_type: {s!r}")
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    out.sort()
+    return out
 
 router = APIRouter(prefix="/categories", tags=["categories"])
 
@@ -29,12 +56,14 @@ class CategoryUpdate(BaseModel):
 class SubcategoryCreate(BaseModel):
     name: str
     sort_order: Optional[int] = 0
+    allowed_cost_types: Optional[List[str]] = None
 
 
 class SubcategoryUpdate(BaseModel):
     name: Optional[str] = None
     category_id: Optional[str] = None
     sort_order: Optional[int] = None
+    allowed_cost_types: Optional[List[str]] = None
 
 
 def _all(table: str, cols: str = "*"):
@@ -85,11 +114,17 @@ async def list_categories():
 
         subs_by_cat: dict = {}
         for s in sorted(subs, key=lambda x: (x.get("sort_order") or 0, (x.get("name") or "").lower())):
+            # Allowed (user-configured) drives the chip UI. The derived set
+            # (what actually has mappings today) ships alongside so the
+            # picker can detect orphan chips (allowed but no account yet).
+            allowed = list(s.get("allowed_cost_types") or [])
+            allowed.sort()
             subs_by_cat.setdefault(s["category_id"], []).append({
                 "id": s["id"],
                 "name": s.get("name"),
                 "sort_order": s.get("sort_order") or 0,
                 "cost_types": sorted(tags.get(s["id"], set())),
+                "allowed_cost_types": allowed,
             })
 
         out = []
@@ -168,6 +203,9 @@ async def create_subcategory(category_id: str, payload: SubcategoryCreate):
         if dup.data:
             raise HTTPException(status_code=400, detail=f"'{name}' already exists in this category")
         row = {"category_id": category_id, "name": name, "sort_order": payload.sort_order or 0}
+        allowed = _normalize_allowed_cost_types(payload.allowed_cost_types)
+        if allowed is not None:
+            row["allowed_cost_types"] = allowed
         res = supabase.table("subcategories").insert(row).execute()
         return {"message": "Subcategory created", "data": (res.data or [{}])[0]}
     except HTTPException:
@@ -178,13 +216,15 @@ async def create_subcategory(category_id: str, payload: SubcategoryCreate):
 
 @router.patch("/subcategories/{subcategory_id}")
 async def update_subcategory(subcategory_id: str, payload: SubcategoryUpdate):
-    """Rename, reorder, or move a subcategory to another category."""
+    """Rename, reorder, move to another category, or set allowed cost_types."""
     try:
         updates = payload.model_dump(exclude_unset=True)
         if "name" in updates:
             updates["name"] = (updates["name"] or "").strip()
             if not updates["name"]:
                 raise HTTPException(status_code=400, detail="name cannot be empty")
+        if "allowed_cost_types" in updates:
+            updates["allowed_cost_types"] = _normalize_allowed_cost_types(updates["allowed_cost_types"]) or []
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
         res = supabase.table("subcategories").update(updates).eq("id", subcategory_id).execute()
