@@ -25,10 +25,9 @@ CREATE INDEX IF NOT EXISTS idx_budgets_qbo_subcat_costtype
   ON budgets_qbo(ngm_project_id, subcategory_id, cost_type)
   WHERE subcategory_id IS NOT NULL;
 
--- 2. Backfill from existing internal account_id via the overlay. QBO-imported
---    budgets carry the QuickBooks account_id (different id space) — those stay
---    NULL until a future QBO-mapping pass; estimator-saved budgets that already
---    persist account_id can be classified now.
+-- 2. Backfill (pass 1): rows whose account_id matches an internal account
+--    directly — works for estimator-saved budgets (they ship the internal
+--    accounts.account_id from the picker).
 UPDATE budgets_qbo b
 SET
   subcategory_id = m.subcategory_id,
@@ -40,15 +39,44 @@ WHERE b.account_id IS NOT NULL
   AND b.account_id = m.account_id
   AND b.subcategory_id IS NULL;
 
--- 3. Sanity counts (for the operator running this script).
+-- 3. Backfill (pass 2): name-based fallback for QBO-imported budgets, whose
+--    account_id lives in QuickBooks's id space (different from internal
+--    accounts.account_id). The CTE de-duplicates so a name collision in the
+--    accounts table can't make this UPDATE join multiple rows.
+WITH name_to_overlay AS (
+  SELECT DISTINCT ON (LOWER(TRIM(a."Name")))
+    LOWER(TRIM(a."Name")) AS norm_name,
+    m.subcategory_id,
+    m.cost_type,
+    sub.category_id
+  FROM accounts a
+  JOIN account_category_map m ON m.account_id = a.account_id
+  JOIN subcategories sub ON sub.id = m.subcategory_id
+  ORDER BY LOWER(TRIM(a."Name")), a.account_id
+)
+UPDATE budgets_qbo b
+SET
+  subcategory_id = n.subcategory_id,
+  cost_type      = n.cost_type,
+  category_id    = n.category_id
+FROM name_to_overlay n
+WHERE b.subcategory_id IS NULL
+  AND b.account_name IS NOT NULL
+  AND LOWER(TRIM(b.account_name)) = n.norm_name;
+
+-- 4. Sanity counts (for the operator running this script).
 DO $$
 DECLARE
   total int;
   classified int;
+  by_id int;
+  by_name int;
 BEGIN
   SELECT COUNT(*) INTO total FROM budgets_qbo;
   SELECT COUNT(*) INTO classified FROM budgets_qbo WHERE subcategory_id IS NOT NULL;
-  RAISE NOTICE 'budgets_qbo: % total, % classified after backfill (delta from previous run).', total, classified;
+  SELECT COUNT(*) INTO by_id FROM budgets_qbo b JOIN account_category_map m ON m.account_id = b.account_id WHERE b.subcategory_id IS NOT NULL;
+  by_name := classified - by_id;
+  RAISE NOTICE 'budgets_qbo: % total, % classified (% via account_id, % via account_name).', total, classified, by_id, by_name;
 END $$;
 
 COMMIT;
