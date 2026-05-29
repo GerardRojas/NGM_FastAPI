@@ -20,7 +20,9 @@ router = APIRouter(prefix="/budgets", tags=["budgets"])
 # ================================
 
 class BudgetCSVRow(BaseModel):
-    """Single row from QuickBooks budget CSV export"""
+    """Single row from QuickBooks budget CSV export, or from the estimator
+    save-as-budget flow (which also carries the categories rearch classification:
+    CategoryId / SubcategoryId / CostType)."""
     BudgetName: str
     BudgetId: str
     Year: Optional[int] = None
@@ -30,6 +32,12 @@ class BudgetCSVRow(BaseModel):
     AccountId: Optional[str] = None
     AccountName: Optional[str] = None
     Amount_SUM: Optional[str] = None  # String because CSV may have formatting
+    # Phase B (categories rearch): direct classification when the producer knows
+    # it (estimator). For QBO-imported rows these stay None and we derive them
+    # from AccountId via the overlay below.
+    CategoryId: Optional[str] = None
+    SubcategoryId: Optional[str] = None
+    CostType: Optional[str] = None
 
 
 class BudgetImportRequest(BaseModel):
@@ -91,6 +99,32 @@ def parse_boolean(bool_str: Optional[str]) -> bool:
     return bool_str in ['true', 't', 'yes', 'y', '1', 'active']
 
 
+def _budget_classification_overlay() -> dict:
+    """Pull the account_category_map overlay once per /budgets/import call so we
+    can auto-derive (category_id, subcategory_id, cost_type) for rows that only
+    carry an account_id. Mirrors the helper used in expenses.py for symmetry."""
+    out: dict = {}
+    try:
+        sub_rows = supabase.table("subcategories").select("id, category_id").execute().data or []
+        sub_to_cat = {row["id"]: row.get("category_id") for row in sub_rows}
+        map_rows = supabase.table("account_category_map").select("account_id, subcategory_id, cost_type").execute().data or []
+        for row in map_rows:
+            aid = row.get("account_id")
+            sid = row.get("subcategory_id")
+            if not aid or not sid:
+                continue
+            out[aid] = {
+                "subcategory_id": sid,
+                "cost_type": row.get("cost_type"),
+                "category_id": sub_to_cat.get(sid),
+            }
+    except Exception as e:
+        # Overlay is optional — without it, rows simply land unclassified and
+        # BVA falls back to the legacy account-name JOIN.
+        print(f"[BUDGETS] Could not load classification overlay: {e}")
+    return out
+
+
 # ================================
 # ROUTES
 # ================================
@@ -149,10 +183,13 @@ async def import_budgets(
     All rows are linked to the specified NGM project.
     """
     try:
-        # Validate headers
+        # Validate headers. CategoryId / SubcategoryId / CostType are accepted
+        # (Phase B of categories rearch) but stay optional — legacy QBO CSVs
+        # still import unchanged.
         expected_headers = [
             "BudgetName", "BudgetId", "Year", "StartDate", "EndDate",
-            "Active", "AccountId", "AccountName", "Amount_SUM"
+            "Active", "AccountId", "AccountName", "Amount_SUM",
+            "CategoryId", "SubcategoryId", "CostType"
         ]
 
         # Create header mapping (case-insensitive)
@@ -176,6 +213,12 @@ async def import_budgets(
 
         # Generate batch ID for this import
         batch_id = f"batch_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
+
+        # Pull the overlay once per import so we can auto-classify rows that
+        # only ship AccountId. Producers that already know the triple (the
+        # estimator) win — we only consult the overlay when SubcategoryId is
+        # empty.
+        classification_overlay = _budget_classification_overlay()
 
         # Prepare records for bulk insert
         records = []
@@ -207,6 +250,21 @@ async def import_budgets(
                 active = parse_boolean(get_val("Active"))
                 amount_sum = parse_amount(amount_str)
 
+                # Classification (Phase B). Producer-provided columns win; when
+                # absent and we have an AccountId in the overlay, derive the
+                # triple from there. None means "couldn't classify" — the row
+                # will still match by account name in BVA.
+                account_id_val = get_val("AccountId")
+                subcategory_id_val = get_val("SubcategoryId")
+                category_id_val = get_val("CategoryId")
+                cost_type_val = get_val("CostType")
+                if not subcategory_id_val and account_id_val:
+                    overlay_hit = classification_overlay.get(account_id_val)
+                    if overlay_hit:
+                        subcategory_id_val = subcategory_id_val or overlay_hit.get("subcategory_id")
+                        cost_type_val = cost_type_val or overlay_hit.get("cost_type")
+                        category_id_val = category_id_val or overlay_hit.get("category_id")
+
                 # Build record
                 record = {
                     "budget_name": budget_name,
@@ -215,12 +273,15 @@ async def import_budgets(
                     "start_date": start_date.isoformat() if start_date else None,
                     "end_date": end_date.isoformat() if end_date else None,
                     "active": active,
-                    "account_id": get_val("AccountId"),
+                    "account_id": account_id_val,
                     "account_name": get_val("AccountName"),
                     "amount_sum": amount_sum,
                     "ngm_project_id": request.project_id,
                     "import_batch_id": batch_id,
-                    "import_source": "csv"
+                    "import_source": "csv",
+                    "category_id": category_id_val,
+                    "subcategory_id": subcategory_id_val,
+                    "cost_type": cost_type_val,
                 }
 
                 records.append(record)

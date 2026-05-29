@@ -60,7 +60,9 @@ async def account_map():
             sub = subs.get(m["subcategory_id"]) or {}
             out.append({
                 "account_id": m["account_id"],
+                "category_id": sub.get("category_id"),
                 "category": cats.get(sub.get("category_id")),
+                "subcategory_id": m["subcategory_id"],
                 "subcategory": sub.get("name"),
                 "cost_type": m["cost_type"],
             })
