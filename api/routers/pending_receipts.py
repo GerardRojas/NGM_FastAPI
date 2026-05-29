@@ -57,6 +57,13 @@ from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Query, Bac
 from pydantic import BaseModel
 from api.supabase_client import supabase
 from api.auth import get_current_user
+# Categories rearch dual-write: every direct insert into expenses_manual_COGS
+# below must funnel through _dual_write_classification so subcategory_id +
+# cost_type are derived from account_id via the overlay. The "good" endpoints
+# in expenses.py already do this; we mirror it here so receipt/check flows can't
+# silently leak unclassified rows. _load_account_overlay is hoisted above loops
+# that create N expenses to avoid N round-trips to account_category_map.
+from api.routers.expenses import _dual_write_classification, _load_account_overlay
 from typing import Optional, List, Dict, Any
 import base64
 import gc
@@ -853,6 +860,9 @@ def process_check(payload: ProcessCheckRequest, background_tasks: BackgroundTask
 
     created = []
     by_project: dict = {}
+    # Categories rearch: load overlay once for the loop so each per-allocation
+    # insert gets subcategory_id + cost_type derived in O(1) per row.
+    classification_overlay = _load_account_overlay()
     for alloc in allocations:
         expense_data = {
             "project": alloc.project_id,
@@ -866,6 +876,7 @@ def process_check(payload: ProcessCheckRequest, background_tasks: BackgroundTask
             "auth_status": False,
         }
         expense_data = {k: v for k, v in expense_data.items() if v is not None}
+        _dual_write_classification(expense_data, classification_overlay)
         try:
             res = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
             if res.data:
@@ -1511,6 +1522,9 @@ def _create_receipt_expense(project_id, parsed_data, receipt_data, vendor_id, ac
         if final_payment:
             expense_data["payment_type"] = final_payment
         expense_data = {k: v for k, v in expense_data.items() if v is not None}
+        # Categories rearch: fill subcategory_id + cost_type from the overlay
+        # before insert so this single-expense path never leaks unclassified.
+        _dual_write_classification(expense_data)
 
         result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
         if result.data:
@@ -3403,6 +3417,8 @@ def _create_check_expenses(receipt_id: str, receipt_data: dict, check_flow: dict
     check_payment_uuid = _get_check_payment_uuid()
     purchase_txn_type_id = _get_purchase_txn_type_id()
 
+    # Categories rearch: load overlay once for the entries loop.
+    classification_overlay = _load_account_overlay()
     for entry in entries:
         cat = entry.get("categorization", {})
         expense_data = {
@@ -3425,6 +3441,7 @@ def _create_check_expenses(receipt_id: str, receipt_data: dict, check_flow: dict
             expense_data["payment_type"] = check_payment_uuid
 
         expense_data = {k: v for k, v in expense_data.items() if v is not None}
+        _dual_write_classification(expense_data, classification_overlay)
         try:
             result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
             if result.data:
@@ -5787,6 +5804,9 @@ def create_expense_from_receipt(receipt_id: str, payload: CreateExpenseFromRecei
 
         # Remove None values
         expense_data = {k: v for k, v in expense_data.items() if v is not None}
+        # Categories rearch: derive subcategory_id + cost_type from account_id
+        # via the overlay so this manual receipt-to-expense path cannot leak.
+        _dual_write_classification(expense_data)
 
         expense_result = supabase.table("expenses_manual_COGS").insert(expense_data).execute()
 
