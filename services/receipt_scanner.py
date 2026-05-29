@@ -1392,6 +1392,72 @@ def _categorize_chunk_via_gpt(
     return cats
 
 
+# ══════════════════════════════════════════════════════════════════
+# Categories rearch Phase C — overlay enrichment
+# ══════════════════════════════════════════════════════════════════
+# Andrew still reasons in the account_id axis (cache, vendor affinity, ML, GPT,
+# rules) — adding subcategory_id + cost_type to each returned categorization is
+# a pure post-processing step that reads account_category_map. Producers/learners
+# don't change; consumers (UI, frontend correction loop) get the triple for free.
+
+def _load_category_overlay() -> dict:
+    """account_id -> {subcategory_id, cost_type, subcategory_name, category_name}.
+    Loaded once per call so remaps in the Categories UI take effect on the next
+    invocation without restart. Small tables (~200 + ~130 + ~30 rows); three
+    queries are cheaper than dispatching N lookups from the consumer."""
+    try:
+        sub_rows = supabase.table("subcategories").select("id, name, category_id").execute().data or []
+        cat_rows = supabase.table("categories").select("id, name").execute().data or []
+        cat_names = {c["id"]: c.get("name") for c in cat_rows}
+        sub_meta = {
+            s["id"]: {
+                "subcategory_name": s.get("name"),
+                "category_name": cat_names.get(s.get("category_id")),
+            }
+            for s in sub_rows
+        }
+        map_rows = supabase.table("account_category_map").select(
+            "account_id, subcategory_id, cost_type"
+        ).execute().data or []
+        out: dict = {}
+        for r in map_rows:
+            sid = r.get("subcategory_id")
+            meta = sub_meta.get(sid) or {}
+            out[r["account_id"]] = {
+                "subcategory_id": sid,
+                "cost_type": r.get("cost_type"),
+                "subcategory_name": meta.get("subcategory_name"),
+                "category_name": meta.get("category_name"),
+            }
+        return out
+    except Exception as e:
+        logger.warning(f"[Andrew] Category overlay unavailable: {e}")
+        return {}
+
+
+def _enrich_with_classification(categorizations: list, overlay: Optional[dict] = None) -> None:
+    """Mutates each categorization in place to add subcategory_id + cost_type
+    plus the resolved subcategory_name + category_name (so the UI can show a
+    chip like "Cabinets · Material" without another round-trip). No-op when
+    overlay is empty, the row has no account_id, or the account isn't mapped.
+    Loads the overlay lazily when not supplied; pass an overlay you've already
+    loaded to avoid the extra query."""
+    if overlay is None:
+        overlay = _load_category_overlay()
+    if not overlay:
+        return
+    for cat in categorizations:
+        aid = cat.get("account_id")
+        if not aid:
+            continue
+        m = overlay.get(aid)
+        if m:
+            cat.setdefault("subcategory_id", m.get("subcategory_id"))
+            cat.setdefault("cost_type", m.get("cost_type"))
+            cat.setdefault("subcategory_name", m.get("subcategory_name"))
+            cat.setdefault("category_name", m.get("category_name"))
+
+
 def auto_categorize(
     stage: str,
     expenses: list,
@@ -1547,6 +1613,7 @@ def auto_categorize(
     # Step 2: If all resolved (cache + affinity + ML), return early
     if not expenses_needing_gpt:
         elapsed_ms = int((time.time() - start_time) * 1000)
+        _enrich_with_classification(categorizations)
         return {
             "categorizations": categorizations,
             "metrics": {
@@ -1683,6 +1750,8 @@ def auto_categorize(
         categorizations=categorizations,
         metrics=metrics
     )
+
+    _enrich_with_classification(categorizations)
 
     return {
         "categorizations": categorizations,
@@ -1985,6 +2054,8 @@ def auto_categorize_fast(
         f"(cache={cache_hits}, affinity={affinity_hits}, ml={ml_hits}, "
         f"rules={rule_hits}, unresolved={len(remaining)})"
     )
+
+    _enrich_with_classification(categorizations)
 
     return {
         "categorizations": categorizations,

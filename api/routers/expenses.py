@@ -2134,6 +2134,13 @@ class CategorizationCorrectionRequest(BaseModel):
     original_account_name: Optional[str] = Field(None, max_length=500)
     original_confidence: Optional[int] = Field(None, ge=0, le=100)
     correction_reason: Optional[str] = Field(None, max_length=1000)
+    # Phase C — categories rearch. Optional: producer (frontend) can ship the
+    # classification triple it wants stored; if absent, the endpoint derives it
+    # from the corresponding account_id via the overlay.
+    original_subcategory_id: Optional[str] = None
+    original_cost_type: Optional[str] = None
+    corrected_subcategory_id: Optional[str] = None
+    corrected_cost_type: Optional[str] = None
 
     @field_validator('project_id', 'user_id', 'corrected_account_id', mode='before')
     @classmethod
@@ -2142,7 +2149,8 @@ class CategorizationCorrectionRequest(BaseModel):
             raise ValueError(f"{info.field_name} is required")
         return _validate_uuid_or_none(v, info.field_name) or v
 
-    @field_validator('expense_id', 'original_account_id', mode='before')
+    @field_validator('expense_id', 'original_account_id',
+                     'original_subcategory_id', 'corrected_subcategory_id', mode='before')
     @classmethod
     def validate_optional_uuids(cls, v, info):
         return _validate_uuid_or_none(v, info.field_name)
@@ -2176,6 +2184,31 @@ async def save_categorization_correction(payload: CategorizationCorrectionReques
             correction_data["original_confidence"] = payload.original_confidence
         if payload.correction_reason:
             correction_data["correction_reason"] = payload.correction_reason
+
+        # Phase C classification triple. Use producer-supplied values when
+        # present; otherwise derive from the corresponding account_id via the
+        # overlay so corrections always carry the (subcategory_id, cost_type)
+        # axis even when the frontend doesn't ship it.
+        original_sub = payload.original_subcategory_id
+        original_ct  = payload.original_cost_type
+        corrected_sub = payload.corrected_subcategory_id
+        corrected_ct  = payload.corrected_cost_type
+        if (original_sub is None or original_ct is None) and payload.original_account_id:
+            overlay = _load_account_overlay()
+            m = overlay.get(payload.original_account_id)
+            if m:
+                if original_sub is None: original_sub = m.get("subcategory_id")
+                if original_ct  is None: original_ct  = m.get("cost_type")
+        if corrected_sub is None or corrected_ct is None:
+            overlay = _load_account_overlay()
+            m = overlay.get(payload.corrected_account_id)
+            if m:
+                if corrected_sub is None: corrected_sub = m.get("subcategory_id")
+                if corrected_ct  is None: corrected_ct  = m.get("cost_type")
+        if original_sub:  correction_data["original_subcategory_id"]  = original_sub
+        if original_ct:   correction_data["original_cost_type"]       = original_ct
+        if corrected_sub: correction_data["corrected_subcategory_id"] = corrected_sub
+        if corrected_ct:  correction_data["corrected_cost_type"]      = corrected_ct
 
         result = supabase.table("categorization_corrections").insert(correction_data).execute()
 
