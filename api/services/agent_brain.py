@@ -18,6 +18,7 @@ import time
 import asyncio
 import logging
 import traceback
+from datetime import date
 from typing import Dict, Any, Optional, Tuple
 from api.services.gpt_client import gpt
 
@@ -96,6 +97,7 @@ IMPORTANT RULES:
 - Use "unknown" ONLY when the user explicitly asks for a specific action/task you cannot perform. Do NOT fabricate answers about data you have not queried.
 
 ## Context
+- Today's date: {today} (use this to resolve relative dates like "last week", "yesterday", "the past 30 days" into ISO YYYY-MM-DD values when filling date parameters)
 - Project: {project_name} (ID: {project_id})
 - User: {user_name}
 - Channel: {channel_type}
@@ -464,6 +466,7 @@ async def _route(
         brain_summary=persona["brain_summary"],
         function_menu=format_functions_for_llm(agent_name),
         other_agent=other_agent or "N/A",
+        today=date.today().isoformat(),
         project_name=context["project_name"],
         project_id=context["project_id"],
         user_name=user_name,
@@ -570,6 +573,7 @@ async def _reroute_with_context(
         brain_summary=persona["brain_summary"],
         function_menu=format_functions_for_llm(agent_name),
         other_agent=other_agent or "N/A",
+        today=date.today().isoformat(),
         project_name=context["project_name"],
         project_id=context["project_id"],
         user_name=user_name,
@@ -1385,6 +1389,161 @@ async def _builtin_reprocess_pending(params: Dict[str, Any]) -> Dict[str, Any]:
             "still_pending": still_pending,
         }
 
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Daneel: criteria audit + edit + recent reports (chat-driven)
+# ---------------------------------------------------------------------------
+# Whitelist of settings the operator can flip from chat. Maps the short alias
+# the LLM emits (e.g. "require_bill") to the actual agent_config row key and
+# the value type to coerce into. Anything not in this map is rejected.
+_DANEEL_EDITABLE_KEYS: Dict[str, tuple] = {
+    "require_bill":               ("daneel_auto_auth_require_bill",      "bool"),
+    "require_receipt":            ("daneel_auto_auth_require_receipt",   "bool"),
+    "fuzzy_threshold":            ("daneel_fuzzy_threshold",             "int"),
+    "amount_tolerance":           ("daneel_amount_tolerance",            "float"),
+    "labor_keywords":             ("daneel_labor_keywords",              "str"),
+    "gpt_fallback_enabled":       ("daneel_gpt_fallback_enabled",        "bool"),
+    "gpt_fallback_confidence":    ("daneel_gpt_fallback_confidence",     "int"),
+    "bill_hint_ocr_enabled":      ("daneel_bill_hint_ocr_enabled",       "bool"),
+    "receipt_hash_check_enabled": ("daneel_receipt_hash_check_enabled",  "bool"),
+    "auto_auth_enabled":          ("daneel_auto_auth_enabled",           "bool"),
+}
+
+
+def _coerce_daneel_value(raw: Any, kind: str) -> Any:
+    """Coerce an operator-supplied string into the right type for a config row."""
+    if kind == "bool":
+        if isinstance(raw, bool):
+            return raw
+        s = str(raw).strip().lower()
+        if s in ("true", "1", "on", "yes", "y", "enable", "enabled"):
+            return True
+        if s in ("false", "0", "off", "no", "n", "disable", "disabled"):
+            return False
+        raise ValueError(f"Expected on/off, got '{raw}'")
+    if kind == "int":
+        return int(float(str(raw).strip().rstrip("%")))
+    if kind == "float":
+        s = str(raw).strip()
+        # Accept percent form: "5%" → 0.05 (for amount_tolerance & friends)
+        if s.endswith("%"):
+            return round(float(s[:-1]) / 100, 4)
+        return float(s)
+    return str(raw).strip()
+
+
+async def _builtin_daneel_show_criteria(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Snapshot of Daneel's authorization config so the operator can audit it from chat."""
+    try:
+        from api.services.daneel_auto_auth import load_auto_auth_config, _public_criteria_view
+        cfg = load_auto_auth_config()
+        view = _public_criteria_view(cfg)
+        view["editable_keys"] = sorted(_DANEEL_EDITABLE_KEYS.keys())
+        return view
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _builtin_daneel_update_criteria(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Toggle/change one Daneel auth setting. Whitelisted keys only — no arbitrary writes."""
+    try:
+        from api.services.daneel_auto_auth import _save_config_key, load_auto_auth_config
+
+        raw_key = str(params.get("key") or "").strip().lower()
+        raw_value = params.get("value")
+        if not raw_key:
+            return {"error": "Setting name is required."}
+        if raw_value is None or str(raw_value).strip() == "":
+            return {"error": "Value is required."}
+
+        # Accept short alias ("require_bill") or the full config key
+        # ("daneel_auto_auth_require_bill") for resilience against LLM phrasing.
+        candidates = [raw_key]
+        if raw_key.startswith("daneel_auto_auth_"):
+            candidates.append(raw_key[len("daneel_auto_auth_"):])
+        if raw_key.startswith("daneel_"):
+            candidates.append(raw_key[len("daneel_"):])
+
+        entry = None
+        alias = raw_key
+        for cand in candidates:
+            if cand in _DANEEL_EDITABLE_KEYS:
+                entry = _DANEEL_EDITABLE_KEYS[cand]
+                alias = cand
+                break
+        if not entry:
+            editable = ", ".join(sorted(_DANEEL_EDITABLE_KEYS.keys()))
+            return {
+                "error": (
+                    f"Setting '{raw_key}' is not editable from chat. "
+                    f"Editable settings: {editable}."
+                ),
+            }
+        cfg_key, kind = entry
+
+        cfg = load_auto_auth_config()
+        old_value = cfg.get(cfg_key)
+
+        try:
+            new_value = _coerce_daneel_value(raw_value, kind)
+        except ValueError as ve:
+            return {"error": str(ve)}
+
+        try:
+            _save_config_key(cfg_key, new_value)
+        except Exception as save_err:
+            return {"error": f"Could not save: {save_err}"}
+
+        return {
+            "key": alias,
+            "config_key": cfg_key,
+            "old_value": old_value,
+            "new_value": new_value,
+            "kind": kind,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _builtin_daneel_list_recent_reports(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Recent auth report headers for browsing past runs from chat."""
+    from api.supabase_client import supabase as sb
+
+    try:
+        limit = int(params.get("limit") or 10)
+    except (ValueError, TypeError):
+        limit = 10
+    limit = max(1, min(25, limit))
+
+    try:
+        result = sb.table("daneel_auth_reports") \
+            .select("report_id, report_type, project_name, created_at, summary") \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+        reports = []
+        for r in (result.data or []):
+            s = r.get("summary") or {}
+            if isinstance(s, str):
+                try:
+                    s = json.loads(s)
+                except Exception:
+                    s = {}
+            reports.append({
+                "report_id": r["report_id"],
+                "report_type": r.get("report_type") or "",
+                "project_name": r.get("project_name") or "All projects",
+                "created_at": r["created_at"],
+                "authorized": int(s.get("authorized", 0)),
+                "missing_info": int(s.get("missing_info", 0)),
+                "duplicates": int(s.get("duplicates", 0)),
+                "escalated": int(s.get("escalated", 0)),
+                "expenses_processed": int(s.get("expenses_processed", 0)),
+            })
+        return {"reports": reports, "count": len(reports)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -2632,6 +2791,9 @@ _BUILTIN_HANDLERS = {
     "check_duplicates": _builtin_check_duplicates,
     "expense_health_report": _builtin_expense_health_report,
     "reprocess_pending": _builtin_reprocess_pending,
+    "daneel_show_criteria": _builtin_daneel_show_criteria,
+    "daneel_update_criteria": _builtin_daneel_update_criteria,
+    "daneel_list_recent_reports": _builtin_daneel_list_recent_reports,
     "review_bill": _builtin_review_bill,
     "hari_create_task": _builtin_hari_create_task,
     "hari_schedule_event": _builtin_hari_schedule_event,
@@ -2640,6 +2802,201 @@ _BUILTIN_HANDLERS = {
     "hari_update_task": _builtin_hari_update_task,
     "hari_weekly_summary": _builtin_hari_weekly_summary,
 }
+
+
+# ---------------------------------------------------------------------------
+# Daneel result formatters (rich markdown for the operator console)
+# ---------------------------------------------------------------------------
+
+def _format_daneel_auth_report(result: Dict[str, Any]) -> str:
+    """Render `run_auto_auth` as a chat-friendly audit report: header (scope),
+    headline counts, criteria applied, then per-decision groups with the rule
+    that fired and the reason. Keeps each group capped so the message stays
+    readable; the full audit trail lives in daneel_auth_reports."""
+    scope = result.get("scope") or {}
+    criteria = result.get("criteria") or {}
+    decisions = result.get("decisions") or []
+    truncated = bool(result.get("decisions_truncated"))
+
+    n_auth = int(result.get("authorized", 0))
+    n_missing = int(result.get("missing_info", 0))
+    n_dup = int(result.get("duplicates", 0))
+    n_esc = int(result.get("escalated", 0))
+    n_proc = int(result.get("expenses_processed", 0))
+
+    # Scope chips for the header line
+    proj_name = scope.get("project_name")
+    if proj_name:
+        scope_proj = proj_name
+    elif scope.get("project_id"):
+        scope_proj = scope.get("project_id")
+    else:
+        scope_proj = "All projects"
+    scope_bits = [f"Project: {scope_proj}"]
+    if scope.get("date_from") or scope.get("date_to"):
+        df = scope.get("date_from") or "…"
+        dt = scope.get("date_to") or "…"
+        scope_bits.append(f"Dates: {df} → {dt}")
+    if scope.get("process_all"):
+        scope_bits.append("Backlog mode")
+
+    if n_proc == 0:
+        return "\n".join([
+            "**Nothing to review.** No pending expenses match this scope.",
+            "  " + " · ".join(scope_bits),
+        ])
+
+    lines = [
+        f"**Authorization run** — reviewed {n_proc} pending expense(s)",
+        "  " + " · ".join(scope_bits),
+        "",
+        (
+            f"**Result:** {n_auth} authorized · {n_missing} need info · "
+            f"{n_dup} duplicates · {n_esc} flagged"
+        ),
+    ]
+
+    if criteria:
+        crit_bits = [
+            f"bill #: {'required' if criteria.get('require_bill') else 'optional'}",
+            f"receipt: {'required' if criteria.get('require_receipt') else 'optional'}",
+            f"fuzzy: {int(criteria.get('fuzzy_threshold', 85))}%",
+            f"$ tol: {float(criteria.get('amount_tolerance', 0.05)) * 100:.1f}%",
+            f"hash check: {'on' if criteria.get('receipt_hash_check_enabled') else 'off'}",
+            f"OCR cross-check: {'on' if criteria.get('bill_hint_ocr_enabled') else 'off'}",
+            f"GPT fallback: {'on' if criteria.get('gpt_fallback_enabled') else 'off'}",
+        ]
+        lines.append("")
+        lines.append("**Criteria applied:** " + " · ".join(crit_bits))
+
+    def _line(d: Dict[str, Any]) -> str:
+        vendor = d.get("vendor") or "Unknown"
+        amount = float(d.get("amount") or 0)
+        rule = d.get("rule") or ""
+        reason = d.get("reason") or ""
+        bill = d.get("bill_id") or ""
+        date = d.get("date") or ""
+        tail_bits = []
+        if date:
+            tail_bits.append(date)
+        if bill:
+            tail_bits.append(f"bill #{bill}")
+        tail = (" · " + " · ".join(tail_bits)) if tail_bits else ""
+        body = f"  - {vendor} — ${amount:,.2f}{tail}"
+        if rule and reason:
+            body += f" — **{rule}**: {reason}"
+        elif rule:
+            body += f" — **{rule}**"
+        elif reason:
+            body += f" — {reason}"
+        return body
+
+    buckets: Dict[str, list] = {"authorized": [], "missing_info": [], "duplicate": [], "escalated": []}
+    for d in decisions:
+        b = d.get("decision") or "escalated"
+        if b not in buckets:
+            b = "escalated"
+        buckets[b].append(d)
+
+    CAP = 12  # per-bucket display cap to keep the chat message short
+
+    def _append_bucket(title: str, total: int, items: list) -> None:
+        if total == 0:
+            return
+        lines.append("")
+        lines.append(f"**{title} ({total}):**")
+        for d in items[:CAP]:
+            if title.startswith("Need info"):
+                missing = d.get("missing_fields") or []
+                base = _line(d)
+                if missing and not d.get("reason"):
+                    base += f" — missing: {', '.join(missing)}"
+                lines.append(base)
+            else:
+                lines.append(_line(d))
+        if total > CAP:
+            lines.append(f"  - …and {total - CAP} more")
+
+    _append_bucket("Authorized", n_auth, buckets["authorized"])
+    _append_bucket("Need info", n_missing, buckets["missing_info"])
+    _append_bucket("Duplicates", n_dup, buckets["duplicate"])
+    _append_bucket("Flagged for human review", n_esc, buckets["escalated"])
+
+    if truncated:
+        lines.append("")
+        lines.append("_More decisions exist than fit in this report — the full audit trail is in recent reports._")
+
+    return "\n".join(lines)
+
+
+def _format_daneel_criteria(result: Dict[str, Any]) -> str:
+    """Render `show_criteria` snapshot as a markdown table-ish list."""
+    if "error" in result:
+        return f"Error: {result['error']}"
+    enabled = bool(result.get("auto_auth_enabled", False))
+    lines = [
+        f"**Daneel authorization criteria** — engine is {'**ON**' if enabled else '**OFF**'}",
+        "",
+        f"- **require_bill**: {'yes' if result.get('require_bill') else 'no'}",
+        f"- **require_receipt**: {'yes' if result.get('require_receipt') else 'no'}",
+        f"- **fuzzy_threshold**: {int(result.get('fuzzy_threshold', 85))}% (description similarity for duplicate match)",
+        f"- **amount_tolerance**: {float(result.get('amount_tolerance', 0.05)) * 100:.1f}% (price match tolerance)",
+        f"- **labor_keywords**: {result.get('labor_keywords', 'labor')}",
+        f"- **bill_hint_ocr_enabled**: {'on' if result.get('bill_hint_ocr_enabled') else 'off'} (cross-check bill total via OCR)",
+        f"- **receipt_hash_check_enabled**: {'on' if result.get('receipt_hash_check_enabled') else 'off'} (detect same file on different bills)",
+        f"- **gpt_fallback_enabled**: {'on' if result.get('gpt_fallback_enabled') else 'off'} (LLM second opinion on ambiguous duplicates)",
+        f"- **gpt_fallback_confidence**: {int(result.get('gpt_fallback_confidence', 75))}% (min confidence to act on GPT verdict)",
+        "",
+        "Change one with: `update_criteria key=<name> value=<on/off or number>`.",
+    ]
+    return "\n".join(lines)
+
+
+def _format_daneel_criteria_update(result: Dict[str, Any]) -> str:
+    """Render an `update_criteria` confirmation (or the editable-keys help on error)."""
+    if "error" in result:
+        if result.get("editable_keys"):
+            keys = ", ".join(f"`{k}`" for k in result["editable_keys"])
+            return f"{result['error']}\n\nEditable settings: {keys}."
+        return f"Error: {result['error']}"
+    key = result.get("key", "?")
+    old = result.get("old_value")
+    new = result.get("new_value")
+    kind = result.get("kind", "")
+
+    def _fmt(v: Any) -> str:
+        if isinstance(v, bool):
+            return "on" if v else "off"
+        if kind == "float" and isinstance(v, (int, float)):
+            return f"{float(v) * 100:.1f}%"
+        return str(v)
+
+    return f"Updated **{key}**: {_fmt(old)} → **{_fmt(new)}**."
+
+
+def _format_daneel_recent_reports(result: Dict[str, Any]) -> str:
+    """Render `list_recent_reports` as a compact list."""
+    if "error" in result:
+        return f"Error: {result['error']}"
+    reports = result.get("reports") or []
+    if not reports:
+        return "No authorization runs on record yet."
+    lines = [f"**Recent authorization runs ({len(reports)}):**", ""]
+    for r in reports:
+        created = (r.get("created_at") or "")[:16].replace("T", " ")
+        proj = r.get("project_name") or "All projects"
+        rtype = r.get("report_type") or ""
+        counts = (
+            f"{r.get('authorized', 0)} auth · "
+            f"{r.get('missing_info', 0)} need info · "
+            f"{r.get('duplicates', 0)} dup · "
+            f"{r.get('escalated', 0)} flagged"
+        )
+        proc = int(r.get("expenses_processed", 0))
+        proc_str = f" ({proc} processed)" if proc else ""
+        rtype_str = f" — _{rtype}_" if rtype else ""
+        lines.append(f"- {created} · **{proj}**{rtype_str} — {counts}{proc_str}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2802,14 +3159,16 @@ def _format_result(agent_name: str, fn_name: str, result: Any) -> str:
         return "Mismatch reconciliation complete. Check the receipts channel for the full report."
 
     if fn_name == "run_auto_auth":
-        # Auto-auth posts its own messages too
-        authorized = result.get("authorized", 0)
-        flagged = result.get("flagged", 0)
-        missing = result.get("missing_info", 0)
-        return (
-            f"Authorization complete. "
-            f"{authorized} authorized, {flagged} flagged, {missing} need info."
-        )
+        return _format_daneel_auth_report(result)
+
+    if fn_name == "show_criteria":
+        return _format_daneel_criteria(result)
+
+    if fn_name == "update_criteria":
+        return _format_daneel_criteria_update(result)
+
+    if fn_name == "list_recent_reports":
+        return _format_daneel_recent_reports(result)
 
     # ── Hari functions ──
 

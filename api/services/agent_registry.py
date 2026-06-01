@@ -138,16 +138,79 @@ DANEEL_FUNCTIONS: List[Dict[str, Any]] = [
     {
         "name": "run_auto_auth",
         "description": (
-            "Run the expense authorization engine for this project. "
-            "Scans pending expenses, auto-authorizes safe ones, flags duplicates, "
-            "and reports missing information."
+            "Run the expense authorization engine. Scans pending expenses, "
+            "auto-authorizes safe ones, flags duplicates, reports missing info, "
+            "and returns a per-expense decision list with the rule that fired and "
+            "the criteria that were applied. USE THIS when the user asks to review, "
+            "authorize, or run authorization on expenses — optionally scoped to a "
+            "project, a date window, or 'all backlog'."
         ),
         "parameters": [
             {"name": "project_id", "type": "string", "required": False,
-             "description": "Project ID. Defaults to current channel project."},
+             "description": "Project ID. Defaults to current channel project. Omit to run across all projects."},
+            {"name": "date_from", "type": "string", "required": False,
+             "description": "Inclusive start date (ISO format YYYY-MM-DD) for the TxnDate filter. Only use if the user explicitly mentions an absolute date."},
+            {"name": "date_to", "type": "string", "required": False,
+             "description": "Inclusive end date (ISO format YYYY-MM-DD) for the TxnDate filter. Only use if the user explicitly mentions an absolute date."},
+            {"name": "process_all", "type": "boolean", "required": False,
+             "description": "When true, scan the entire backlog (every pending expense, not just new ones since the last run). Set true when the user says 'all pending', 'everything', or 'backlog'."},
         ],
         "handler": "api.services.daneel_auto_auth.run_auto_auth",
         "long_running": True,
+    },
+    {
+        "name": "show_criteria",
+        "description": (
+            "Show the authorization criteria Daneel is currently applying: which "
+            "rules are on, threshold values, and what's required. USE THIS when the "
+            "user asks 'what rules are you using?', 'show settings', 'what are the "
+            "criteria?', or wants to audit Daneel's behavior before running a scan."
+        ),
+        "parameters": [],
+        "handler": "_builtin:daneel_show_criteria",
+        "long_running": False,
+    },
+    {
+        "name": "update_criteria",
+        "description": (
+            "Change one of Daneel's authorization settings. USE THIS when the user "
+            "asks to toggle a requirement, raise/lower a threshold, or enable/disable "
+            "a rule. Examples: 'require receipt off', 'set fuzzy threshold to 90', "
+            "'amount tolerance 3%', 'turn on GPT fallback', 'disable auto-auth'."
+        ),
+        "parameters": [
+            {"name": "key", "type": "string", "required": True,
+             "description": (
+                 "Short setting name. One of: require_bill, require_receipt, "
+                 "fuzzy_threshold, amount_tolerance, labor_keywords, "
+                 "gpt_fallback_enabled, gpt_fallback_confidence, "
+                 "bill_hint_ocr_enabled, receipt_hash_check_enabled, "
+                 "auto_auth_enabled."
+             )},
+            {"name": "value", "type": "string", "required": True,
+             "description": (
+                 "New value as text. For booleans use 'on'/'off' (also accepts "
+                 "true/false, yes/no, enable/disable). For numeric thresholds use "
+                 "a plain number (e.g. 85) or a percent ('5%' for amount_tolerance "
+                 "becomes 0.05). For labor_keywords use plain text."
+             )},
+        ],
+        "handler": "_builtin:daneel_update_criteria",
+        "long_running": False,
+    },
+    {
+        "name": "list_recent_reports",
+        "description": (
+            "List the most recent authorization runs with their summary "
+            "(authorized / missing / duplicate / escalated counts). USE THIS when "
+            "the user asks about recent Daneel activity, past runs, or history."
+        ),
+        "parameters": [
+            {"name": "limit", "type": "integer", "required": False,
+             "description": "How many reports to return (default 10, max 25)."},
+        ],
+        "handler": "_builtin:daneel_list_recent_reports",
+        "long_running": False,
     },
     {
         "name": "check_budget",

@@ -100,6 +100,23 @@ def load_auto_auth_config() -> dict:
         return dict(_DEFAULT_CONFIG)
 
 
+def _public_criteria_view(cfg: dict) -> dict:
+    """Subset of the config that's safe + useful to echo back to the operator in chat.
+    Excludes secrets and noisy plumbing (mention recipients, last_run, etc.)."""
+    return {
+        "auto_auth_enabled": bool(cfg.get("daneel_auto_auth_enabled", False)),
+        "require_bill": bool(cfg.get("daneel_auto_auth_require_bill", True)),
+        "require_receipt": bool(cfg.get("daneel_auto_auth_require_receipt", True)),
+        "fuzzy_threshold": int(cfg.get("daneel_fuzzy_threshold", 85)),
+        "amount_tolerance": float(cfg.get("daneel_amount_tolerance", 0.05)),
+        "labor_keywords": str(cfg.get("daneel_labor_keywords", "labor")),
+        "gpt_fallback_enabled": bool(cfg.get("daneel_gpt_fallback_enabled", False)),
+        "gpt_fallback_confidence": int(cfg.get("daneel_gpt_fallback_confidence", 75)),
+        "bill_hint_ocr_enabled": bool(cfg.get("daneel_bill_hint_ocr_enabled", True)),
+        "receipt_hash_check_enabled": bool(cfg.get("daneel_receipt_hash_check_enabled", True)),
+    }
+
+
 def _save_config_key(key: str, value):
     """Persist a single config key."""
     import json
@@ -1128,13 +1145,26 @@ def _trigger_andrew_reconciliation(bill_id: str, project_id: str, source: str):
 # Main orchestrator
 # ============================================================================
 
-def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None, _loop=None) -> dict:
+def run_auto_auth(
+    process_all: bool = False,
+    project_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    _loop=None,
+) -> dict:
     """
     Process pending expenses.
     process_all=False (default): only new since last run.
     process_all=True: process ALL pending expenses (backlog).
     project_id: if provided, only process expenses for this project.
+    date_from / date_to: ISO YYYY-MM-DD, inclusive; filter by TxnDate when supplied.
+        Date filters are independent of process_all — they always narrow the scope.
     """
+    # Normalize: empty strings → None (LLM router may emit "")
+    if isinstance(date_from, str) and not date_from.strip():
+        date_from = None
+    if isinstance(date_to, str) and not date_to.strip():
+        date_to = None
     t0 = time.monotonic()
     _t = time.monotonic  # alias for micro-benchmarks
     timings: dict = {}  # phase -> ms (returned to frontend)
@@ -1164,8 +1194,13 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None, _
     if project_id:
         # Per-project run: always process ALL pending for that project
         query = query.eq("project", project_id)
-    elif not process_all and last_run:
+    elif not process_all and last_run and not (date_from or date_to):
+        # Incremental: only when no explicit date window was requested
         query = query.gt("created_at", last_run)
+    if date_from:
+        query = query.gte("TxnDate", date_from)
+    if date_to:
+        query = query.lte("TxnDate", date_to)
     result = query.order("created_at").execute()
 
     pending = result.data or []
@@ -1173,7 +1208,34 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None, _
     if not pending:
         _save_config_key("daneel_auto_auth_last_run", now)
         logger.info("[DaneelAutoAuth] No pending expenses found")
-        return {"status": "ok", "message": "No new pending expenses", "authorized": 0, "timings": timings}
+        # Resolve project name even on empty result so the chat header reads cleanly
+        empty_project_name = None
+        if project_id:
+            try:
+                pn = sb.table("projects").select("project_name").eq("project_id", project_id).single().execute()
+                empty_project_name = (pn.data or {}).get("project_name")
+            except Exception:
+                empty_project_name = None
+        return {
+            "status": "ok",
+            "message": "No pending expenses match this scope.",
+            "authorized": 0,
+            "missing_info": 0,
+            "duplicates": 0,
+            "escalated": 0,
+            "expenses_processed": 0,
+            "decisions": [],
+            "decisions_truncated": False,
+            "scope": {
+                "project_id": project_id,
+                "project_name": empty_project_name,
+                "process_all": bool(process_all),
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+            "criteria": _public_criteria_view(cfg),
+            "timings": timings,
+        }
     logger.info("[DaneelAutoAuth] Found %d pending expenses across projects", len(pending))
 
     # Load all bills metadata (normalized keys for case-insensitive lookup)
@@ -1726,6 +1788,27 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None, _
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     timings["total_ms"] = elapsed_ms
     timings["projects"] = project_timings
+
+    # Trimmed decisions for chat rendering. The full audit trail (with the
+    # per-check breakdown) lives in daneel_auth_reports — keep this payload
+    # under a few KB so the brain message doesn't blow past chat limits.
+    _DECISIONS_CHAT_CAP = 60
+    chat_decisions = [
+        {
+            "expense_id": d.get("expense_id"),
+            "vendor": d.get("vendor"),
+            "amount": d.get("amount"),
+            "date": d.get("date"),
+            "bill_id": d.get("bill_id"),
+            "decision": d.get("decision"),
+            "rule": d.get("rule"),
+            "reason": d.get("reason"),
+            "missing_fields": d.get("missing_fields") or [],
+        }
+        for d in all_decisions[:_DECISIONS_CHAT_CAP]
+    ]
+
+    scope_project_name = proj_names.get(project_id) if project_id else None
     summary = {
         "status": "ok",
         "authorized": total_authorized,
@@ -1734,6 +1817,16 @@ def run_auto_auth(process_all: bool = False, project_id: Optional[str] = None, _
         "escalated": total_escalated,
         "expenses_processed": len(pending),
         "missing_detail": missing_detail[:20],  # cap for response size
+        "scope": {
+            "project_id": project_id,
+            "project_name": scope_project_name,
+            "process_all": bool(process_all),
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+        "criteria": _public_criteria_view(cfg),
+        "decisions": chat_decisions,
+        "decisions_truncated": len(all_decisions) > _DECISIONS_CHAT_CAP,
         "timings": timings,
     }
     logger.info("[DaneelAutoAuth] Run complete in %dms | processed=%d authorized=%d missing=%d duplicates=%d escalated=%d",
