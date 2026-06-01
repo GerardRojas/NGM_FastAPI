@@ -14,9 +14,10 @@
 # no key the endpoint returns a small set of demo San Diego listings (source:
 # "demo") so the feature is demonstrable end-to-end before a key is provisioned.
 
+import asyncio
 import os
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -33,16 +34,37 @@ RENTCAST_TIMEOUT = 25.0
 
 
 class ListingSearch(BaseModel):
-    state: Optional[str] = None          # 2-letter, e.g. "CA"
+    state: Optional[str] = None                              # 2-letter, e.g. "CA"
     city: Optional[str] = None
     zip_code: Optional[str] = None
-    property_type: Optional[str] = None  # "Single Family" | "Condo" | "Townhouse" | "Multi-Family" | ...
+    # Single string (legacy) OR list (multi-type filter). Empty string / empty
+    # list both mean "no filter". RentCast's API only accepts a single type per
+    # call, so when a list is provided we fan out one call per type and merge.
+    property_type: Optional[Union[str, List[str]]] = None
     bedrooms: Optional[int] = None
     bathrooms: Optional[float] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    days_old: Optional[int] = None       # only listings active within N days
+    days_old: Optional[int] = None                           # only listings active within N days
     limit: int = 50
+
+    def normalized_types(self) -> List[str]:
+        """Return the requested property types as a clean, dedup'd list. Empty
+        list means 'no type filter'. Trims whitespace and drops empty entries
+        so the legacy '' sentinel ('Any') from older clients still works."""
+        if self.property_type is None:
+            return []
+        if isinstance(self.property_type, str):
+            t = self.property_type.strip()
+            return [t] if t else []
+        seen: List[str] = []
+        for t in self.property_type:
+            if not isinstance(t, str):
+                continue
+            tn = t.strip()
+            if tn and tn not in seen:
+                seen.append(tn)
+        return seen
 
 
 def _normalize(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -106,8 +128,10 @@ def _filter(rows: List[Dict[str, Any]], payload: ListingSearch) -> List[Dict[str
         out = [r for r in out if (r.get("price") or 0) >= payload.min_price]
     if payload.max_price is not None:
         out = [r for r in out if (r.get("price") or 0) <= payload.max_price]
-    if payload.property_type:
-        out = [r for r in out if (r.get("property_type") or "") == payload.property_type]
+    types = payload.normalized_types()
+    if types:
+        wanted = {t.lower() for t in types}
+        out = [r for r in out if (r.get("property_type") or "").lower() in wanted]
     if payload.bedrooms is not None:
         out = [r for r in out if (r.get("bedrooms") or 0) >= payload.bedrooms]
     if payload.zip_code:
@@ -115,10 +139,60 @@ def _filter(rows: List[Dict[str, Any]], payload: ListingSearch) -> List[Dict[str
     return out
 
 
+def _build_rentcast_params(payload: ListingSearch, limit: int, property_type: Optional[str]) -> Dict[str, Any]:
+    """Translate one search payload (+ a single property type, if any) into the
+    query params RentCast expects. Factored out so the multi-type fan-out can
+    reuse the same translation per type."""
+    params: Dict[str, Any] = {"status": "Active", "limit": limit}
+    if payload.city:
+        params["city"] = payload.city
+    if payload.state:
+        params["state"] = payload.state.upper()
+    if payload.zip_code:
+        params["zipCode"] = payload.zip_code
+    if property_type:
+        params["propertyType"] = property_type
+    if payload.bedrooms is not None:
+        params["bedrooms"] = payload.bedrooms
+    if payload.bathrooms is not None:
+        params["bathrooms"] = payload.bathrooms
+    if payload.days_old is not None:
+        params["daysOld"] = payload.days_old
+    return params
+
+
+async def _rentcast_fetch(
+    client: httpx.AsyncClient, api_key: str, params: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Hit RentCast once and return normalized rows. Raises HTTPException on
+    non-recoverable provider errors so the caller can short-circuit."""
+    r = await client.get(
+        f"{RENTCAST_BASE}/listings/sale",
+        params=params,
+        headers={"X-Api-Key": api_key, "Accept": "application/json"},
+        timeout=RENTCAST_TIMEOUT,
+    )
+    if r.status_code == 401:
+        raise HTTPException(status_code=502, detail="Listings provider rejected the API key (401).")
+    if r.status_code == 429:
+        raise HTTPException(status_code=429, detail="Listings provider quota exceeded. Try again later.")
+    if r.status_code >= 400:
+        logger.warning("[LISTINGS] RentCast %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail=f"Listings provider returned {r.status_code}.")
+    data = r.json()
+    items = data if isinstance(data, list) else (data.get("listings") or data.get("data") or [])
+    return [_normalize(it) for it in items]
+
+
 @router.post("/search")
 async def search_listings(payload: ListingSearch, current_user: dict = Depends(get_current_user)):
     """Search active for-sale listings for a market. Proxies RentCast; falls back
-    to demo data when RENTCAST_API_KEY is not configured."""
+    to demo data when RENTCAST_API_KEY is not configured.
+
+    property_type may be a string or a list of strings. RentCast accepts only one
+    propertyType per call, so when the caller asks for several we fan out one
+    request per type in parallel and merge by id. Single-type and unfiltered
+    runs stay at exactly one quota request."""
     api_key = os.getenv("RENTCAST_API_KEY")
     # RentCast returns up to 500 records per call and bills the same 1 request
     # regardless of how many come back, so we let a single search pull the full 500.
@@ -132,45 +206,45 @@ async def search_listings(payload: ListingSearch, current_user: dict = Depends(g
     if not (payload.state or payload.city or payload.zip_code):
         raise HTTPException(status_code=400, detail="Provide at least a state, city, or ZIP code.")
 
-    params: Dict[str, Any] = {"status": "Active", "limit": limit}
-    if payload.city:
-        params["city"] = payload.city
-    if payload.state:
-        params["state"] = payload.state.upper()
-    if payload.zip_code:
-        params["zipCode"] = payload.zip_code
-    if payload.property_type:
-        params["propertyType"] = payload.property_type
-    if payload.bedrooms is not None:
-        params["bedrooms"] = payload.bedrooms
-    if payload.bathrooms is not None:
-        params["bathrooms"] = payload.bathrooms
-    if payload.days_old is not None:
-        params["daysOld"] = payload.days_old
+    types = payload.normalized_types()
 
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{RENTCAST_BASE}/listings/sale",
-                params=params,
-                headers={"X-Api-Key": api_key, "Accept": "application/json"},
-                timeout=RENTCAST_TIMEOUT,
-            )
+            if len(types) > 1:
+                # Multi-type fan-out: 1 RentCast call per type, merged + dedup'd
+                # by listing id. Note: this multiplies the quota cost by the
+                # number of types — keep the picker bounded on the frontend.
+                tasks = [
+                    _rentcast_fetch(client, api_key, _build_rentcast_params(payload, limit, t))
+                    for t in types
+                ]
+                results = await asyncio.gather(*tasks)
+                seen: set = set()
+                rows: List[Dict[str, Any]] = []
+                for batch in results:
+                    for row in batch:
+                        rid = row.get("id")
+                        # No id (rare): fall back to address to dedupe; else keep.
+                        key = rid if rid is not None else row.get("address")
+                        if key is not None and key in seen:
+                            continue
+                        if key is not None:
+                            seen.add(key)
+                        rows.append(row)
+            else:
+                # Single-type or unfiltered: one RentCast call (unchanged path).
+                single = types[0] if types else None
+                rows = await _rentcast_fetch(
+                    client, api_key, _build_rentcast_params(payload, limit, single)
+                )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("[LISTINGS] RentCast request failed: %r", e)
         raise HTTPException(status_code=502, detail=f"Listings provider error: {e}")
 
-    if r.status_code == 401:
-        raise HTTPException(status_code=502, detail="Listings provider rejected the API key (401).")
-    if r.status_code == 429:
-        raise HTTPException(status_code=429, detail="Listings provider quota exceeded. Try again later.")
-    if r.status_code >= 400:
-        logger.warning("[LISTINGS] RentCast %s: %s", r.status_code, r.text[:300])
-        raise HTTPException(status_code=502, detail=f"Listings provider returned {r.status_code}.")
-
-    data = r.json()
-    items = data if isinstance(data, list) else (data.get("listings") or data.get("data") or [])
-    rows = [_normalize(it) for it in items]
-    # Price/extra filters RentCast does not support as query params.
+    # Price + bedrooms + zip filters that RentCast doesn't support as query params.
+    # Also re-applies the type filter as a safety net in case RentCast returns a
+    # row that doesn't match what we asked for (which we've seen happen).
     rows = _filter(rows, payload)
     return {"listings": rows, "count": len(rows), "source": "rentcast"}
