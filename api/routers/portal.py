@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/portal", tags=["Client Portal"])
 
 # Portal module keys carried in project_client_access.modules
-PORTAL_MODULES = {"overview", "photos", "plans", "timeline", "documents", "messages"}
+PORTAL_MODULES = {"overview", "photos", "plans", "timeline", "documents", "messages", "deals", "estimates"}
 
 
 # ============================================================
@@ -269,6 +269,84 @@ def get_timeline(project_id: str) -> Dict[str, Any]:
     return {"phases": phases, "milestones": milestones}
 
 
+def get_deals(project_id: str) -> List[Dict[str, Any]]:
+    """
+    Published Fix & Flip deals (item_type='deal' -> fix_flip_deals). The client
+    view is intentionally curated — we surface address-ish/name + headline
+    numbers (asking & ARV) only, NOT rehab budget, profit or ROI. The team adds
+    context with the share's client_caption.
+    """
+    shares = _active_shares(project_id, "deal")
+    if not shares:
+        return []
+    by_id = {s["item_id"]: s for s in shares}
+    rows = (
+        supabase.table("fix_flip_deals")
+        .select("id, name, notes, data")
+        .in_("id", list(by_id.keys()))
+        .execute()
+    ).data or []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        s = by_id.get(r["id"], {})
+        inputs = ((r.get("data") or {}).get("inputs") or {}) if isinstance(r.get("data"), dict) else {}
+        out.append({
+            "id": r["id"],
+            "name": s.get("client_caption") or r.get("name"),
+            "notes": r.get("notes") or None,
+            "asking_price": _to_number(inputs.get("purchase_price")),
+            "arv": _to_number(inputs.get("sale_price")),
+            "client_caption": s.get("client_caption"),
+            "shared_at": s.get("shared_at"),
+        })
+    return out
+
+
+def get_estimates(project_id: str) -> List[Dict[str, Any]]:
+    """
+    Published estimates (item_type='estimate' -> estimates bucket). item_id is
+    the estimate folder name. We surface name + shared_at; the PDF link is
+    deferred until the export pipeline lives behind a stable URL.
+    """
+    shares = _active_shares(project_id, "estimate")
+    if not shares:
+        return []
+    out: List[Dict[str, Any]] = []
+    for s in shares:
+        estimate_id = s["item_id"]
+        name = s.get("client_caption") or _estimate_display_name(estimate_id)
+        out.append({
+            "id": estimate_id,
+            "name": name,
+            "client_caption": s.get("client_caption"),
+            "shared_at": s.get("shared_at"),
+        })
+    return out
+
+
+def _to_number(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _estimate_display_name(estimate_id: str) -> str:
+    """Best-effort lookup of the estimate's project_name from its manifest."""
+    try:
+        from api.routers import estimator as estimator_mod  # local import: optional dep
+        manifest = estimator_mod._download_json(estimator_mod._manifest_path(estimate_id))  # noqa: SLF001
+        if isinstance(manifest, dict):
+            name = manifest.get("project_name")
+            if name:
+                return str(name)
+    except Exception:
+        pass
+    return estimate_id
+
+
 def get_overview(project_id: str) -> Dict[str, Any]:
     """Derived progress snapshot from PUBLISHED content only."""
     project = (
@@ -344,3 +422,15 @@ def portal_timeline(project_id: str, client: dict = Depends(get_current_client))
 def portal_documents(project_id: str, client: dict = Depends(get_current_client)):
     assert_module(client["client_id"], project_id, "documents")
     return {"documents": get_documents(project_id)}
+
+
+@router.get("/projects/{project_id}/deals")
+def portal_deals(project_id: str, client: dict = Depends(get_current_client)):
+    assert_module(client["client_id"], project_id, "deals")
+    return {"deals": get_deals(project_id)}
+
+
+@router.get("/projects/{project_id}/estimates")
+def portal_estimates(project_id: str, client: dict = Depends(get_current_client)):
+    assert_module(client["client_id"], project_id, "estimates")
+    return {"estimates": get_estimates(project_id)}

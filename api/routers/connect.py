@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/connect", tags=["NGM Connect"])
 
-VALID_ITEM_TYPES = {"photo", "plan_revision", "vault_file", "milestone", "phase"}
+VALID_ITEM_TYPES = {"photo", "plan_revision", "vault_file", "milestone", "phase", "deal", "estimate"}
 INVITE_TTL_DAYS = 14
 
 
@@ -260,6 +260,10 @@ def preview_workspace(
         sections["timeline"] = portal_mod.get_timeline(project_id)
     if modules.get("documents"):
         sections["documents"] = portal_mod.get_documents(project_id)
+    if modules.get("deals"):
+        sections["deals"] = portal_mod.get_deals(project_id)
+    if modules.get("estimates"):
+        sections["estimates"] = portal_mod.get_estimates(project_id)
 
     return {
         "client_id": client_id,
