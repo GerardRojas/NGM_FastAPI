@@ -232,6 +232,76 @@ def revoke_client_access(client_id: str, project_id: str, user: dict = Depends(r
 
 
 # ============================================================
+# External-user access configuration — project_user_access
+# ============================================================
+# Parallel to project_client_access. Drives workspace access for users with
+# is_external=true (external collaborators in Team Management).
+
+@router.get("/users/{user_id}/access")
+def list_user_access(user_id: str, user: dict = Depends(require_internal)):
+    """Which projects this external user can see, and the enabled modules for each."""
+    try:
+        res = (
+            supabase.table("project_user_access")
+            .select("id, project_id, modules, granted_at")
+            .eq("user_id", user_id)
+            .execute()
+        )
+    except Exception as e:
+        logger.error("[connect] list_user_access failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not list access")
+    return {"access": res.data or []}
+
+
+@router.post("/users/{user_id}/access")
+def upsert_user_access(user_id: str, payload: AccessUpsert, user: dict = Depends(require_internal)):
+    """Grant/update an external user's access to a project and its enabled portal modules."""
+    bad = set(payload.modules) - portal_mod.PORTAL_MODULES
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown modules: {sorted(bad)}")
+    existing = (
+        supabase.table("project_user_access")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("project_id", payload.project_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    try:
+        if existing:
+            res = (
+                supabase.table("project_user_access")
+                .update({"modules": payload.modules})
+                .eq("id", existing[0]["id"])
+                .execute()
+            )
+        else:
+            res = supabase.table("project_user_access").insert({
+                "user_id": user_id,
+                "project_id": payload.project_id,
+                "modules": payload.modules,
+                "granted_by": user.get("user_id"),
+            }).execute()
+    except Exception as e:
+        logger.error("[connect] upsert user access failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not save access")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Save returned no data")
+    return res.data[0]
+
+
+@router.delete("/users/{user_id}/access/{project_id}")
+def revoke_user_access(user_id: str, project_id: str, user: dict = Depends(require_internal)):
+    """Remove an external user's access to a project entirely."""
+    try:
+        supabase.table("project_user_access").delete().eq("user_id", user_id).eq("project_id", project_id).execute()
+    except Exception as e:
+        logger.error("[connect] revoke user access failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not revoke access")
+    return {"ok": True}
+
+
+# ============================================================
 # WYSIWYG preview — render the portal as a given client sees it
 # ============================================================
 
