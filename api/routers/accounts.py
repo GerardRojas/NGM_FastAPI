@@ -1,7 +1,7 @@
 """
 Router para gestión de Accounts (Cuentas Contables)
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
@@ -19,6 +19,7 @@ class AccountCreate(BaseModel):
     AccountCategory: Optional[str] = None
     account_id: Optional[str] = None  # Si es auto-generado por Supabase, hacerlo opcional
     is_cogs: Optional[bool] = False  # True si es cuenta COGS (Cost of Goods Sold)
+    company_id: Optional[str] = None  # Owning workspace; stamped by the active org
 
 
 class AccountUpdate(BaseModel):
@@ -33,12 +34,21 @@ class AccountUpdate(BaseModel):
 # ========================================
 
 @router.get("")
-async def list_accounts():
+async def list_accounts(
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to the active workspace. Returns that company's accounts plus shared (company_id NULL) ones. Omit for all.",
+    ),
+):
     """
-    Lista todas las cuentas ordenadas por nombre
+    Lista las cuentas ordenadas por nombre. Si se provee company_id, devuelve las
+    de esa compañía mas las compartidas (company_id NULL); sin el parametro, todas.
     """
     try:
-        response = supabase.table("accounts").select("*").order("Name").execute()
+        query = supabase.table("accounts").select("*")
+        if company_id:
+            query = query.or_(f"company_id.eq.{company_id},company_id.is.null")
+        response = query.order("Name").execute()
         return {"data": response.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching accounts: {str(e)}")
@@ -83,6 +93,8 @@ async def create_account(account: AccountCreate):
             insert_data["account_id"] = account.account_id
         if account.is_cogs is not None:
             insert_data["is_cogs"] = account.is_cogs
+        if account.company_id:
+            insert_data["company_id"] = account.company_id
 
         response = supabase.table("accounts").insert(insert_data).execute()
 

@@ -30,6 +30,7 @@ class CreateInvoiceLinkRequest(BaseModel):
     link_type: str = "fixed"            # "fixed" | "open"
     invoice_ref: Optional[str] = None
     expires_days: int = 30
+    company_id: Optional[str] = None    # Owning workspace; stamped by the active org
 
 
 class CreateInvoiceLinkResponse(BaseModel):
@@ -128,6 +129,8 @@ async def create_invoice_link(
         "created_by": user_id,
         "expires_at": exp.isoformat(),
     }
+    if req.company_id:
+        row["company_id"] = req.company_id
 
     result = supabase.table("invoice_links").insert(row).execute()
     if not result.data:
@@ -256,8 +259,12 @@ async def list_invoice_links(
     current_user: dict = Depends(get_current_user),
     status: Optional[str] = None,
     limit: int = 50,
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to the active workspace (its links plus shared NULL ones). Omit for all.",
+    ),
 ):
-    """List invoice links created by the current user. Auth required."""
+    """List invoice links. Auth required. Scoped to the active workspace when company_id is given."""
     query = supabase.table("invoice_links").select(
         "id, invoice_ref, client_name, client_email, description, "
         "amount_cents, link_type, status, created_at, expires_at, paid_at, paid_amount"
@@ -265,6 +272,8 @@ async def list_invoice_links(
 
     if status:
         query = query.eq("status", status)
+    if company_id:
+        query = query.or_(f"company_id.eq.{company_id},company_id.is.null")
 
     result = query.execute()
     return {"links": result.data or []}

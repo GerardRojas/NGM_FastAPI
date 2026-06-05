@@ -2,7 +2,7 @@
 Router para gestión de Payment Methods (Métodos de Pago)
 NOTA: La tabla en Supabase se llama "paymet_methods" (con typo)
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
@@ -16,6 +16,7 @@ router = APIRouter(prefix="/payment-methods", tags=["payment_methods"])
 
 class PaymentMethodCreate(BaseModel):
     payment_method_name: str
+    company_id: Optional[str] = None  # Owning workspace; stamped by the active org
 
 
 class PaymentMethodUpdate(BaseModel):
@@ -27,12 +28,21 @@ class PaymentMethodUpdate(BaseModel):
 # ========================================
 
 @router.get("")
-async def list_payment_methods():
+async def list_payment_methods(
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to the active workspace (its payment methods plus shared NULL ones). Omit for all.",
+    ),
+):
     """
-    Lista todos los payment methods ordenados por nombre
+    Lista los payment methods ordenados por nombre. Con company_id devuelve los de
+    esa compañía mas los compartidos (company_id NULL); sin el parametro, todos.
     """
     try:
-        response = supabase.table("paymet_methods").select("*").order("payment_method_name").execute()
+        query = supabase.table("paymet_methods").select("*")
+        if company_id:
+            query = query.or_(f"company_id.eq.{company_id},company_id.is.null")
+        response = query.order("payment_method_name").execute()
         return {"data": response.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching payment methods: {str(e)}")
@@ -70,9 +80,11 @@ async def create_payment_method(payment_method: PaymentMethodCreate):
                 if item.get("payment_method_name", "").lower().strip() == payment_method.payment_method_name.lower().strip():
                     raise HTTPException(status_code=400, detail="Payment method with this name already exists")
 
-        response = supabase.table("paymet_methods").insert({
-            "payment_method_name": payment_method.payment_method_name
-        }).execute()
+        insert_data = {"payment_method_name": payment_method.payment_method_name}
+        if payment_method.company_id:
+            insert_data["company_id"] = payment_method.company_id
+
+        response = supabase.table("paymet_methods").insert(insert_data).execute()
 
         return {"message": "Payment method created successfully", "data": response.data[0] if response.data else None}
     except HTTPException:

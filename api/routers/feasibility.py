@@ -24,7 +24,7 @@ import logging
 from typing import Optional, List, Dict, Any, Literal
 
 import httpx
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 
 from api.auth import get_current_user
@@ -316,6 +316,7 @@ class DealCreate(BaseModel):
     irr: Optional[float] = None
     max_units: Optional[int] = None
     data: Dict[str, Any]            # full analysis snapshot (parcel, zone, proforma, etc.)
+    company_id: Optional[str] = None  # Owning workspace; stamped by the active org
 
 
 # ====== HELPERS ======
@@ -834,6 +835,8 @@ async def create_deal(payload: DealCreate, current_user: dict = Depends(get_curr
         "max_units": payload.max_units,
         "data": payload.data,
     }
+    if payload.company_id:
+        row["company_id"] = payload.company_id
     try:
         res = supabase.table("feasibility_deals").insert(row).execute()
     except Exception as e:
@@ -844,17 +847,24 @@ async def create_deal(payload: DealCreate, current_user: dict = Depends(get_curr
 
 
 @router.get("/deals")
-async def list_deals(current_user: dict = Depends(get_current_user)):
-    """List the current user's saved deals (lightweight, newest first)."""
+async def list_deals(
+    current_user: dict = Depends(get_current_user),
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to the active workspace (deals tagged to it plus shared NULL ones). Omit for all of the user's deals.",
+    ),
+):
+    """List the current user's saved deals (lightweight, newest first), scoped to
+    the active workspace when company_id is given."""
     try:
-        res = (
+        q = (
             supabase.table("feasibility_deals")
             .select("id,name,address,apn,zoning,decision,total_uses,irr,max_units,created_at")
             .eq("user_id", str(current_user["user_id"]))
-            .order("created_at", desc=True)
-            .limit(100)
-            .execute()
         )
+        if company_id:
+            q = q.or_(f"company_id.eq.{company_id},company_id.is.null")
+        res = q.order("created_at", desc=True).limit(100).execute()
     except Exception as e:
         logger.error("[FEASIBILITY] list deals failed: %r", e)
         raise HTTPException(status_code=500, detail=f"Could not list deals: {e}")

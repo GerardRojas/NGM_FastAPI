@@ -108,16 +108,25 @@ def create_project(payload: ProjectCreate):
 
 
 @router.get("")
-def list_projects(limit: int = 100):
+def list_projects(
+    limit: int = 100,
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to one organization via source_company. Omit to return every project (used by 'All Workspaces' and the reporting project pickers).",
+    ),
+):
     """
     Devuelve lista de proyectos desde 'projects',
     incluyendo:
       - status_name desde project_status.status
       - company_name desde companies.name
       - client_name desde clients.client_name
+
+    Cuando se provee company_id, la lista se filtra al workspace activo
+    (source_company). Sin company_id devuelve todos.
     """
     try:
-        resp = (
+        query = (
             supabase
             .table("projects")
             .select(
@@ -137,9 +146,12 @@ def list_projects(limit: int = 100):
                 """
             )
             .order("project_name")
-            .limit(limit)
-            .execute()
         )
+
+        if company_id:
+            query = query.eq("source_company", company_id)
+
+        resp = query.limit(limit).execute()
 
         raw_projects = resp.data or []
         projects = []

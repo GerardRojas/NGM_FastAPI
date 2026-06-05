@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 import logging
 import traceback
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Query
 from pydantic import BaseModel, field_validator
 from api.supabase_client import supabase
 
@@ -70,10 +70,14 @@ class TaskUpdate(BaseModel):
 # ====== CATALOG ENDPOINTS ======
 
 @router.get("/projects")
-def get_pipeline_projects() -> Dict[str, Any]:
-    """Devuelve lista de proyectos para dropdowns en Pipeline UI."""
+def get_pipeline_projects(company_id: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Devuelve lista de proyectos para dropdowns en Pipeline UI, scopeada al
+    workspace activo cuando se provee company_id."""
     try:
-        response = supabase.table("projects").select("project_id, project_name").order("project_name").execute()
+        query = supabase.table("projects").select("project_id, project_name")
+        if company_id:
+            query = query.eq("source_company", company_id)
+        response = query.order("project_name").execute()
         return {"data": response.data or []}
     except Exception as e:
         logger.error(f"[PIPELINE] ERROR in GET /pipeline/projects: {repr(e)}")
@@ -144,7 +148,7 @@ def get_pipeline_users() -> Dict[str, Any]:
 # ====== MAIN GROUPED ENDPOINT ======
 
 @router.get("/grouped")
-def get_pipeline_grouped() -> Dict[str, Any]:
+def get_pipeline_grouped(company_id: Optional[str] = Query(None)) -> Dict[str, Any]:
     """
     Devuelve las tareas agrupadas por task_status.
     Usa múltiples queries al cliente Supabase para obtener los datos relacionados.
@@ -158,9 +162,13 @@ def get_pipeline_grouped() -> Dict[str, Any]:
         statuses = statuses_response.data or []
         logger.info(f"[PIPELINE] Found {len(statuses)} statuses")
 
-        # 2. Obtener todas las tareas
+        # 2. Obtener las tareas (scopeadas al workspace activo cuando se provee
+        #    company_id: tareas de esa compañía mas las compartidas/NULL).
         logger.info("[PIPELINE] Fetching tasks...")
-        tasks_response = supabase.table("tasks").select("*").order("created_at", desc=True).execute()
+        tasks_query = supabase.table("tasks").select("*").order("created_at", desc=True)
+        if company_id:
+            tasks_query = tasks_query.or_(f"company_management.eq.{company_id},company_management.is.null")
+        tasks_response = tasks_query.execute()
         tasks = tasks_response.data or []
         logger.info(f"[PIPELINE] Found {len(tasks)} tasks")
 

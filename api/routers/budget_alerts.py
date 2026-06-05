@@ -477,15 +477,36 @@ async def trigger_budget_check(
 # SUMMARY ENDPOINT
 # ================================
 
+def _company_project_ids(company_id: str) -> list:
+    """Resolve the project_ids owned by a company (workspace). Budget alerts are
+    per-project, so we scope alert queries by the company's project set instead of
+    a company_id column on budget_alerts_log."""
+    res = (
+        supabase.table("projects")
+        .select("project_id")
+        .eq("source_company", company_id)
+        .execute()
+    )
+    return [r["project_id"] for r in (res.data or []) if r.get("project_id")]
+
+
 @router.get("/summary")
 async def get_budget_alert_summary(
     project_id: Optional[str] = None,
+    company_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get a summary of budget alert status.
+    Get a summary of budget alert status. Scoped to a single project (project_id)
+    or to the active workspace's projects (company_id) when provided.
     """
     try:
+        company_pids = None
+        if not project_id and company_id:
+            company_pids = _company_project_ids(company_id)
+            if not company_pids:
+                return {"unread_count": 0, "alerts_last_7_days": 0, "by_type": {}}
+
         # Count unread alerts
         unread_query = supabase.table("budget_alerts_log") \
             .select("id", count="exact") \
@@ -493,6 +514,8 @@ async def get_budget_alert_summary(
 
         if project_id:
             unread_query = unread_query.eq("project_id", project_id)
+        elif company_pids is not None:
+            unread_query = unread_query.in_("project_id", company_pids)
 
         unread_result = unread_query.execute()
 
@@ -506,6 +529,8 @@ async def get_budget_alert_summary(
 
         if project_id:
             recent_query = recent_query.eq("project_id", project_id)
+        elif company_pids is not None:
+            recent_query = recent_query.in_("project_id", company_pids)
 
         recent_result = recent_query.execute()
 
@@ -532,10 +557,12 @@ async def get_budget_alert_summary(
 @router.get("/pending")
 async def get_pending_acknowledgments(
     project_id: Optional[str] = None,
+    company_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get alerts pending acknowledgment.
+    Get alerts pending acknowledgment. Scoped to a single project (project_id) or
+    to the active workspace's projects (company_id) when provided.
     These are overspend/no_budget alerts that require review.
     """
     try:
@@ -547,6 +574,11 @@ async def get_pending_acknowledgments(
 
         if project_id:
             query = query.eq("project_id", project_id)
+        elif company_id:
+            company_pids = _company_project_ids(company_id)
+            if not company_pids:
+                return {"data": [], "count": 0}
+            query = query.in_("project_id", company_pids)
 
         result = query.execute()
 
@@ -566,10 +598,12 @@ async def get_pending_acknowledgments(
 @router.get("/pending/count")
 async def get_pending_acknowledgment_count(
     project_id: Optional[str] = None,
+    company_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get count of alerts pending acknowledgment.
+    Get count of alerts pending acknowledgment. Scoped to a single project
+    (project_id) or the active workspace's projects (company_id) when provided.
     Used for badge display in UI.
     """
     try:
@@ -580,6 +614,11 @@ async def get_pending_acknowledgment_count(
 
         if project_id:
             query = query.eq("project_id", project_id)
+        elif company_id:
+            company_pids = _company_project_ids(company_id)
+            if not company_pids:
+                return {"count": 0}
+            query = query.in_("project_id", company_pids)
 
         result = query.execute()
 

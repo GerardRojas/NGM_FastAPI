@@ -29,6 +29,7 @@ class BillCreate(BaseModel):
     split_projects: Optional[List[int]] = None
     receipt_url: Optional[str] = None
     notes: Optional[str] = None
+    company_id: Optional[str] = None  # Owning workspace; stamped by the active org
 
 
 class BillUpdate(BaseModel):
@@ -55,12 +56,21 @@ class BillReceiptAttach(BaseModel):
 # ========================================
 
 @router.get("")
-async def list_bills():
+async def list_bills(
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to the active workspace (its bills plus shared NULL ones). Omit for all.",
+    ),
+):
     """
-    Lista todos los bills ordenados por fecha de creación (más recientes primero)
+    Lista los bills ordenados por fecha de creación (más recientes primero). Con
+    company_id devuelve los de esa compañía mas los compartidos (NULL); sin él, todos.
     """
     try:
-        response = supabase.table("bills").select("*").order("created_at", desc=True).execute()
+        query = supabase.table("bills").select("*")
+        if company_id:
+            query = query.or_(f"company_id.eq.{company_id},company_id.is.null")
+        response = query.order("created_at", desc=True).execute()
         return {"data": response.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching bills: {str(e)}")
@@ -149,6 +159,8 @@ async def create_bill(bill: BillCreate, background_tasks: BackgroundTasks):
             insert_data["receipt_url"] = bill.receipt_url
         if bill.notes:
             insert_data["notes"] = bill.notes
+        if bill.company_id:
+            insert_data["company_id"] = bill.company_id
 
         response = supabase.table("bills").insert(insert_data).execute()
 

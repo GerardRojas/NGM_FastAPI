@@ -313,11 +313,13 @@ async def list_events(
     to: Optional[str] = Query(None, description="ISO 8601 upper bound (inclusive)"),
     project_id: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None, description="Filter to events the given user attends or created"),
+    company_id: Optional[str] = Query(None, description="Scope to the active workspace (its events plus shared NULL ones). Omit for all."),
     current_user: dict = Depends(get_current_user),
 ):
     """List events overlapping [from, to] (inclusive). Visibility-filtered for
     the current user. `project_id` narrows to a single project. `user_id`
-    narrows to a single attendee/creator (defaults to no filter)."""
+    narrows to a single attendee/creator. `company_id` scopes to the active
+    workspace (events tagged to it plus shared/untagged ones)."""
     try:
         me = str(current_user.get("user_id") or "")
 
@@ -347,6 +349,13 @@ async def list_events(
                 continue
             seen_ids.add(eid)
             rows.append(r)
+
+        # Workspace scope (additive): keep events tagged to the active company
+        # plus shared/untagged ones. Applied in Python so it composes with the
+        # one-off/recurring union without conflicting PostgREST or-groups.
+        if company_id:
+            rows = [r for r in rows if r.get("company_id") in (company_id, None)]
+
         event_ids = [str(r["event_id"]) for r in rows]
         attendees_by_event = _fetch_attendees(event_ids)
 

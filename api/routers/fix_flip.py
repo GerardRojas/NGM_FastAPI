@@ -13,7 +13,7 @@
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from api.auth import get_current_user
@@ -33,6 +33,7 @@ class DealCreate(BaseModel):
     net_profit_hm: Optional[float] = None
     roi_hm: Optional[float] = None
     data: Dict[str, Any]            # { inputs, outputs } snapshot
+    company_id: Optional[str] = None  # Owning workspace; stamped by the active org
 
 
 class DealUpdate(BaseModel):
@@ -47,17 +48,24 @@ class DealUpdate(BaseModel):
 # ====== ENDPOINTS ======
 
 @router.get("/deals")
-async def list_deals(current_user: dict = Depends(get_current_user)):
-    """List the current user's saved deals (lightweight, newest first)."""
+async def list_deals(
+    current_user: dict = Depends(get_current_user),
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to the active workspace (deals tagged to it plus shared NULL ones). Omit for all of the user's deals.",
+    ),
+):
+    """List the current user's saved deals (lightweight, newest first), scoped to
+    the active workspace when company_id is given."""
     try:
-        res = (
+        q = (
             supabase.table("fix_flip_deals")
             .select("id,name,notes,scenario,net_profit_hm,roi_hm,created_at,updated_at")
             .eq("user_id", str(current_user["user_id"]))
-            .order("updated_at", desc=True)
-            .limit(200)
-            .execute()
         )
+        if company_id:
+            q = q.or_(f"company_id.eq.{company_id},company_id.is.null")
+        res = q.order("updated_at", desc=True).limit(200).execute()
     except Exception as e:
         logger.error("[FIX_FLIP] list deals failed: %r", e)
         raise HTTPException(status_code=500, detail=f"Could not list deals: {e}")
@@ -122,6 +130,8 @@ async def create_deal(payload: DealCreate, current_user: dict = Depends(get_curr
         "roi_hm": payload.roi_hm,
         "data": payload.data,
     }
+    if payload.company_id:
+        row["company_id"] = payload.company_id
     try:
         res = supabase.table("fix_flip_deals").insert(row).execute()
     except Exception as e:
