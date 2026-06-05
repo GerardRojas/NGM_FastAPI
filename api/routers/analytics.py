@@ -4,10 +4,10 @@ Aggregated project health, cost trends, and budget-vs-actual endpoints
 for the dashboard analytics layer.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import Optional
+from fastapi import APIRouter, HTTPException, Depends, Query, Body
+from typing import Optional, Any
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import logging
 import math
 
@@ -25,7 +25,8 @@ _PAGE_SIZE = 1000
 # ============================================================
 
 def _paginated_fetch(table: str, select: str, filters: dict,
-                     neq_filters: dict | None = None) -> list[dict]:
+                     neq_filters: dict | None = None,
+                     in_filters: dict | None = None) -> list[dict]:
     """
     Fetch all rows from *table* with pagination to bypass the
     Supabase 1000-row default limit.
@@ -35,7 +36,14 @@ def _paginated_fetch(table: str, select: str, filters: dict,
         select:      PostgREST select clause
         filters:     dict of {column: value} for .eq() filters
         neq_filters: optional dict of {column: value} for .neq() filters
+        in_filters:  optional dict of {column: list[value]} for .in_() filters.
+                     An empty list short-circuits to an empty result (vs
+                     PostgREST's confusing default of matching everything).
     """
+    if in_filters:
+        for col, vals in in_filters.items():
+            if vals is not None and len(vals) == 0:
+                return []
     all_rows: list[dict] = []
     offset = 0
     while True:
@@ -45,6 +53,9 @@ def _paginated_fetch(table: str, select: str, filters: dict,
         if neq_filters:
             for col, val in neq_filters.items():
                 query = query.neq(col, val)
+        if in_filters:
+            for col, vals in in_filters.items():
+                query = query.in_(col, list(vals))
         query = query.range(offset, offset + _PAGE_SIZE - 1)
         try:
             batch = query.execute().data or []
@@ -132,6 +143,48 @@ def _name_map(table: str, id_col: str, name_col: str, ids: set) -> dict:
     except Exception as exc:
         logger.warning("[analytics] name_map %s: %s", table, exc)
     return out
+
+
+def _parse_csv_list(value: Optional[str]) -> list[str]:
+    """Parse a comma- or semicolon-separated query param into a stripped list.
+
+    Drops empty tokens. Returns [] for None / blank input. Multi-value query
+    params (`?foo=a&foo=b`) are not handled here — the dashboard endpoint uses
+    the csv form so a saved view can serialize trivially as a single string.
+    """
+    if not value:
+        return []
+    parts = [p.strip() for p in str(value).replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
+
+def _parse_date(value: Optional[str]) -> Optional[date]:
+    """Parse a YYYY-MM-DD prefix into a `date`. None on failure / empty input."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def _in_date_range(txn_date: Optional[str],
+                   date_from: Optional[date],
+                   date_to: Optional[date]) -> bool:
+    """True if *txn_date* (YYYY-MM-DD prefix) falls in [date_from, date_to]."""
+    if not date_from and not date_to:
+        return True
+    if not txn_date or len(txn_date) < 10:
+        return False
+    try:
+        d = date.fromisoformat(txn_date[:10])
+    except (ValueError, TypeError):
+        return False
+    if date_from and d < date_from:
+        return False
+    if date_to and d > date_to:
+        return False
+    return True
 
 
 # ============================================================
@@ -755,14 +808,41 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
     return _compute_executive_kpis()
 
 
-def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
+def _compute_executive_kpis(
+    project_id: Optional[str] = None,
+    project_ids: Optional[list[str]] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    project_status_filter: Optional[list[str]] = None,
+) -> dict:
     """
     Core multi-project financial aggregation, decoupled from the route so it can
     be reused (e.g. by the Operations Dashboard). Performs no permission check.
 
-    When *project_id* is provided, all underlying fetches are scoped to that
-    single project; otherwise the aggregation is global (default).
+    Filter scopes:
+      * project_id / project_ids   — both supported; project_ids takes priority.
+        When set, every fetch (projects, expenses, budgets, tasks, ...) is
+        narrowed to that subset.
+      * date_from / date_to        — applied ONLY to time-windowed aggregations
+        (monthly_spend_total, top_vendors). Burn % and project status stay
+        lifetime so the project-health view doesn't go to 0 when the user
+        picks "last 7 days".
+      * project_status_filter      — applied AFTER per-project status is
+        computed; filters the final projects list (and adjusts kpi totals to
+        match).
     """
+
+    # --- Normalize project filter ---
+    pid_set: Optional[set[str]] = None
+    if project_ids:
+        pid_set = {str(p) for p in project_ids if p}
+        if not pid_set:
+            pid_set = None
+    elif project_id:
+        pid_set = {str(project_id)}
+    pid_list = sorted(pid_set) if pid_set else None
+
+    status_set = {s.lower() for s in project_status_filter or []} or None
 
     # --- Active projects ---
     active_projects: list[dict] = []
@@ -771,8 +851,8 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
             supabase.table("projects")
             .select("project_id, project_name, project_status(status)")
         )
-        if project_id:
-            proj_query = proj_query.eq("project_id", project_id)
+        if pid_list:
+            proj_query = proj_query.in_("project_id", pid_list)
         proj_resp = proj_query.execute()
         for p in (proj_resp.data or []):
             ps = p.get("project_status") or {}
@@ -788,16 +868,18 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
 
     # --- ALL authorized expenses (paginated) ---
     ek_expense_filters: dict = {"auth_status": True}
-    if project_id:
-        ek_expense_filters["project"] = project_id
+    ek_expense_in: dict = {}
+    if pid_list:
+        ek_expense_in["project"] = pid_list
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
         "expense_id, Amount, project, vendor_id, TxnDate, auth_status, status",
         ek_expense_filters,
         neq_filters={"status": "review"},
+        in_filters=ek_expense_in or None,
     )
 
-    # Group expenses by project
+    # Group expenses by project (lifetime, used for burn % / actual)
     expenses_by_project: dict[str, list[dict]] = defaultdict(list)
     for e in all_expenses:
         pid = str(e.get("project") or "")
@@ -814,8 +896,8 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
                 .select("ngm_project_id, amount_sum")
                 .eq("active", True)
             )
-            if project_id:
-                bud_query = bud_query.eq("ngm_project_id", project_id)
+            if pid_list:
+                bud_query = bud_query.in_("ngm_project_id", pid_list)
             bud_resp = (
                 bud_query
                 .range(bud_offset, bud_offset + _PAGE_SIZE - 1)
@@ -845,8 +927,8 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
                 .select("project_id")
                 .is_("expense_id", "null")
             )
-            if project_id:
-                pr_query = pr_query.eq("project_id", project_id)
+            if pid_list:
+                pr_query = pr_query.in_("project_id", pid_list)
             pr_resp = (
                 pr_query
                 .range(pr_offset, pr_offset + _PAGE_SIZE - 1)
@@ -873,8 +955,8 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
                 .select("project")
                 .eq("status", "pending")
             )
-            if project_id:
-                pa_query = pa_query.eq("project", project_id)
+            if pid_list:
+                pa_query = pa_query.in_("project", pid_list)
             pa_resp = (
                 pa_query
                 .range(pa_offset, pa_offset + _PAGE_SIZE - 1)
@@ -907,8 +989,8 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
                 supabase.table("tasks")
                 .select("project_id, task_status")
             )
-            if project_id:
-                t_query = t_query.eq("project_id", project_id)
+            if pid_list:
+                t_query = t_query.in_("project_id", pid_list)
             t_resp = (
                 t_query
                 .range(tasks_offset, tasks_offset + _PAGE_SIZE - 1)
@@ -993,6 +1075,11 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
         else:
             status = "on_track" if actual == 0 else "over_budget"
 
+        # Skip rows that don't match the project_status filter (if any). Done
+        # AFTER status is computed because the status is derived, not stored.
+        if status_set and status not in status_set:
+            continue
+
         margin = _round2(((budget - actual) / budget * 100) if budget > 0 else 0.0)
         margins.append(margin)
 
@@ -1015,9 +1102,19 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
         (sum(margins) / len(margins)) if margins else 0.0
     )
 
-    # --- Monthly spend total (all authorized expenses) ---
+    # --- Date-windowed expense subset for spend trend + top vendors ---
+    # Once project_status filtering kicks in, restrict spend aggregations to
+    # the surviving projects so KPI totals stay consistent across the response.
+    surviving_pids = {p["project_id"] for p in projects_list} if status_set else None
+    windowed_expenses = [
+        e for e in all_expenses
+        if _in_date_range(e.get("TxnDate"), date_from, date_to)
+        and (surviving_pids is None or str(e.get("project") or "") in surviving_pids)
+    ]
+
+    # --- Monthly spend total (date-windowed) ---
     month_spend_agg: dict[str, float] = defaultdict(float)
-    for e in all_expenses:
+    for e in windowed_expenses:
         txn_date = e.get("TxnDate") or ""
         if len(txn_date) >= 7:
             month_spend_agg[txn_date[:7]] += _safe_float(e.get("Amount"))
@@ -1027,11 +1124,11 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
         key=lambda x: x["month"],
     )
 
-    # --- Top vendors across all projects ---
+    # --- Top vendors (date-windowed) ---
     vendor_agg: dict[str, dict] = defaultdict(
         lambda: {"amount": 0.0, "projects": set()}
     )
-    for e in all_expenses:
+    for e in windowed_expenses:
         vid = str(e.get("vendor_id") or "")
         if not vid:
             continue
@@ -1064,7 +1161,7 @@ def _compute_executive_kpis(project_id: Optional[str] = None) -> dict:
     )[:10]
 
     return {
-        "active_projects": len(active_projects),
+        "active_projects": len(projects_list),
         "total_spend": _round2(total_spend),
         "total_budget": _round2(total_budget),
         "avg_margin_pct": avg_margin_pct,
@@ -2485,16 +2582,44 @@ async def project_scorecard(
 _DONE_STATUS_NAMES = {"done", "completed", "good to go"}
 
 
-def _compute_task_overview(project_id: Optional[str] = None) -> dict:
+def _compute_task_overview(
+    project_id: Optional[str] = None,
+    project_ids: Optional[list[str]] = None,
+    owner_ids: Optional[list[str]] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    task_status_filter: Optional[list[str]] = None,
+) -> dict:
     """
     Global task progress for the Operations Dashboard:
     - by_status: task counts grouped by status name
     - overdue: overdue, not-done tasks (owner + project names resolved)
     - completed_this_week / created_this_week: 7-day throughput
 
-    When *project_id* is provided, task aggregation is scoped to that project.
+    Filter scopes:
+      * project_id / project_ids   — both supported; project_ids wins.
+      * owner_ids                  — restrict to tasks owned by these users.
+      * date_from / date_to        — when set, replaces the default 7-day window
+        for completed/created counts and is used as the overdue cutoff
+        (overdue = past today, optionally bounded by the lower edge).
+      * task_status_filter         — restrict by status NAME (e.g. ["stuck",
+        "working on it"]); affects `by_status`, `created_in_window`, `overdue`.
     """
-    from datetime import datetime, timedelta
+
+    # --- Normalize multi-value filters ---
+    pid_set: Optional[set[str]] = None
+    if project_ids:
+        pid_set = {str(p) for p in project_ids if p}
+        if not pid_set:
+            pid_set = None
+    elif project_id:
+        pid_set = {str(project_id)}
+    pid_list = sorted(pid_set) if pid_set else None
+
+    owner_set = {str(o) for o in owner_ids or [] if o} or None
+    owner_list = sorted(owner_set) if owner_set else None
+
+    status_set = {s.lower() for s in task_status_filter or []} or None
 
     status_map: dict = {}
     try:
@@ -2506,21 +2631,31 @@ def _compute_task_overview(project_id: Optional[str] = None) -> dict:
     except Exception as exc:
         logger.warning("[analytics:ops-dashboard] status fetch: %s", exc)
 
-    task_filters: dict = {}
-    if project_id:
-        task_filters["project_id"] = project_id
+    task_in: dict = {}
+    if pid_list:
+        task_in["project_id"] = pid_list
+    if owner_list:
+        task_in["Owner_id"] = owner_list
     all_tasks = _paginated_fetch(
         "tasks",
         "task_id, task_description, project_id, Owner_id, task_status, deadline, due_date, created_at",
-        task_filters,
+        {},
+        in_filters=task_in or None,
     )
 
+    # Apply status-name filter in Python (status_map is the bridge from id->name).
+    if status_set:
+        all_tasks = [t for t in all_tasks if status_map.get(t.get("task_status"), "other") in status_set]
+
     today = datetime.utcnow().date()
-    week_ago = today - timedelta(days=7)
+    # If the caller didn't pin a window, default to the last 7 days for the
+    # throughput counters — keeps the legacy "this week" semantics intact.
+    window_from = date_from or (today - timedelta(days=7))
+    window_to = date_to or today
 
     by_status: dict = defaultdict(int)
     overdue_raw: list[dict] = []
-    created_this_week = 0
+    created_in_window = 0
 
     for t in all_tasks:
         sname = status_map.get(t.get("task_status"), "other")
@@ -2529,8 +2664,9 @@ def _compute_task_overview(project_id: Optional[str] = None) -> dict:
         created = str(t.get("created_at") or "")
         if len(created) >= 10:
             try:
-                if datetime.fromisoformat(created[:10]).date() >= week_ago:
-                    created_this_week += 1
+                cdt = date.fromisoformat(created[:10])
+                if window_from <= cdt <= window_to:
+                    created_in_window += 1
             except Exception:
                 pass
 
@@ -2539,15 +2675,15 @@ def _compute_task_overview(project_id: Optional[str] = None) -> dict:
             if deadline_str:
                 try:
                     dl = datetime.fromisoformat(str(deadline_str).replace("Z", "")).date()
-                    if dl < today:
+                    if dl < today and (not date_from or dl >= date_from):
                         overdue_raw.append({**t, "_deadline": dl})
                 except Exception:
                     pass
 
-    owner_ids = {str(t.get("Owner_id")) for t in overdue_raw if t.get("Owner_id")}
-    project_ids = {str(t.get("project_id")) for t in overdue_raw if t.get("project_id")}
-    user_name_map = _name_map("users", "user_id", "user_name", owner_ids)
-    project_name_map = _name_map("projects", "project_id", "project_name", project_ids)
+    overdue_owner_ids = {str(t.get("Owner_id")) for t in overdue_raw if t.get("Owner_id")}
+    overdue_project_ids = {str(t.get("project_id")) for t in overdue_raw if t.get("project_id")}
+    user_name_map = _name_map("users", "user_id", "user_name", overdue_owner_ids)
+    project_name_map = _name_map("projects", "project_id", "project_name", overdue_project_ids)
 
     overdue = []
     for t in sorted(overdue_raw, key=lambda x: x["_deadline"]):
@@ -2559,47 +2695,346 @@ def _compute_task_overview(project_id: Optional[str] = None) -> dict:
             "days_overdue": (today - t["_deadline"]).days,
         })
 
-    # Completed this week: approval events in the workflow log (this is how the
-    # pipeline marks a task done after review).
-    completed_this_week = 0
+    # Completed in window: approval events in the workflow log (how the pipeline
+    # marks a task done after review). Owner/project scoping isn't applied here
+    # because workflow log doesn't carry those fks; if the caller filtered by
+    # project/owner, the count below over-counts that scope and is treated as a
+    # global throughput signal.
+    completed_in_window = 0
     try:
         cw_resp = (
             supabase.table("task_workflow_log")
             .select("log_id, performed_at")
             .eq("event_type", "approved")
-            .gte("performed_at", week_ago.isoformat())
+            .gte("performed_at", window_from.isoformat())
+            .lte("performed_at", (window_to + timedelta(days=1)).isoformat())
             .execute()
         )
-        completed_this_week = len(cw_resp.data or [])
+        completed_in_window = len(cw_resp.data or [])
     except Exception as exc:
-        logger.warning("[analytics:ops-dashboard] completed_this_week: %s", exc)
+        logger.warning("[analytics:ops-dashboard] completed_in_window: %s", exc)
 
     return {
         "by_status": dict(by_status),
         "overdue": overdue[:50],
         "overdue_count": len(overdue),
-        "completed_this_week": completed_this_week,
-        "created_this_week": created_this_week,
+        # Legacy keys preserved for the frontend until it migrates; both refer
+        # to the same window (defaults to last 7 days).
+        "completed_this_week": completed_in_window,
+        "created_this_week": created_in_window,
+        "window_from": window_from.isoformat(),
+        "window_to": window_to.isoformat(),
     }
+
+
+def _compute_throughput_weekly(
+    project_ids: Optional[list[str]] = None,
+    owner_ids: Optional[list[str]] = None,
+    weeks: int = 12,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+) -> list[dict]:
+    """
+    Created-vs-completed task counts grouped into ISO weeks (Monday-start).
+    When date_from/to are passed, the window is [date_from, date_to]; otherwise
+    the last *weeks* full weeks ending today are returned.
+
+    Created counts come from `tasks.created_at`; completed counts come from
+    approval events in `task_workflow_log` (same source as completed_this_week
+    in the task overview). Owner/project scoping applies to created but NOT to
+    completed (workflow log lacks the fks) — see the task-overview comment.
+    """
+    today = date.today()
+    if date_to:
+        end = date_to
+    else:
+        end = today
+    if date_from:
+        start = date_from
+    else:
+        start = end - timedelta(weeks=weeks) + timedelta(days=1)
+
+    # Snap to Monday so weekly buckets align with ISO weeks.
+    start_monday = start - timedelta(days=start.weekday())
+    end_sunday = end + timedelta(days=(6 - end.weekday()))
+
+    buckets: dict[date, dict[str, int]] = {}
+    cursor = start_monday
+    while cursor <= end_sunday:
+        buckets[cursor] = {"created": 0, "completed": 0}
+        cursor += timedelta(days=7)
+
+    if not buckets:
+        return []
+
+    def _bucket_for(d: date) -> Optional[date]:
+        if d < start_monday or d > end_sunday:
+            return None
+        offset = (d - start_monday).days // 7
+        key = start_monday + timedelta(days=offset * 7)
+        return key if key in buckets else None
+
+    # --- Created tasks ---
+    pid_list = sorted({str(p) for p in project_ids or [] if p}) or None
+    owner_list = sorted({str(o) for o in owner_ids or [] if o}) or None
+    task_in: dict = {}
+    if pid_list:
+        task_in["project_id"] = pid_list
+    if owner_list:
+        task_in["Owner_id"] = owner_list
+
+    try:
+        # Pull only what we need; cap at the bucket window with gte/lte.
+        rows = _paginated_fetch(
+            "tasks",
+            "task_id, created_at",
+            {},
+            in_filters=task_in or None,
+        )
+        for r in rows:
+            created = str(r.get("created_at") or "")[:10]
+            if not created:
+                continue
+            try:
+                d = date.fromisoformat(created)
+            except ValueError:
+                continue
+            key = _bucket_for(d)
+            if key is not None:
+                buckets[key]["created"] += 1
+    except Exception as exc:
+        logger.warning("[analytics:throughput] created fetch: %s", exc)
+
+    # --- Completed tasks (approval events) ---
+    try:
+        cw_offset = 0
+        while True:
+            cw_resp = (
+                supabase.table("task_workflow_log")
+                .select("log_id, performed_at")
+                .eq("event_type", "approved")
+                .gte("performed_at", start_monday.isoformat())
+                .lte("performed_at", (end_sunday + timedelta(days=1)).isoformat())
+                .range(cw_offset, cw_offset + _PAGE_SIZE - 1)
+                .execute()
+            )
+            batch = cw_resp.data or []
+            for r in batch:
+                perf = str(r.get("performed_at") or "")[:10]
+                if not perf:
+                    continue
+                try:
+                    d = date.fromisoformat(perf)
+                except ValueError:
+                    continue
+                key = _bucket_for(d)
+                if key is not None:
+                    buckets[key]["completed"] += 1
+            if len(batch) < _PAGE_SIZE:
+                break
+            cw_offset += _PAGE_SIZE
+    except Exception as exc:
+        logger.warning("[analytics:throughput] completed fetch: %s", exc)
+
+    return [
+        {
+            "week_start": key.isoformat(),
+            "created": val["created"],
+            "completed": val["completed"],
+        }
+        for key, val in sorted(buckets.items())
+    ]
+
+
+def _compute_workload_by_owner(
+    project_ids: Optional[list[str]] = None,
+    owner_ids: Optional[list[str]] = None,
+) -> list[dict]:
+    """
+    Per-owner workload counts: open tasks (not done/completed) and overdue.
+    Filterable by project_ids and owner_ids. Sorted by overdue desc, then
+    open desc, so the busiest people surface at the top of a horizontal bar.
+    """
+    pid_list = sorted({str(p) for p in project_ids or [] if p}) or None
+    owner_list = sorted({str(o) for o in owner_ids or [] if o}) or None
+
+    status_map: dict = {}
+    try:
+        st_resp = supabase.table("tasks_status").select("task_status_id, task_status").execute()
+        status_map = {
+            s["task_status_id"]: (s.get("task_status") or "").lower()
+            for s in (st_resp.data or [])
+        }
+    except Exception as exc:
+        logger.warning("[analytics:workload] status fetch: %s", exc)
+
+    task_in: dict = {}
+    if pid_list:
+        task_in["project_id"] = pid_list
+    if owner_list:
+        task_in["Owner_id"] = owner_list
+
+    rows = _paginated_fetch(
+        "tasks",
+        "task_id, Owner_id, task_status, deadline, due_date",
+        {},
+        in_filters=task_in or None,
+    )
+
+    today = date.today()
+    agg: dict[str, dict[str, int]] = defaultdict(lambda: {"open": 0, "overdue": 0, "total": 0})
+
+    for t in rows:
+        owner = str(t.get("Owner_id") or "")
+        if not owner:
+            continue
+        sname = status_map.get(t.get("task_status"), "other")
+        agg[owner]["total"] += 1
+        if sname in _DONE_STATUS_NAMES:
+            continue
+        agg[owner]["open"] += 1
+        deadline_str = t.get("deadline") or t.get("due_date")
+        if not deadline_str:
+            continue
+        try:
+            dl = datetime.fromisoformat(str(deadline_str).replace("Z", "")).date()
+            if dl < today:
+                agg[owner]["overdue"] += 1
+        except Exception:
+            continue
+
+    if not agg:
+        return []
+
+    user_map = _name_map("users", "user_id", "user_name", set(agg.keys()))
+    color_map: dict[str, Any] = {}
+    try:
+        u_resp = supabase.table("users").select("user_id, avatar_color").execute()
+        for u in (u_resp.data or []):
+            color_map[str(u.get("user_id", ""))] = u.get("avatar_color")
+    except Exception as exc:
+        logger.warning("[analytics:workload] avatar fetch: %s", exc)
+
+    out: list[dict] = [
+        {
+            "user_id": uid,
+            "user_name": user_map.get(uid, "Unassigned"),
+            "avatar_color": color_map.get(uid),
+            "open": counts["open"],
+            "overdue": counts["overdue"],
+            "total": counts["total"],
+        }
+        for uid, counts in agg.items()
+    ]
+    out.sort(key=lambda x: (x["overdue"], x["open"]), reverse=True)
+    return out
+
+
+def _compute_spend_by_category(
+    project_ids: Optional[list[str]] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    limit: int = 10,
+) -> list[dict]:
+    """
+    Authorized expenses grouped by AccountCategory (via accounts table), with
+    optional project/date scoping. Mirrors the per-project health breakdown so
+    the frontend can render the same legend across views.
+    """
+    pid_list = sorted({str(p) for p in project_ids or [] if p}) or None
+
+    expense_in: dict = {}
+    if pid_list:
+        expense_in["project"] = pid_list
+
+    expenses = _paginated_fetch(
+        "expenses_manual_COGS",
+        "expense_id, Amount, project, account_id, TxnDate, status, auth_status",
+        {"auth_status": True},
+        neq_filters={"status": "review"},
+        in_filters=expense_in or None,
+    )
+
+    accounts_map: dict[str, str] = {}
+    try:
+        acc_resp = supabase.table("accounts").select("account_id, AccountCategory").execute()
+        for a in (acc_resp.data or []):
+            accounts_map[str(a.get("account_id", ""))] = a.get("AccountCategory") or "Uncategorized"
+    except Exception as exc:
+        logger.warning("[analytics:spend_by_category] accounts fetch: %s", exc)
+
+    cat_agg: dict[str, dict] = defaultdict(lambda: {"amount": 0.0, "count": 0})
+    for e in expenses:
+        if not _in_date_range(e.get("TxnDate"), date_from, date_to):
+            continue
+        aid = str(e.get("account_id") or "")
+        cat = accounts_map.get(aid, "Uncategorized")
+        cat_agg[cat]["amount"] += _safe_float(e.get("Amount"))
+        cat_agg[cat]["count"] += 1
+
+    total = sum(v["amount"] for v in cat_agg.values()) or 0.0
+    rows = sorted(
+        [
+            {
+                "category": k,
+                "amount": _round2(v["amount"]),
+                "count": v["count"],
+                "pct": _round2((v["amount"] / total * 100) if total > 0 else 0.0),
+            }
+            for k, v in cat_agg.items()
+        ],
+        key=lambda x: x["amount"],
+        reverse=True,
+    )
+    return rows[:limit]
+
+
+def _filter_workload_team(team: list[dict],
+                          owner_ids: Optional[list[str]]) -> list[dict]:
+    """Trim the pipeline's get_team_workload() output to the selected owners."""
+    if not owner_ids:
+        return team
+    wanted = {str(o) for o in owner_ids if o}
+    return [m for m in team if str(m.get("user_id") or "") in wanted]
 
 
 @router.get("/operations-dashboard")
 async def operations_dashboard(
-    project_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None, description="Legacy single-project filter"),
+    project_ids: Optional[str] = Query(None, description="CSV of project_ids"),
+    owner_ids: Optional[str] = Query(None, description="CSV of user_ids"),
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    project_status: Optional[str] = Query(None, description="CSV of on_track,at_risk,over_budget"),
+    task_status: Optional[str] = Query(None, description="CSV of task status names"),
     current_user: dict = Depends(get_current_user),
 ):
     """
     Single aggregation for the weekly Operations Dashboard meeting view:
     financial KPIs + per-project status (gated by `project_kpis`), task progress,
-    team workload, and overdue items. Task/team data is returned for any
-    authenticated user; financial fields are omitted without `project_kpis`.
+    team workload, overdue items, weekly throughput, and spend-by-category.
+    Task/team data is returned for any authenticated user; financial fields are
+    omitted without `project_kpis`.
+
+    All multi-value query params accept comma-separated lists so saved views
+    can round-trip through a single string column.
     """
-    from datetime import date
 
     if not current_user.get("user_rol"):
         raise HTTPException(status_code=403, detail="No role assigned to user")
 
     can_view_financials = _user_has_permission(current_user, "project_kpis")
+
+    pid_list = _parse_csv_list(project_ids)
+    owner_list = _parse_csv_list(owner_ids)
+    project_status_list = _parse_csv_list(project_status)
+    task_status_list = _parse_csv_list(task_status)
+    df = _parse_date(date_from)
+    dt = _parse_date(date_to)
+
+    # Honor the legacy single-project param when no list is given.
+    if not pid_list and project_id:
+        pid_list = [project_id]
 
     kpis = {
         "active_projects": 0,
@@ -2611,10 +3046,16 @@ async def operations_dashboard(
     projects: list[dict] = []
     spend_trend: list[dict] = []
     top_vendors: list[dict] = []
+    spend_by_category: list[dict] = []
 
     if can_view_financials:
         try:
-            ek = _compute_executive_kpis(project_id=project_id)
+            ek = _compute_executive_kpis(
+                project_ids=pid_list or None,
+                date_from=df,
+                date_to=dt,
+                project_status_filter=project_status_list or None,
+            )
             kpis = {
                 "active_projects": ek.get("active_projects", 0),
                 "total_budget": ek.get("total_budget", 0.0),
@@ -2628,13 +3069,59 @@ async def operations_dashboard(
         except Exception as exc:
             logger.error("[analytics:ops-dashboard] executive kpis: %s", exc)
 
-    tasks = _compute_task_overview(project_id=project_id)
+        try:
+            spend_by_category = _compute_spend_by_category(
+                project_ids=pid_list or None,
+                date_from=df,
+                date_to=dt,
+            )
+        except Exception as exc:
+            logger.error("[analytics:ops-dashboard] spend_by_category: %s", exc)
 
+    # Cascade project_status filtering: the surviving project ids constrain
+    # task/team aggregations so the page reads consistently. When financials
+    # are gated, project_status_list has no surviving set so we fall back to
+    # the user-supplied pid_list verbatim.
+    effective_pids = pid_list or None
+    if can_view_financials and project_status_list:
+        surviving = [p.get("project_id") for p in projects if p.get("project_id")]
+        effective_pids = surviving if surviving else ["__none__"]  # force empty
+
+    tasks = _compute_task_overview(
+        project_ids=effective_pids,
+        owner_ids=owner_list or None,
+        date_from=df,
+        date_to=dt,
+        task_status_filter=task_status_list or None,
+    )
+
+    throughput_weekly: list[dict] = []
+    try:
+        throughput_weekly = _compute_throughput_weekly(
+            project_ids=effective_pids,
+            owner_ids=owner_list or None,
+            date_from=df,
+            date_to=dt,
+        )
+    except Exception as exc:
+        logger.error("[analytics:ops-dashboard] throughput_weekly: %s", exc)
+
+    workload_by_owner: list[dict] = []
+    try:
+        workload_by_owner = _compute_workload_by_owner(
+            project_ids=effective_pids,
+            owner_ids=owner_list or None,
+        )
+    except Exception as exc:
+        logger.error("[analytics:ops-dashboard] workload_by_owner: %s", exc)
+
+    # Legacy team capacity (utilization %, days_to_clear); kept for the
+    # frontend's existing tile until it migrates fully to workload_by_owner.
     team: list[dict] = []
     try:
         from api.routers.pipeline import get_team_workload
         wl = get_team_workload() or {}
-        for m in (wl.get("team") or []):
+        for m in _filter_workload_team(wl.get("team") or [], owner_list):
             team.append({
                 "user_id": str(m.get("user_id", "")),
                 "user_name": m.get("user_name"),
@@ -2650,10 +3137,253 @@ async def operations_dashboard(
     return {
         "as_of": date.today().isoformat(),
         "can_view_financials": can_view_financials,
+        "filters": {
+            "project_ids": pid_list,
+            "owner_ids": owner_list,
+            "date_from": df.isoformat() if df else None,
+            "date_to": dt.isoformat() if dt else None,
+            "project_status": project_status_list,
+            "task_status": task_status_list,
+        },
         "kpis": kpis,
         "projects": projects,
         "tasks": tasks,
         "team": team,
+        "workload_by_owner": workload_by_owner,
+        "throughput_weekly": throughput_weekly,
         "spend_trend": spend_trend,
         "top_vendors": top_vendors,
+        "spend_by_category": spend_by_category,
     }
+
+
+# ============================================================
+# 11. Saved views for Operations Dashboard
+# ============================================================
+# Per-user named filter presets. Backed by operations_dashboard_views
+# (see sql/operations_dashboard_views.sql). RLS is service_role only; per-user
+# scoping is enforced here via current_user.user_id on every read/write.
+
+_ODV_TABLE = "operations_dashboard_views"
+
+
+def _odv_serialize(row: dict) -> dict:
+    return {
+        "view_id": str(row.get("view_id", "")),
+        "name": row.get("name", ""),
+        "filters": row.get("filters") or {},
+        "is_default": bool(row.get("is_default")),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _odv_normalize_filters(raw: Any) -> dict:
+    """
+    Whitelist the filter keys we persist so a malformed payload can't leak
+    arbitrary jsonb into the table. Lists are coerced to str-lists; dates are
+    re-parsed and normalized back to ISO so we never store bad values.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key in ("project_ids", "owner_ids", "project_status", "task_status"):
+        val = raw.get(key)
+        if isinstance(val, list):
+            out[key] = [str(v) for v in val if v not in (None, "")]
+        elif isinstance(val, str):
+            out[key] = _parse_csv_list(val)
+        else:
+            out[key] = []
+    for key in ("date_from", "date_to"):
+        d = _parse_date(raw.get(key))
+        out[key] = d.isoformat() if d else None
+    return out
+
+
+def _odv_owner_required(current_user: dict) -> str:
+    uid = current_user.get("user_id")
+    if not uid:
+        raise HTTPException(status_code=401, detail="No user_id on token")
+    return str(uid)
+
+
+@router.get("/operations-dashboard/views")
+async def list_operations_dashboard_views(
+    current_user: dict = Depends(get_current_user),
+):
+    """List the caller's saved views, most-recently-updated first."""
+    uid = _odv_owner_required(current_user)
+    try:
+        resp = (
+            supabase.table(_ODV_TABLE)
+            .select("*")
+            .eq("user_id", uid)
+            .order("updated_at", desc=True)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error("[analytics:odv] list: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not list views")
+    return {"views": [_odv_serialize(r) for r in (resp.data or [])]}
+
+
+@router.post("/operations-dashboard/views")
+async def create_operations_dashboard_view(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Create a new saved view. Body: { name: str, filters: dict, is_default?: bool }.
+    Name must be unique per user (case-insensitive). If is_default is true, any
+    existing default for this user is cleared first so the partial-unique index
+    on (user_id) where is_default doesn't reject the insert.
+    """
+    uid = _odv_owner_required(current_user)
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    filters = _odv_normalize_filters(payload.get("filters"))
+    is_default = bool(payload.get("is_default"))
+
+    if is_default:
+        try:
+            supabase.table(_ODV_TABLE).update({"is_default": False}).eq(
+                "user_id", uid
+            ).eq("is_default", True).execute()
+        except Exception as exc:
+            logger.warning("[analytics:odv] clear-default: %s", exc)
+
+    try:
+        ins = (
+            supabase.table(_ODV_TABLE)
+            .insert({
+                "user_id": uid,
+                "name": name,
+                "filters": filters,
+                "is_default": is_default,
+            })
+            .execute()
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "uq_odv_user_name" in msg or "duplicate key" in msg.lower():
+            raise HTTPException(status_code=409, detail="A view with this name already exists")
+        logger.error("[analytics:odv] create: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not create view")
+    row = (ins.data or [None])[0]
+    if not row:
+        raise HTTPException(status_code=500, detail="Insert returned no row")
+    return _odv_serialize(row)
+
+
+@router.patch("/operations-dashboard/views/{view_id}")
+async def update_operations_dashboard_view(
+    view_id: str,
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Update name / filters / is_default on a saved view. Only fields present in
+    the body are touched. Setting is_default=true clears any previous default
+    for the user first.
+    """
+    uid = _odv_owner_required(current_user)
+
+    try:
+        existing = (
+            supabase.table(_ODV_TABLE)
+            .select("view_id, user_id")
+            .eq("view_id", view_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error("[analytics:odv] read-for-update: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not load view")
+    row = (existing.data or [None])[0]
+    if not row or str(row.get("user_id")) != uid:
+        raise HTTPException(status_code=404, detail="View not found")
+
+    updates: dict = {}
+    if "name" in payload:
+        new_name = str(payload.get("name") or "").strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="name cannot be empty")
+        updates["name"] = new_name
+    if "filters" in payload:
+        updates["filters"] = _odv_normalize_filters(payload.get("filters"))
+    if "is_default" in payload:
+        updates["is_default"] = bool(payload.get("is_default"))
+        if updates["is_default"]:
+            try:
+                supabase.table(_ODV_TABLE).update({"is_default": False}).eq(
+                    "user_id", uid
+                ).eq("is_default", True).neq("view_id", view_id).execute()
+            except Exception as exc:
+                logger.warning("[analytics:odv] clear-default-other: %s", exc)
+
+    if not updates:
+        return await _odv_fetch_one(view_id)
+
+    try:
+        upd = (
+            supabase.table(_ODV_TABLE)
+            .update(updates)
+            .eq("view_id", view_id)
+            .execute()
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "uq_odv_user_name" in msg or "duplicate key" in msg.lower():
+            raise HTTPException(status_code=409, detail="A view with this name already exists")
+        logger.error("[analytics:odv] update: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not update view")
+    out = (upd.data or [None])[0]
+    if not out:
+        raise HTTPException(status_code=404, detail="View not found")
+    return _odv_serialize(out)
+
+
+async def _odv_fetch_one(view_id: str) -> dict:
+    resp = (
+        supabase.table(_ODV_TABLE)
+        .select("*")
+        .eq("view_id", view_id)
+        .limit(1)
+        .execute()
+    )
+    row = (resp.data or [None])[0]
+    if not row:
+        raise HTTPException(status_code=404, detail="View not found")
+    return _odv_serialize(row)
+
+
+@router.delete("/operations-dashboard/views/{view_id}")
+async def delete_operations_dashboard_view(
+    view_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete one of the caller's saved views. 404 if it isn't theirs."""
+    uid = _odv_owner_required(current_user)
+    try:
+        existing = (
+            supabase.table(_ODV_TABLE)
+            .select("view_id, user_id")
+            .eq("view_id", view_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error("[analytics:odv] read-for-delete: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not load view")
+    row = (existing.data or [None])[0]
+    if not row or str(row.get("user_id")) != uid:
+        raise HTTPException(status_code=404, detail="View not found")
+
+    try:
+        supabase.table(_ODV_TABLE).delete().eq("view_id", view_id).execute()
+    except Exception as exc:
+        logger.error("[analytics:odv] delete: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not delete view")
+    return {"ok": True, "view_id": view_id}

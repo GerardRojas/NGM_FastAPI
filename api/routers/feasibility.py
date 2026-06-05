@@ -21,7 +21,7 @@
 import re
 import asyncio
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 import httpx
 from fastapi import APIRouter, HTTPException, Depends
@@ -40,13 +40,28 @@ GEOCODER_URL = (
     "https://webmaps.sandiego.gov/arcgis/rest/services/DSD/"
     "Accela_Locator/GeocodeServer/findAddressCandidates"
 )
+# Free U.S. Census geocoder, used as the county-wide fallback when the City of
+# SD DSD locator does not match (e.g. addresses in Chula Vista, Encinitas, or
+# unincorporated communities like Jamul). No API key needed.
+CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+
 PARCELS_URL = (
     "https://geo.sandag.org/server/rest/services/Hosted/"
     "Parcels/FeatureServer/0/query"
 )
+# City of San Diego zoning (Ch.13 base zones + planned districts in Ch.15).
 ZONING_URL = (
     "https://webmaps.sandiego.gov/arcgis/rest/services/DSD/"
     "Zoning_Base/MapServer/0/query"
+)
+# County of San Diego Planning & Development Services zoning, for parcels in
+# unincorporated communities (Ramona, Jamul, Alpine, Fallbrook, Spring Valley,
+# Bonita, etc.). Verify the URL is still live on first deploy — if PDS reorgs
+# their REST endpoints, point this at the new path; the graceful-degradation
+# fallback below will turn a bad URL into a warning rather than a hard 502.
+COUNTY_ZONING_URL = (
+    "https://gis.sandiegocounty.gov/arcgis/rest/services/PDS/"
+    "Zoning/MapServer/0/query"
 )
 
 GIS_TIMEOUT = 25.0
@@ -63,6 +78,37 @@ BASE_ZONE_PREFIXES = (
 )
 
 WEBMAPS = "https://webmaps.sandiego.gov/arcgis/rest/services"
+
+# Incorporated cities in San Diego County OTHER than the City of San Diego. A
+# parcel whose situs_community matches one of these is in an incorporated city
+# whose zoning we don't yet automate — the lookup still returns parcel + APN
+# + lot data, but zoning/standards come back null with a clear warning. Add a
+# city here only after wiring its zoning MapServer.
+INCORPORATED_CITIES_NON_SD = frozenset({
+    "CHULA VISTA", "OCEANSIDE", "ESCONDIDO", "CARLSBAD", "EL CAJON",
+    "VISTA", "SAN MARCOS", "ENCINITAS", "NATIONAL CITY", "LA MESA",
+    "SANTEE", "POWAY", "CORONADO", "IMPERIAL BEACH", "LEMON GROVE",
+    "DEL MAR", "SOLANA BEACH",
+})
+
+# Where a parcel falls in the SD County jurisdictional hierarchy. Drives which
+# zoning service we hit and which sections of DEFAULT_REGULATIONS apply (only
+# the city_san_diego regs are seeded by jurisdiction today).
+Jurisdiction = Literal["city_san_diego", "county_unincorporated", "other_city", "unknown"]
+
+
+def _jurisdiction_for(community: Optional[str]) -> Jurisdiction:
+    """Map a parcel's situs_community to its jurisdictional bucket. Anything
+    that isn't the City of SD nor one of the other 17 incorporated cities is
+    treated as unincorporated county territory (Ramona, Jamul, Alpine, etc.)."""
+    if not community:
+        return "unknown"
+    c = community.strip().upper()
+    if c == "SAN DIEGO":
+        return "city_san_diego"
+    if c in INCORPORATED_CITIES_NON_SD:
+        return "other_city"
+    return "county_unincorporated"
 
 # Constraint catalog. Every layer is hosted by the City of San Diego (reliable;
 # avoids the FEMA/CAL-FIRE TLS + timeout problems) and queried as a point
@@ -214,6 +260,10 @@ class ParcelRecord(BaseModel):
     city: Optional[str] = None
     zip: Optional[str] = None
     county: str = "San Diego"
+    # Jurisdictional bucket — drives which zoning service this record came from
+    # and whether DEFAULT_REGULATIONS (City-of-SD-only today) applies. Other-city
+    # parcels return with zoning=None and an explanatory warning.
+    jurisdiction: Jurisdiction = "unknown"
     lot_sf: int = 0
     lot_acres: float = 0.0
     zoning: Optional[str] = None
@@ -293,7 +343,10 @@ def _shoelace_sqft(rings: List[List[List[float]]]) -> float:
     return total
 
 
-async def _geocode(client: httpx.AsyncClient, address: str) -> Optional[Dict[str, float]]:
+async def _geocode_dsd(client: httpx.AsyncClient, address: str) -> Optional[Dict[str, Any]]:
+    """City of San Diego DSD Accela locator. Best precision inside city limits;
+    returns a 0–100 score that we threshold for warnings. Returns None when no
+    candidate is found (caller falls back to Census)."""
     params = {
         "SingleLine": address,
         "outSR": 4326,
@@ -314,7 +367,64 @@ async def _geocode(client: httpx.AsyncClient, address: str) -> Optional[Dict[str
         "lat": loc["y"],
         "matched": candidates[0].get("address"),
         "score": candidates[0].get("score", 0),
+        "source": "dsd",
     }
+
+
+async def _geocode_census(client: httpx.AsyncClient, address: str) -> Optional[Dict[str, Any]]:
+    """U.S. Census geocoder. County-wide (actually U.S.-wide), no API key,
+    slightly slower than DSD. Used as the fallback so the tool can resolve
+    addresses outside the City of SD (Chula Vista, Encinitas, unincorporated
+    communities, etc.). Census has no confidence score — exact-match output is
+    treated as ~95 so the low-confidence warning only fires for true low-score
+    DSD matches."""
+    params = {
+        "address": address,
+        "benchmark": "Public_AR_Current",
+        "format": "json",
+    }
+    r = await client.get(CENSUS_GEOCODER_URL, params=params, timeout=GIS_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    matches = ((data.get("result") or {}).get("addressMatches")) or []
+    if not matches:
+        return None
+    m = matches[0]
+    coords = m.get("coordinates") or {}
+    if "x" not in coords or "y" not in coords:
+        return None
+    return {
+        "lng": coords["x"],
+        "lat": coords["y"],
+        "matched": m.get("matchedAddress"),
+        "score": 95,
+        "source": "census",
+    }
+
+
+async def _geocode_address(client: httpx.AsyncClient, address: str) -> Optional[Dict[str, Any]]:
+    """Cascade geocoder: try DSD first (best for in-city addresses), fall back
+    to U.S. Census for county-wide coverage. Returns the first hit with its
+    `source` tagged so the caller can record it in GisSource."""
+    try:
+        dsd = await _geocode_dsd(client, address)
+        if dsd:
+            return dsd
+    except Exception as e:
+        logger.warning("[FEASIBILITY] DSD geocoder error, falling back to Census: %r", e)
+    try:
+        census = await _geocode_census(client, address)
+        if census:
+            return census
+    except Exception as e:
+        logger.warning("[FEASIBILITY] Census geocoder error: %r", e)
+    return None
+
+
+# Backwards-compat shim: `_geocode` was the DSD-only function. Anything that
+# imported it externally still gets the same shape. New code should call
+# `_geocode_address` for the cascade behavior.
+_geocode = _geocode_dsd
 
 
 async def _parcel_by_point(client: httpx.AsyncClient, lng: float, lat: float) -> Optional[Dict[str, Any]]:
@@ -364,21 +474,47 @@ def _ring_centroid(rings: List[List[List[float]]]) -> Optional[Dict[str, float]]
     return {"x": xs, "y": ys}
 
 
-async def _zoning_at(client: httpx.AsyncClient, geometry: str, in_sr: int) -> Optional[Dict[str, Any]]:
+async def _zoning_at(
+    client: httpx.AsyncClient,
+    geometry: str,
+    in_sr: int,
+    *,
+    url: str = ZONING_URL,
+    out_fields: str = "ZONE_NAME,ORDNUM",
+) -> Optional[Dict[str, Any]]:
+    """Point-intersect query against an ArcGIS zoning MapServer. Defaults to
+    the City of San Diego service; callers in unincorporated/other-city paths
+    pass their own URL + outFields. Returns the matching feature's attributes
+    dict (or None if no feature intersects the point)."""
     params = {
         "geometry": geometry,
         "geometryType": "esriGeometryPoint",
         "inSR": in_sr,
         "spatialRel": "esriSpatialRelIntersects",
-        "outFields": "ZONE_NAME,ORDNUM",
+        "outFields": out_fields,
         "returnGeometry": "false",
         "f": "json",
     }
-    r = await client.get(ZONING_URL, params=params, timeout=GIS_TIMEOUT)
+    r = await client.get(url, params=params, timeout=GIS_TIMEOUT)
     r.raise_for_status()
     data = r.json()
     feats = data.get("features") or []
     return feats[0]["attributes"] if feats else None
+
+
+def _normalize_zone_attrs(attrs: Optional[Dict[str, Any]], jurisdiction: Jurisdiction) -> Dict[str, Optional[str]]:
+    """Each zoning service uses different output field names; normalize them
+    to {zone, ordinance} so downstream code (ParcelRecord, standards lookup)
+    doesn't have to know which jurisdiction it came from."""
+    if not attrs:
+        return {"zone": None, "ordinance": None}
+    if jurisdiction == "city_san_diego":
+        return {"zone": attrs.get("ZONE_NAME"), "ordinance": attrs.get("ORDNUM")}
+    # County PDS Zoning typically exposes ZONE / USE_REGS; tolerate variants.
+    return {
+        "zone": attrs.get("ZONE") or attrs.get("ZONING") or attrs.get("USE_REGS"),
+        "ordinance": attrs.get("ORD_NUM") or attrs.get("ORDNUM"),
+    }
 
 
 def _fetch_standards(zone: str) -> Optional[Dict[str, Any]]:
@@ -445,8 +581,9 @@ async def lookup_parcel(payload: LookupRequest, current_user: dict = Depends(get
                 pass
         else:
             try:
-                geo = await _geocode(client, address)
-                sources.append(GisSource(name="geocoder", ok=geo is not None))
+                geo = await _geocode_address(client, address)
+                geo_source_name = f"geocoder_{geo.get('source')}" if geo else "geocoder"
+                sources.append(GisSource(name=geo_source_name, ok=geo is not None))
             except Exception as e:
                 sources.append(GisSource(name="geocoder", ok=False, detail=str(e)))
                 raise HTTPException(status_code=502, detail=f"Geocoder error: {e}")
@@ -474,40 +611,69 @@ async def lookup_parcel(payload: LookupRequest, current_user: dict = Depends(get
         lot_acres = round(lot_sf / 43560.0, 4) if lot_sf else 0.0
 
         community = (attrs.get("situs_community") or "").strip()
-        if community and community.upper() != "SAN DIEGO":
+        jurisdiction = _jurisdiction_for(community)
+
+        # ── Zoning — routed by jurisdiction ──────────────────────────────
+        zone_attrs: Optional[Dict[str, Any]] = None
+        if jurisdiction == "other_city":
+            # Incorporated city we don't yet automate — return parcel data but
+            # skip the zoning query entirely. Standards must be entered manually
+            # in the UI for now. Add the city's MapServer + a normalize_zone_attrs
+            # branch to bring it online.
+            sources.append(GisSource(
+                name="zoning", ok=False,
+                detail=f"Not automated: {community.title()}",
+            ))
             warnings.append(
-                f"Parcel community is '{community}', not City of San Diego — "
-                "zoning standards may be unavailable for this jurisdiction"
+                f"Parcel is in {community.title()} — zoning is not yet automated "
+                "for this jurisdiction; standards must be entered manually. "
+                "Parcel APN, lot size, and assessed value above are accurate."
+            )
+        else:
+            # city_san_diego → DSD service; county_unincorporated / unknown →
+            # County PDS service (covers Ramona, Jamul, Alpine, Fallbrook, etc.).
+            if jurisdiction == "city_san_diego":
+                z_url, z_fields = ZONING_URL, "ZONE_NAME,ORDNUM"
+            else:
+                z_url = COUNTY_ZONING_URL
+                z_fields = "ZONE,ZONING,USE_REGS,ORD_NUM,ORDNUM"
+            try:
+                if lng is not None and lat is not None:
+                    zone_attrs = await _zoning_at(client, f"{lng},{lat}", 4326, url=z_url, out_fields=z_fields)
+                elif rings:
+                    c = _ring_centroid(rings)
+                    if c:
+                        zone_attrs = await _zoning_at(client, f"{c['x']},{c['y']}", 2230, url=z_url, out_fields=z_fields)
+                sources.append(GisSource(name="zoning", ok=zone_attrs is not None))
+            except Exception as e:
+                sources.append(GisSource(name="zoning", ok=False, detail=str(e)))
+                warnings.append(f"Zoning service error: {e}")
+
+        zone_norm = _normalize_zone_attrs(zone_attrs, jurisdiction)
+        zone = zone_norm["zone"]
+        if not zone and jurisdiction in ("city_san_diego", "county_unincorporated"):
+            warnings.append("No zoning designation found at this location")
+        if jurisdiction == "county_unincorporated" and zone:
+            # State laws still apply but the seeded DEFAULT_REGULATIONS ADU bonus
+            # program is City-of-SD-specific. Tell the operator so the feasibility
+            # engine output is read correctly.
+            warnings.append(
+                "Unincorporated SD County: state laws (SB 9, AB 2011, AB 2097) "
+                "apply, but the City of San Diego ADU Bonus Program does not. "
+                "Verify county-specific code requirements."
             )
 
-        # ── Zoning ────────────────────────────────────────────────────────
-        zone_attrs: Optional[Dict[str, Any]] = None
-        try:
-            if lng is not None and lat is not None:
-                zone_attrs = await _zoning_at(client, f"{lng},{lat}", 4326)
-            elif rings:
-                c = _ring_centroid(rings)
-                if c:
-                    zone_attrs = await _zoning_at(client, f"{c['x']},{c['y']}", 2230)
-            sources.append(GisSource(name="zoning", ok=zone_attrs is not None))
-        except Exception as e:
-            sources.append(GisSource(name="zoning", ok=False, detail=str(e)))
-            warnings.append(f"Zoning service error: {e}")
-
-        zone = (zone_attrs or {}).get("ZONE_NAME")
-        if not zone:
-            warnings.append("No zoning designation found at this location")
-
-    is_pd = _is_planned_district(zone)
+    is_pd = _is_planned_district(zone) if jurisdiction == "city_san_diego" else False
     record = ParcelRecord(
         apn=attrs.get("apn"),
         address=_build_address(attrs) or None,
         city=community or None,
         zip=attrs.get("situs_zip"),
+        jurisdiction=jurisdiction,
         lot_sf=lot_sf,
         lot_acres=lot_acres,
         zoning=zone,
-        zoning_ordinance=(zone_attrs or {}).get("ORDNUM"),
+        zoning_ordinance=zone_norm["ordinance"],
         is_planned_district=is_pd,
         assessed_total=attrs.get("asr_total"),
         assessed_land=attrs.get("asr_land"),

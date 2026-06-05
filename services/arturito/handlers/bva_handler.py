@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 from api.services.gpt_client import gpt
 from api.supabase_client import supabase
 from api.services.vault_service import save_to_project_folder
+from services.reporting.engine import build_report, fetch_category_tree
 
 # Para generación de PDF
 try:
@@ -59,6 +60,7 @@ def handle_budget_vs_actuals(
     """
     entities = request.get("entities", {})
     ctx = context or {}
+    company_id = ctx.get("company_id")
 
     # Extraer proyecto
     project_input = entities.get("project")
@@ -74,7 +76,7 @@ def handle_budget_vs_actuals(
     space_id = ctx.get("space_id", "default")
 
     if not project_input or project_input.lower() in ["default", "general", "random", "none", "ngm hub web"]:
-        recent_projects = fetch_recent_projects(limit=8)
+        recent_projects = fetch_recent_projects(limit=8, company_id=company_id)
         hint = ""
         data = None
         if recent_projects:
@@ -93,8 +95,8 @@ def handle_budget_vs_actuals(
         return result
 
     try:
-        # 1. Resolver proyecto (buscar por nombre o ID)
-        project = resolve_project(project_input)
+        # 1. Resolver proyecto (buscar por nombre o ID, scoped al workspace)
+        project = resolve_project(project_input, company_id=company_id)
         if not project:
             return {
                 "ok": False,
@@ -110,9 +112,10 @@ def handle_budget_vs_actuals(
         expenses = fetch_expenses(project_id)
         accounts = fetch_accounts()
         overlay = fetch_account_overlay()
+        category_order, subcategory_index = fetch_category_tree()
 
-        # 3. Procesar reporte (con jerarquía Category -> tipo)
-        report_data = process_report_data(budgets, expenses, accounts, overlay)
+        # 3. Procesar reporte con el motor unificado (Phase-B + orden de categorías)
+        report_data = build_report(budgets, expenses, accounts, overlay, category_order, subcategory_index)
 
         # 4. Generar PDF y subir a Storage
         if not REPORTLAB_AVAILABLE:
@@ -129,7 +132,8 @@ def handle_budget_vs_actuals(
                 }
             }
 
-        pdf_url = generate_and_upload_pdf(project_name, report_data, project_id=project_id)
+        company_name = fetch_company_name(company_id)
+        pdf_url = generate_and_upload_pdf(project_name, report_data, project_id=project_id, company_name=company_name)
 
         if not pdf_url:
             # Fallback si falla el PDF
@@ -179,11 +183,12 @@ def _word_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
+def resolve_project(project_input: str, company_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Busca el proyecto por nombre o ID con busqueda fuzzy mejorada.
 
     Algoritmo de busqueda:
+    0. (si hay company_id) Busqueda por nombre dentro del workspace activo
     1. Busqueda exacta por ID
     2. Busqueda directa por nombre (ilike)
     3. Busqueda por palabras (substring + typo tolerance via edit distance)
@@ -192,6 +197,23 @@ def resolve_project(project_input: str) -> Optional[Dict[str, Any]]:
     Each step is isolated so a failure in one (e.g. UUID type mismatch)
     does not prevent subsequent steps from running.
     """
+    # 0. Scoped lookup within the active organization. Additive: falls through to
+    # the global search below if nothing matches in-scope (e.g. shared/legacy
+    # projects with no source_company).
+    if company_id:
+        try:
+            scoped = (
+                supabase.table("projects").select("*")
+                .eq("source_company", company_id)
+                .ilike("project_name", f"%{project_input}%")
+                .execute()
+            )
+            if scoped.data:
+                matches = sorted(scoped.data, key=lambda x: len(x.get("project_name", "")))
+                return matches[0]
+        except Exception as e:
+            logger.info("[BVA] resolve_project scoped lookup skipped: %s", e)
+
     # 1. Busqueda exacta por ID (may fail if project_id is UUID and input is text)
     try:
         result = supabase.table("projects").select("*").eq("project_id", project_input).execute()
@@ -358,23 +380,37 @@ def _gpt_ask_missing_entity(
         return _fallback(missing, hint)
 
 
-def fetch_recent_projects(limit: int = 8) -> List[Dict[str, Any]]:
-    """Obtiene lista de proyectos recientes/activos para sugerir."""
+def fetch_company_name(company_id: Optional[str]) -> str:
+    """Resolve the active organization's display name for report headers. Falls
+    back to the legacy default when no workspace is in context."""
+    if not company_id:
+        return "KD Developers LLC"
     try:
-        result = supabase.table("projects") \
-            .select("project_id, project_name") \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
+        result = supabase.table("companies").select("name").eq("id", company_id).single().execute()
+        if result.data and result.data.get("name"):
+            return result.data["name"]
+    except Exception as e:
+        logger.info("[BVA] fetch_company_name failed for %s: %s", company_id, e)
+    return "KD Developers LLC"
+
+
+def fetch_recent_projects(limit: int = 8, company_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Obtiene lista de proyectos recientes/activos para sugerir. Si se provee
+    company_id, se limita al workspace activo (projects.source_company)."""
+    try:
+        query = supabase.table("projects").select("project_id, project_name")
+        if company_id:
+            query = query.eq("source_company", company_id)
+        result = query.order("created_at", desc=True).limit(limit).execute()
         return result.data or []
     except Exception as _exc:
         logger.debug("Suppressed: %s", _exc)
     # Fallback: sin ordenamiento si created_at no existe
     try:
-        result = supabase.table("projects") \
-            .select("project_id, project_name") \
-            .limit(limit) \
-            .execute()
+        query = supabase.table("projects").select("project_id, project_name")
+        if company_id:
+            query = query.eq("source_company", company_id)
+        result = query.limit(limit).execute()
         return result.data or []
     except Exception as e:
         logger.error("[BVA] Error fetching recent projects: %s", e)
@@ -472,153 +508,7 @@ def fetch_account_overlay() -> Dict[str, Dict[str, str]]:
         return {}
 
 
-def _build_categories(
-    budgets_by_id: Dict[str, float],
-    expenses_by_id: Dict[str, float],
-    id_name: Dict[str, str],
-    overlay: Dict[str, Dict[str, str]],
-) -> List[Dict[str, Any]]:
-    """Group account-id sums into Category -> cost_type lines. Unmapped accounts
-    fall under 'Uncategorized' (by name) so totals always reconcile."""
-    groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for key in set(list(budgets_by_id) + list(expenses_by_id)):
-        ov = overlay.get(key)
-        if ov:
-            category = ov["category"]
-            ctype = ov["cost_type"]
-            line_key = ctype or "_"
-            label = TYPE_LABEL.get(ctype, ctype or "—")
-        else:
-            category = UNCATEGORIZED
-            ctype = ""
-            label = id_name.get(key, "Unknown Account")
-            line_key = f"acct:{label}"
-        line = groups.setdefault(category, {}).setdefault(
-            line_key, {"label": label, "cost_type": ctype, "budget": 0.0, "actual": 0.0})
-        line["budget"] += budgets_by_id.get(key, 0.0)
-        line["actual"] += expenses_by_id.get(key, 0.0)
-
-    cats: List[Dict[str, Any]] = []
-    for name, lines in groups.items():
-        line_list = []
-        for a in lines.values():
-            b, ac = a["budget"], a["actual"]
-            line_list.append({
-                "label": a["label"], "cost_type": a["cost_type"],
-                "budget": round(b, 2), "actual": round(ac, 2),
-                "balance": round(b - ac, 2),
-                "percent_of_budget": round((ac / b * 100) if b > 0 else 0, 2),
-            })
-        line_list.sort(key=lambda l: (
-            TYPE_ORDER.index(l["cost_type"]) if l["cost_type"] in TYPE_ORDER else 99,
-            l["label"].lower()))
-        b = sum(l["budget"] for l in line_list)
-        ac = sum(l["actual"] for l in line_list)
-        cats.append({
-            "name": name, "budget": round(b, 2), "actual": round(ac, 2),
-            "balance": round(b - ac, 2),
-            "percent_of_budget": round((ac / b * 100) if b > 0 else 0, 2),
-            "lines": line_list,
-        })
-    cats.sort(key=lambda c: (c["name"] == UNCATEGORIZED, c["name"].lower()))
-    return cats
-
-
-def process_report_data(
-    budgets: List[Dict[str, Any]],
-    expenses: List[Dict[str, Any]],
-    accounts: List[Dict[str, Any]],
-    overlay: Optional[Dict[str, Dict[str, str]]] = None
-) -> Dict[str, Any]:
-    """Procesa datos y genera el reporte comparativo. Si `overlay` viene, agrega
-    también la jerarquía Category -> material/labor/external_service en
-    report_data['categories'] (rows/totals se conservan para los fallbacks)."""
-
-    def get_account_name(account_id: str, account_name: str = None) -> str:
-        if account_name:
-            return account_name
-        if account_id:
-            for acc in accounts:
-                if (acc.get("account_id") or acc.get("id")) == account_id:
-                    return acc.get("Name") or acc.get("account_name") or "Unknown"
-        return "Unknown Account"
-
-    def get_account_number(account_name: str) -> int:
-        for acc in accounts:
-            if (acc.get("Name") or acc.get("account_name")) == account_name:
-                return acc.get("AcctNum") or 99999
-        return 99999
-
-    # account-id-keyed sums for the hierarchy (key = account_id, or name fallback)
-    budgets_by_id: Dict[str, float] = {}
-    expenses_by_id: Dict[str, float] = {}
-    id_name: Dict[str, str] = {}
-
-    def _key(account_id, name):
-        return str(account_id) if account_id else f"name:{name}"
-
-    # Agrupar budgets por cuenta
-    budgets_by_account = {}
-    for budget in budgets:
-        account_name = get_account_name(budget.get("account_id"), budget.get("account_name"))
-        amount = float(budget.get("amount_sum") or 0)
-        budgets_by_account[account_name] = budgets_by_account.get(account_name, 0) + amount
-        k = _key(budget.get("account_id"), account_name)
-        budgets_by_id[k] = budgets_by_id.get(k, 0) + amount
-        id_name[k] = account_name
-
-    # Agrupar expenses por cuenta
-    expenses_by_account = {}
-    for expense in expenses:
-        account_name = get_account_name(expense.get("account_id"), expense.get("account_name"))
-        amount = float(expense.get("Amount") or expense.get("amount") or 0)
-        expenses_by_account[account_name] = expenses_by_account.get(account_name, 0) + amount
-        k = _key(expense.get("account_id"), account_name)
-        expenses_by_id[k] = expenses_by_id.get(k, 0) + amount
-        id_name[k] = account_name
-
-    # Construir filas
-    all_accounts = set(list(budgets_by_account.keys()) + list(expenses_by_account.keys()))
-    rows = []
-
-    for account_name in all_accounts:
-        budget_amount = budgets_by_account.get(account_name, 0)
-        actual_amount = expenses_by_account.get(account_name, 0)
-        balance = budget_amount - actual_amount
-        percent = (actual_amount / budget_amount * 100) if budget_amount > 0 else 0
-
-        rows.append({
-            "account": account_name,
-            "account_number": get_account_number(account_name),
-            "budget": round(budget_amount, 2),
-            "actual": round(actual_amount, 2),
-            "balance": round(balance, 2),
-            "percent_of_budget": round(percent, 2)
-        })
-
-    rows.sort(key=lambda x: (x["account_number"], x["account"]))
-
-    # Totales
-    total_budget = sum(r["budget"] for r in rows)
-    total_actual = sum(r["actual"] for r in rows)
-    total_balance = total_budget - total_actual
-    total_percent = (total_actual / total_budget * 100) if total_budget > 0 else 0
-
-    categories = _build_categories(budgets_by_id, expenses_by_id, id_name, overlay) if overlay else []
-
-    return {
-        "rows": rows,
-        "categories": categories,
-        "totals": {
-            "budget": round(total_budget, 2),
-            "actual": round(total_actual, 2),
-            "balance": round(total_balance, 2),
-            "percent_of_budget": round(total_percent, 2)
-        }
-    }
-
-
-def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any], project_id: str = None) -> Optional[str]:
+def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any], project_id: str = None, company_name: str = None) -> Optional[str]:
     """
     Genera el PDF del reporte BVA y lo sube al Vault del proyecto.
     Retorna la URL publica del archivo.
@@ -626,7 +516,7 @@ def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any], proj
     try:
         # Generar PDF en memoria
         pdf_buffer = io.BytesIO()
-        generate_bva_pdf(pdf_buffer, project_name, report_data)
+        generate_bva_pdf(pdf_buffer, project_name, report_data, company_name=company_name)
         pdf_buffer.seek(0)
 
         # Nombre del archivo con timestamp
@@ -650,7 +540,7 @@ def generate_and_upload_pdf(project_name: str, report_data: Dict[str, Any], proj
         return None
 
 
-def generate_bva_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[str, Any]):
+def generate_bva_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[str, Any], company_name: str = None):
     """
     Genera el PDF con el mismo formato que el frontend.
     Replica el estilo de budget-vs-actuals.js
@@ -701,7 +591,7 @@ def generate_bva_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[st
     )
 
     # Header
-    elements.append(Paragraph("KD Developers LLC", title_style))
+    elements.append(Paragraph(company_name or "KD Developers LLC", title_style))
     elements.append(Paragraph(f"Budget Vs Actuals Report: {project_name}", subtitle_style))
     elements.append(Paragraph("All Dates (Not Use this Report for Accounting Purposes)", note_style))
     elements.append(Spacer(1, 12))

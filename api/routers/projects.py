@@ -1,7 +1,9 @@
 import logging
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from api.supabase_client import supabase
@@ -160,12 +162,17 @@ def list_projects(limit: int = 100):
 
 
 @router.get("/meta")
-def get_projects_meta():
+def get_projects_meta(
+    company_id: Optional[str] = Query(None, description="Scope the clients dropdown to one organization; shared (NULL) rows always included"),
+):
     """
     Devuelve catálogos básicos para la UI de Projects:
       - companies: company_id + name  (mapeado desde companies.id)
       - statuses: status_id + status
       - clients: client_id + client_name
+
+    El catálogo de companies y statuses se mantiene global; solo el dropdown de
+    clients se filtra por organización (company_id) cuando se provee.
     """
     try:
         # Companies (PK se llama 'id')
@@ -186,14 +193,16 @@ def get_projects_meta():
             .execute()
         )
 
-        # Clients
-        clients_resp = (
+        # Clients (scoped to the active organization when provided; shared rows
+        # with company_id NULL are always included)
+        clients_query = (
             supabase
             .table("clients")
             .select("client_id, client_name")
-            .order("client_name")
-            .execute()
         )
+        if company_id:
+            clients_query = clients_query.or_(f"company_id.eq.{company_id},company_id.is.null")
+        clients_resp = clients_query.order("client_name").execute()
 
         raw_companies = companies_resp.data or []
         raw_statuses = status_resp.data or []

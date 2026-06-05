@@ -73,13 +73,25 @@ class EstimateSaveRequest(BaseModel):
 
 
 class BranchCreateRequest(BaseModel):
-    """Request body for creating a new branch (variation) of an estimate."""
+    """Request body for creating a new branch of an estimate.
+
+    A `variation` is a full independent copy of the source branch (default).
+    A `change_order` starts empty: only the project metadata is carried over,
+    `categories` and `overhead` are reset. `empty=True` forces the empty
+    behaviour even for `variation` (rarely useful, but explicit)."""
     name: str
-    based_on: Optional[str] = None  # branch_id to copy from; defaults to main
+    based_on: Optional[str] = None        # branch_id to copy from; defaults to main
+    kind: Optional[str] = "variation"     # "variation" | "change_order"
+    empty: Optional[bool] = False
+    # Optional CO bookkeeping (only meaningful when kind == "change_order").
+    status: Optional[str] = None          # "pending" | "approved" | "rejected"
 
 
-class BranchRenameRequest(BaseModel):
-    name: str
+class BranchUpdateRequest(BaseModel):
+    """PATCH body — every field is optional; only those set get updated."""
+    name: Optional[str] = None
+    status: Optional[str] = None          # "pending" | "approved" | "rejected"
+    kind: Optional[str] = None            # "variation" | "change_order"
 
 
 class TemplateSaveRequest(BaseModel):
@@ -231,6 +243,15 @@ def extract_estimate_meta(estimate_id: str, data: Dict[str, Any]) -> Dict[str, A
 
 MAIN_BRANCH_ID = "main"
 
+# Branch kinds. "variation" = full alternate (e.g. "Without appliances").
+# "change_order" = additive scope; starts empty, has a status (pending/approved/
+# rejected) and rolls into the contract value only when approved.
+BRANCH_KIND_VARIATION = "variation"
+BRANCH_KIND_CHANGE_ORDER = "change_order"
+BRANCH_KINDS = {BRANCH_KIND_VARIATION, BRANCH_KIND_CHANGE_ORDER}
+
+CO_STATUSES = {"pending", "approved", "rejected"}
+
 
 def _branch_path(estimate_id: str, branch_id: str) -> str:
     return f"{estimate_id}/branches/{branch_id}.ngm"
@@ -273,9 +294,21 @@ def find_branch(manifest: Dict[str, Any], branch_id: str) -> Optional[Dict[str, 
 
 def ensure_manifest(estimate_id: str) -> Dict[str, Any]:
     """Return the branches manifest, lazily migrating legacy estimates that
-    predate branching into a single 'main' branch."""
+    predate branching into a single 'main' branch. Also backfills `kind` on
+    pre-CO entries so consumers can rely on it being present."""
     manifest = _download_json(_manifest_path(estimate_id))
     if manifest and isinstance(manifest.get("branches"), list) and manifest["branches"]:
+        # Backfill kind on existing entries that predate the CO field.
+        dirty = False
+        for entry in manifest["branches"]:
+            if "kind" not in entry:
+                entry["kind"] = BRANCH_KIND_VARIATION
+                dirty = True
+        if dirty:
+            try:
+                _upload_json(_manifest_path(estimate_id), manifest)
+            except Exception as exc:
+                logger.debug("[ESTIMATOR] kind backfill upload skipped for %s: %s", estimate_id, exc)
         return manifest
 
     data = _download_json(f"{estimate_id}/estimate.ngm") or {}
@@ -294,6 +327,7 @@ def ensure_manifest(estimate_id: str) -> Dict[str, Any]:
         "branches": [{
             "id": MAIN_BRANCH_ID,
             "name": "Main",
+            "kind": BRANCH_KIND_VARIATION,
             "created_at": created,
             "updated_at": updated,
             "grand_total": meta["grand_total"],
@@ -402,11 +436,22 @@ async def list_estimates():
                 "project": None,
                 "project_type": None,
                 "branch_count": 1,
+                "variation_count": 0,
+                "change_order_count": 0,
             }
             try:
                 manifest = _download_json(_manifest_path(name))
                 if manifest and isinstance(manifest.get("branches"), list) and manifest["branches"]:
                     main = find_branch(manifest, manifest.get("main_branch_id")) or manifest["branches"][0]
+                    branches = manifest["branches"]
+                    co_count = sum(1 for b in branches if b.get("kind") == BRANCH_KIND_CHANGE_ORDER)
+                    main_id = manifest.get("main_branch_id")
+                    # Variations = every non-main, non-CO branch. Pre-CO entries
+                    # default to "variation" so this stays correct historically.
+                    var_count = sum(
+                        1 for b in branches
+                        if b.get("id") != main_id and b.get("kind") != BRANCH_KIND_CHANGE_ORDER
+                    )
                     summary.update({
                         "name": manifest.get("project_name") or name,
                         "created_at": manifest.get("created_at") or summary["created_at"],
@@ -415,7 +460,9 @@ async def list_estimates():
                         "grand_total": main.get("grand_total"),
                         "project": manifest.get("project"),
                         "project_type": manifest.get("project_type"),
-                        "branch_count": len(manifest["branches"]),
+                        "branch_count": len(branches),
+                        "variation_count": var_count,
+                        "change_order_count": co_count,
                     })
                 else:
                     data = _download_json(f"{name}/estimate.ngm")
@@ -530,10 +577,14 @@ async def save_estimate(request: EstimateSaveRequest):
             entry = {
                 "id": branch_id,
                 "name": "Main" if is_main else branch_id,
+                "kind": BRANCH_KIND_VARIATION,
                 "based_on": None,
                 "created_at": created_at,
             }
             manifest["branches"].append(entry)
+        # Older entries written before kind existed get backfilled here.
+        if "kind" not in entry:
+            entry["kind"] = BRANCH_KIND_VARIATION
         entry["grand_total"] = grand_total
         entry["created_at"] = entry.get("created_at") or created_at
         entry["updated_at"] = now_iso
@@ -650,11 +701,20 @@ async def get_branch(estimate_id: str, branch_id: str):
 
 @router.post("/estimates/{estimate_id}/branches")
 async def create_branch(estimate_id: str, request: BranchCreateRequest):
-    """Create a new branch as a full independent copy of an existing one
-    (defaults to copying the main branch)."""
+    """Create a new branch. By default it's a `variation` — a full independent
+    copy of the source branch. When `kind="change_order"` (or `empty=True`) it
+    starts empty: the source's project metadata is carried over but
+    `categories` and `overhead` are reset, so the user can build the CO's
+    scope from scratch."""
     try:
         ensure_bucket_exists(ESTIMATES_BUCKET)
         manifest = ensure_manifest(estimate_id)
+
+        kind = (request.kind or BRANCH_KIND_VARIATION).strip().lower()
+        if kind not in BRANCH_KINDS:
+            raise HTTPException(status_code=400, detail=f"Invalid branch kind: {kind}")
+        is_co = kind == BRANCH_KIND_CHANGE_ORDER
+        empty = bool(request.empty) or is_co
 
         source_id = request.based_on or manifest["main_branch_id"]
         if not find_branch(manifest, source_id):
@@ -666,22 +726,45 @@ async def create_branch(estimate_id: str, request: BranchCreateRequest):
         branch_id = generate_branch_id(request.name)
         now_iso = datetime.now().isoformat()
 
-        new_data = dict(source)
-        new_data["estimate_id"] = estimate_id
-        new_data["branch_id"] = branch_id
-        new_data["branch_name"] = request.name
-        new_data["created_at"] = now_iso
-        new_data["updated_at"] = now_iso
+        if empty:
+            # Carry only project metadata; reset scope so the user starts at $0.
+            new_data: Dict[str, Any] = {
+                "estimate_id": estimate_id,
+                "branch_id": branch_id,
+                "branch_name": request.name,
+                "project_name": source.get("project_name") or request.name,
+                "project": source.get("project") or {},
+                "categories": [],
+                "overhead": {"percentage": 0, "amount": 0},
+                "created_from_template": source.get("created_from_template"),
+                "created_at": now_iso,
+                "updated_at": now_iso,
+                "version": source.get("version") or "1.0",
+            }
+        else:
+            new_data = dict(source)
+            new_data["estimate_id"] = estimate_id
+            new_data["branch_id"] = branch_id
+            new_data["branch_name"] = request.name
+            new_data["created_at"] = now_iso
+            new_data["updated_at"] = now_iso
         _upload_json(_branch_path(estimate_id, branch_id), new_data)
 
-        manifest["branches"].append({
+        entry: Dict[str, Any] = {
             "id": branch_id,
             "name": request.name,
+            "kind": kind,
             "based_on": source_id,
             "created_at": now_iso,
             "updated_at": now_iso,
             "grand_total": compute_grand_total(new_data),
-        })
+        }
+        if is_co:
+            status = (request.status or "pending").strip().lower()
+            if status not in CO_STATUSES:
+                raise HTTPException(status_code=400, detail=f"Invalid CO status: {status}")
+            entry["status"] = status
+        manifest["branches"].append(entry)
         _upload_json(_manifest_path(estimate_id), manifest)
 
         return {"success": True, "branch_id": branch_id, "manifest": manifest}
@@ -692,22 +775,55 @@ async def create_branch(estimate_id: str, request: BranchCreateRequest):
 
 
 @router.patch("/estimates/{estimate_id}/branches/{branch_id}")
-async def rename_branch(estimate_id: str, branch_id: str, request: BranchRenameRequest):
-    """Rename a branch."""
+async def update_branch(estimate_id: str, branch_id: str, request: BranchUpdateRequest):
+    """Update mutable manifest fields on a branch (name, status, kind). Every
+    field is optional; only those provided in the body get written. Validates
+    `status` (only for change_orders) and `kind` against the allowed sets."""
     try:
         ensure_bucket_exists(ESTIMATES_BUCKET)
         manifest = ensure_manifest(estimate_id)
         entry = find_branch(manifest, branch_id)
         if not entry:
             raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
-        entry["name"] = request.name
-        entry["updated_at"] = datetime.now().isoformat()
-        _upload_json(_manifest_path(estimate_id), manifest)
+
+        changed = False
+        if request.name is not None:
+            new_name = request.name.strip()
+            if not new_name:
+                raise HTTPException(status_code=400, detail="Branch name cannot be empty")
+            entry["name"] = new_name
+            changed = True
+
+        if request.kind is not None:
+            kind = request.kind.strip().lower()
+            if kind not in BRANCH_KINDS:
+                raise HTTPException(status_code=400, detail=f"Invalid branch kind: {kind}")
+            entry["kind"] = kind
+            # Switching away from change_order drops a stale status; switching
+            # in seeds a sensible default so the UI has something to render.
+            if kind != BRANCH_KIND_CHANGE_ORDER:
+                entry.pop("status", None)
+            elif "status" not in entry:
+                entry["status"] = "pending"
+            changed = True
+
+        if request.status is not None:
+            status = request.status.strip().lower()
+            if status not in CO_STATUSES:
+                raise HTTPException(status_code=400, detail=f"Invalid CO status: {status}")
+            if entry.get("kind") != BRANCH_KIND_CHANGE_ORDER:
+                raise HTTPException(status_code=400, detail="status only applies to change_order branches")
+            entry["status"] = status
+            changed = True
+
+        if changed:
+            entry["updated_at"] = datetime.now().isoformat()
+            _upload_json(_manifest_path(estimate_id), manifest)
         return {"success": True, "manifest": manifest}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error renaming branch: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating branch: {str(e)}")
 
 
 @router.post("/estimates/{estimate_id}/branches/{branch_id}/set-main")

@@ -122,10 +122,12 @@ class ManifestCreate(BaseModel):
     name: str
     project_type: str
     manifest: dict
+    company_id: Optional[str] = None
 
 class ManifestUpdate(BaseModel):
     name: Optional[str] = None
     manifest: Optional[dict] = None
+    company_id: Optional[str] = None
 
 
 @router.post("/manifests")
@@ -137,6 +139,7 @@ async def create_manifest(body: ManifestCreate):
             "project_type": body.project_type,
             "manifest": body.manifest,
             "project_id": body.project_id,
+            "company_id": body.company_id,
         }
         res = supabase.table("build_manifests").insert(row).execute()
         if res.data:
@@ -151,13 +154,16 @@ async def create_manifest(body: ManifestCreate):
 @router.get("/manifests")
 async def list_manifests(
     project_id: Optional[str] = Query(None),
+    company_id: Optional[str] = Query(None, description="Scope to one organization; shared (NULL) rows always included"),
     limit: int = Query(20, ge=1, le=100),
 ):
     """List saved manifests, optionally filtered by project."""
     try:
-        q = supabase.table("build_manifests").select("id, name, project_type, project_id, created_at, updated_at").order("created_at", desc=True).limit(limit)
+        q = supabase.table("build_manifests").select("id, name, project_type, project_id, company_id, created_at, updated_at").order("created_at", desc=True).limit(limit)
         if project_id:
             q = q.eq("project_id", project_id)
+        if company_id:
+            q = q.or_(f"company_id.eq.{company_id},company_id.is.null")
         res = q.execute()
         return res.data or []
     except Exception as e:

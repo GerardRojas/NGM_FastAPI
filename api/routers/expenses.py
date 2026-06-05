@@ -609,13 +609,33 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, background_tasks: Backgro
 
 
 @router.get("")
-def list_expenses(project: Optional[str] = None, limit: Optional[int] = None, current_user: dict = Depends(get_current_user)):
+def list_expenses(project: Optional[str] = None, company_id: Optional[str] = None, limit: Optional[int] = None, current_user: dict = Depends(get_current_user)):
     """
     Lista todos los gastos, opcionalmente filtrados por project.
     Incluye información de tipo de transacción, proyecto, vendor, etc.
     Si no se especifica limit, devuelve todos los gastos (capped a 50000).
+
+    company_id (opcional) restringe los gastos a los proyectos de una
+    organización (projects.source_company). Solo aplica cuando NO se pasa
+    `project` (un project ya es de una sola company). Si la organización no
+    tiene proyectos, devuelve lista vacía.
     """
     try:
+        # Resolver los proyectos de la organización activa para el scope por company.
+        company_project_ids: Optional[list] = None
+        if company_id and not project:
+            comp_resp = (
+                supabase.table("projects")
+                .select("project_id")
+                .eq("source_company", company_id)
+                .execute()
+            )
+            company_project_ids = [
+                r["project_id"] for r in (comp_resp.data or []) if r.get("project_id")
+            ]
+            if not company_project_ids:
+                return {"data": []}
+
         # Obtener los gastos — paginar para superar límite de 1000 de Supabase
         raw_expenses: list = []
         page_size = 1000
@@ -632,6 +652,8 @@ def list_expenses(project: Optional[str] = None, limit: Optional[int] = None, cu
             query = supabase.table("expenses_manual_COGS").select("*")
             if project:
                 query = query.eq("project", project)
+            elif company_project_ids is not None:
+                query = query.in_("project", company_project_ids)
             query = query.order("TxnDate", desc=True)
 
             # Calcular cuántos traer en esta página
@@ -795,14 +817,17 @@ def list_all_expenses(limit: Optional[int] = 1000, current_user: dict = Depends(
 
 
 @router.get("/meta")
-def get_expenses_meta(current_user: dict = Depends(get_current_user)):
+def get_expenses_meta(company_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """
     Devuelve catálogos necesarios para la UI de expenses:
       - txn_types: tipos de transacción
-      - projects: proyectos
+      - projects: proyectos (scoped a la organización activa cuando se pasa company_id)
       - vendors: proveedores
       - payment_methods: métodos de pago
       - accounts: cuentas contables
+
+    company_id (opcional) restringe el dropdown de proyectos a una organización
+    (projects.source_company). Si se omite, devuelve todos los proyectos.
 
     PERFORMANCE: Queries ejecutadas en paralelo usando ThreadPoolExecutor
     """
@@ -812,7 +837,10 @@ def get_expenses_meta(current_user: dict = Depends(get_current_user)):
             return supabase.table("txn_types").select("*").order("TnxType_name").execute()
 
         def fetch_projects():
-            return supabase.table("projects").select("project_id, project_name").order("project_name").execute()
+            q = supabase.table("projects").select("project_id, project_name")
+            if company_id:
+                q = q.eq("source_company", company_id)
+            return q.order("project_name").execute()
 
         def fetch_vendors():
             return supabase.table("Vendors").select("*").order("vendor_name").execute()

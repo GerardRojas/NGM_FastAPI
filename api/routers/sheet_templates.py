@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from api.auth import get_current_user
@@ -34,6 +34,7 @@ class SheetTemplateCreate(BaseModel):
     branding: Dict[str, Any] = {}
     view_config: Dict[str, Any] = {}
     is_default: bool = False
+    company_id: Optional[str] = None
 
 
 class SheetTemplateUpdate(BaseModel):
@@ -42,6 +43,7 @@ class SheetTemplateUpdate(BaseModel):
     branding: Optional[Dict[str, Any]] = None
     view_config: Optional[Dict[str, Any]] = None
     is_default: Optional[bool] = None
+    company_id: Optional[str] = None
 
 
 # ================================
@@ -52,12 +54,68 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _clear_other_defaults(keep_id: Optional[str] = None) -> None:
-    """Only one template may be the default; unset every other row."""
+def _clear_other_defaults(keep_id: Optional[str] = None, company_id: Optional[str] = None) -> None:
+    """Only one template may be the default *within an organization*; unset every
+    other row in the same company scope (or the shared NULL scope)."""
     query = supabase.table("sheet_templates").update({"is_default": False}).eq("is_default", True)
+    if company_id:
+        query = query.eq("company_id", company_id)
+    else:
+        query = query.is_("company_id", "null")
     if keep_id:
         query = query.neq("id", keep_id)
     query.execute()
+
+
+def provision_default_templates_for_company(company_id: str, company_name: str) -> int:
+    """Clone the shared preset templates into per-company copies, stamping the
+    company's name into the branding header so reports/exports carry it. The
+    copies are editable (but kept is_preset=True so the UI marks them built-in
+    and they can't be deleted). Idempotent: skips presets already cloned for the
+    company (matched by name). Returns how many were created."""
+    presets = (
+        supabase.table("sheet_templates")
+        .select("*")
+        .eq("is_preset", True)
+        .is_("company_id", "null")
+        .execute()
+        .data
+        or []
+    )
+    if not presets:
+        return 0
+
+    existing = (
+        supabase.table("sheet_templates")
+        .select("name")
+        .eq("company_id", company_id)
+        .execute()
+        .data
+        or []
+    )
+    existing_names = {r.get("name") for r in existing}
+
+    rows = []
+    for preset in presets:
+        if preset.get("name") in existing_names:
+            continue
+        branding = dict(preset.get("branding") or {})
+        branding["companyName"] = company_name
+        branding["companyInfo"] = company_name
+        rows.append({
+            "name": preset.get("name"),
+            "theme": preset.get("theme") or "classic",
+            "branding": branding,
+            "view_config": preset.get("view_config") or {},
+            "is_default": bool(preset.get("is_default")),
+            "is_preset": True,
+            "company_id": company_id,
+        })
+
+    if not rows:
+        return 0
+    supabase.table("sheet_templates").insert(rows).execute()
+    return len(rows)
 
 
 # ================================
@@ -65,12 +123,22 @@ def _clear_other_defaults(keep_id: Optional[str] = None) -> None:
 # ================================
 
 @router.get("")
-def list_templates(current_user: dict = Depends(get_current_user)):
+def list_templates(
+    company_id: Optional[str] = Query(None, description="Scope to one organization; shared (NULL) rows always included"),
+    current_user: dict = Depends(get_current_user),
+):
     """List all sheet templates (presets first, then alphabetical)."""
     try:
+        query = supabase.table("sheet_templates").select("*")
+        if company_id:
+            # The company's own rows + shared CUSTOM templates. Global presets
+            # (company_id NULL, is_preset true) are hidden because every company
+            # gets its own personalized copies via provisioning — avoids dupes.
+            query = query.or_(
+                f"company_id.eq.{company_id},and(company_id.is.null,is_preset.is.false)"
+            )
         res = (
-            supabase.table("sheet_templates")
-            .select("*")
+            query
             .order("is_preset", desc=True)
             .order("name")
             .execute()
@@ -103,12 +171,13 @@ def create_template(payload: SheetTemplateCreate, current_user: dict = Depends(g
             "view_config": payload.view_config or {},
             "is_default": bool(payload.is_default),
             "is_preset": False,
+            "company_id": payload.company_id,
             "created_by": current_user.get("id") if isinstance(current_user, dict) else None,
         }
         res = supabase.table("sheet_templates").insert(record).execute()
         created = res.data[0] if res.data else None
         if created and created.get("is_default"):
-            _clear_other_defaults(keep_id=created.get("id"))
+            _clear_other_defaults(keep_id=created.get("id"), company_id=created.get("company_id"))
         return {"message": "Sheet template created", "template": created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating sheet template: {e}")
@@ -130,7 +199,7 @@ def update_template(
         if not res.data:
             raise HTTPException(status_code=404, detail="Sheet template not found")
         if update_data.get("is_default"):
-            _clear_other_defaults(keep_id=template_id)
+            _clear_other_defaults(keep_id=template_id, company_id=res.data[0].get("company_id"))
         return {"message": "Sheet template updated", "template": res.data[0]}
     except HTTPException:
         raise
@@ -152,3 +221,29 @@ def delete_template(template_id: str, current_user: dict = Depends(get_current_u
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting sheet template: {e}")
+
+
+@router.post("/provision")
+def provision_templates(
+    company_id: Optional[str] = Query(None, description="Provision a single company; omit to backfill all"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Ensure every organization has its own personalized copies of the preset
+    templates. Idempotent — safe to re-run. Use to backfill existing companies."""
+    try:
+        if company_id:
+            comp = supabase.table("companies").select("id, name").eq("id", company_id).single().execute()
+            if not comp.data:
+                raise HTTPException(status_code=404, detail="Company not found")
+            companies = [comp.data]
+        else:
+            companies = supabase.table("companies").select("id, name").execute().data or []
+
+        total = 0
+        for c in companies:
+            total += provision_default_templates_for_company(c.get("id"), c.get("name") or "")
+        return {"message": "Templates provisioned", "companies": len(companies), "created": total}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error provisioning templates: {e}")

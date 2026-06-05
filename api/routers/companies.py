@@ -90,7 +90,22 @@ async def create_company(company: CompanyCreate):
 
         response = supabase.table("companies").insert(insert_data).execute()
 
-        return {"message": "Company created successfully", "data": response.data[0] if response.data else None}
+        created = response.data[0] if response.data else None
+
+        # Seed the new workspace with its own personalized copies of the default
+        # export templates (the report/export header carries the company name).
+        # Best-effort: never fail company creation if provisioning hiccups.
+        if created:
+            try:
+                from api.routers.sheet_templates import provision_default_templates_for_company
+                provision_default_templates_for_company(created.get("id"), created.get("name") or "")
+            except Exception as provision_err:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Template provisioning failed for company %s: %s", created.get("id"), provision_err
+                )
+
+        return {"message": "Company created successfully", "data": created}
     except HTTPException:
         raise
     except Exception as e:

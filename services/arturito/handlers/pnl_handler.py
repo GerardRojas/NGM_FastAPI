@@ -18,11 +18,14 @@ from api.services.vault_service import save_to_project_folder
 from .bva_handler import (
     resolve_project,
     fetch_recent_projects,
+    fetch_company_name,
     fetch_expenses,
     fetch_accounts,
+    fetch_account_overlay,
     upload_to_storage,
     _gpt_ask_missing_entity,
 )
+from services.reporting.engine import build_report, fetch_category_tree
 
 # PDF generation
 try:
@@ -58,6 +61,7 @@ def handle_pnl_cogs(
     """
     entities = request.get("entities", {})
     ctx = context or {}
+    company_id = ctx.get("company_id")
 
     # Extract project
     project_input = entities.get("project")
@@ -73,7 +77,7 @@ def handle_pnl_cogs(
 
     # Validate project
     if not project_input or project_input.lower() in ["default", "general", "random", "none", "ngm hub web"]:
-        recent_projects = fetch_recent_projects(limit=8)
+        recent_projects = fetch_recent_projects(limit=8, company_id=company_id)
         hint = ""
         data = None
         if recent_projects:
@@ -95,8 +99,8 @@ def handle_pnl_cogs(
         return result
 
     try:
-        # 1. Resolve project
-        project = resolve_project(project_input)
+        # 1. Resolve project (scoped to the active workspace)
+        project = resolve_project(project_input, company_id=company_id)
         if not project:
             return {
                 "ok": False,
@@ -110,9 +114,11 @@ def handle_pnl_cogs(
         # 2. Fetch data
         expenses = fetch_expenses(project_id)
         accounts = fetch_accounts()
+        overlay = fetch_account_overlay()
+        category_order, subcategory_index = fetch_category_tree()
 
-        # 3. Process report
-        report_data = process_pnl_data(expenses, accounts)
+        # 3. Process report with the unified engine (no budgets -> actuals only)
+        report_data = build_report([], expenses, accounts, overlay, category_order, subcategory_index)
 
         # 4. Generate PDF
         if not REPORTLAB_AVAILABLE:
@@ -128,7 +134,8 @@ def handle_pnl_cogs(
                 }
             }
 
-        pdf_url = generate_and_upload_pnl_pdf(project_name, report_data, project_id=project_id)
+        company_name = fetch_company_name(company_id)
+        pdf_url = generate_and_upload_pnl_pdf(project_name, report_data, project_id=project_id, company_name=company_name)
 
         if not pdf_url:
             response_text = format_pnl_response(project_name, report_data)
@@ -168,55 +175,6 @@ Accounts: {len(report_data['rows'])}"""
         }
 
 
-def process_pnl_data(
-    expenses: List[Dict[str, Any]],
-    accounts: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """Process expenses into account-grouped report data (no budget)."""
-
-    def get_account_name(account_id: str, account_name: str = None) -> str:
-        if account_name:
-            return account_name
-        if account_id:
-            for acc in accounts:
-                if (acc.get("account_id") or acc.get("id")) == account_id:
-                    return acc.get("Name") or acc.get("account_name") or "Unknown"
-        return "Unknown Account"
-
-    def get_account_number(account_name: str) -> int:
-        for acc in accounts:
-            if (acc.get("Name") or acc.get("account_name")) == account_name:
-                return acc.get("AcctNum") or 99999
-        return 99999
-
-    # Group expenses by account
-    expenses_by_account = {}
-    for expense in expenses:
-        account_name = get_account_name(expense.get("account_id"), expense.get("account_name"))
-        amount = float(expense.get("Amount") or expense.get("amount") or 0)
-        expenses_by_account[account_name] = expenses_by_account.get(account_name, 0) + amount
-
-    # Build rows
-    rows = []
-    for account_name, actual_amount in expenses_by_account.items():
-        rows.append({
-            "account": account_name,
-            "account_number": get_account_number(account_name),
-            "actual": round(actual_amount, 2)
-        })
-
-    rows.sort(key=lambda x: (x["account_number"], x["account"]))
-
-    total_actual = sum(r["actual"] for r in rows)
-
-    return {
-        "rows": rows,
-        "totals": {
-            "actual": round(total_actual, 2)
-        }
-    }
-
-
 def format_pnl_response(project_name: str, report_data: Dict[str, Any]) -> str:
     """Format P&L COGS as text (fallback without PDF)."""
     totals = report_data["totals"]
@@ -244,12 +202,13 @@ def format_pnl_response(project_name: str, report_data: Dict[str, Any]) -> str:
 def generate_and_upload_pnl_pdf(
     project_name: str,
     report_data: Dict[str, Any],
-    project_id: str = None
+    project_id: str = None,
+    company_name: str = None
 ) -> Optional[str]:
     """Generate P&L COGS PDF and upload to Vault."""
     try:
         pdf_buffer = io.BytesIO()
-        generate_pnl_pdf(pdf_buffer, project_name, report_data)
+        generate_pnl_pdf(pdf_buffer, project_name, report_data, company_name=company_name)
         pdf_buffer.seek(0)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -272,7 +231,7 @@ def generate_and_upload_pnl_pdf(
         return None
 
 
-def generate_pnl_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[str, Any]):
+def generate_pnl_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[str, Any], company_name: str = None):
     """Generate P&L COGS PDF — same style as BVA but only ACCOUNT + ACTUAL columns."""
     doc = SimpleDocTemplate(
         buffer,
@@ -319,7 +278,7 @@ def generate_pnl_pdf(buffer: io.BytesIO, project_name: str, report_data: Dict[st
     )
 
     # Header
-    elements.append(Paragraph("KD Developers LLC", title_style))
+    elements.append(Paragraph(company_name or "KD Developers LLC", title_style))
     elements.append(Paragraph(f"P&L COGS Report: {project_name}", subtitle_style))
     elements.append(Paragraph("All Dates (Not Use this Report for Accounting Purposes)", note_style))
     elements.append(Spacer(1, 12))

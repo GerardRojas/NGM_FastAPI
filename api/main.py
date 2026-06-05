@@ -61,6 +61,9 @@ from api.routers.messages import router as messages_router
 # ========= NOTIFICATIONS: Push Notifications ==========
 from api.routers.notifications import router as notifications_router
 
+# ========= CALENDAR: In-house calendar (events + attendees) ==========
+from api.routers.calendar import router as calendar_router
+
 # ========= BUDGET ALERTS: Budget Monitoring ==========
 from api.routers.budget_alerts import router as budget_alerts_router
 
@@ -237,6 +240,9 @@ app.include_router(messages_router)
 
 # Notifications (Push notification token management)
 app.include_router(notifications_router)
+
+# Calendar (in-house events + attendees; pipeline/milestones overlay handled FE)
+app.include_router(calendar_router)
 
 # Budget Alerts (automated budget monitoring)
 app.include_router(budget_alerts_router)

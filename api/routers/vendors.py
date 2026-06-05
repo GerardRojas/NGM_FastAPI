@@ -34,6 +34,7 @@ class VendorCreate(BaseModel):
     default_account_id: Optional[str] = None
     status: Optional[str] = "active"
     notes: Optional[str] = None
+    company_id: Optional[str] = None
 
 
 class VendorUpdate(BaseModel):
@@ -62,6 +63,7 @@ class VendorUpdate(BaseModel):
     default_account_id: Optional[str] = None
     status: Optional[str] = None
     notes: Optional[str] = None
+    company_id: Optional[str] = None
 
 
 # ========================================
@@ -73,7 +75,8 @@ async def list_vendors(
     status: Optional[str] = Query(None, description="Filter by status: active, inactive"),
     vendor_type: Optional[str] = Query(None, description="Filter by type"),
     is_1099: Optional[bool] = Query(None, description="Filter 1099 vendors"),
-    w9_status: Optional[str] = Query(None, description="Filter by W-9 status")
+    w9_status: Optional[str] = Query(None, description="Filter by W-9 status"),
+    company_id: Optional[str] = Query(None, description="Scope to one organization; shared (NULL) rows always included")
 ):
     """
     Lista todos los vendors ordenados por nombre, con filtros opcionales
@@ -89,6 +92,8 @@ async def list_vendors(
             query = query.eq("is_1099", is_1099)
         if w9_status:
             query = query.eq("w9_status", w9_status)
+        if company_id:
+            query = query.or_(f"company_id.eq.{company_id},company_id.is.null")
 
         response = query.execute()
         return {"data": response.data or []}

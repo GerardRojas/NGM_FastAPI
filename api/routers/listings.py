@@ -46,7 +46,21 @@ class ListingSearch(BaseModel):
     min_price: Optional[float] = None
     max_price: Optional[float] = None
     days_old: Optional[int] = None                           # only listings active within N days
+    # Radial search (map-driven). When all three are set the request takes
+    # precedence over city/zip and goes to RentCast as a radius query. radius
+    # is in MILES; RentCast caps it server-side (~50 mi typical).
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    radius: Optional[float] = None
     limit: int = 50
+
+    def has_radial_search(self) -> bool:
+        return (
+            self.latitude is not None
+            and self.longitude is not None
+            and self.radius is not None
+            and self.radius > 0
+        )
 
     def normalized_types(self) -> List[str]:
         """Return the requested property types as a clean, dedup'd list. Empty
@@ -122,6 +136,18 @@ _DEMO_LISTINGS: List[Dict[str, Any]] = [
 ]
 
 
+def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance between two lat/lng points, in miles. Used for the
+    demo data path so a radial search can pre-filter without RentCast."""
+    import math
+    r_miles = 3958.7613
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r_miles * math.asin(math.sqrt(a))
+
+
 def _filter(rows: List[Dict[str, Any]], payload: ListingSearch) -> List[Dict[str, Any]]:
     out = rows
     if payload.min_price is not None:
@@ -134,22 +160,39 @@ def _filter(rows: List[Dict[str, Any]], payload: ListingSearch) -> List[Dict[str
         out = [r for r in out if (r.get("property_type") or "").lower() in wanted]
     if payload.bedrooms is not None:
         out = [r for r in out if (r.get("bedrooms") or 0) >= payload.bedrooms]
-    if payload.zip_code:
+    if payload.zip_code and not payload.has_radial_search():
         out = [r for r in out if str(r.get("zip") or "") == str(payload.zip_code)]
+    if payload.has_radial_search():
+        lat0, lng0, r = payload.latitude, payload.longitude, payload.radius
+        out = [
+            row for row in out
+            if row.get("lat") is not None and row.get("lng") is not None
+            and _haversine_miles(lat0, lng0, row["lat"], row["lng"]) <= r
+        ]
     return out
 
 
 def _build_rentcast_params(payload: ListingSearch, limit: int, property_type: Optional[str]) -> Dict[str, Any]:
     """Translate one search payload (+ a single property type, if any) into the
     query params RentCast expects. Factored out so the multi-type fan-out can
-    reuse the same translation per type."""
+    reuse the same translation per type.
+
+    When a radial search (lat/lng/radius) is requested the city/zip filters are
+    omitted — RentCast treats lat/lng/radius as the search anchor. state is
+    still passed if set so cross-state radii get bounded."""
     params: Dict[str, Any] = {"status": "Active", "limit": limit}
-    if payload.city:
-        params["city"] = payload.city
+    radial = payload.has_radial_search()
+    if radial:
+        params["latitude"] = payload.latitude
+        params["longitude"] = payload.longitude
+        params["radius"] = payload.radius
+    else:
+        if payload.city:
+            params["city"] = payload.city
+        if payload.zip_code:
+            params["zipCode"] = payload.zip_code
     if payload.state:
         params["state"] = payload.state.upper()
-    if payload.zip_code:
-        params["zipCode"] = payload.zip_code
     if property_type:
         params["propertyType"] = property_type
     if payload.bedrooms is not None:
@@ -203,8 +246,11 @@ async def search_listings(payload: ListingSearch, current_user: dict = Depends(g
         return {"listings": rows, "count": len(rows), "source": "demo",
                 "note": "Demo data — set RENTCAST_API_KEY on the server to pull live listings."}
 
-    if not (payload.state or payload.city or payload.zip_code):
-        raise HTTPException(status_code=400, detail="Provide at least a state, city, or ZIP code.")
+    if not (payload.state or payload.city or payload.zip_code or payload.has_radial_search()):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide a state, city, ZIP code, or a lat/lng/radius search area.",
+        )
 
     types = payload.normalized_types()
 
@@ -248,3 +294,209 @@ async def search_listings(payload: ListingSearch, current_user: dict = Depends(g
     # row that doesn't match what we asked for (which we've seen happen).
     rows = _filter(rows, payload)
     return {"listings": rows, "count": len(rows), "source": "rentcast"}
+
+
+# ============================================================================
+# Geocoder + Comparable sales (RentCast AVM)
+# ============================================================================
+# Geocoding sits next to listings so the Calculator can validate / locate an
+# address before pulling comps. Census is free and county-wide; no quota cost.
+# Comps use RentCast's AVM endpoint which returns a value estimate AND the 3-5
+# comparable sale properties it used — same vendor, same key, same quota pool
+# (no new contract). Demo mode mirrors the listings demo path so the feature
+# works end-to-end without RENTCAST_API_KEY.
+
+CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+
+
+class GeocodeRequest(BaseModel):
+    address: str
+
+
+@router.post("/geocode")
+async def geocode_address(payload: GeocodeRequest, current_user: dict = Depends(get_current_user)):
+    """Resolve a U.S. address to lat/lng via the free Census geocoder. Used by
+    the Calculator to locate a subject property before pulling comps. Returns
+    404 when no match — no other errors are raised so the UI can show a single
+    'address not found' message without parsing a 502.
+    """
+    addr = (payload.address or "").strip()
+    if not addr:
+        raise HTTPException(status_code=400, detail="Address is required.")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                CENSUS_GEOCODER_URL,
+                params={"address": addr, "benchmark": "Public_AR_Current", "format": "json"},
+                timeout=20.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        logger.error("[LISTINGS] Census geocoder failed: %r", e)
+        raise HTTPException(status_code=502, detail=f"Geocoder error: {e}")
+
+    matches = ((data.get("result") or {}).get("addressMatches")) or []
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Address not found: {addr}")
+
+    m = matches[0]
+    coords = m.get("coordinates") or {}
+    if "x" not in coords or "y" not in coords:
+        raise HTTPException(status_code=404, detail="Geocoder returned no coordinates.")
+
+    return {
+        "lat": coords["y"],
+        "lng": coords["x"],
+        "matched_address": m.get("matchedAddress") or addr,
+        "source": "census",
+    }
+
+
+class CompsRequest(BaseModel):
+    # Either address OR (latitude+longitude) must be set. Subject attributes
+    # narrow the comp set (RentCast picks comps closer to these traits).
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    property_type: Optional[str] = None
+    bedrooms: Optional[int] = None
+    bathrooms: Optional[float] = None
+    square_footage: Optional[int] = None
+    radius: Optional[float] = None       # miles, defaults to RentCast's default (5)
+    days_old: Optional[int] = None       # only comps sold within N days
+    comp_count: Optional[int] = None     # number of comps to return (max 25)
+
+
+def _normalize_comp(c: Dict[str, Any]) -> Dict[str, Any]:
+    """RentCast comparable property → compact UI shape."""
+    return {
+        "id": c.get("id") or c.get("formattedAddress"),
+        "address": c.get("formattedAddress") or c.get("addressLine1"),
+        "city": c.get("city"),
+        "state": c.get("state"),
+        "zip": c.get("zipCode"),
+        "lat": c.get("latitude"),
+        "lng": c.get("longitude"),
+        "property_type": c.get("propertyType"),
+        "bedrooms": c.get("bedrooms"),
+        "bathrooms": c.get("bathrooms"),
+        "sqft": c.get("squareFootage"),
+        "lot_size": c.get("lotSize"),
+        "year_built": c.get("yearBuilt"),
+        "price": c.get("price"),
+        # RentCast names it "listingType" — "Sale" / "Standard Sale" usually.
+        "listing_type": c.get("listingType"),
+        "listed_date": c.get("listedDate"),
+        "removed_date": c.get("removedDate"),
+        "last_seen_date": c.get("lastSeenDate"),
+        "days_on_market": c.get("daysOnMarket"),
+        "distance": c.get("distance"),       # miles
+        "correlation": c.get("correlation"), # 0..1, RentCast's "how similar"
+    }
+
+
+# Tiny demo subject + comps so the comps button works without RENTCAST_API_KEY.
+_DEMO_COMPS_BASE = {
+    "value": 712_000,
+    "value_low": 670_000,
+    "value_high": 755_000,
+    "lat": 32.748,
+    "lng": -117.097,
+}
+_DEMO_COMPS_ROWS: List[Dict[str, Any]] = [
+    {"id": "comp-1", "address": "3760 Marlborough Ave, San Diego, CA 92105",
+     "city": "San Diego", "state": "CA", "zip": "92105", "lat": 32.749, "lng": -117.099,
+     "property_type": "Single Family", "bedrooms": 3, "bathrooms": 2, "sqft": 1280,
+     "lot_size": 5800, "year_built": 1951, "price": 705_000, "listing_type": "Sale",
+     "removed_date": "2026-04-12", "distance": 0.10, "correlation": 0.91},
+    {"id": "comp-2", "address": "3890 Marlborough Ave, San Diego, CA 92105",
+     "city": "San Diego", "state": "CA", "zip": "92105", "lat": 32.751, "lng": -117.096,
+     "property_type": "Single Family", "bedrooms": 3, "bathrooms": 2, "sqft": 1340,
+     "lot_size": 6200, "year_built": 1955, "price": 720_000, "listing_type": "Sale",
+     "removed_date": "2026-05-03", "distance": 0.16, "correlation": 0.88},
+    {"id": "comp-3", "address": "4012 Polk Ave, San Diego, CA 92105",
+     "city": "San Diego", "state": "CA", "zip": "92105", "lat": 32.746, "lng": -117.094,
+     "property_type": "Single Family", "bedrooms": 3, "bathrooms": 1.5, "sqft": 1180,
+     "lot_size": 5400, "year_built": 1948, "price": 668_000, "listing_type": "Sale",
+     "removed_date": "2026-03-22", "distance": 0.28, "correlation": 0.82},
+]
+
+
+@router.post("/comps")
+async def fetch_comps(payload: CompsRequest, current_user: dict = Depends(get_current_user)):
+    """Return RentCast's AVM value + comparable sale properties for a subject.
+    Provide an address OR lat/lng; subject traits (beds/baths/sqft) narrow the
+    comp pool. Falls back to demo data when RENTCAST_API_KEY is unset so the
+    UI can be developed against the same shape."""
+    api_key = os.getenv("RENTCAST_API_KEY")
+    if not (payload.address or (payload.latitude is not None and payload.longitude is not None)):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide an address or a lat+lng for the subject property.",
+        )
+
+    if not api_key:
+        return {
+            **_DEMO_COMPS_BASE,
+            "comps": _DEMO_COMPS_ROWS,
+            "source": "demo",
+            "note": "Demo comps — set RENTCAST_API_KEY on the server to pull live data.",
+        }
+
+    params: Dict[str, Any] = {}
+    if payload.address:
+        params["address"] = payload.address
+    if payload.latitude is not None and payload.longitude is not None:
+        params["latitude"] = payload.latitude
+        params["longitude"] = payload.longitude
+    if payload.property_type:
+        params["propertyType"] = payload.property_type
+    if payload.bedrooms is not None:
+        params["bedrooms"] = payload.bedrooms
+    if payload.bathrooms is not None:
+        params["bathrooms"] = payload.bathrooms
+    if payload.square_footage is not None:
+        params["squareFootage"] = payload.square_footage
+    if payload.radius is not None and payload.radius > 0:
+        params["radius"] = payload.radius
+    if payload.days_old is not None and payload.days_old > 0:
+        params["daysOld"] = payload.days_old
+    if payload.comp_count is not None:
+        params["compCount"] = max(1, min(25, int(payload.comp_count)))
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{RENTCAST_BASE}/avm/value",
+                params=params,
+                headers={"X-Api-Key": api_key, "Accept": "application/json"},
+                timeout=RENTCAST_TIMEOUT,
+            )
+    except Exception as e:
+        logger.error("[LISTINGS] RentCast AVM request failed: %r", e)
+        raise HTTPException(status_code=502, detail=f"Comps provider error: {e}")
+
+    if r.status_code == 401:
+        raise HTTPException(status_code=502, detail="Comps provider rejected the API key (401).")
+    if r.status_code == 404:
+        # RentCast 404 usually means "no record / not enough comps in coverage."
+        raise HTTPException(status_code=404, detail="No comps found for this subject.")
+    if r.status_code == 429:
+        raise HTTPException(status_code=429, detail="Comps provider quota exceeded. Try again later.")
+    if r.status_code >= 400:
+        logger.warning("[LISTINGS] RentCast AVM %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail=f"Comps provider returned {r.status_code}.")
+
+    data = r.json() if r.content else {}
+    comparables = data.get("comparables") or []
+    return {
+        "value": data.get("price"),
+        "value_low": data.get("priceRangeLow"),
+        "value_high": data.get("priceRangeHigh"),
+        "lat": data.get("latitude"),
+        "lng": data.get("longitude"),
+        "comps": [_normalize_comp(c) for c in comparables],
+        "source": "rentcast",
+    }
