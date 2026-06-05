@@ -713,27 +713,46 @@ def list_expenses(project: Optional[str] = None, company_id: Optional[str] = Non
 
 
 @router.get("/all")
-def list_all_expenses(limit: Optional[int] = 1000, current_user: dict = Depends(get_current_user)):
+def list_all_expenses(limit: Optional[int] = 1000, company_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """
     Lista todos los gastos de todos los proyectos.
     Incluye información del proyecto en cada gasto.
     Por defecto limita a 1000 gastos para evitar problemas de rendimiento.
 
+    company_id (opcional) restringe los gastos a los proyectos de la organización
+    activa (projects.source_company). Si se omite, devuelve todos.
+
     PERFORMANCE: Metadata queries ejecutadas en paralelo con ThreadPoolExecutor
     """
     try:
+        # Resolver los proyectos de la organización activa para el scope por company.
+        company_project_ids: Optional[list] = None
+        if company_id:
+            comp_resp = (
+                supabase.table("projects")
+                .select("project_id")
+                .eq("source_company", company_id)
+                .execute()
+            )
+            company_project_ids = [
+                r["project_id"] for r in (comp_resp.data or []) if r.get("project_id")
+            ]
+            if not company_project_ids:
+                return {"data": []}
+
         # Paginated fetch to avoid Supabase 1000-row silent truncation
         raw_expenses = []
         offset = 0
         max_rows = min(limit or 10000, 50000)  # hard cap to prevent DoS
         while offset < max_rows:
             page_end = min(offset + _PAGE_SIZE, max_rows) - 1
-            resp = (
+            q = (
                 supabase.table("expenses_manual_COGS").select("*")
                 .order("TxnDate", desc=True)
-                .range(offset, page_end)
-                .execute()
             )
+            if company_project_ids is not None:
+                q = q.in_("project", company_project_ids)
+            resp = q.range(offset, page_end).execute()
             batch = resp.data or []
             raw_expenses.extend(batch)
             if len(batch) < _PAGE_SIZE:

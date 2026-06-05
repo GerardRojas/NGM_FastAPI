@@ -29,7 +29,7 @@ from datetime import datetime
 import json
 import uuid
 
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, HTTPException, Body, Query
 from pydantic import BaseModel
 
 from api.supabase_client import supabase
@@ -70,6 +70,7 @@ class EstimateSaveRequest(BaseModel):
     concepts_snapshot: Optional[List[Dict[str, Any]]] = None
     concept_materials_snapshot: Optional[List[Dict[str, Any]]] = None
     created_from_template: Optional[str] = None
+    company_id: Optional[str] = None  # Owning workspace; stamped into the manifest
 
 
 class BranchCreateRequest(BaseModel):
@@ -406,10 +407,13 @@ async def get_buckets_status():
 # ============================================
 
 @router.get("/estimates")
-async def list_estimates():
+async def list_estimates(
+    company_id: Optional[str] = Query(None, description="Scope the board to the active workspace. Estimates with no company (legacy) are shown in all workspaces."),
+):
     """
     List all saved estimates from the estimates bucket.
-    Returns folders (each estimate is a folder).
+    Returns folders (each estimate is a folder). When company_id is given, the
+    board is scoped to that workspace's estimates (plus untagged/shared ones).
     """
     try:
         ensure_bucket_exists(ESTIMATES_BUCKET)
@@ -439,9 +443,11 @@ async def list_estimates():
                 "variation_count": 0,
                 "change_order_count": 0,
             }
+            est_company = None
             try:
                 manifest = _download_json(_manifest_path(name))
                 if manifest and isinstance(manifest.get("branches"), list) and manifest["branches"]:
+                    est_company = manifest.get("company_id")
                     main = find_branch(manifest, manifest.get("main_branch_id")) or manifest["branches"][0]
                     branches = manifest["branches"]
                     co_count = sum(1 for b in branches if b.get("kind") == BRANCH_KIND_CHANGE_ORDER)
@@ -471,6 +477,10 @@ async def list_estimates():
                         summary["id"] = name  # keep folder id as the canonical key
             except Exception as _exc:
                 logger.debug("[ESTIMATOR] list meta skip for %s: %s", name, _exc)
+            # Workspace scope: drop estimates that belong to a different company.
+            # Untagged/legacy estimates (no company_id) stay visible everywhere.
+            if company_id and est_company and est_company != company_id:
+                continue
             estimates.append(summary)
 
         return {"estimates": estimates, "count": len(estimates)}
@@ -564,6 +574,9 @@ async def save_estimate(request: EstimateSaveRequest):
         grand_total = compute_grand_total(estimate_data)
         if manifest is None:
             manifest = {"main_branch_id": main_id, "branches": []}
+        # Tag the estimate with the owning workspace so the board can scope it.
+        if request.company_id:
+            manifest["company_id"] = request.company_id
         if is_main:
             meta = extract_estimate_meta(estimate_id, estimate_data)
             manifest["project_name"] = meta["name"]

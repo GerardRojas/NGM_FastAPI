@@ -788,8 +788,41 @@ async def expense_timeline(
 # 4. GET /analytics/executive/kpis
 # ============================================================
 
+def _company_project_id_set(company_id: Optional[str]) -> Optional[set]:
+    """Project ids owned by a company (workspace), as a set for membership
+    filtering of analytics aggregations. Returns None when company_id is falsy
+    (= no workspace scope / all). Returns an (possibly empty) set otherwise —
+    an empty set means the company has no projects, so callers scope to nothing.
+    """
+    if not company_id:
+        return None
+    try:
+        resp = (
+            supabase.table("projects")
+            .select("project_id")
+            .eq("source_company", company_id)
+            .execute()
+        )
+        return {str(r["project_id"]) for r in (resp.data or []) if r.get("project_id")}
+    except Exception as exc:
+        logger.error("[analytics] company project ids: %s", exc)
+        return set()
+
+
+def _company_pid_list(cset: Optional[set]) -> Optional[list]:
+    """Turn a company project-id set into a list for `.in_()` filters. None stays
+    None (no scope); an empty set becomes ['__none__'] so the filter matches no
+    rows instead of silently returning everything."""
+    if cset is None:
+        return None
+    return sorted(cset) or ["__none__"]
+
+
 @router.get("/executive/kpis")
-async def executive_kpis(current_user: dict = Depends(get_current_user)):
+async def executive_kpis(
+    company_id: Optional[str] = Query(None, description="Scope to the active workspace's projects. Omit for all."),
+    current_user: dict = Depends(get_current_user),
+):
     """
     Multi-project KPI aggregation for the executive dashboard.
     Reachable by any role with can_view on `project_kpis`, `analytics`, or
@@ -805,7 +838,7 @@ async def executive_kpis(current_user: dict = Depends(get_current_user)):
             detail="You do not have permission to view executive KPIs",
         )
 
-    return _compute_executive_kpis()
+    return _compute_executive_kpis(project_ids=_company_pid_list(_company_project_id_set(company_id)))
 
 
 def _compute_executive_kpis(
@@ -1177,7 +1210,10 @@ def _compute_executive_kpis(
 # ============================================================
 
 @router.get("/health/all")
-async def health_all(current_user: dict = Depends(get_current_user)):
+async def health_all(
+    company_id: Optional[str] = Query(None, description="Scope to the active workspace's projects. Omit for all."),
+    current_user: dict = Depends(get_current_user),
+):
     """
     Aggregated health snapshot across ALL active projects.
     Returns the same shape as /projects/{project_id}/health so the
@@ -1202,6 +1238,11 @@ async def health_all(current_user: dict = Depends(get_current_user)):
     except Exception as exc:
         logger.error("[analytics:health_all] projects fetch: %s", exc)
 
+    # Workspace scope: restrict every aggregation to this company's projects.
+    _ha_cset = _company_project_id_set(company_id)
+    if _ha_cset is not None:
+        active_project_ids = [p for p in active_project_ids if p in _ha_cset]
+
     # --- Budget (all active budgets) ---
     budget_total = 0.0
     try:
@@ -1209,13 +1250,15 @@ async def health_all(current_user: dict = Depends(get_current_user)):
         while True:
             bud_resp = (
                 supabase.table("budgets_qbo")
-                .select("amount_sum")
+                .select("amount_sum, ngm_project_id")
                 .eq("active", True)
                 .range(bud_offset, bud_offset + _PAGE_SIZE - 1)
                 .execute()
             )
             batch = bud_resp.data or []
             for row in batch:
+                if _ha_cset is not None and str(row.get("ngm_project_id") or "") not in _ha_cset:
+                    continue
                 budget_total += _safe_float(row.get("amount_sum"))
             if len(batch) < _PAGE_SIZE:
                 break
@@ -1226,10 +1269,14 @@ async def health_all(current_user: dict = Depends(get_current_user)):
     # --- Expenses (all, paginated) ---
     all_expenses = _paginated_fetch(
         "expenses_manual_COGS",
-        "expense_id, Amount, status, auth_status, txn_type, vendor_id, TxnDate",
+        "expense_id, Amount, status, auth_status, txn_type, vendor_id, TxnDate, project",
         {},
         neq_filters={"status": "review"},
     )
+
+    # Workspace scope: keep only expenses on this company's projects.
+    if _ha_cset is not None:
+        all_expenses = [e for e in all_expenses if str(e.get("project") or "") in _ha_cset]
 
     # Separate authorized vs pending
     # Use BOTH status='auth' and auth_status=True to match per-project health
@@ -1436,6 +1483,7 @@ async def health_all(current_user: dict = Depends(get_current_user)):
 @router.get("/vendors/summary")
 async def vendors_summary(
     project_id: Optional[str] = Query(None),
+    company_id: Optional[str] = Query(None, description="Scope spend to the active workspace's projects. Omit for all."),
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -1466,6 +1514,11 @@ async def vendors_summary(
         expense_filters,
         neq_filters={"status": "review"},
     )
+
+    # Workspace scope: keep only expenses on the active company's projects.
+    _cset = _company_project_id_set(company_id)
+    if _cset is not None:
+        all_expenses = [e for e in all_expenses if str(e.get("project") or "") in _cset]
 
     # --- Aggregate by vendor ---
     vendor_agg: dict[str, dict] = defaultdict(
@@ -1791,6 +1844,7 @@ async def vendor_scorecard(
 @router.get("/expense-intelligence")
 async def expense_intelligence(
     project_id: Optional[str] = Query(default=None, description="Filter expenses to a specific project"),
+    company_id: Optional[str] = Query(None, description="Scope to the active workspace's projects. Omit for all."),
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -1805,9 +1859,14 @@ async def expense_intelligence(
 
         all_expenses = _paginated_fetch(
             "expenses_manual_COGS",
-            "expense_id, TxnDate, Amount, vendor_id, txn_type, payment_type, status, account_id, LineDescription",
+            "expense_id, TxnDate, Amount, vendor_id, txn_type, payment_type, status, account_id, LineDescription, project",
             filters,
         )
+
+        # Workspace scope: keep only expenses on the active company's projects.
+        _cset = _company_project_id_set(company_id)
+        if _cset is not None:
+            all_expenses = [e for e in all_expenses if str(e.get("project") or "") in _cset]
 
         # --- Lookup tables ---
         vendor_map: dict[str, str] = {}
@@ -2042,6 +2101,7 @@ async def expense_intelligence(
 async def budget_health(
     project_id: Optional[str] = Query(default=None, description="Filter to a specific project"),
     year: Optional[int] = Query(default=None, description="Filter to a specific budget year"),
+    company_id: Optional[str] = Query(None, description="Scope to the active workspace's projects. Omit for all."),
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -2079,6 +2139,11 @@ async def budget_health(
             if year:
                 bud_query = bud_query.eq("year", year)
 
+        # Workspace scope: keep only this company's budgets.
+        _bh_cset = _company_project_id_set(company_id)
+        if _bh_cset is not None:
+            budgets = [b for b in budgets if str(b.get("ngm_project_id") or "") in _bh_cset]
+
         # --- Projects for names ---
         project_map: dict[str, str] = {}
         try:
@@ -2098,6 +2163,10 @@ async def budget_health(
             "project, Amount, TxnDate, account_id",
             expense_filters,
         )
+
+        # Workspace scope: keep only expenses on this company's projects.
+        if _bh_cset is not None:
+            all_expenses = [e for e in all_expenses if str(e.get("project") or "") in _bh_cset]
 
         # Group expenses by project
         expenses_by_project: dict[str, list[dict]] = defaultdict(list)
@@ -2304,12 +2373,14 @@ async def budget_health(
 @router.get("/project-scorecard")
 async def project_scorecard(
     project_id: Optional[str] = Query(None),
+    company_id: Optional[str] = Query(None, description="Scope to the active workspace's projects. Omit for all."),
     current_user: dict = Depends(get_current_user),
 ):
     """
     Cross-project scorecard: budget health, timeline progress, milestone
     status, and composite health score (0-10) for every project.
     """
+    _sc_cset = _company_project_id_set(company_id)
     try:
         # --- All projects with status ---
         projects_raw: list[dict] = []
@@ -2325,6 +2396,10 @@ async def project_scorecard(
         except Exception as exc:
             logger.error("[analytics:project-scorecard] projects fetch: %s", exc)
             raise HTTPException(status_code=500, detail="Failed to fetch projects")
+
+        # Workspace scope: keep only this company's projects.
+        if _sc_cset is not None:
+            projects_raw = [p for p in projects_raw if str(p.get("project_id") or "") in _sc_cset]
 
         # --- All active budgets (paginated) ---
         all_budgets: list[dict] = []
@@ -2355,6 +2430,8 @@ async def project_scorecard(
         budget_by_project: dict[str, float] = defaultdict(float)
         for b in all_budgets:
             pid = str(b.get("ngm_project_id") or "")
+            if _sc_cset is not None and pid not in _sc_cset:
+                continue
             if pid:
                 budget_by_project[pid] += _safe_float(b.get("amount_sum"))
 
@@ -2371,6 +2448,8 @@ async def project_scorecard(
         spent_by_project: dict[str, float] = defaultdict(float)
         for e in all_expenses:
             pid = str(e.get("project") or "")
+            if _sc_cset is not None and pid not in _sc_cset:
+                continue
             if pid:
                 spent_by_project[pid] += _safe_float(e.get("Amount"))
 
@@ -3007,6 +3086,7 @@ async def operations_dashboard(
     date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
     project_status: Optional[str] = Query(None, description="CSV of on_track,at_risk,over_budget"),
     task_status: Optional[str] = Query(None, description="CSV of task status names"),
+    company_id: Optional[str] = Query(None, description="Scope to the active workspace's projects when no explicit project filter is given."),
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -3035,6 +3115,11 @@ async def operations_dashboard(
     # Honor the legacy single-project param when no list is given.
     if not pid_list and project_id:
         pid_list = [project_id]
+
+    # Scope to the active workspace when no explicit project filter was given:
+    # restrict every aggregation to that company's projects.
+    if not pid_list and company_id:
+        pid_list = _company_pid_list(_company_project_id_set(company_id))
 
     kpis = {
         "active_projects": 0,
