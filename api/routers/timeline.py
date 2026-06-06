@@ -286,6 +286,43 @@ async def list_milestones(
         raise HTTPException(status_code=500, detail=f"Error listing milestones: {e}")
 
 
+@router.get("/milestones")
+async def list_all_milestones(
+    company_id: Optional[str] = Query(
+        None,
+        description="Scope to a workspace's projects (source_company). Omit for all projects.",
+    ),
+    from_: Optional[str] = Query(None, alias="from", description="due_date >= (ISO date)"),
+    to: Optional[str] = Query(None, description="due_date <= (ISO date)"),
+    current_user: dict = Depends(get_current_user),
+):
+    """All milestones across projects in ONE call (calendar overlay). Scoped to
+    the active workspace's projects when company_id is given. Replaces N
+    per-project requests (which the frontend previously capped at 25)."""
+    try:
+        pq = supabase.table("projects").select("project_id, project_name, source_company")
+        if company_id:
+            pq = pq.eq("source_company", company_id)
+        projects = pq.execute().data or []
+        name_by_id = {str(p["project_id"]): p.get("project_name") for p in projects}
+        ids = list(name_by_id.keys())
+        if not ids:
+            return []
+
+        q = supabase.table("project_milestones").select("*").in_("project_id", ids)
+        if from_:
+            q = q.gte("due_date", from_)
+        if to:
+            q = q.lte("due_date", to)
+        rows = q.order("due_date").execute().data or []
+        for r in rows:
+            r["project_name"] = name_by_id.get(str(r.get("project_id")))
+        return rows
+    except Exception as e:
+        logger.error("Error listing milestones (batch): %s", e)
+        raise HTTPException(status_code=500, detail=f"Error listing milestones: {e}")
+
+
 @router.post("/projects/{project_id}/milestones", status_code=201)
 async def create_milestone(
     project_id: str,

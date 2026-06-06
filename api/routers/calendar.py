@@ -253,15 +253,23 @@ def _serialize_event(row: dict, attendees: List[dict], sync: Optional[dict] = No
 
 
 def _fetch_sync_mappings(event_ids: List[str]) -> dict:
-    """Returns {event_id: {status, source, last_synced_at}} for the given events."""
+    """Returns {event_id: {status, source, last_synced_at}} for the given events.
+
+    Sync mappings are optional metadata (Google sync). A schema/sync issue here
+    must never take down event listing, so any failure degrades to "no sync info".
+    """
     if not event_ids:
         return {}
-    res = (
-        supabase.table("calendar_sync_mappings")
-        .select("event_id, sync_status, sync_source, last_synced_at")
-        .in_("event_id", event_ids)
-        .execute()
-    )
+    try:
+        res = (
+            supabase.table("calendar_sync_mappings")
+            .select("event_id, sync_status, sync_source, last_synced_at")
+            .in_("event_id", event_ids)
+            .execute()
+        )
+    except Exception:
+        logger.exception("_fetch_sync_mappings failed; returning no sync info")
+        return {}
     out: dict = {}
     for r in (res.data or []):
         eid = str(r.get("event_id"))
@@ -271,6 +279,54 @@ def _fetch_sync_mappings(event_ids: List[str]) -> dict:
             "last_synced_at": r.get("last_synced_at"),
         }
     return out
+
+
+def _require_cron(request: Request) -> None:
+    """Authorize a cron endpoint. Fails CLOSED: if NGM_CRON_SECRET isn't set the
+    endpoint is unavailable rather than open to the public. Callers must send the
+    secret via the X-Cron-Secret header (or ?secret= query param)."""
+    secret = os.getenv("NGM_CRON_SECRET")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Cron not configured")
+    provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
+    if provided != secret:
+        raise HTTPException(status_code=403, detail="Bad cron secret")
+
+
+def _project_company_id(project_id: Optional[str]) -> Optional[str]:
+    """The authoritative company for a project (projects.source_company)."""
+    if not project_id:
+        return None
+    try:
+        res = (
+            supabase.table("projects")
+            .select("source_company")
+            .eq("project_id", project_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0].get("source_company") or None
+    except Exception:
+        logger.exception("_project_company_id lookup failed")
+    return None
+
+
+def _resolve_company_id(payload_company_id: Optional[str], project_id: Optional[str]) -> Optional[str]:
+    """Server-side workspace scope. A project-linked event is tagged to that
+    project's company (authoritative, not client-trusted); otherwise it falls
+    back to the company the client supplied (the active workspace)."""
+    if project_id:
+        derived = _project_company_id(project_id)
+        if derived:
+            return derived
+    return payload_company_id or None
+
+
+def _validate_rrule(rrule: Optional[str]) -> None:
+    """Reject a non-empty recurrence rule that doesn't parse to a valid RRULE."""
+    if rrule and parse_rrule(rrule) is None:
+        raise HTTPException(status_code=400, detail="Invalid recurrence rule")
 
 
 def _notify_invitees(event_row: dict, attendee_ids: List[str], actor_id: str) -> None:
@@ -420,6 +476,7 @@ async def create_event(payload: EventCreate, current_user: dict = Depends(get_cu
             raise HTTPException(status_code=400, detail="Title is required")
         if not payload.start_at or not payload.end_at:
             raise HTTPException(status_code=400, detail="start_at and end_at are required")
+        _validate_rrule(payload.rrule)
 
         row = {
             "title": title,
@@ -430,7 +487,7 @@ async def create_event(payload: EventCreate, current_user: dict = Depends(get_cu
             "all_day": bool(payload.all_day),
             "color": (payload.color or None),
             "project_id": payload.project_id or None,
-            "company_id": payload.company_id or None,
+            "company_id": _resolve_company_id(payload.company_id, payload.project_id),
             "created_by": me,
             "visibility": _normalize_visibility(payload.visibility),
             "rrule": (payload.rrule or None),
@@ -505,11 +562,16 @@ async def update_event(event_id: str, payload: EventUpdate, current_user: dict =
             update["color"] = payload.color or None
         if payload.project_id is not None:
             update["project_id"] = payload.project_id or None
-        if payload.company_id is not None:
-            update["company_id"] = payload.company_id or None
+        # Re-resolve the workspace whenever the project or company changes: a
+        # project-linked event always follows the project's company.
+        if payload.project_id is not None or payload.company_id is not None:
+            eff_project = (payload.project_id if payload.project_id is not None else row.get("project_id")) or None
+            eff_company = (payload.company_id if payload.company_id is not None else row.get("company_id")) or None
+            update["company_id"] = _resolve_company_id(eff_company, eff_project)
         if payload.visibility is not None:
             update["visibility"] = _normalize_visibility(payload.visibility)
         if payload.rrule is not None:
+            _validate_rrule(payload.rrule)
             update["rrule"] = payload.rrule or None
         if payload.rrule_until is not None:
             update["rrule_until"] = payload.rrule_until or None
@@ -848,11 +910,7 @@ async def revoke_feed_token(label: str, current_user: dict = Depends(get_current
 async def dispatch_reminders(request: Request):
     """Sweep events whose reminder fires in the last ~lookback_seconds window
     and emit notifications. Idempotent via calendar_reminder_log."""
-    secret = os.getenv("NGM_CRON_SECRET")
-    if secret:
-        provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
-        if provided != secret:
-            raise HTTPException(status_code=403, detail="Bad cron secret")
+    _require_cron(request)
 
     lookback_seconds = int(request.query_params.get("lookback_seconds") or 90)
     now = datetime.now(timezone.utc)
@@ -909,6 +967,22 @@ async def dispatch_reminders(request: Request):
                     "reminder_minutes": reminder,
                 },
             )
+
+            # Also push to devices (best-effort) so reminders actually ping the
+            # phone/desktop, not just the in-app bell. Push failure never blocks.
+            try:
+                from api.services.firebase_notifications import send_push_notification
+                for rid in recipients:
+                    await send_push_notification(
+                        rid,
+                        title="Event reminder",
+                        body=f"{row.get('title') or 'Event'} — {preview_when}",
+                        data={"event_id": event_id, "deep_link": "/calendar"},
+                        tag=f"event-reminder-{event_id}",
+                    )
+            except Exception:
+                logger.exception("dispatch_reminders: push failed for event %s", event_id)
+
             dispatched += 1
         except Exception:
             errors += 1
@@ -1064,11 +1138,7 @@ async def cron_google_sync(request: Request):
     curl -fsSL -H "X-Cron-Secret: $NGM_CRON_SECRET" \\
         https://ngm-fastapi.onrender.com/calendar/cron/google-sync
     """
-    secret = os.getenv("NGM_CRON_SECRET")
-    if secret:
-        provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
-        if provided != secret:
-            raise HTTPException(status_code=403, detail="Bad cron secret")
+    _require_cron(request)
 
     if not gcal.is_google_configured():
         return {"ok": False, "configured": False, "reason": "Google OAuth not configured"}
@@ -1189,11 +1259,7 @@ async def cron_google_watch_renew(request: Request):
     curl -fsSL -H "X-Cron-Secret: $NGM_CRON_SECRET" \\
         https://ngm-fastapi.onrender.com/calendar/cron/google-watch-renew
     """
-    secret = os.getenv("NGM_CRON_SECRET")
-    if secret:
-        provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
-        if provided != secret:
-            raise HTTPException(status_code=403, detail="Bad cron secret")
+    _require_cron(request)
 
     if not gcal.is_google_configured():
         return {"ok": False, "configured": False}
