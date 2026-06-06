@@ -147,6 +147,12 @@ from api.routers.connect import router as connect_router
 # ========= RESPONSIBILITIES: unified role/user duties -> pipeline tasks =====
 from api.routers.responsibilities import router as responsibilities_router
 
+# ========= BETA ACCESS: Public landing-page lead capture ==========
+from api.routers.beta_access import router as beta_access_router
+
+# ========= ISSUES / FEEDBACK: Internal issue + suggestion board ====
+from api.routers.issues import router as issues_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -172,6 +178,8 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
+        "http://localhost:4321",
+        "http://127.0.0.1:4321",
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -344,6 +352,12 @@ app.include_router(fix_flip_router)
 
 # Listings (for-sale property listings via RentCast proxy; feeds Fix & Flip Deal Finder)
 app.include_router(listings_router)
+
+# Beta Access (public landing-page lead capture)
+app.include_router(beta_access_router)
+
+# Issues / Feedback (internal issue + suggestion board)
+app.include_router(issues_router)
 
 _mem_logger = logging.getLogger("memory")
 
