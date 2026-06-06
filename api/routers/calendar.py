@@ -293,6 +293,42 @@ def _require_cron(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Bad cron secret")
 
 
+def _project_company_id(project_id: Optional[str]) -> Optional[str]:
+    """The authoritative company for a project (projects.source_company)."""
+    if not project_id:
+        return None
+    try:
+        res = (
+            supabase.table("projects")
+            .select("source_company")
+            .eq("project_id", project_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0].get("source_company") or None
+    except Exception:
+        logger.exception("_project_company_id lookup failed")
+    return None
+
+
+def _resolve_company_id(payload_company_id: Optional[str], project_id: Optional[str]) -> Optional[str]:
+    """Server-side workspace scope. A project-linked event is tagged to that
+    project's company (authoritative, not client-trusted); otherwise it falls
+    back to the company the client supplied (the active workspace)."""
+    if project_id:
+        derived = _project_company_id(project_id)
+        if derived:
+            return derived
+    return payload_company_id or None
+
+
+def _validate_rrule(rrule: Optional[str]) -> None:
+    """Reject a non-empty recurrence rule that doesn't parse to a valid RRULE."""
+    if rrule and parse_rrule(rrule) is None:
+        raise HTTPException(status_code=400, detail="Invalid recurrence rule")
+
+
 def _notify_invitees(event_row: dict, attendee_ids: List[str], actor_id: str) -> None:
     """Best-effort: drop an "invited to event" notification per attendee. The
     actor is filtered out by create_notifications. Failures never propagate."""
@@ -440,6 +476,7 @@ async def create_event(payload: EventCreate, current_user: dict = Depends(get_cu
             raise HTTPException(status_code=400, detail="Title is required")
         if not payload.start_at or not payload.end_at:
             raise HTTPException(status_code=400, detail="start_at and end_at are required")
+        _validate_rrule(payload.rrule)
 
         row = {
             "title": title,
@@ -450,7 +487,7 @@ async def create_event(payload: EventCreate, current_user: dict = Depends(get_cu
             "all_day": bool(payload.all_day),
             "color": (payload.color or None),
             "project_id": payload.project_id or None,
-            "company_id": payload.company_id or None,
+            "company_id": _resolve_company_id(payload.company_id, payload.project_id),
             "created_by": me,
             "visibility": _normalize_visibility(payload.visibility),
             "rrule": (payload.rrule or None),
@@ -525,11 +562,16 @@ async def update_event(event_id: str, payload: EventUpdate, current_user: dict =
             update["color"] = payload.color or None
         if payload.project_id is not None:
             update["project_id"] = payload.project_id or None
-        if payload.company_id is not None:
-            update["company_id"] = payload.company_id or None
+        # Re-resolve the workspace whenever the project or company changes: a
+        # project-linked event always follows the project's company.
+        if payload.project_id is not None or payload.company_id is not None:
+            eff_project = (payload.project_id if payload.project_id is not None else row.get("project_id")) or None
+            eff_company = (payload.company_id if payload.company_id is not None else row.get("company_id")) or None
+            update["company_id"] = _resolve_company_id(eff_company, eff_project)
         if payload.visibility is not None:
             update["visibility"] = _normalize_visibility(payload.visibility)
         if payload.rrule is not None:
+            _validate_rrule(payload.rrule)
             update["rrule"] = payload.rrule or None
         if payload.rrule_until is not None:
             update["rrule_until"] = payload.rrule_until or None
