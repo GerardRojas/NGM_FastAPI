@@ -967,6 +967,22 @@ async def dispatch_reminders(request: Request):
                     "reminder_minutes": reminder,
                 },
             )
+
+            # Also push to devices (best-effort) so reminders actually ping the
+            # phone/desktop, not just the in-app bell. Push failure never blocks.
+            try:
+                from api.services.firebase_notifications import send_push_notification
+                for rid in recipients:
+                    await send_push_notification(
+                        rid,
+                        title="Event reminder",
+                        body=f"{row.get('title') or 'Event'} — {preview_when}",
+                        data={"event_id": event_id, "deep_link": "/calendar"},
+                        tag=f"event-reminder-{event_id}",
+                    )
+            except Exception:
+                logger.exception("dispatch_reminders: push failed for event %s", event_id)
+
             dispatched += 1
         except Exception:
             errors += 1
