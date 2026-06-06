@@ -2502,6 +2502,30 @@ def get_attachments_bucket_info():
         }
 
 
+@router.get("/tasks/{task_id}/attachments")
+def list_task_attachments(task_id: str) -> Dict[str, Any]:
+    """List files uploaded for a task (the `{task_id}/` folder in the bucket).
+    Returns readable names (the stored "<uuid>-" prefix is stripped) + public URLs."""
+    try:
+        ensure_attachments_bucket()
+        entries = supabase.storage.from_(TASK_ATTACHMENTS_BUCKET).list(task_id) or []
+        files: List[Dict[str, str]] = []
+        for entry in entries:
+            name = entry.get("name") if isinstance(entry, dict) else getattr(entry, "name", None)
+            if not name:
+                continue
+            object_path = f"{task_id}/{name}"
+            display = name.split("-", 1)[1] if "-" in name else name
+            files.append({
+                "name": display,
+                "url": supabase.storage.from_(TASK_ATTACHMENTS_BUCKET).get_public_url(object_path),
+            })
+        return {"success": True, "files": files}
+    except Exception as e:
+        logger.error(f"[PIPELINE] ERROR in GET /pipeline/tasks/{task_id}/attachments: {repr(e)}")
+        return {"success": False, "files": []}
+
+
 @router.post("/tasks/{task_id}/attachments")
 async def upload_task_attachments(
     task_id: str,
