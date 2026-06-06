@@ -10,3 +10,54 @@ services:
     # Paquetes del sistema necesarios
     nativeEnvironments:
       - name: poppler-utils
+
+  # ---------------------------------------------------------------------------
+  # Scheduled jobs. Each one POSTs to an API cron endpoint with the shared
+  # secret (the endpoints are fail-closed when NGM_CRON_SECRET is unset).
+  # NGM_CRON_SECRET must match the web service's value (set it in the dashboard).
+  # API_HOST is wired to the web service host automatically.
+  # ---------------------------------------------------------------------------
+  - type: cron
+    name: ngm-calendar-reminders
+    env: python
+    schedule: "*/5 * * * *"            # every 5 min; lookback covers the gap
+    buildCommand: "true"
+    startCommand: 'curl -fsS -X POST -H "X-Cron-Secret: $NGM_CRON_SECRET" "https://$API_HOST/calendar/cron/dispatch-reminders?lookback_seconds=360"'
+    envVars:
+      - key: NGM_CRON_SECRET
+        sync: false
+      - key: API_HOST
+        fromService:
+          type: web
+          name: ngm-api
+          property: host
+
+  - type: cron
+    name: ngm-calendar-google-sync
+    env: python
+    schedule: "*/15 * * * *"           # pull Google changes every 15 min
+    buildCommand: "true"
+    startCommand: 'curl -fsS -X POST -H "X-Cron-Secret: $NGM_CRON_SECRET" "https://$API_HOST/calendar/cron/google-sync"'
+    envVars:
+      - key: NGM_CRON_SECRET
+        sync: false
+      - key: API_HOST
+        fromService:
+          type: web
+          name: ngm-api
+          property: host
+
+  - type: cron
+    name: ngm-calendar-google-watch-renew
+    env: python
+    schedule: "0 6 * * *"             # renew Google watch channels daily (06:00 UTC)
+    buildCommand: "true"
+    startCommand: 'curl -fsS -X POST -H "X-Cron-Secret: $NGM_CRON_SECRET" "https://$API_HOST/calendar/cron/google-watch-renew"'
+    envVars:
+      - key: NGM_CRON_SECRET
+        sync: false
+      - key: API_HOST
+        fromService:
+          type: web
+          name: ngm-api
+          property: host
