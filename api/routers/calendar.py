@@ -253,15 +253,23 @@ def _serialize_event(row: dict, attendees: List[dict], sync: Optional[dict] = No
 
 
 def _fetch_sync_mappings(event_ids: List[str]) -> dict:
-    """Returns {event_id: {status, source, last_synced_at}} for the given events."""
+    """Returns {event_id: {status, source, last_synced_at}} for the given events.
+
+    Sync mappings are optional metadata (Google sync). A schema/sync issue here
+    must never take down event listing, so any failure degrades to "no sync info".
+    """
     if not event_ids:
         return {}
-    res = (
-        supabase.table("calendar_sync_mappings")
-        .select("event_id, sync_status, sync_source, last_synced_at")
-        .in_("event_id", event_ids)
-        .execute()
-    )
+    try:
+        res = (
+            supabase.table("calendar_sync_mappings")
+            .select("event_id, sync_status, sync_source, last_synced_at")
+            .in_("event_id", event_ids)
+            .execute()
+        )
+    except Exception:
+        logger.exception("_fetch_sync_mappings failed; returning no sync info")
+        return {}
     out: dict = {}
     for r in (res.data or []):
         eid = str(r.get("event_id"))
@@ -271,6 +279,18 @@ def _fetch_sync_mappings(event_ids: List[str]) -> dict:
             "last_synced_at": r.get("last_synced_at"),
         }
     return out
+
+
+def _require_cron(request: Request) -> None:
+    """Authorize a cron endpoint. Fails CLOSED: if NGM_CRON_SECRET isn't set the
+    endpoint is unavailable rather than open to the public. Callers must send the
+    secret via the X-Cron-Secret header (or ?secret= query param)."""
+    secret = os.getenv("NGM_CRON_SECRET")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Cron not configured")
+    provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
+    if provided != secret:
+        raise HTTPException(status_code=403, detail="Bad cron secret")
 
 
 def _notify_invitees(event_row: dict, attendee_ids: List[str], actor_id: str) -> None:
@@ -848,11 +868,7 @@ async def revoke_feed_token(label: str, current_user: dict = Depends(get_current
 async def dispatch_reminders(request: Request):
     """Sweep events whose reminder fires in the last ~lookback_seconds window
     and emit notifications. Idempotent via calendar_reminder_log."""
-    secret = os.getenv("NGM_CRON_SECRET")
-    if secret:
-        provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
-        if provided != secret:
-            raise HTTPException(status_code=403, detail="Bad cron secret")
+    _require_cron(request)
 
     lookback_seconds = int(request.query_params.get("lookback_seconds") or 90)
     now = datetime.now(timezone.utc)
@@ -1064,11 +1080,7 @@ async def cron_google_sync(request: Request):
     curl -fsSL -H "X-Cron-Secret: $NGM_CRON_SECRET" \\
         https://ngm-fastapi.onrender.com/calendar/cron/google-sync
     """
-    secret = os.getenv("NGM_CRON_SECRET")
-    if secret:
-        provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
-        if provided != secret:
-            raise HTTPException(status_code=403, detail="Bad cron secret")
+    _require_cron(request)
 
     if not gcal.is_google_configured():
         return {"ok": False, "configured": False, "reason": "Google OAuth not configured"}
@@ -1189,11 +1201,7 @@ async def cron_google_watch_renew(request: Request):
     curl -fsSL -H "X-Cron-Secret: $NGM_CRON_SECRET" \\
         https://ngm-fastapi.onrender.com/calendar/cron/google-watch-renew
     """
-    secret = os.getenv("NGM_CRON_SECRET")
-    if secret:
-        provided = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
-        if provided != secret:
-            raise HTTPException(status_code=403, detail="Bad cron secret")
+    _require_cron(request)
 
     if not gcal.is_google_configured():
         return {"ok": False, "configured": False}
