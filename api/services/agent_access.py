@@ -83,6 +83,22 @@ def _load_list(key: Optional[str]) -> List[str]:
         return []
 
 
+def roles_for(key: str, default: List[str]) -> List[str]:
+    """Configurable role-name list for a capability, from agent_config[key].
+    Falls back to *default* when unset. Lets gates that used to hardcode role
+    lists be edited without a deploy."""
+    return _load_list(key) or list(default)
+
+
+# Roles treated as bookkeeping / receipt owners (who Andrew @mentions about
+# pending receipts). Configurable via agent_config key 'andrew_bookkeeping_roles'.
+_BOOKKEEPING_ROLES_DEFAULT = ["Bookkeeper", "Accounting Manager"]
+
+
+def bookkeeping_roles() -> List[str]:
+    return roles_for("andrew_bookkeeping_roles", _BOOKKEEPING_ROLES_DEFAULT)
+
+
 def _rol_name(rol_id: Optional[str]) -> str:
     """Resolve a rols.rol_id (UUID) to its rol_name. Cached per process."""
     if not rol_id:

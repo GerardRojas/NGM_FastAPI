@@ -114,6 +114,15 @@ INTENT_ROLE_PERMISSIONS: Dict[str, Dict[str, Any]] = {
         "responsible_team": "estimating",
         "action_description": "consultar el Scope of Work",
     },
+
+    # Permission management - solo management (CEO/COO/KD COO). Esta es una
+    # pre-verificacion suave usando el rol que envia el cliente; la verificacion
+    # autoritativa vive en el handler usando el rol del JWT (verified_role).
+    "MANAGE_EXPENSE_AUTHORIZER": {
+        "allowed_roles": ["CEO", "COO", "KD COO"],
+        "responsible_team": "management",
+        "action_description": "cambiar quien puede autorizar gastos",
+    },
 }
 
 
@@ -369,6 +378,16 @@ ARTURITO_PERMISSIONS: Dict[str, Dict[str, Any]] = {
         "risk_level": "low",
         "category": "navigation",
     },
+
+    # ================================
+    # MANAGEMENT Operations (high risk - CEO/COO gated in handler)
+    # ================================
+    "MANAGE_EXPENSE_AUTHORIZER": {
+        "enabled": True,
+        "description": "Conceder o quitar el permiso para autorizar gastos",
+        "risk_level": "high",
+        "category": "management",
+    },
 }
 
 
@@ -571,6 +590,7 @@ def reset_permissions_to_defaults() -> bool:
         "UPDATE_VENDOR": False, "UPDATE_PROJECT": False,
         "EXPENSE_REMINDER": True, "REPORT_BUG": True,
         "NGM_ACTION": True, "COPILOT": True,
+        "MANAGE_EXPENSE_AUTHORIZER": True,
     }
 
     success = True

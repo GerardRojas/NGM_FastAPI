@@ -27,6 +27,30 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 
+
+def _is_messages_admin(current_user: dict) -> bool:
+    """Messages super-admin: sees every channel, can write to any broadcast and
+    clear conversations. CEO/COO always qualify (leadership failsafe); any role
+    granted Delete on the 'messages' module in Roles Management also qualifies —
+    so this is configurable from the UI instead of a hardcoded role list."""
+    role = (current_user or {}).get("role") or ""
+    if role in ("CEO", "COO"):
+        return True
+    user_id = (current_user or {}).get("user_id")
+    if not user_id:
+        return False
+    try:
+        resp = supabase.table("users").select(
+            "rols!users_user_rol_fkey(role_permissions(module_key, can_delete))"
+        ).eq("user_id", user_id).single().execute()
+        rols_data = (resp.data or {}).get("rols") or {}
+        perms = rols_data.get("role_permissions") or []
+        perm = next((p for p in perms if p.get("module_key") == "messages"), None)
+        return bool(perm and perm.get("can_delete"))
+    except Exception as exc:
+        logger.debug("[messages] admin check failed for %s: %s", user_id, exc)
+        return False
+
 # In-memory cache for unread-counts (per user_id): {user_id: {"data": {...}, "ts": float}}
 # Cleanup: stale entries purged by _purge_stale_caches() in main.py every 5 min
 _unread_cache: Dict[str, dict] = {}
@@ -688,10 +712,11 @@ def get_broadcast_feed(
             .eq("type", "broadcast") \
             .execute()
 
+        is_admin = _is_messages_admin(current_user)
         channel_names: Dict[str, Optional[str]] = {}
         for bc in (broadcast_res.data or []):
             read_roles = bc.get("read_roles") or []
-            if user_role in ("CEO", "COO") or not read_roles or user_role in read_roles:
+            if is_admin or not read_roles or user_role in read_roles:
                 channel_names[str(bc["id"])] = bc.get("name")
 
         if not channel_names:
@@ -748,7 +773,7 @@ def create_message(
 
         # Broadcast channels: check write permission
         if payload.channel_type == "broadcast" and payload.channel_id:
-            if user_role not in ("CEO", "COO"):
+            if not _is_messages_admin(current_user):
                 # Fetch channel to check write_roles
                 ch_res = supabase.table("channels") \
                     .select("write_roles") \
@@ -1201,12 +1226,13 @@ def get_channels(
             .execute()
 
         existing_ids = {c["id"] for c in channels}
+        is_admin = _is_messages_admin(current_user)
         for bc in (broadcast_res.data or []):
             if bc["id"] in existing_ids:
                 continue
             read_roles = bc.get("read_roles") or []
-            # CEO/COO see all; empty read_roles = everyone can see
-            if user_role in ("CEO", "COO") or not read_roles or user_role in read_roles:
+            # Messages admin sees all; empty read_roles = everyone can see
+            if is_admin or not read_roles or user_role in read_roles:
                 channels.append(normalize_channel(bc))
 
         return {"channels": channels}
@@ -1743,13 +1769,11 @@ def clear_channel_messages(
     payload: ChannelClearRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Clear all messages in a channel. CEO and COO only."""
+    """Clear all messages in a channel. Messages admins only (CEO/COO or a role
+    granted Delete on the Messages module)."""
     try:
-        user_id = current_user["user_id"]
-        role = current_user.get("role", "")
-
-        if role not in ["CEO", "COO"]:
-            raise HTTPException(status_code=403, detail="Only CEO and COO can clear conversations")
+        if not _is_messages_admin(current_user):
+            raise HTTPException(status_code=403, detail="You do not have permission to clear conversations")
 
         # Hard-delete: remove messages entirely (no "this message was deleted" placeholders)
         query = supabase.table("messages") \

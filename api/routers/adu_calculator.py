@@ -207,16 +207,18 @@ async def analyze_screenshot(
         prompt_with_label = f"Floor being analyzed: {floor_label}\n\n{SCREENSHOT_ANALYSIS_PROMPT}"
 
         # Call GPT-5.2 Vision
-        raw = gpt.heavy(
-            system=prompt_with_label,
-            user=[{"type": "image_url", "image_url": {
-                "url": f"data:{media_type};base64,{img_b64}",
-                "detail": "high"
-            }}],
-            max_tokens=1500,
-            json_mode=True,
-            timeout=60,
-        )
+        from api.services.ai_usage import ai_context
+        with ai_context(feature="adu"):
+            raw = gpt.heavy(
+                system=prompt_with_label,
+                user=[{"type": "image_url", "image_url": {
+                    "url": f"data:{media_type};base64,{img_b64}",
+                    "detail": "high"
+                }}],
+                max_tokens=1500,
+                json_mode=True,
+                timeout=60,
+            )
         if not raw:
             raise HTTPException(status_code=500, detail="GPT Vision returned empty response")
 

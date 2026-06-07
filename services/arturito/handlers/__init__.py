@@ -11,6 +11,7 @@ from .vault_handler import handle_vault_search, handle_vault_list, handle_vault_
 from .health_summary_handler import handle_project_health
 from .cam_handler import handle_cam_photo_search
 from .progress_handler import handle_project_progress
+from .permissions_handler import handle_manage_expense_authorizer
 
 __all__ = [
     "handle_budget_vs_actuals",
@@ -37,4 +38,5 @@ __all__ = [
     "handle_project_health",
     "handle_cam_photo_search",
     "handle_project_progress",
+    "handle_manage_expense_authorizer",
 ]

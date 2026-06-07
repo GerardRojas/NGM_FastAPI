@@ -677,6 +677,10 @@ DO NOT include any text before or after the JSON. ONLY return the JSON object.""
 
 # ====== MAIN FUNCTIONS ======
 
+from api.services.ai_usage import ai_feature
+
+
+@ai_feature("receipt_ocr")
 def scan_receipt(
     file_content: bytes,
     file_type: str,
@@ -1458,6 +1462,7 @@ def _enrich_with_classification(categorizations: list, overlay: Optional[dict] =
             cat.setdefault("category_name", m.get("category_name"))
 
 
+@ai_feature("categorization")
 def auto_categorize(
     stage: str,
     expenses: list,

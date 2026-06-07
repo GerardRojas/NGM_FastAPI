@@ -193,6 +193,10 @@ def _encode_to_vision_image(file_content: bytes, content_type: str, receipt_url:
         return base64.b64encode(file_content).decode('utf-8'), content_type or "image/jpeg"
 
 
+from api.services.ai_usage import ai_feature
+
+
+@ai_feature("andrew")
 def extract_invoice_line_items(receipt_url: str) -> Optional[dict]:
     """
     Extract detailed line items from an invoice.

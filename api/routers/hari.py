@@ -28,8 +28,8 @@ class HariConfigUpdate(BaseModel):
     hari_escalation_interval_hours: Optional[int] = None
     hari_max_escalations: Optional[int] = None
     hari_stale_task_hours: Optional[int] = None
-    hari_instructor_roles: Optional[str] = None
-    hari_viewer_roles: Optional[str] = None
+    hari_instructor_roles: Optional[List[str]] = None
+    hari_viewer_roles: Optional[List[str]] = None
     hari_auto_confirm_users: Optional[str] = None
     hari_notify_assignee_on_create: Optional[bool] = None
     hari_notify_channel: Optional[bool] = None

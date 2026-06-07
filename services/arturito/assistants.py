@@ -274,6 +274,23 @@ def send_message_and_get_response(
             )
 
         if run.status == "completed":
+            # Token + cost telemetry (feature/company resolved from ai_context).
+            try:
+                from api.services.ai_usage import log_ai_usage
+                usage = getattr(run, "usage", None)
+                if usage is not None:
+                    log_ai_usage(
+                        model=MODEL,
+                        input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                        output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+                        latency_ms=int((time.time() - start_time) * 1000),
+                        success=True,
+                        feature="art",
+                        source="assistants",
+                    )
+            except Exception:
+                pass
+
             # Get the latest message
             messages = client.beta.threads.messages.list(
                 thread_id=current_thread_id,

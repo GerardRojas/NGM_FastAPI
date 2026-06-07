@@ -29,7 +29,19 @@ from typing import Optional, Union
 
 from openai import OpenAI, AsyncOpenAI
 
+from api.services.ai_usage import log_ai_usage, log_ai_usage_bg
+
 logger = logging.getLogger(__name__)
+
+
+def _usage_tokens(resp, in_field: str, out_field: str):
+    """Pull (input_tokens, output_tokens) off an OpenAI response, tolerant of
+    missing usage. Responses API uses input/output_tokens; chat.completions
+    uses prompt/completion_tokens."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return 0, 0
+    return int(getattr(usage, in_field, 0) or 0), int(getattr(usage, out_field, 0) or 0)
 
 # ── Model constants ──────────────────────────────────────────────
 MINI_MODEL = "gpt-5-mini"
@@ -94,10 +106,14 @@ def mini(instructions: str, input: str, json_mode: bool = False,
         text = r.output_text if hasattr(r, "output_text") else ""
         result = text.strip() if text and text.strip() else None
         ms = int((time.monotonic() - t0) * 1000)
+        in_tok, out_tok = _usage_tokens(r, "input_tokens", "output_tokens")
+        log_ai_usage(model=MINI_MODEL, input_tokens=in_tok, output_tokens=out_tok,
+                     latency_ms=ms, success=bool(result))
         logger.info("[GPT:mini] %s %dms %s", MINI_MODEL, ms, "OK" if result else "EMPTY")
         return result
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
+        log_ai_usage(model=MINI_MODEL, latency_ms=ms, success=False)
         logger.warning("[GPT:mini] %s %dms FAIL: %s", MINI_MODEL, ms, e)
         return None
 
@@ -124,10 +140,14 @@ async def mini_async(instructions: str, input: str, json_mode: bool = False,
         text = r.output_text if hasattr(r, "output_text") else ""
         result = text.strip() if text and text.strip() else None
         ms = int((time.monotonic() - t0) * 1000)
+        in_tok, out_tok = _usage_tokens(r, "input_tokens", "output_tokens")
+        log_ai_usage_bg(model=MINI_MODEL, input_tokens=in_tok, output_tokens=out_tok,
+                        latency_ms=ms, success=bool(result))
         logger.info("[GPT:mini_async] %s %dms %s", MINI_MODEL, ms, "OK" if result else "EMPTY")
         return result
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
+        log_ai_usage_bg(model=MINI_MODEL, latency_ms=ms, success=False)
         logger.warning("[GPT:mini_async] %s %dms FAIL: %s", MINI_MODEL, ms, e)
         return None
 
@@ -171,11 +191,15 @@ def heavy(system: str, user: Union[str, list], temperature: float = 0.1,
         result = text.strip() if text and text.strip() else None
         ms = int((time.monotonic() - t0) * 1000)
         vision = isinstance(user, list)
+        in_tok, out_tok = _usage_tokens(r, "prompt_tokens", "completion_tokens")
+        log_ai_usage(model=HEAVY_MODEL, input_tokens=in_tok, output_tokens=out_tok,
+                     latency_ms=ms, success=bool(result), source="vision" if vision else None)
         logger.info("[GPT:heavy] %s %dms %s%s", HEAVY_MODEL, ms,
                     "OK" if result else "EMPTY", " (vision)" if vision else "")
         return result
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
+        log_ai_usage(model=HEAVY_MODEL, latency_ms=ms, success=False)
         logger.warning("[GPT:heavy] %s %dms FAIL: %s", HEAVY_MODEL, ms, e)
         return None
 
@@ -206,11 +230,15 @@ async def heavy_async(system: str, user: Union[str, list],
         result = text.strip() if text and text.strip() else None
         ms = int((time.monotonic() - t0) * 1000)
         vision = isinstance(user, list)
+        in_tok, out_tok = _usage_tokens(r, "prompt_tokens", "completion_tokens")
+        log_ai_usage_bg(model=HEAVY_MODEL, input_tokens=in_tok, output_tokens=out_tok,
+                        latency_ms=ms, success=bool(result), source="vision" if vision else None)
         logger.info("[GPT:heavy_async] %s %dms %s%s", HEAVY_MODEL, ms,
                     "OK" if result else "EMPTY", " (vision)" if vision else "")
         return result
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
+        log_ai_usage_bg(model=HEAVY_MODEL, latency_ms=ms, success=False)
         logger.warning("[GPT:heavy_async] %s %dms FAIL: %s", HEAVY_MODEL, ms, e)
         return None
 

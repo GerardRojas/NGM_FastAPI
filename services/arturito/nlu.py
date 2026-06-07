@@ -47,6 +47,7 @@ VALID_INTENTS = [
     "VAULT_UPLOAD",         # Upload file to vault (redirect to UI)
     "CAM_PHOTO_SEARCH",     # Search construction photos from NGM Cam
     "PROJECT_PROGRESS",     # Composite progress report (photos + budget + tasks)
+    "MANAGE_EXPENSE_AUTHORIZER",  # Grant/revoke who can authorize expenses (CEO/COO only)
     "UNKNOWN",              # No clasificado
 ]
 
@@ -181,6 +182,38 @@ def _detect_consulta_especifica(t: str) -> Optional[Dict[str, Any]]:
 # Interpretación Local (regex rápido)
 # ================================
 
+# Capitalized name token(s), e.g. "Amora" or "Amora Lopez". Allows accents.
+_NAME_TOKEN = r"[A-ZÁÉÍÓÚÑ][\wáéíóúñ'’-]+(?:\s+[A-ZÁÉÍÓÚÑ][\wáéíóúñ'’-]+)?"
+
+
+def _extract_authorizer_person(text: str) -> Optional[str]:
+    """
+    Best-effort pull of the target person's name from a "let X approve expenses"
+    style message, preserving original casing. Returns None if nothing looks like
+    a name — the GPT fallback (and, failing that, the handler's "who?" reprompt)
+    cover the rest, so this only needs to catch the common phrasings.
+    """
+    patterns = [
+        # EN: "let/allow/make/give/enable [my <title>] Amora ..."
+        rf"(?:let|allow|make|give|enable|grant)\s+(?:my\s+[\w\s]+?\s+)?({_NAME_TOKEN})\b",
+        # EN possessive / removal: "remove Amora's", "revoke Amora ..."
+        rf"(?:remove|revoke|take away)\s+({_NAME_TOKEN})['’]?s?\b",
+        # EN subject-first: "Amora can/should/can no longer ... approve expenses"
+        rf"\b({_NAME_TOKEN})\s+(?:can|should|could|no longer|to be able|cannot|can['’]?t)\b",
+        # ES: "deja/permite que Amora", "dale a Amora", "haz a Amora", "autoriza a Amora", "quita a Amora"
+        rf"(?:que|a)\s+({_NAME_TOKEN})\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            name = m.group(1).strip()
+            # Strip a trailing possessive the NAME_TOKEN may have swallowed
+            # ("remove Amora's ..." -> "Amora").
+            name = re.sub(r"['’]s$", "", name).strip()
+            return name or None
+    return None
+
+
 def interpret_local(text: str) -> Optional[Dict[str, Any]]:
     """
     Intenta clasificar el mensaje con reglas locales antes de llamar a GPT.
@@ -198,6 +231,37 @@ def interpret_local(text: str) -> Optional[Dict[str, Any]]:
             "confidence": 1.0,
             "source": "local"
         }
+
+    # ================================
+    # Manage expense authorizers: "let Amora approve expenses",
+    # "give Amora expense authorization", "Amora can no longer approve expenses".
+    # Permission change, CEO/COO-gated server-side (handlers/permissions_handler.py).
+    # Only short-circuits when a name was extracted; otherwise we fall through so
+    # the GPT fallback can pull the person more reliably.
+    # ================================
+    # approve/authorize verb stems, EN + ES (incl. ES conjugations: aprob-, aprueb-,
+    # autoriz-, autoric-).
+    _auth_verb = r'(?:approv\w*|authoriz\w*|autoriz\w*|autoric\w*|aprob\w*|aprueb\w*)'
+    expense_auth_topic = re.search(
+        rf'{_auth_verb}\s+(the\s+|los\s+|las\s+)?(expenses?|gastos?)'
+        rf'|(expenses?|gastos?)\s+{_auth_verb}'
+        r'|expense\s+authoriz\w*'
+        r'|autorizad\w*\s+de\s+gastos',
+        t)
+    if expense_auth_topic:
+        revoke_kw = re.search(
+            r"\b(no longer|cannot|can'?t|cant|don'?t|do not|remove|revoke|disable|"
+            r"take away|quita\w*|saca\w*|elimina\w*|revoca\w*|ya no)\b", t)
+        operation = "revoke" if revoke_kw else "grant"
+        person = _extract_authorizer_person(text)
+        if person:
+            return {
+                "intent": "MANAGE_EXPENSE_AUTHORIZER",
+                "entities": {"person": person, "operation": operation},
+                "confidence": 0.95,
+                "source": "local"
+            }
+        # No name found locally — let GPT take a shot at extracting it.
 
     # BVA con proyecto: "bva del rio", "budgetvsactuals arthur neal"
     match_bva = re.match(r'^(bva|budgetvsactuals)\s+(.+)$', t)
@@ -1088,7 +1152,27 @@ NLU_SYSTEM_PROMPT = """Eres un PARSER ESTRICTO. Clasifica el mensaje del usuario
      * "avance del proyecto Oak Creek" -> project: "Oak Creek"
      * "progress" (no project) -> project: null
 
+15) MANAGE_EXPENSE_AUTHORIZER
+   - User wants to GRANT or REVOKE someone's ability to AUTHORIZE/APPROVE expenses.
+   - This is a permission change (only CEO/COO may do it; enforced elsewhere).
+   - Signals: "let X approve expenses", "give X expense authorization", "make X an
+     expense authorizer", "X should be able to approve expenses", "X can no longer
+     approve expenses", "remove X's expense authorization", "deja que X apruebe
+     gastos", "quita a X aprobar gastos".
+   - Extracts: 'person' (the target person's name, original casing, e.g. "Amora"),
+     'operation' = "grant" (default) or "revoke" (when negation/removal words appear:
+     "no longer", "remove", "revoke", "don't", "quita", "ya no").
+   - DIFFERENCE from EXPENSE_REMINDER: that one NOTIFIES authorizers about pending
+     expenses; this one CHANGES who is allowed to authorize.
+   - Examples:
+     * "let Amora approve expenses" -> person: "Amora", operation: "grant"
+     * "I need my financial specialist Amora to be able to approve expenses"
+        -> person: "Amora", operation: "grant"
+     * "Amora can no longer authorize expenses" -> person: "Amora", operation: "revoke"
+     * "deja que Amora apruebe gastos" -> person: "Amora", operation: "grant"
+
 PRIORIDAD DE CLASIFICACIÓN:
+- Si el usuario quiere CAMBIAR quién puede AUTORIZAR/APROBAR gastos (dar o quitar el permiso a una persona) → MANAGE_EXPENSE_AUTHORIZER
 - Si el usuario quiere CONTROLAR la pagina actual (filtrar, ordenar, buscar) → COPILOT
 - Si el usuario pregunta sobre FUNCIONES del sistema NGM Hub → NGM_HELP
 - Si el usuario quiere NAVEGAR o ABRIR modales → NGM_ACTION
@@ -1122,7 +1206,9 @@ REGLAS DE RESPUESTA:
     "search_query": "...",
     "milestone": "...",
     "date_from": "...",
-    "date_to": "..."
+    "date_to": "...",
+    "person": "...",
+    "operation": "..."
   },
   "confidence": 0.85
 }

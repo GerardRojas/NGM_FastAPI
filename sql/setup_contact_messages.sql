@@ -5,12 +5,13 @@
 -- It is the combination of create_contact_messages.sql + contact_menu_item.sql,
 -- in the correct order. IDEMPOTENT: safe to re-run.
 --
--- Backs the landing "Contact us" modal -> api/routers/contact.py -> the hub
--- Contact inbox (/contact-messages). Kept SEPARATE from beta_access_requests
--- (beta/early-access leads) so the two inboxes never mix.
+-- Backs the landing "Let's talk" / "Contact us" modal -> api/routers/contact.py
+-- -> the hub "Leads" inbox (/contact-messages, Admin group). Kept SEPARATE from
+-- beta_access_requests (the "Requests" inbox: Request-demo / early-access leads
+-- in the IT group) so the two inboxes never mix.
 --
 -- After running, users must refresh their session for the cached sidebar menu
--- to pick up the new "Contact" item.
+-- to pick up the new "Leads" item.
 -- Path: C:\Users\germa\Desktop\NGM_API\sql\setup_contact_messages.sql
 -- =============================================================================
 
@@ -43,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_contact_messages_status
 -- Admin tooling, like Leads Management: can_view granted only to CEO/COO.
 -- Widen later from Roles Management if other roles should triage contacts.
 INSERT INTO role_permissions (rol_id, module_key, module_name, module_url, can_view, can_edit, can_delete)
-SELECT r.rol_id, 'contact-messages', 'Contact', 'contact-messages',
+SELECT r.rol_id, 'contact-messages', 'Leads', 'contact-messages',
     CASE WHEN r.rol_name IN ('CEO', 'COO') THEN true ELSE false END,  -- can_view
     CASE WHEN r.rol_name IN ('CEO', 'COO') THEN true ELSE false END,  -- can_edit (status + notes)
     CASE WHEN r.rol_name IN ('CEO', 'COO') THEN true ELSE false END   -- can_delete
@@ -54,12 +55,18 @@ WHERE NOT EXISTS (
 );
 
 
--- 3) MENU ITEM (General group) -----------------------------------------------
+-- 3) MENU ITEM (Admin group) -------------------------------------------------
+-- Shown in the sidebar as "Leads" (contact requests from the landing
+-- "Let's talk" CTA). DO UPDATE so a prior run that placed it under "General"
+-- as "Contact" gets relabeled/regrouped on re-run.
 INSERT INTO menu_items (slug, item_name, icon_type, icon_text, category_id, "order")
-SELECT 'contact-messages', 'Contact', 'material', 'forward_to_inbox',
-       (SELECT id FROM public.menu_categories WHERE name = 'General' LIMIT 1),
-       52
-ON CONFLICT (slug) DO NOTHING;
+SELECT 'contact-messages', 'Leads', 'material', 'forward_to_inbox',
+       (SELECT id FROM public.menu_categories WHERE name = 'Admin' LIMIT 1),
+       3
+ON CONFLICT (slug) DO UPDATE SET
+  item_name = EXCLUDED.item_name,
+  category_id = EXCLUDED.category_id,
+  "order" = EXCLUDED."order";
 
 
 -- 4) LINK role_permissions -> menu_item --------------------------------------
@@ -71,6 +78,12 @@ FROM menu_items mi
 WHERE mi.slug = 'contact-messages'
   AND rp.module_key = 'contact-messages'
   AND (rp.menu_item_id IS NULL OR rp.menu_item_id <> mi.id);
+
+-- 5) RELABEL prior runs ------------------------------------------------------
+-- Keep the Roles UI label in sync if an earlier run stored it as 'Contact'.
+UPDATE role_permissions
+SET module_name = 'Leads'
+WHERE module_key = 'contact-messages' AND module_name <> 'Leads';
 
 
 -- =============================================================================
