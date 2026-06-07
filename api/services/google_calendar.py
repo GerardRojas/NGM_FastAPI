@@ -449,13 +449,33 @@ def renew_expiring_watches() -> Dict[str, int]:
 # Event payload mapping (local row <-> Google body)
 # ============================================================================
 
-def _local_to_google_body(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Map a calendar_events row to a Google Calendar event body."""
+def _local_to_google_body(
+    row: Dict[str, Any], *, create_meet: bool = False, remove_meet: bool = False,
+) -> Dict[str, Any]:
+    """Map a calendar_events row to a Google Calendar event body.
+
+    When `create_meet` is True, attach a conferenceData.createRequest so Google
+    provisions a Google Meet link on insert/patch. When `remove_meet` is True,
+    set conferenceData to null so Google strips the existing conference. Either
+    way the caller MUST send the `conferenceDataVersion=1` query param (push_event
+    does) or Google ignores the conferenceData field.
+    """
     body: Dict[str, Any] = {
         "summary": row.get("title") or "",
         "description": row.get("description") or None,
         "location": row.get("location") or None,
     }
+    if remove_meet:
+        body["conferenceData"] = None
+    elif create_meet:
+        body["conferenceData"] = {
+            "createRequest": {
+                # Per-request idempotency token. A fresh value each call is fine:
+                # Google only creates one conference per event regardless.
+                "requestId": secrets.token_urlsafe(16),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        }
     if row.get("all_day"):
         body["start"] = {"date": _iso_date(row.get("start_at"))}
         body["end"] = {"date": _iso_date(row.get("end_at"))}
@@ -470,6 +490,19 @@ def _local_to_google_body(row: Dict[str, Any]) -> Dict[str, Any]:
             "overrides": [{"method": "popup", "minutes": int(row["reminder_minutes"])}],
         }
     return body
+
+
+def _extract_meet_link(g: Dict[str, Any]) -> Optional[str]:
+    """Pull the join URL out of a Google event resource. Prefers `hangoutLink`;
+    falls back to the first video entryPoint in conferenceData."""
+    link = g.get("hangoutLink")
+    if link:
+        return link
+    cd = g.get("conferenceData") or {}
+    for ep in cd.get("entryPoints", []) or []:
+        if ep.get("entryPointType") == "video" and ep.get("uri"):
+            return ep["uri"]
+    return None
 
 
 def _google_to_local_patch(g: Dict[str, Any]) -> Dict[str, Any]:
@@ -494,6 +527,10 @@ def _google_to_local_patch(g: Dict[str, Any]) -> Dict[str, Any]:
         "all_day": all_day,
         "rrule": rrule,
     }
+    meet = _extract_meet_link(g)
+    if meet:
+        patch["meeting_url"] = meet
+        patch["meeting_provider"] = "google_meet"
     return patch
 
 
@@ -506,6 +543,8 @@ def push_event(
     event_row: Dict[str, Any],
     *,
     force: bool = False,
+    create_meet: bool = False,
+    remove_meet: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Insert-or-update the local event in Google. Returns the mapping row
     (or None if not connected). The mapping is annotated with sync_status so
@@ -513,7 +552,10 @@ def push_event(
 
     If `force=True`, the existing etag is NOT sent (If-Match is omitted), which
     overwrites Google's version unconditionally. Used by the "Use mine" conflict
-    resolution flow."""
+    resolution flow.
+
+    If `create_meet=True`, a Google Meet conference is requested on this push and
+    the resulting join URL is written back to calendar_events.meeting_url."""
     if not is_google_configured():
         return None
     try:
@@ -521,7 +563,10 @@ def push_event(
     except GoogleSyncError:
         return None
     event_id = str(event_row.get("event_id"))
-    body = _local_to_google_body(event_row)
+    body = _local_to_google_body(event_row, create_meet=create_meet, remove_meet=remove_meet)
+    # conferenceDataVersion=1 is required for Meet creation AND to keep an
+    # existing conference intact on patches (version 0 would strip it).
+    conf_params = {"conferenceDataVersion": 1}
 
     existing_map = (
         supabase.table("calendar_sync_mappings").select("*")
@@ -539,7 +584,7 @@ def push_event(
                     req_headers["If-Match"] = m["google_etag"]
                 res = client.patch(
                     f"{_CAL_BASE}/calendars/{calendar_id}/events/{gid}",
-                    headers=req_headers, json=body,
+                    headers=req_headers, json=body, params=conf_params,
                 )
                 if res.status_code == 412:
                     # Etag mismatch — Google has a newer version. Mark as
@@ -559,7 +604,7 @@ def push_event(
             else:
                 res = client.post(
                     f"{_CAL_BASE}/calendars/{calendar_id}/events",
-                    headers=headers, json=body,
+                    headers=headers, json=body, params=conf_params,
                 )
                 if res.status_code >= 400:
                     logger.warning("push_event: create failed %s %s", res.status_code, res.text)
@@ -576,6 +621,28 @@ def push_event(
             except Exception:
                 pass
         return None
+
+    # Reflect the conference state locally: clear it on removal, otherwise
+    # persist the join URL Google created (or surfaced).
+    if remove_meet:
+        if event_row.get("meeting_url"):
+            try:
+                supabase.table("calendar_events").update({
+                    "meeting_url": None,
+                    "meeting_provider": None,
+                }).eq("event_id", event_id).execute()
+            except Exception:
+                logger.exception("push_event: failed to clear meeting_url for %s", event_id)
+    else:
+        meet_link = _extract_meet_link(g)
+        if meet_link and meet_link != event_row.get("meeting_url"):
+            try:
+                supabase.table("calendar_events").update({
+                    "meeting_url": meet_link,
+                    "meeting_provider": "google_meet",
+                }).eq("event_id", event_id).execute()
+            except Exception:
+                logger.exception("push_event: failed to persist meeting_url for %s", event_id)
 
     mapping_row = {
         "event_id": event_id,
