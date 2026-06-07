@@ -153,6 +153,9 @@ from api.routers.beta_access import router as beta_access_router
 # ========= ISSUES / FEEDBACK: Internal issue + suggestion board ====
 from api.routers.issues import router as issues_router
 
+# ========= CONTACT: public landing contact form + internal inbox ============
+from api.routers.contact import router as contact_router
+
 
 # ========================================
 # Inicializar FastAPI
@@ -358,6 +361,9 @@ app.include_router(beta_access_router)
 
 # Issues / Feedback (internal issue + suggestion board)
 app.include_router(issues_router)
+
+# Contact (public landing contact form -> contact_messages; internal inbox)
+app.include_router(contact_router)
 
 _mem_logger = logging.getLogger("memory")
 
