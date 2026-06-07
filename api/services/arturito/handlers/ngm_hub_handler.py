@@ -24,6 +24,16 @@ from ..ngm_knowledge import (
 
 logger = logging.getLogger(__name__)
 
+# Maps a knowledge permission action ("module:action") to its real
+# role_permissions column. "approve" → can_authorize keeps Art in sync with the
+# expense-authorize permission managed in Roles Management.
+_PERMISSION_ACTION_COLUMN = {
+    "view": "can_view",
+    "edit": "can_edit",
+    "delete": "can_delete",
+    "approve": "can_authorize",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PERMISSION CHECKING
@@ -45,35 +55,31 @@ async def check_user_permission(
         return True, None
 
     try:
-        # Get user with role
+        # Get user with role + its real role_permissions rows (module_key + can_*).
         result = db_client.table("users").select(
-            "user_id, user_name, email, role, role_id"
+            "user_id, user_name, email, user_rol, "
+            "rols!users_user_rol_fkey(rol_name, role_permissions(module_key, can_view, can_edit, can_delete, can_authorize))"
         ).eq("user_id", user_id).single().execute()
 
         if not result.data:
             return False, None
 
         user = result.data
-        role = user.get("role") or user.get("role_id")
+        rols_data = user.get("rols") or {}
+        role_name = rols_data.get("rol_name")
 
-        # CEO and COO have all permissions
-        if role in ["CEO", "COO"]:
+        # CEO and COO have all permissions (leadership failsafe).
+        if role_name in ("CEO", "COO"):
             return True, user
 
-        # Get role permissions
-        perm_result = db_client.table("role_permissions").select(
-            "permissions"
-        ).eq("role_name", role).single().execute()
+        if ":" not in (permission or ""):
+            return False, user
+        module, action = permission.split(":", 1)
+        col = _PERMISSION_ACTION_COLUMN.get(action, "can_view")
 
-        if perm_result.data:
-            permissions = perm_result.data.get("permissions", {})
-            # Check if permission is granted
-            module, action = permission.split(":")
-            module_perms = permissions.get(module, {})
-            has_perm = module_perms.get(action, False)
-            return has_perm, user
-
-        return False, user
+        perms = rols_data.get("role_permissions") or []
+        perm = next((p for p in perms if p.get("module_key") == module), None)
+        return bool(perm and perm.get(col)), user
 
     except Exception as e:
         logger.error(f"Error checking permission: {e}")
@@ -94,26 +100,23 @@ async def get_users_with_permission(
         return [{"role": role} for role in helper_roles]
 
     try:
-        # Get roles with this permission
-        module, action = permission.split(":")
+        if ":" not in (permission or ""):
+            return [{"role": r} for r in HELPER_ROLES.get(permission, ["CEO", "COO"])]
+        module, action = permission.split(":", 1)
+        col = _PERMISSION_ACTION_COLUMN.get(action, "can_view")
 
-        # Get all role permissions
-        result = db_client.table("role_permissions").select("*").execute()
+        # Roles that hold this capability on the module (real schema).
+        perm_rows = db_client.table("role_permissions").select("rol_id") \
+            .eq("module_key", module).eq(col, True).execute()
+        role_ids = [r["rol_id"] for r in (perm_rows.data or []) if r.get("rol_id")]
 
-        helper_roles = []
-        for row in result.data or []:
-            permissions = row.get("permissions", {})
-            module_perms = permissions.get(module, {})
-            if module_perms.get(action, False):
-                helper_roles.append(row.get("role_name"))
+        if not role_ids:
+            # No one configured: fall back to the static role-name hints.
+            return [{"role": r} for r in HELPER_ROLES.get(permission, ["CEO", "COO"])]
 
-        if not helper_roles:
-            helper_roles = HELPER_ROLES.get(permission, ["CEO", "COO"])
-
-        # Get users with these roles
         users_result = db_client.table("users").select(
-            "user_id, user_name, email, role"
-        ).in_("role", helper_roles).eq("status", "active").limit(5).execute()
+            "user_id, user_name, email, user_rol"
+        ).in_("user_rol", role_ids).limit(5).execute()
 
         return users_result.data or []
 

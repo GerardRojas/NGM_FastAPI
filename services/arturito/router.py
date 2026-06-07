@@ -33,6 +33,7 @@ from .handlers import (
     handle_project_health,
     handle_cam_photo_search,
     handle_project_progress,
+    handle_manage_expense_authorizer,
 )
 from .permissions import is_action_permitted, get_permission_denial_message, check_role_permission
 from .persona import set_personality_level, get_identity_response
@@ -74,6 +75,9 @@ _CAPABILITY_GROUPS = {
     "Photos": [
         ("show photos from [project]", "View construction photos from NGM Cam"),
         ("show [milestone] photos from [project]", "Filter photos by construction milestone"),
+    ],
+    "Management": [
+        ("let [person] approve expenses", "Grant expense authorization to someone's role (CEO/COO only)"),
     ],
     "Other": [
         ("scope of work", "Ask about a project's scope"),
@@ -250,6 +254,13 @@ ROUTES: Dict[str, Dict[str, Any]] = {
         "required_entities": [],
         "optional_entities": ["message"],
         "description": "Enviar recordatorio de gastos pendientes a autorizadores",
+    },
+
+    "MANAGE_EXPENSE_AUTHORIZER": {
+        "handler": None,  # Manejado en route_async (DB + verified role)
+        "required_entities": [],
+        "optional_entities": ["person", "operation"],
+        "description": "Conceder o quitar el permiso para autorizar gastos (solo CEO/COO)",
     },
 
     "LIST_PROJECTS": {
@@ -764,6 +775,16 @@ async def route_async(
             "raw_text": raw_text,
         }
         result = await handle_expense_reminder(request, context, db_client)
+        return result
+
+    # Handle MANAGE_EXPENSE_AUTHORIZER (grant/revoke expense authorization)
+    if intent == "MANAGE_EXPENSE_AUTHORIZER":
+        request = {
+            "intent": intent,
+            "entities": entities,
+            "raw_text": raw_text,
+        }
+        result = await handle_manage_expense_authorizer(request, context, db_client)
         return result
 
     # Fall back to sync route for all other intents

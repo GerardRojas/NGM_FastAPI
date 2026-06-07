@@ -10,9 +10,11 @@ brain's _execute_function_call — see api/helpers/agent_activity.py).
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import Optional
+from pydantic import BaseModel
+from typing import Optional, List
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+import json
 import logging
 
 from api.supabase_client import supabase
@@ -21,6 +23,7 @@ from api.services.agent_registry import AGENT_REGISTRY, get_functions
 from api.services.agent_access import (
     check_agent_operator_permission,
     check_agent_viewer_permission,
+    roles_for,
 )
 
 router = APIRouter(prefix="/agent-hub", tags=["Agent Hub"])
@@ -30,16 +33,75 @@ _PAGE_SIZE = 1000
 
 # Roles allowed to see the per-user breakdown (who runs which commands).
 # Everyone else can still see global analytics + their own activity.
-_MANAGER_ROLES = {"ceo", "coo", "admin", "administrator", "manager", "accounting manager", "owner"}
+# Configurable via agent_config key 'agent_hub_manager_roles'; the substring
+# match for "manager"/"admin" stays as a convenience on top of the list.
+_MANAGER_ROLES_DEFAULT = ["CEO", "COO", "Admin", "Administrator", "Manager", "Accounting Manager", "Owner"]
 
 
 def _can_view_all_users(role: Optional[str]) -> bool:
     r = (role or "").strip().lower()
     if not r:
         return False
-    if r in _MANAGER_ROLES:
+    manager_roles = {x.strip().lower() for x in roles_for("agent_hub_manager_roles", _MANAGER_ROLES_DEFAULT)}
+    if r in manager_roles:
         return True
     return "manager" in r or "admin" in r
+
+
+# ============================================================================
+# Access & Roles — hub-wide role lists that gate privileged agent actions.
+# Backed by agent_config (JSON arrays). Editable from Agent Settings so these
+# no longer need a code deploy. CEO/COO failsafes stay enforced in code.
+# ============================================================================
+
+_ARTURITO_ADMIN_ROLES_DEFAULT = ["CEO", "COO", "KD COO"]
+_ANDREW_BOOKKEEPING_ROLES_DEFAULT = ["Bookkeeper", "Accounting Manager"]
+
+
+class AccessRolesUpdate(BaseModel):
+    arturito_admin_roles: Optional[List[str]] = None
+    andrew_bookkeeping_roles: Optional[List[str]] = None
+    agent_hub_manager_roles: Optional[List[str]] = None
+
+
+@router.get("/access-roles")
+def get_access_roles(current_user: dict = Depends(get_current_user)):
+    """Role lists that gate privileged agent actions. Returns the configured
+    list or the hardcoded default for each key."""
+    return {
+        "arturito_admin_roles": roles_for("arturito_admin_roles", _ARTURITO_ADMIN_ROLES_DEFAULT),
+        "andrew_bookkeeping_roles": roles_for("andrew_bookkeeping_roles", _ANDREW_BOOKKEEPING_ROLES_DEFAULT),
+        "agent_hub_manager_roles": roles_for("agent_hub_manager_roles", _MANAGER_ROLES_DEFAULT),
+    }
+
+
+@router.put("/access-roles")
+def set_access_roles(payload: AccessRolesUpdate, current_user: dict = Depends(get_current_user)):
+    """Persist role lists to agent_config (stored as JSON arrays so agent_access
+    reads them back via json.loads)."""
+    updates = {k: v for k, v in payload.dict().items() if v is not None}
+    if not updates:
+        return {"ok": True, "updated_keys": []}
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        for key, value in updates.items():
+            # Normalize: trim, drop blanks, dedupe preserving order.
+            clean: list = []
+            for raw in value:
+                name = str(raw).strip()
+                if name and name not in clean:
+                    clean.append(name)
+            json_val = json.dumps(clean)
+            existing = supabase.table("agent_config").select("key").eq("key", key).execute()
+            if existing.data:
+                supabase.table("agent_config").update(
+                    {"value": json_val, "updated_at": now}).eq("key", key).execute()
+            else:
+                supabase.table("agent_config").insert(
+                    {"key": key, "value": json_val, "updated_at": now}).execute()
+        return {"ok": True, "updated_keys": list(updates.keys())}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating access roles: {str(e)}")
 
 
 def _cutoff_iso(days: int) -> str:

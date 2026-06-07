@@ -115,7 +115,7 @@ async def get_permissions_by_role(rol_id: str):
     """
     try:
         response = supabase.table("role_permissions").select(
-            "id, module_key, module_name, module_url, can_view, can_edit, can_delete"
+            "id, module_key, module_name, module_url, can_view, can_edit, can_delete, can_authorize"
         ).eq("rol_id", rol_id).execute()
 
         return {"rol_id": rol_id, "permissions": response.data or []}
@@ -131,7 +131,7 @@ async def get_permissions_by_user(user_id: str):
     """
     try:
         response = supabase.table("users").select(
-            "user_rol, rols!users_user_rol_fkey(rol_id, rol_name, role_permissions(id, module_key, module_name, module_url, can_view, can_edit, can_delete))"
+            "user_rol, rols!users_user_rol_fkey(rol_id, rol_name, role_permissions(id, module_key, module_name, module_url, can_view, can_edit, can_delete, can_authorize))"
         ).eq("user_id", user_id).single().execute()
 
         if not response.data:
@@ -211,7 +211,7 @@ async def check_permission(user_id: str, module_key: str = None, slug: str = Non
         raise HTTPException(status_code=422, detail="module_key or slug is required")
     try:
         response = supabase.table("users").select(
-            "user_rol, rols!users_user_rol_fkey(rol_id, role_permissions(module_key, can_view, can_edit, can_delete))"
+            "user_rol, rols!users_user_rol_fkey(rol_id, role_permissions(module_key, can_view, can_edit, can_delete, can_authorize))"
         ).eq("user_id", user_id).single().execute()
 
         if not response.data:
@@ -232,7 +232,8 @@ async def check_permission(user_id: str, module_key: str = None, slug: str = Non
         action_map = {
             "view": perm.get("can_view", False),
             "edit": perm.get("can_edit", False),
-            "delete": perm.get("can_delete", False)
+            "delete": perm.get("can_delete", False),
+            "authorize": perm.get("can_authorize", False)
         }
 
         has_permission = action_map.get(action, False)
@@ -261,6 +262,10 @@ class PermissionUpdate(BaseModel):
     can_view: bool
     can_edit: bool
     can_delete: bool
+    # Optional: only meaningful for the 'expenses' module. When omitted, the
+    # prior value is preserved so the generic Roles grid (which never sends it)
+    # can't accidentally clear an authorizer flag set via the dedicated panel.
+    can_authorize: Optional[bool] = None
     menu_item_id: Optional[str] = None
 
 
@@ -299,7 +304,7 @@ async def batch_update_permissions(data: BatchPermissionUpdate):
         existing_by_key: Dict[Any, Dict[str, Any]] = {}
         if rol_ids:
             existing_rows = (supabase.table("role_permissions")
-                             .select("rol_id, module_key, module_name, module_url, menu_item_id")
+                             .select("rol_id, module_key, module_name, module_url, menu_item_id, can_authorize")
                              .in_("rol_id", rol_ids).execute().data) or []
             existing_by_key = {
                 (str(r["rol_id"]), r["module_key"]): r for r in existing_rows
@@ -337,6 +342,14 @@ async def batch_update_permissions(data: BatchPermissionUpdate):
                 module_name = update.module_key.replace("_", " ").title()
                 module_url = f"{update.module_key}.html"
 
+            # can_authorize is managed by the dedicated Expense Authorization panel,
+            # not the generic grid. Preserve the prior value unless this update
+            # explicitly sets it (None = not sent → keep what's there).
+            if update.can_authorize is not None:
+                can_authorize = update.can_authorize
+            else:
+                can_authorize = bool(prior.get("can_authorize")) if prior else False
+
             # Todas las filas llevan las MISMAS claves: PostgREST arma el SET del
             # upsert con la unión de columnas, así que menu_item_id debe ir siempre
             # (con su valor previo) o se nullificaría el enlace de menú en el update.
@@ -349,6 +362,7 @@ async def batch_update_permissions(data: BatchPermissionUpdate):
                 "can_view": update.can_view,
                 "can_edit": update.can_edit,
                 "can_delete": update.can_delete,
+                "can_authorize": can_authorize,
             })
 
         # Single upsert for all allowed rows
@@ -377,3 +391,188 @@ async def batch_update_permissions(data: BatchPermissionUpdate):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in batch update: {str(e)}")
+
+
+# ========================================
+# Expense Authorization panel
+# "Which roles can authorize expenses" — a consolidated view over the
+# can_authorize flag of every role's 'expenses' permission row. CEO/COO are
+# always authorizers (locked on), mirroring the protected-role rule elsewhere.
+# ========================================
+
+EXPENSE_MODULE_KEY = "expenses"
+ALWAYS_AUTHORIZE_ROLES = ["CEO", "COO"]
+
+
+class ExpenseAuthorizerUpdate(BaseModel):
+    rol_id: str
+    can_authorize: bool
+
+
+class ExpenseAuthorizersPayload(BaseModel):
+    authorizers: List[ExpenseAuthorizerUpdate]
+
+
+def _role_name_for(rol_id: str) -> Optional[str]:
+    """Look up a role's name by id (best-effort)."""
+    try:
+        r = (supabase.table("rols").select("rol_name")
+             .eq("rol_id", rol_id).limit(1).execute().data) or []
+        return r[0].get("rol_name") if r else None
+    except Exception:
+        return None
+
+
+def _log_authorize_change(rol_id, rol_name, old_value, new_value,
+                          actor_user_id, actor_name, actor_role, source) -> None:
+    """Write a who/when/what audit row for a can_authorize change. Best-effort:
+    a failed insert must never block the permission change (the table may not
+    exist yet on a pre-migration DB). See sql/expense_authorizer_setup.sql."""
+    try:
+        supabase.table("role_permission_audit").insert({
+            "rol_id": str(rol_id) if rol_id is not None else None,
+            "rol_name": rol_name,
+            "module_key": EXPENSE_MODULE_KEY,
+            "field": "can_authorize",
+            "old_value": old_value,
+            "new_value": new_value,
+            "actor_user_id": str(actor_user_id) if actor_user_id is not None else None,
+            "actor_name": actor_name,
+            "actor_role": actor_role,
+            "source": source,
+        }).execute()
+    except Exception as e:
+        logger.warning(f"[permissions] audit log failed (non-fatal): {e}")
+
+
+def set_role_can_authorize(
+    rol_id: str,
+    value: bool,
+    *,
+    rol_name: Optional[str] = None,
+    actor_user_id: Optional[str] = None,
+    actor_name: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    source: str = "roles_ui",
+) -> Dict[str, Any]:
+    """
+    Set can_authorize on the 'expenses' role_permissions row for ONE role.
+
+    Single source of truth shared by the PUT /expense-authorizers endpoint (called
+    once per role in a loop) and Art's conversational grant flow. Preserves the
+    row's view/edit/delete flags and menu link; creates the row (can_view=value)
+    if the role had no expenses permission yet. CEO/COO are always authorizers and
+    cannot be turned off here. Writes an audit row only when the value changes.
+
+    Returns {old, new, changed, rol_name, locked}.
+    """
+    rid = str(rol_id)
+    if rol_name is None:
+        rol_name = _role_name_for(rid)
+    locked = rol_name in ALWAYS_AUTHORIZE_ROLES
+    effective = True if locked else bool(value)
+
+    prior = (supabase.table("role_permissions")
+             .select("module_name, module_url, menu_item_id, can_view, can_edit, can_delete, can_authorize")
+             .eq("module_key", EXPENSE_MODULE_KEY)
+             .eq("rol_id", rid).limit(1).execute().data) or []
+    prior_row = prior[0] if prior else None
+    old_value = bool(prior_row.get("can_authorize")) if prior_row else False
+
+    if prior_row:
+        row = {
+            "rol_id": rol_id,
+            "module_key": EXPENSE_MODULE_KEY,
+            "module_name": prior_row.get("module_name") or "Expenses",
+            "module_url": prior_row.get("module_url") or "expenses.html",
+            "menu_item_id": prior_row.get("menu_item_id"),
+            "can_view": bool(prior_row.get("can_view")),
+            "can_edit": bool(prior_row.get("can_edit")),
+            "can_delete": bool(prior_row.get("can_delete")),
+            "can_authorize": effective,
+        }
+    else:
+        # No expenses row yet: create one. An authorizer must at least be able to
+        # view the module, so default can_view to the granted value.
+        mi = (supabase.table("menu_items").select("id")
+              .eq("slug", EXPENSE_MODULE_KEY).limit(1).execute().data) or []
+        row = {
+            "rol_id": rol_id,
+            "module_key": EXPENSE_MODULE_KEY,
+            "module_name": "Expenses",
+            "module_url": "expenses.html",
+            "menu_item_id": mi[0]["id"] if mi else None,
+            "can_view": effective,
+            "can_edit": False,
+            "can_delete": False,
+            "can_authorize": effective,
+        }
+
+    supabase.table("role_permissions").upsert(
+        row, on_conflict="rol_id,module_key"
+    ).execute()
+
+    changed = old_value != effective
+    if changed:
+        _log_authorize_change(rid, rol_name, old_value, effective,
+                              actor_user_id, actor_name, actor_role, source)
+
+    return {"old": old_value, "new": effective, "changed": changed,
+            "rol_name": rol_name, "locked": locked}
+
+
+@router.get("/expense-authorizers")
+async def get_expense_authorizers():
+    """
+    List every role with whether it can authorize expenses (can_authorize on the
+    'expenses' module row). CEO/COO are reported as locked authorizers.
+    """
+    try:
+        roles = (supabase.table("rols").select("rol_id, rol_name")
+                 .execute().data) or []
+        perms = (supabase.table("role_permissions")
+                 .select("rol_id, can_authorize")
+                 .eq("module_key", EXPENSE_MODULE_KEY).execute().data) or []
+        auth_by_role = {str(p["rol_id"]): bool(p.get("can_authorize")) for p in perms}
+
+        out = []
+        for r in roles:
+            rid = str(r["rol_id"])
+            name = r.get("rol_name") or ""
+            locked = name in ALWAYS_AUTHORIZE_ROLES
+            out.append({
+                "rol_id": rid,
+                "rol_name": name,
+                "can_authorize": True if locked else auth_by_role.get(rid, False),
+                "locked": locked,
+            })
+        out.sort(key=lambda x: x["rol_name"].lower())
+        return {"data": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching expense authorizers: {str(e)}")
+
+
+@router.put("/expense-authorizers")
+async def set_expense_authorizers(payload: ExpenseAuthorizersPayload):
+    """
+    Set can_authorize on the 'expenses' permission row for the given roles.
+    Preserves each row's view/edit/delete flags and menu link; creates the row
+    (with can_view=true) if a role had no expenses permission yet. CEO/COO are
+    always authorizers and cannot be turned off here.
+    """
+    try:
+        # Resolve role names once so the per-role helper doesn't re-query, and so
+        # CEO/COO get forced on / can't be turned off (handled inside the helper).
+        roles_resp = (supabase.table("rols").select("rol_id, rol_name").execute().data) or []
+        name_by_id = {str(r["rol_id"]): r.get("rol_name") for r in roles_resp}
+
+        for u in payload.authorizers:
+            set_role_can_authorize(
+                u.rol_id, u.can_authorize,
+                rol_name=name_by_id.get(str(u.rol_id)),
+                source="roles_ui",
+            )
+
+        return {"message": "Expense authorizers updated", "updated": len(payload.authorizers)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating expense authorizers: {str(e)}")

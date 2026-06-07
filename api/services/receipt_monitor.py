@@ -52,11 +52,12 @@ def _get_bookkeeping_mentions(supabase: Client) -> str:
         result = supabase.table("users") \
             .select("user_name, rols!users_user_rol_fkey(rol_name)") \
             .execute()
-        bookkeeping_roles = {"Bookkeeper", "Accounting Manager"}
+        from api.services.agent_access import bookkeeping_roles
+        bk_roles = set(bookkeeping_roles())
         mentions = []
         for u in (result.data or []):
             role = u.get("rols") or {}
-            if role.get("rol_name") in bookkeeping_roles:
+            if role.get("rol_name") in bk_roles:
                 name = (u.get("user_name") or "").replace(" ", "")
                 if name:
                     mentions.append(f"@{name}")

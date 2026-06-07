@@ -49,6 +49,26 @@ def _bg_insert(table_name: str, data, label: str = ""):
         logger.error("[BG %s] Insert into %s failed: %s", label, table_name, exc)
 
 
+def _user_can_authorize_expenses(user_id: str) -> tuple[bool, str]:
+    """Whether *user_id* may authorize expenses, via role_permissions.can_authorize
+    on the 'expenses' module (the same flag the Roles UI manages). Returns
+    (can_authorize, role_name). Missing user/role/permission → (False, "")."""
+    if not user_id:
+        return False, ""
+    try:
+        resp = supabase.table("users").select(
+            "user_rol, rols!users_user_rol_fkey(rol_name, role_permissions(module_key, can_authorize))"
+        ).eq("user_id", user_id).single().execute()
+        rols_data = (resp.data or {}).get("rols") or {}
+        role_name = rols_data.get("rol_name") or ""
+        perms = rols_data.get("role_permissions") or []
+        perm = next((p for p in perms if p.get("module_key") == "expenses"), None)
+        return bool(perm and perm.get("can_authorize")), role_name
+    except Exception as exc:
+        logger.error("[AUTHZ] can_authorize lookup failed for %s: %s", user_id, exc)
+        return False, ""
+
+
 def _load_account_overlay() -> dict:
     """account_id -> {subcategory_id, cost_type} from the categories overlay.
     Fetched fresh (small table) so remaps in the Categories UI take effect."""
@@ -485,6 +505,22 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, background_tasks: Backgro
         - summary: resumen de la operación
     """
     try:
+        # If this batch authorizes any expense (status='auth' or auth_status=True),
+        # the acting user must have can_authorize on the expenses module.
+        needs_auth = any(
+            (lambda d: d.get("status") == "auth" or d.get("auth_status") is True)(
+                item.data.model_dump(exclude_unset=True)
+            )
+            for item in payload.updates
+        )
+        if needs_auth:
+            can_auth, _ = _user_can_authorize_expenses(user_id)
+            if not can_auth:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not have permission to authorize expenses."
+                )
+
         updated = []
         failed = []
         status_logs = []
@@ -604,6 +640,8 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, background_tasks: Backgro
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1356,6 +1394,18 @@ def update_expense(expense_id: str, payload: ExpenseUpdate, current_user: dict =
         if uid:
             data["updated_by"] = uid
 
+        # Authorizing via this raw update also requires the expense-authorize
+        # permission (the dedicated /status + /batch paths enforce the same).
+        _raw_status = data.get("status")
+        _raw_status = _raw_status.value if hasattr(_raw_status, "value") else _raw_status
+        if _raw_status == "auth" or data.get("auth_status") is True:
+            can_auth, _ = _user_can_authorize_expenses(uid)
+            if not can_auth:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not have permission to authorize expenses."
+                )
+
         # Re-derive subcategory_id + cost_type when the account changes (dual-write).
         if "account_id" in data:
             data["subcategory_id"] = None
@@ -1457,6 +1507,13 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
                 status_changed = True
                 # Update auth_status for backwards compatibility
                 if new_status == 'auth':
+                    # Only roles with can_authorize on the expenses module may authorize.
+                    can_auth, _ = _user_can_authorize_expenses(user_id)
+                    if not can_auth:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="You do not have permission to authorize expenses."
+                        )
                     data["auth_status"] = True
                     data["auth_by"] = user_id
                 elif new_status in ['review', 'pending']:
@@ -1668,24 +1725,25 @@ def update_expense_status(expense_id: str, payload: ExpenseStatusUpdate, user_id
         current_expense = expense_resp.data
         old_status = current_expense.get("status") or ("auth" if current_expense.get("auth_status") else "pending")
 
-        # Permission check for 'review' status
+        # Permission check for 'review' status. Flagging for review is part of
+        # the authorization lifecycle (it de-authorizes), so it's gated by the
+        # same can_authorize permission managed in Roles Management.
         if status_value == 'review':
-            user_resp = supabase.table("users").select(
-                "user_id, rols!users_user_rol_fkey(rol_name)"
-            ).eq("user_id", user_id).single().execute()
-
-            if not user_resp.data:
-                raise HTTPException(status_code=404, detail="User not found")
-
-            role_info = user_resp.data.get("rols") or {}
-            role_name = role_info.get("rol_name", "")
-
-            REVIEW_ALLOWED_ROLES = ["CEO", "COO", "Accounting Manager", "Project Manager"]
-
-            if role_name not in REVIEW_ALLOWED_ROLES:
+            can_auth, _ = _user_can_authorize_expenses(user_id)
+            if not can_auth:
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Only {', '.join(REVIEW_ALLOWED_ROLES)} can set status to 'review'"
+                    detail="You do not have permission to flag expenses for review."
+                )
+
+        # Permission check for 'auth' status: only roles with can_authorize on the
+        # expenses module (managed in Roles Management) may authorize.
+        if status_value == 'auth':
+            can_auth, _ = _user_can_authorize_expenses(user_id)
+            if not can_auth:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not have permission to authorize expenses."
                 )
 
         # Update expense status
@@ -2423,10 +2481,9 @@ def get_pending_authorization_count(user_id: str, current_user: dict = Depends(g
         role_info = user_data.get("rols") or {}
         role_name = role_info.get("rol_name", "")
 
-        # Define roles that can authorize expenses
-        AUTHORIZER_ROLES = ["CEO", "COO", "Accounting Manager", "Project Manager"]
-
-        can_authorize = role_name in AUTHORIZER_ROLES
+        # Authorization is a real permission now (role_permissions.can_authorize
+        # on the expenses module), managed from Roles Management.
+        can_authorize, _ = _user_can_authorize_expenses(user_id)
 
         if not can_authorize:
             return {
@@ -2490,10 +2547,9 @@ def get_pending_authorization_summary(user_id: str, current_user: dict = Depends
         role_info = user_data.get("rols") or {}
         role_name = role_info.get("rol_name", "")
 
-        # Define roles that can authorize expenses
-        AUTHORIZER_ROLES = ["CEO", "COO", "Accounting Manager", "Project Manager"]
-
-        can_authorize = role_name in AUTHORIZER_ROLES
+        # Authorization is a real permission now (role_permissions.can_authorize
+        # on the expenses module), managed from Roles Management.
+        can_authorize, _ = _user_can_authorize_expenses(user_id)
 
         if not can_authorize:
             return {

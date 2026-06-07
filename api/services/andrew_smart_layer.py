@@ -731,13 +731,15 @@ def _get_bookkeeping_mentions_safe() -> str:
     """Get bookkeeping @mentions. Never fails."""
     try:
         from api.supabase_client import supabase
+        from api.services.agent_access import bookkeeping_roles
         result = supabase.table("users") \
             .select("user_name, rols!users_user_rol_fkey(rol_name)") \
             .execute()
+        bk_roles = set(bookkeeping_roles())
         mentions = []
         for u in (result.data or []):
             role = u.get("rols") or {}
-            if role.get("rol_name") in ("Bookkeeper", "Accounting Manager"):
+            if role.get("rol_name") in bk_roles:
                 name = (u.get("user_name") or "").replace(" ", "")
                 if name:
                     mentions.append(f"@{name}")

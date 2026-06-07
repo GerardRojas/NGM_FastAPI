@@ -365,6 +365,14 @@ app.include_router(issues_router)
 # Contact (public landing contact form -> contact_messages; internal inbox)
 app.include_router(contact_router)
 
+# AI Usage (token + estimated-cost ledger; IT > AI Usage page)
+from api.routers.ai_usage import router as ai_usage_router
+app.include_router(ai_usage_router)
+
+# Demo Admin (manage demo accounts + per-demo module visibility; IT > Demo Manager)
+from api.routers.demo_admin import router as demo_admin_router
+app.include_router(demo_admin_router)
+
 _mem_logger = logging.getLogger("memory")
 
 # ========================================

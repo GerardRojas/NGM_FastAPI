@@ -332,26 +332,24 @@ async def notify_message_recipients(
 
 async def get_expense_authorizers() -> List[dict]:
     """
-    Get all users who can authorize expenses.
-    These are users with roles: CEO, COO, CFO, Admin
-    or users with can_edit permission on expenses module.
+    Get all users who can authorize expenses — i.e. members of any role with
+    can_authorize on the 'expenses' module (the permission managed in Roles
+    Management). This stays in sync with who actually gets the authorize controls.
     """
     try:
         supabase = get_supabase()
 
-        # Get users with authorizing roles
-        authorizing_roles = ['CEO', 'COO', 'CFO', 'Admin', 'Accounting Manager']
-
-        # First get the role IDs for these roles
-        roles_result = supabase.table("rols") \
-            .select("rol_id, rol_name") \
-            .in_("rol_name", authorizing_roles) \
+        # Roles that can authorize expenses (role_permissions.can_authorize).
+        perms_result = supabase.table("role_permissions") \
+            .select("rol_id, can_authorize") \
+            .eq("module_key", "expenses") \
+            .eq("can_authorize", True) \
             .execute()
 
-        role_ids = [r["rol_id"] for r in (roles_result.data or [])]
+        role_ids = [p["rol_id"] for p in (perms_result.data or []) if p.get("can_authorize")]
 
         if not role_ids:
-            logger.warning("[Firebase] No authorizing roles found")
+            logger.warning("[Firebase] No roles with expense-authorize permission found")
             return []
 
         # Get users with these roles

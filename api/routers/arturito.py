@@ -6,6 +6,7 @@
 # Usa OpenAI Assistants API para memoria contextual eficiente.
 
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -16,8 +17,9 @@ import logging
 
 logger_art = logging.getLogger(__name__)
 
-from api.auth import get_current_user
+from api.auth import get_current_user, JWT_SECRET, JWT_ALG
 from api.services.gpt_client import gpt
+from api.services.agent_access import roles_for
 
 # Importar el engine de Arturito
 from services.arturito import (
@@ -26,6 +28,36 @@ from services.arturito import (
     route_slash_command,
     set_personality_level,
 )
+from services.arturito.router import route_async
+from services.arturito.handlers.permissions_handler import (
+    has_pending as _perm_has_pending,
+    is_affirmation as _perm_is_affirmation,
+    is_negation as _perm_is_negation,
+    confirm_pending as _perm_confirm_pending,
+    cancel_pending as _perm_cancel_pending,
+)
+
+# Optional bearer for /web-chat: lets us VERIFY the requester's role from the JWT
+# for privileged commands, while leaving ordinary chat working even without a
+# token. auto_error=False so a missing header doesn't 401 the whole endpoint.
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+def get_optional_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+) -> Optional[Dict[str, Any]]:
+    if not credentials:
+        return None
+    try:
+        import jwt
+        decoded = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALG])
+        return {
+            "user_id": decoded.get("sub"),
+            "username": decoded.get("username"),
+            "role": decoded.get("role"),
+        }
+    except Exception:
+        return None
 from services.arturito.handlers.info_handler import get_system_status
 from services.arturito.assistants import (
     send_message_and_get_response,
@@ -198,7 +230,10 @@ async def health_check():
 # ================================
 
 @router.post("/web-chat", response_model=BotResponse)
-async def web_chat(message: WebChatMessage):
+async def web_chat(
+    message: WebChatMessage,
+    current_user: Optional[Dict[str, Any]] = Depends(get_optional_user),
+):
     """
     Endpoint para el chat web de NGM HUB usando OpenAI Assistants API.
 
@@ -219,6 +254,9 @@ async def web_chat(message: WebChatMessage):
 
     Response incluye thread_id para que el cliente lo guarde y reutilice.
     """
+    from api.services.ai_usage import set_ai_context, clear_ai_context
+    # Attribute every AI call this request makes (routing + handlers + Assistants).
+    set_ai_context(feature="art", company_id=message.company_id)
     try:
         text = message.text.strip()
 
@@ -232,7 +270,11 @@ async def web_chat(message: WebChatMessage):
         context = {
             "user_name": message.user_name,
             "user_email": message.user_email,
-            "user_role": message.user_role,  # Rol para control de permisos
+            "user_role": message.user_role,  # Rol CLIENT-CLAIMED (no confiar para permisos)
+            # Identity VERIFIED from the JWT — used to gate privileged commands.
+            # None when no/invalid token; privileged handlers refuse in that case.
+            "verified_role": (current_user or {}).get("role"),
+            "actor_user_id": (current_user or {}).get("user_id"),
             "space_name": "NGM HUB Web",
             "space_id": session_id,
             "is_mention": True,
@@ -257,6 +299,23 @@ async def web_chat(message: WebChatMessage):
                 thread_id=message.thread_id or get_thread_id(session_id)
             )
 
+        # Pending permission-change confirmation: if Art proposed a change last
+        # turn and is now waiting on this session, treat "yes"/"no" as the answer
+        # before running normal NLU. Anything else falls through (pending expires).
+        if _perm_has_pending(session_id):
+            confirm_result = None
+            if _perm_is_affirmation(text):
+                confirm_result = _perm_confirm_pending(session_id, context)
+            elif _perm_is_negation(text):
+                confirm_result = _perm_cancel_pending(session_id)
+            if confirm_result is not None:
+                return BotResponse(
+                    text=confirm_result.get("text", ""),
+                    action=confirm_result.get("action"),
+                    data=confirm_result.get("data"),
+                    thread_id=message.thread_id or get_thread_id(session_id),
+                )
+
         # Interpretar mensaje
         intent_result = interpret_message(text, context)
 
@@ -278,8 +337,14 @@ async def web_chat(message: WebChatMessage):
                 thread_id=thread_id,
             )
 
-        # Para otros intents (BVA, SOW, etc.), rutear al handler
-        response = route(intent_result, context)
+        # Para otros intents (BVA, SOW, etc.), rutear al handler.
+        # MANAGE_EXPENSE_AUTHORIZER needs DB + the verified context, so it goes
+        # through route_async; everything else keeps the existing sync path.
+        if intent_result.get("intent") == "MANAGE_EXPENSE_AUTHORIZER":
+            from api.supabase_client import supabase
+            response = await route_async(intent_result, context, db_client=supabase)
+        else:
+            response = route(intent_result, context)
 
         if response.get("error"):
             logger_art.warning("[ART] Route handler error: %s", response.get('error'))
@@ -297,6 +362,8 @@ async def web_chat(message: WebChatMessage):
             text="Something went wrong processing your message. Please try again.",
             action="error",
         )
+    finally:
+        clear_ai_context()
 
 
 @router.post("/clear-thread")
@@ -433,7 +500,7 @@ async def update_permission(update: PermissionUpdate, current_user: dict = Depen
     Actualiza un permiso específico de Arturito.
     Requires CEO, COO, or KD COO role.
     """
-    allowed_roles = ["CEO", "COO", "KD COO"]
+    allowed_roles = roles_for("arturito_admin_roles", ["CEO", "COO", "KD COO"])
     if current_user.get("role") not in allowed_roles:
         raise HTTPException(status_code=403, detail="Only CEO/COO can modify Arturito permissions")
 
@@ -465,7 +532,7 @@ async def reset_permissions(current_user: dict = Depends(get_current_user)):
     Resetea todos los permisos a sus valores por defecto.
     Requires CEO, COO, or KD COO role.
     """
-    allowed_roles = ["CEO", "COO", "KD COO"]
+    allowed_roles = roles_for("arturito_admin_roles", ["CEO", "COO", "KD COO"])
     if current_user.get("role") not in allowed_roles:
         raise HTTPException(status_code=403, detail="Only CEO/COO can reset Arturito permissions")
     from services.arturito.permissions import reset_permissions_to_defaults
@@ -559,7 +626,7 @@ async def get_failed_commands_endpoint(
     Requires CEO, COO, or KD COO role.
     """
     try:
-        allowed_roles = ["CEO", "COO", "KD COO"]
+        allowed_roles = roles_for("arturito_admin_roles", ["CEO", "COO", "KD COO"])
         if current_user.get("role") not in allowed_roles:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
 
@@ -1092,7 +1159,7 @@ async def get_failed_commands_stats_endpoint(
     Requires CEO, COO, or KD COO role.
     """
     try:
-        allowed_roles = ["CEO", "COO", "KD COO"]
+        allowed_roles = roles_for("arturito_admin_roles", ["CEO", "COO", "KD COO"])
         if current_user.get("role") not in allowed_roles:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
 
