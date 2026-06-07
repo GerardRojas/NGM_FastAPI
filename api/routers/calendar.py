@@ -75,6 +75,8 @@ class EventOut(BaseModel):
     rrule: Optional[str] = None
     rrule_until: Optional[str] = None
     reminder_minutes: Optional[int] = None
+    meeting_url: Optional[str] = None
+    meeting_provider: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     attendees: List[AttendeeOut] = Field(default_factory=list)
@@ -95,6 +97,7 @@ class EventCreate(BaseModel):
     rrule_until: Optional[str] = None
     reminder_minutes: Optional[int] = None
     attendee_user_ids: Optional[List[str]] = None
+    add_meet: bool = False           # request a Google Meet link (needs Google connected)
 
 
 class EventUpdate(BaseModel):
@@ -112,6 +115,7 @@ class EventUpdate(BaseModel):
     rrule_until: Optional[str] = None
     reminder_minutes: Optional[int] = None
     attendee_user_ids: Optional[List[str]] = None   # if provided, replaces the set
+    add_meet: Optional[bool] = None                  # set True to add a Google Meet link
 
 
 class AttendeeStatus(BaseModel):
@@ -245,6 +249,8 @@ def _serialize_event(row: dict, attendees: List[dict], sync: Optional[dict] = No
         "rrule": row.get("rrule"),
         "rrule_until": row.get("rrule_until"),
         "reminder_minutes": row.get("reminder_minutes"),
+        "meeting_url": row.get("meeting_url"),
+        "meeting_provider": row.get("meeting_provider"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "attendees": attendees,
@@ -512,16 +518,26 @@ async def create_event(payload: EventCreate, current_user: dict = Depends(get_cu
         # Phase 4: best-effort push to Google Calendar (if the creator has
         # connected their account). Failures don't break the local write — the
         # periodic pull-sync will reconcile.
+        # When add_meet is set, push_event requests a Google Meet conference and
+        # writes meeting_url back to the row, so re-read it for the response.
         try:
-            gcal.push_event(me, created)
+            gcal.push_event(me, created, create_meet=bool(payload.add_meet))
         except gcal.GoogleNotConfigured:
             pass
         except Exception:
             logger.exception("push_event after create failed")
 
+        final_row = created
+        if payload.add_meet:
+            refreshed = (
+                supabase.table("calendar_events").select("*").eq("event_id", event_id).limit(1).execute()
+            )
+            if refreshed.data:
+                final_row = refreshed.data[0]
+
         atts = _fetch_attendees([event_id]).get(event_id, [])
         sync = _fetch_sync_mappings([event_id]).get(event_id)
-        return _serialize_event(created, atts, sync)
+        return _serialize_event(final_row, atts, sync)
     except HTTPException:
         raise
     except Exception as e:
@@ -600,17 +616,32 @@ async def update_event(event_id: str, payload: EventUpdate, current_user: dict =
         # Phase 4: push update to Google. Only the event creator has tokens;
         # other editors don't have OAuth to the creator's calendar, so this
         # is intentionally creator-scoped.
+        # add_meet semantics: True = add a Meet (if none yet), False = remove the
+        # existing one, None = leave the conference untouched.
+        existing_meet = refreshed.data[0].get("meeting_url")
+        want_meet = payload.add_meet is True and not existing_meet
+        want_remove = payload.add_meet is False and bool(existing_meet)
+        final_row = refreshed.data[0]
         try:
             creator_id = str(refreshed.data[0].get("created_by") or "")
             if creator_id:
-                gcal.push_event(creator_id, refreshed.data[0])
+                gcal.push_event(
+                    creator_id, refreshed.data[0],
+                    create_meet=want_meet, remove_meet=want_remove,
+                )
+                if want_meet or want_remove:
+                    re_read = (
+                        supabase.table("calendar_events").select("*").eq("event_id", event_id).limit(1).execute()
+                    )
+                    if re_read.data:
+                        final_row = re_read.data[0]
         except gcal.GoogleNotConfigured:
             pass
         except Exception:
             logger.exception("push_event after update failed")
 
         sync = _fetch_sync_mappings([event_id]).get(event_id)
-        return _serialize_event(refreshed.data[0], atts, sync)
+        return _serialize_event(final_row, atts, sync)
     except HTTPException:
         raise
     except Exception as e:
@@ -733,6 +764,10 @@ def _ics_lines_for_event(row: dict) -> List[str]:
         out.append(f"DESCRIPTION:{_ics_escape(row.get('description'))}")
     if row.get("location"):
         out.append(f"LOCATION:{_ics_escape(row.get('location'))}")
+    if row.get("meeting_url"):
+        # Join link for video meetings (Google Meet). URL is the canonical field;
+        # also surfaced in the description so clients that ignore URL still show it.
+        out.append(f"URL:{_ics_escape(row.get('meeting_url'))}")
     if row.get("rrule"):
         # Our stored RRULE-lite is already RFC 5545 compatible.
         out.append(f"RRULE:{row.get('rrule')}")
