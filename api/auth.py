@@ -14,11 +14,114 @@ from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME")
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    # Fail closed: never run with a guessable/default signing secret. Tokens signed
+    # with a known secret can be forged, which would defeat every auth check below.
+    raise RuntimeError("Falta JWT_SECRET en el entorno")
 JWT_ALG = "HS256"
 JWT_EXPIRES_MIN = int(os.getenv("JWT_EXPIRES_MIN", "2880"))  # 2 días
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# ====== DEPENDENCY: Get current user from JWT ======
+
+security = HTTPBearer()
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """
+    Dependency to extract and verify JWT token from Authorization header.
+    Returns user info from token payload.
+    """
+    token = credentials.credentials
+
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
+    user_id = decoded.get("sub")
+    username = decoded.get("username")
+    role = decoded.get("role")
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    return {
+        "user_id": user_id,
+        "username": username,
+        "role": role,
+        "account_type": decoded.get("account_type") or "internal",
+        "client_id": decoded.get("client_id"),
+    }
+
+
+# ====== DEPENDENCIES: account-type gates (client portal) ======
+
+def require_internal(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Guard for internal-only endpoints: rejects external client accounts.
+    Defense-in-depth — clients should never reach the internal API surface.
+    """
+    if (current_user.get("account_type") or "internal") == "client":
+        raise HTTPException(status_code=403, detail="Internal access only")
+    return current_user
+
+
+# Roles considered "leadership" for management-only endpoints (demo users, role/
+# permission edits, company management, user creation). Keep in sync with the
+# pattern in routers/demo_admin.py::_require_leadership.
+LEADERSHIP_ROLES = {"ceo", "coo"}
+
+
+def require_leadership(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Guard for management-only endpoints: only CEO/COO may pass. Used for sensitive
+    administrative surface (creating users, editing roles/permissions, company CRUD).
+    """
+    role = str(current_user.get("role") or "").strip().lower()
+    if role not in LEADERSHIP_ROLES:
+        raise HTTPException(status_code=403, detail="Only CEO/COO can perform this action.")
+    return current_user
+
+
+def get_current_client(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Dependency for the /portal router: requires an external client account and
+    exposes its client_id. The portal resolves all data scope from this — never
+    from request parameters — so a client can only ever see their own data.
+    """
+    if (current_user.get("account_type") or "internal") != "client":
+        raise HTTPException(status_code=403, detail="Client portal access only")
+    client_id = current_user.get("client_id")
+    if not client_id:
+        raise HTTPException(status_code=403, detail="Client account is not linked to a client")
+    return {
+        "user_id": current_user.get("user_id"),
+        "username": current_user.get("username"),
+        "client_id": client_id,
+    }
+
+
+def demo_account_from_request(authorization: "str | None") -> bool:
+    """
+    Lightweight check (no Depends) for the global write-block middleware: returns
+    True only when the Authorization header carries a valid demo-account token.
+    Invalid/absent tokens return False so the endpoint's own auth still runs.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return False
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except Exception:
+        return False
+    return (decoded.get("account_type") or "internal") == "demo"
 
 
 # ====== MODELOS Pydantic ======
@@ -68,7 +171,7 @@ def make_access_token(
 # ====== ENDPOINT: Crear usuario (para ti / admin) ======
 
 @router.post("/create_user")
-def create_user(payload: CreateUserRequest):
+def create_user(payload: CreateUserRequest, current_user: dict = Depends(require_leadership)):
     hashed = hash_password(payload.password)
 
     data_to_insert = {
@@ -308,70 +411,4 @@ def me(authorization: str | None = Header(default=None)):
         "user_name": decoded.get("username"),
         "user_role": decoded.get("role"),
         "user_id": decoded.get("sub"),
-    }
-
-
-# ====== DEPENDENCY: Get current user from JWT ======
-
-security = HTTPBearer()
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """
-    Dependency to extract and verify JWT token from Authorization header.
-    Returns user info from token payload.
-    """
-    token = credentials.credentials
-
-    try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
-
-    user_id = decoded.get("sub")
-    username = decoded.get("username")
-    role = decoded.get("role")
-
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    return {
-        "user_id": user_id,
-        "username": username,
-        "role": role,
-        "account_type": decoded.get("account_type") or "internal",
-        "client_id": decoded.get("client_id"),
-    }
-
-
-# ====== DEPENDENCIES: account-type gates (client portal) ======
-
-def require_internal(current_user: dict = Depends(get_current_user)) -> dict:
-    """
-    Guard for internal-only endpoints: rejects external client accounts.
-    Defense-in-depth — clients should never reach the internal API surface.
-    """
-    if (current_user.get("account_type") or "internal") == "client":
-        raise HTTPException(status_code=403, detail="Internal access only")
-    return current_user
-
-
-def get_current_client(current_user: dict = Depends(get_current_user)) -> dict:
-    """
-    Dependency for the /portal router: requires an external client account and
-    exposes its client_id. The portal resolves all data scope from this — never
-    from request parameters — so a client can only ever see their own data.
-    """
-    if (current_user.get("account_type") or "internal") != "client":
-        raise HTTPException(status_code=403, detail="Client portal access only")
-    client_id = current_user.get("client_id")
-    if not client_id:
-        raise HTTPException(status_code=403, detail="Client account is not linked to a client")
-    return {
-        "user_id": current_user.get("user_id"),
-        "username": current_user.get("username"),
-        "client_id": client_id,
     }

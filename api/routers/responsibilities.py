@@ -16,7 +16,8 @@ Unified item ids are prefixed so PUT/DELETE can route without ambiguity:
   - system: "sys:<automation_type>"
   - manual: "man:<responsibility_id>"
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ import traceback
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/responsibilities", tags=["responsibilities"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/responsibilities", tags=["responsibilities"])
 
 
 # ---------------------------------------------------------------------------

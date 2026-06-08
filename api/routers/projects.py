@@ -3,7 +3,8 @@ import uuid
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 
 from api.supabase_client import supabase
@@ -11,7 +12,7 @@ from api.services.vault_service import create_default_folders
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/projects", tags=["Projects"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/projects", tags=["Projects"])
 
 
 # ====== MODELOS ======

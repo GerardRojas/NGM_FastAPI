@@ -5,12 +5,13 @@ Los 11 cost codes de QuickBooks. Se gestionan en la página de Accounting y son 
 link contabilidad<->costos: cada Category (categories_rearch) referencia uno por
 FK. Por ahora CRUD manual; el sync en vivo con QBO es un follow-up.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/qbo-cost-codes", tags=["qbo-cost-codes"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/qbo-cost-codes", tags=["qbo-cost-codes"])
 
 TABLE = "qbo_cost_codes"
 

@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
+from api.auth import require_internal, require_leadership
 from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, Field
@@ -10,7 +11,7 @@ from pydantic import BaseModel, Field
 from api.supabase_client import supabase
 from utils.auth import hash_password
 
-router = APIRouter(prefix="/team", tags=["team"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/team", tags=["team"])
 
 SELECT_CLAUSE = """
   user_id,
@@ -164,7 +165,7 @@ def list_roles() -> List[Dict[str, Any]]:
     return [{"id": r["rol_id"], "name": r["rol_name"]} for r in roles]
 
 
-@router.post("/rols")
+@router.post("/rols", dependencies=[Depends(require_leadership)])
 def create_role(payload: RoleCreate) -> Dict[str, Any]:
     """Crea un nuevo rol."""
     name = payload.rol_name.strip()
@@ -186,7 +187,7 @@ def create_role(payload: RoleCreate) -> Dict[str, Any]:
     return {"id": r.get("rol_id"), "name": r.get("rol_name")}
 
 
-@router.patch("/rols/{rol_id}")
+@router.patch("/rols/{rol_id}", dependencies=[Depends(require_leadership)])
 def update_role(rol_id: str, payload: RoleUpdate) -> Dict[str, Any]:
     """Renombra un rol existente."""
     name = payload.rol_name.strip()
@@ -208,7 +209,7 @@ def update_role(rol_id: str, payload: RoleUpdate) -> Dict[str, Any]:
     return {"id": r.get("rol_id"), "name": r.get("rol_name")}
 
 
-@router.delete("/rols/{rol_id}")
+@router.delete("/rols/{rol_id}", dependencies=[Depends(require_leadership)])
 def delete_role(rol_id: str) -> Dict[str, Any]:
     """Borra un rol. Si hay users apuntando a este rol, la FK puede impedir el borrado."""
     try:
@@ -243,7 +244,7 @@ def list_team_users(
     return [normalize_user_row(r) for r in (res.data or [])]
 
 
-@router.post("/users")
+@router.post("/users", dependencies=[Depends(require_leadership)])
 def create_user(payload: UserCreate) -> Dict[str, Any]:
     data = payload.model_dump()
 
@@ -282,7 +283,7 @@ def create_user(payload: UserCreate) -> Dict[str, Any]:
     return fetch_user_by_id(user_id)
 
 
-@router.patch("/users/{user_id}")
+@router.patch("/users/{user_id}", dependencies=[Depends(require_leadership)])
 def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
     data = payload.model_dump(exclude_unset=True)
 
@@ -331,7 +332,7 @@ def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
     return fetch_user_by_id(user_id)
 
 
-@router.delete("/users/{user_id}")
+@router.delete("/users/{user_id}", dependencies=[Depends(require_leadership)])
 def delete_user(user_id: str) -> Dict[str, Any]:
     try:
         # delete returns deleted rows in data (often)

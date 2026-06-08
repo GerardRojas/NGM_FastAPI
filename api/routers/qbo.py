@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from api.supabase_client import supabase
@@ -22,7 +23,7 @@ from services.qbo_service import (
     fetch_budgets
 )
 
-router = APIRouter(prefix="/qbo", tags=["QBO Integration"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/qbo", tags=["QBO Integration"])
 
 
 # ====== OAUTH ENDPOINTS ======

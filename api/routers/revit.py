@@ -4,7 +4,8 @@ Serves definitions, templates, materials, registry, and manifest schema
 from the revit_data submodule (NGM_REVIT repo).
 Also handles build manifest CRUD (stored in Supabase).
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
@@ -13,7 +14,7 @@ import json
 
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/revit", tags=["revit"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/revit", tags=["revit"])
 
 # Path to revit_data submodule (relative to project root)
 REVIT_DATA = Path(__file__).resolve().parent.parent.parent / "revit_data"

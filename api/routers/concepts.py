@@ -2,14 +2,15 @@
 Router para gestion de Concepts (Conceptos compuestos de materiales)
 """
 import logging
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/concepts", tags=["concepts"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/concepts", tags=["concepts"])
 
 
 # ========================================

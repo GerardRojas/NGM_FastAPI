@@ -2,14 +2,15 @@
 Router para gestion de Materials (Base de datos de materiales para estimator)
 """
 import logging
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional, List
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/materials", tags=["materials"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/materials", tags=["materials"])
 
 
 # ========================================

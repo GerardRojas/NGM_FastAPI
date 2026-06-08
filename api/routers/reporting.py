@@ -8,7 +8,8 @@
 # truth the web pages can adopt); /pnl additionally renders a PDF to the Vault.
 
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 
@@ -31,7 +32,7 @@ from services.arturito.handlers.pnl_handler import (
 )
 from services.reporting.engine import build_report, fetch_category_tree
 
-router = APIRouter(prefix="/reports", tags=["Reporting"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/reports", tags=["Reporting"])
 
 
 # ================================

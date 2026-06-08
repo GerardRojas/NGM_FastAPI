@@ -7,13 +7,14 @@ from typing import Dict, Any, List, Optional
 import logging
 import traceback
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel, field_validator
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/pipeline", tags=["pipeline"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/pipeline", tags=["pipeline"])
 
 
 # ====== MODELOS ======

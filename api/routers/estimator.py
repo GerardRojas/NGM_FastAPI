@@ -29,14 +29,15 @@ from datetime import datetime
 import json
 import uuid
 
-from fastapi import APIRouter, HTTPException, Body, Query
+from fastapi import APIRouter, HTTPException, Body, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/estimator", tags=["estimator"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/estimator", tags=["estimator"])
 
 # ============================================
 # BUCKET CONFIGURATION

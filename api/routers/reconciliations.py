@@ -42,13 +42,14 @@
 # @step_description: Mark both expenses as reconciled
 # =============================================================================
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from api.supabase_client import supabase
 from typing import Optional, List
 from datetime import datetime
 
-router = APIRouter(prefix="/expenses/reconciliations", tags=["Reconciliations"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/expenses/reconciliations", tags=["Reconciliations"])
 
 
 # ====== MODELOS ======

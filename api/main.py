@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # .../NGM_API
 env_path = BASE_DIR / ".env"
 load_dotenv(env_path)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.supabase_client import supabase
@@ -25,7 +25,6 @@ from api.routers.projects import router as projects_router
 from api.routers.pipeline import router as pipeline_router
 from api.routers.estimator import router as estimator_router
 from api.routers.sheet_templates import router as sheet_templates_router
-from api.routers.debug_supabase import router as debug_supabase_router
 from api.routers.team import router as team_router
 from api.routers.companies import router as companies_router
 from api.routers.expenses import router as expenses_router
@@ -50,7 +49,9 @@ from api.routers.qbo import router as qbo_router
 from api.routers.bills import router as bills_router
 
 # ========= NUEVO: AUTH LOGIN ==========
-from api.auth import router as auth_router
+from api.auth import router as auth_router, require_leadership, demo_account_from_request
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse
 
 # ========= ART: Chat Bot ==========
 from api.routers.arturito import router as art_router
@@ -165,6 +166,26 @@ app = FastAPI(title="NGM HUB API", redirect_slashes=False)
 
 
 # ========================================
+# Demo accounts are read-only: block all mutating requests carrying a demo token.
+# Registered BEFORE CORS so the CORS middleware stays outermost and still tags
+# the 403 with CORS headers. This is the server-side counterpart to the client
+# write-block; it also stops direct (non-browser) API calls with a demo token.
+# ========================================
+_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+async def _block_demo_writes(request, call_next):
+    if request.method in _MUTATING_METHODS and demo_account_from_request(
+        request.headers.get("authorization")
+    ):
+        return JSONResponse(status_code=403, content={"detail": "Demo accounts are read-only."})
+    return await call_next(request)
+
+
+app.add_middleware(BaseHTTPMiddleware, dispatch=_block_demo_writes)
+
+
+# ========================================
 # CORS (permitir acceso desde NGM HUB frontend)
 # ========================================
 app.add_middleware(
@@ -186,7 +207,7 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # ========================================
@@ -210,8 +231,6 @@ app.include_router(estimator_router)
 
 # Budget Sheet Manager (export templates for the Estimator)
 app.include_router(sheet_templates_router)
-
-app.include_router(debug_supabase_router)
 
 app.include_router(team_router)
 
@@ -475,7 +494,7 @@ def _purge_stale_caches():
 # Debug: Memory monitoring endpoint
 # ========================================
 
-@app.get("/debug/memory", include_in_schema=False)
+@app.get("/debug/memory", include_in_schema=False, dependencies=[Depends(require_leadership)])
 async def debug_memory():
     """Return current memory usage and cache sizes for leak monitoring."""
     import psutil, os as _os
