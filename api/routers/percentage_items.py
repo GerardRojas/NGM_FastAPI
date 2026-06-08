@@ -2,12 +2,13 @@
 Router para gestion de Percentage Items (items de porcentaje reutilizables)
 Waste, overhead, profit margins, etc. para el Concept Builder
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/percentage-items", tags=["percentage-items"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/percentage-items", tags=["percentage-items"])
 
 
 # ========================================

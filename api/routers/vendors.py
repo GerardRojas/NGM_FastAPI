@@ -2,12 +2,13 @@
 Router para gestion de Vendors (Proveedores)
 Phase 1: QuickBooks-level vendor profiles
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional, List
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/vendors", tags=["vendors"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/vendors", tags=["vendors"])
 
 
 # ========================================

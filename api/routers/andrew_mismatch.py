@@ -3,14 +3,15 @@ Andrew Mismatch Reconciliation Router
 Endpoints for triggering and configuring Andrew's bill reconciliation protocol.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timezone
 
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/andrew", tags=["andrew"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/andrew", tags=["andrew"])
 
 
 # ================================

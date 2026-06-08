@@ -1,12 +1,13 @@
 """
 Router para gestion de Material Categories
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional, List
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/material-categories", tags=["material-categories"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/material-categories", tags=["material-categories"])
 
 
 # ========================================

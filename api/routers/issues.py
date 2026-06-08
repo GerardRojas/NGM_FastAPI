@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
-from api.auth import get_current_user
+from api.auth import get_current_user, require_internal
 from api.supabase_client import supabase
 
 router = APIRouter(prefix="/issues", tags=["issues"])
@@ -67,7 +67,7 @@ def _attachments_for(issue_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
 # ── POST /issues ───────────────────────────────────────────────
 
 @router.post("", status_code=201)
-async def create_issue(payload: IssueCreate, current_user: dict = Depends(get_current_user)):
+async def create_issue(payload: IssueCreate, current_user: dict = Depends(require_internal)):
     """Raise a new issue or suggestion. Any authenticated hub user can do this."""
     title = _clean(payload.title)
     if not title:
@@ -106,7 +106,7 @@ async def create_issue(payload: IssueCreate, current_user: dict = Depends(get_cu
 async def upload_issue_attachment(
     issue_id: str,
     file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ):
     """Attach a screenshot/file to an existing issue."""
     existing = supabase.table("issue_reports").select("id").eq("id", issue_id).execute()
@@ -158,7 +158,7 @@ async def list_issues(
     q: Optional[str] = Query(default=None, description="Search by title or description"),
     status: Optional[str] = Query(default=None, description="Filter by status"),
     type: Optional[str] = Query(default=None, description="Filter by type"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ) -> List[Dict[str, Any]]:
     """List issues (newest first) with their attachments."""
     try:
@@ -190,7 +190,7 @@ async def list_issues(
 # ── PATCH /issues/{id} ─────────────────────────────────────────
 
 @router.patch("/{issue_id}")
-async def update_issue(issue_id: str, payload: IssueUpdate, current_user: dict = Depends(get_current_user)):
+async def update_issue(issue_id: str, payload: IssueUpdate, current_user: dict = Depends(require_internal)):
     """Update an issue — primarily its status (resolved / not)."""
     update: Dict[str, Any] = {}
 
@@ -240,7 +240,7 @@ async def update_issue(issue_id: str, payload: IssueUpdate, current_user: dict =
 # ── DELETE /issues/{id} ────────────────────────────────────────
 
 @router.delete("/{issue_id}")
-async def delete_issue(issue_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_issue(issue_id: str, current_user: dict = Depends(require_internal)):
     """Delete an issue and its attachments (DB rows + storage objects)."""
     attachments = (
         supabase.table("issue_attachments").select("bucket_path").eq("issue_id", issue_id).execute().data

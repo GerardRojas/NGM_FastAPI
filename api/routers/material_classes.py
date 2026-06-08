@@ -1,12 +1,13 @@
 """
 Router para gestion de Material Classes
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/material-classes", tags=["material-classes"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/material-classes", tags=["material-classes"])
 
 
 # ========================================

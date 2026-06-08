@@ -4,7 +4,8 @@ Endpoints for task management, configuration, and stats
 for the Hari team coordination agent.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from api.supabase_client import supabase
 
 logger = logging.getLogger("hari.router")
 
-router = APIRouter(prefix="/hari", tags=["hari"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/hari", tags=["hari"])
 
 
 # ================================

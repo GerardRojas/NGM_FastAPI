@@ -6,7 +6,8 @@ subcategorías son type-agnósticas; los tags material/labor/external_service qu
 se muestran por subcategoría se derivan de account_category_map (overlay de los
 accounts existentes). Gestión gráfica que reemplaza los ~200 accounts planos.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import List, Optional
 from api.supabase_client import supabase
@@ -38,7 +39,7 @@ def _normalize_allowed_cost_types(value):
     out.sort()
     return out
 
-router = APIRouter(prefix="/categories", tags=["categories"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/categories", tags=["categories"])
 
 
 class CategoryCreate(BaseModel):

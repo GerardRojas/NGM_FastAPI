@@ -5,7 +5,8 @@ across receipt_scanner, Daneel, and Andrew agents.
 """
 
 import logging
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Depends
+from api.auth import require_internal
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 
@@ -13,7 +14,7 @@ from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/ocr-metrics", tags=["ocr-metrics"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/ocr-metrics", tags=["ocr-metrics"])
 
 
 @router.get("/summary")

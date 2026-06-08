@@ -4,7 +4,8 @@ Endpoints for triggering, monitoring, and configuring Daneel's
 automatic expense authorization engine.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
@@ -16,7 +17,7 @@ from api.supabase_client import supabase
 
 logger = logging.getLogger("daneel.auto_auth")
 
-router = APIRouter(prefix="/daneel", tags=["daneel"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/daneel", tags=["daneel"])
 
 # References to background tasks to prevent garbage collection
 _running_tasks: set = set()

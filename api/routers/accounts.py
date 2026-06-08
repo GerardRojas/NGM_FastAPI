@@ -1,12 +1,13 @@
 """
 Router para gestión de Accounts (Cuentas Contables)
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/accounts", tags=["accounts"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/accounts", tags=["accounts"])
 
 
 # ========================================

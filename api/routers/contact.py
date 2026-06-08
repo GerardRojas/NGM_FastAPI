@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from api.auth import get_current_user
+from api.auth import get_current_user, require_internal
 from api.supabase_client import supabase
 
 router = APIRouter(prefix="/contact", tags=["contact"])
@@ -91,7 +91,7 @@ async def submit_contact_message(req: ContactMessageRequest):
 async def list_contact_messages(
     q: Optional[str] = Query(default=None, description="Search by name, email or message"),
     status: Optional[str] = Query(default=None, description="Filter by lifecycle status"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ) -> List[Dict[str, Any]]:
     """
     List contact messages for the internal Contact inbox.
@@ -119,7 +119,7 @@ async def list_contact_messages(
 async def update_contact_message(
     message_id: str,
     payload: ContactUpdate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ):
     """
     Update a contact message's status and/or internal notes (partial update).
@@ -157,7 +157,7 @@ async def update_contact_message(
 @router.delete("/{message_id}")
 async def delete_contact_message(
     message_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ):
     """
     Delete a contact message from the inbox.

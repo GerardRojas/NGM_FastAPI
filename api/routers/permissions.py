@@ -1,7 +1,8 @@
 """
 Router para gestión de permisos basados en roles
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal, require_leadership
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 import logging
@@ -9,7 +10,7 @@ import logging
 from api.supabase_client import supabase
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/permissions", tags=["permissions"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/permissions", tags=["permissions"])
 
 
 def _build_user_menu(rol_id):
@@ -277,7 +278,7 @@ class BatchPermissionUpdate(BaseModel):
 # Batch Update Endpoint
 # ========================================
 
-@router.post("/batch-update")
+@router.post("/batch-update", dependencies=[Depends(require_leadership)])
 async def batch_update_permissions(data: BatchPermissionUpdate):
     """
     Actualiza múltiples permisos en batch.
@@ -552,7 +553,7 @@ async def get_expense_authorizers():
         raise HTTPException(status_code=500, detail=f"Error fetching expense authorizers: {str(e)}")
 
 
-@router.put("/expense-authorizers")
+@router.put("/expense-authorizers", dependencies=[Depends(require_leadership)])
 async def set_expense_authorizers(payload: ExpenseAuthorizersPayload):
     """
     Set can_authorize on the 'expenses' permission row for the given roles.

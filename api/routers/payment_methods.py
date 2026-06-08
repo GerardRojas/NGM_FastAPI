@@ -2,12 +2,13 @@
 Router para gestión de Payment Methods (Métodos de Pago)
 NOTA: La tabla en Supabase se llama "paymet_methods" (con typo)
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/payment-methods", tags=["payment_methods"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/payment-methods", tags=["payment_methods"])
 
 
 # ========================================

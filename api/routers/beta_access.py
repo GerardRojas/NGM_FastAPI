@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from api.auth import get_current_user
+from api.auth import get_current_user, require_internal
 from api.supabase_client import supabase
 
 router = APIRouter(prefix="/beta", tags=["beta"])
@@ -101,7 +101,7 @@ async def request_beta_access(req: BetaAccessRequest):
 async def list_beta_requests(
     q: Optional[str] = Query(default=None, description="Search by name, email or company"),
     status: Optional[str] = Query(default=None, description="Filter by lifecycle status"),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ) -> List[Dict[str, Any]]:
     """
     List beta access requests (leads) for the internal Leads Management page.
@@ -129,7 +129,7 @@ async def list_beta_requests(
 async def update_beta_request(
     lead_id: str,
     payload: LeadUpdate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ):
     """
     Update a lead's status and/or internal notes (partial update).
@@ -167,7 +167,7 @@ async def update_beta_request(
 @router.delete("/requests/{lead_id}")
 async def delete_beta_request(
     lead_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_internal),
 ):
     """
     Delete a lead from the beta access requests list.

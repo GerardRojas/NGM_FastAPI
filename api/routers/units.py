@@ -1,12 +1,13 @@
 """
 Router para gestion de Units (Unidades de medida)
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/units", tags=["units"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/units", tags=["units"])
 
 
 # ========================================

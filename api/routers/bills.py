@@ -2,7 +2,8 @@
 Router para gestión de Bills (Facturas/Recibos)
 Tabla: bills
 """
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Depends
+from api.auth import require_internal
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -12,7 +13,7 @@ from api.services.receipt_vault_sync import (
     backfill_bill_receipts_to_vault,
 )
 
-router = APIRouter(prefix="/bills", tags=["bills"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/bills", tags=["bills"])
 
 _PAGE_SIZE = 1000
 

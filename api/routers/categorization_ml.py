@@ -7,7 +7,8 @@ Endpoints for managing the TF-IDF + k-NN expense categorization model.
 """
 
 import logging
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal
 from typing import Optional
 
 from api.supabase_client import supabase
@@ -15,7 +16,7 @@ from api.services.categorization_ml import get_ml_service
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/categorization-ml", tags=["categorization-ml"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/categorization-ml", tags=["categorization-ml"])
 
 
 @router.post("/train")

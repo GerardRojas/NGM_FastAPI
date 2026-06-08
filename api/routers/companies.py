@@ -1,12 +1,13 @@
 """
 Router para gestion de Companies (Empresas)
 """
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from api.auth import require_internal, require_leadership
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from api.supabase_client import supabase
 
-router = APIRouter(prefix="/companies", tags=["companies"])
+router = APIRouter(dependencies=[Depends(require_internal)], prefix="/companies", tags=["companies"])
 
 
 # ========================================
@@ -72,7 +73,7 @@ async def get_company(company_id: str):
         raise HTTPException(status_code=500, detail=f"Error fetching company: {str(e)}")
 
 
-@router.post("")
+@router.post("", dependencies=[Depends(require_leadership)])
 async def create_company(company: CompanyCreate):
     """
     Crea una nueva company.
@@ -112,7 +113,7 @@ async def create_company(company: CompanyCreate):
         raise HTTPException(status_code=500, detail=f"Error creating company: {str(e)}")
 
 
-@router.patch("/{company_id}")
+@router.patch("/{company_id}", dependencies=[Depends(require_leadership)])
 async def update_company(company_id: str, company: CompanyUpdate):
     """
     Actualiza una company existente (actualizacion parcial).
@@ -145,7 +146,7 @@ async def update_company(company_id: str, company: CompanyUpdate):
         raise HTTPException(status_code=500, detail=f"Error updating company: {str(e)}")
 
 
-@router.delete("/{company_id}")
+@router.delete("/{company_id}", dependencies=[Depends(require_leadership)])
 async def delete_company(company_id: str):
     """
     Elimina una company.
