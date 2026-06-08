@@ -11,15 +11,9 @@ multiple instances, point `storage_uri` at a shared Redis so buckets are global.
 """
 
 from slowapi import Limiter
-from slowapi.util import get_remote_address
+
+from api.security_log import client_ip
 
 
-def client_ip(request) -> str:
-    """First hop in X-Forwarded-For (the originating client), else the peer IP."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return get_remote_address(request)
-
-
+# Key buckets by the real client IP (Cloudflare-aware; see security_log.client_ip)
 limiter = Limiter(key_func=client_ip)
