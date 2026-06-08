@@ -52,6 +52,9 @@ from api.routers.bills import router as bills_router
 from api.auth import router as auth_router, require_leadership, demo_account_from_request
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from api.rate_limit import limiter
 
 # ========= ART: Chat Bot ==========
 from api.routers.arturito import router as art_router
@@ -163,6 +166,15 @@ from api.routers.contact import router as contact_router
 # ========================================
 # redirect_slashes=False evita redirects HTTP que causan Mixed Content errors
 app = FastAPI(title="NGM HUB API", redirect_slashes=False)
+
+
+# ========================================
+# Rate limiting (slowapi) — protects abuse-prone public endpoints (login brute
+# force, public form spam). Limits are declared per-endpoint via @limiter.limit;
+# here we wire the shared limiter and the 429 handler onto the app.
+# ========================================
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ========================================

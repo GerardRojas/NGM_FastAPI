@@ -14,7 +14,8 @@ require a valid session.
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from api.rate_limit import limiter
 from pydantic import BaseModel
 
 from api.auth import get_current_user, require_internal
@@ -53,7 +54,8 @@ def _clean(value: Optional[str]) -> Optional[str]:
 # ── POST /contact ─────────────────────────────────────────────
 
 @router.post("")
-async def submit_contact_message(req: ContactMessageRequest):
+@limiter.limit("5/minute;30/hour")
+async def submit_contact_message(request: Request, req: ContactMessageRequest):
     """
     Submit a contact message from the landing page.
     Public endpoint — no auth required.
