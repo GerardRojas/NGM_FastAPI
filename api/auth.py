@@ -12,6 +12,7 @@ import jwt
 from utils.auth import hash_password, verify_password
 from api.supabase_client import supabase
 from api.rate_limit import limiter
+from api.security_log import logger as security_logger, client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,7 @@ def create_user(payload: CreateUserRequest, current_user: dict = Depends(require
 @router.post("/login")
 @limiter.limit("10/minute")
 def login(request: Request, payload: LoginRequest):
+    ip = client_ip(request)
     # 1) Buscar usuario + rol embebido (1 sola query en vez de 2)
     try:
         result = (
@@ -228,6 +230,7 @@ def login(request: Request, payload: LoginRequest):
             .execute()
         )
     except APIError:
+        security_logger.warning("login_failed user=%r ip=%s reason=user_not_found", payload.username, ip)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     except Exception as e:
         logger.error("Error en /auth/login query: %r", e)
@@ -235,6 +238,7 @@ def login(request: Request, payload: LoginRequest):
 
     user = result.data
     if not user:
+        security_logger.warning("login_failed user=%r ip=%s reason=user_not_found", payload.username, ip)
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     hashed = user.get("password_hash")
@@ -254,6 +258,7 @@ def login(request: Request, payload: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     if not ok:
+        security_logger.warning("login_failed user=%r ip=%s reason=bad_password", payload.username, ip)
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     # 3) Extraer rol del join embebido (sin segunda query)
@@ -271,6 +276,8 @@ def login(request: Request, payload: LoginRequest):
         account_type=user.get("account_type") or "internal",
         client_id=user.get("client_id"),
     )
+
+    security_logger.info("login_ok user=%r ip=%s role=%s", user.get("user_name"), ip, role_name)
 
     # 5) Respuesta OK
     seniority_name = None

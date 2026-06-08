@@ -55,6 +55,7 @@ from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from api.rate_limit import limiter
+from api.security_log import logger as security_logger, client_ip
 
 # ========= ART: Chat Bot ==========
 from api.routers.arturito import router as art_router
@@ -195,6 +196,27 @@ async def _block_demo_writes(request, call_next):
 
 
 app.add_middleware(BaseHTTPMiddleware, dispatch=_block_demo_writes)
+
+
+# ========================================
+# Security event logging: centrally record auth-relevant rejections (invalid/
+# expired tokens -> 401, permission denials & demo write-blocks -> 403, rate-limit
+# hits -> 429) with method, path and real client IP. Registered after the demo
+# block (so its 403s are seen) and before CORS (so CORS stays outermost).
+# ========================================
+async def _log_auth_failures(request, call_next):
+    response = await call_next(request)
+    status = response.status_code
+    if status in (401, 403, 429):
+        msg = "auth_block status=%s method=%s path=%s ip=%s" % (
+            status, request.method, request.url.path, client_ip(request),
+        )
+        # 401s are noisy (normal expired sessions) -> info; 403/429 are signal -> warning
+        security_logger.info(msg) if status == 401 else security_logger.warning(msg)
+    return response
+
+
+app.add_middleware(BaseHTTPMiddleware, dispatch=_log_auth_failures)
 
 
 # ========================================
