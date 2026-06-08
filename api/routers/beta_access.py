@@ -5,6 +5,7 @@ plus authenticated admin endpoints powering the internal Leads Management page.
 Stores beta access requests in Supabase (table: beta_access_requests).
 The landing POST is public; the /requests admin endpoints require a session.
 """
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,8 @@ from api.auth import get_current_user, require_internal
 from api.supabase_client import supabase
 
 router = APIRouter(prefix="/beta", tags=["beta"])
+
+logger = logging.getLogger("beta_access")
 
 # Lifecycle states an internal user can move a lead through.
 LEAD_STATUSES = {"pending", "contacted", "qualified", "converted", "rejected"}
@@ -51,6 +54,37 @@ def _clean(value: Optional[str]) -> Optional[str]:
         return None
     value = value.strip()
     return value or None
+
+
+def _build_linked_lead(beta_id: Any, row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a Leads-inbox row mirroring a demo/beta request so coordination can
+    follow up. Linked back to the request via linked_request_id; the synthesized
+    message carries the request context the Leads table has no columns for.
+    """
+    bits = []
+    for label, key in (
+        ("Company", "company"), ("Role", "role"), ("Industry", "industry"),
+        ("Team size", "team_size"), ("Active proj", "active_projects"),
+        ("Plan", "plan_interest"), ("Billing", "billing_period"),
+    ):
+        val = row.get(key)
+        if val:
+            bits.append(f"{label}: {val}")
+    message = "Demo/beta access request."
+    if bits:
+        message += " " + " / ".join(bits)
+    if row.get("message"):
+        message += "\n\nMessage: " + str(row["message"])
+    return {
+        "name": row.get("name"),
+        "email": row.get("email"),
+        "message": message,
+        "source": "demo-request",
+        "lang": row.get("lang"),
+        "status": "new",
+        "linked_request_id": beta_id,
+    }
 
 
 # ── POST /beta/request-access ──────────────────────────────────
@@ -93,7 +127,16 @@ async def request_beta_access(request: Request, req: BetaAccessRequest):
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to save request")
 
-    return {"success": True, "id": result.data[0].get("id")}
+    beta_id = result.data[0].get("id")
+
+    # Mirror the request into the Leads inbox (coordination side), linked back to
+    # the request. Best-effort: never fail the public submission if this errors.
+    try:
+        supabase.table("contact_messages").insert(_build_linked_lead(beta_id, row)).execute()
+    except Exception as e:
+        logger.warning("Could not create linked lead for beta request %s: %r", beta_id, e)
+
+    return {"success": True, "id": beta_id}
 
 
 # ── Admin (internal portal) — Leads Management ─────────────────
