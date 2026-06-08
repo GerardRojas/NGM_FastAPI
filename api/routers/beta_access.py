@@ -8,7 +8,8 @@ The landing POST is public; the /requests admin endpoints require a session.
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from api.rate_limit import limiter
 from pydantic import BaseModel
 
 from api.auth import get_current_user, require_internal
@@ -55,7 +56,8 @@ def _clean(value: Optional[str]) -> Optional[str]:
 # ── POST /beta/request-access ──────────────────────────────────
 
 @router.post("/request-access")
-async def request_beta_access(req: BetaAccessRequest):
+@limiter.limit("5/minute;30/hour")
+async def request_beta_access(request: Request, req: BetaAccessRequest):
     """
     Submit a beta access request from the landing page.
     Public endpoint — no auth required.

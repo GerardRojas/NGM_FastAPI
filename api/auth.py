@@ -2,7 +2,7 @@
 
 import os
 import logging
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from postgrest.exceptions import APIError
@@ -11,6 +11,7 @@ import jwt
 
 from utils.auth import hash_password, verify_password
 from api.supabase_client import supabase
+from api.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +216,8 @@ def create_user(payload: CreateUserRequest, current_user: dict = Depends(require
 # ====== ENDPOINT: Login ======
 
 @router.post("/login")
-def login(payload: LoginRequest):
+@limiter.limit("10/minute")
+def login(request: Request, payload: LoginRequest):
     # 1) Buscar usuario + rol embebido (1 sola query en vez de 2)
     try:
         result = (
