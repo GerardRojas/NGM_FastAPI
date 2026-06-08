@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
+from dataclasses import dataclass, field
 import logging
 import traceback
 
@@ -1093,23 +1094,196 @@ def _resolve_pending_expense_managers(settings: Dict[str, Any]) -> List[str]:
     return _resolve_expense_managers_by_name()
 
 
-def trigger_pending_expenses_automation() -> None:
-    """Background-task entrypoint, called after expense create/edit.
+# =============================================================================
+# DUTY ENGINE -- generic runner for "connected" system duties
+# -----------------------------------------------------------------------------
+# A system duty turns some source condition into one idempotent task per project,
+# assigned to the role/user configured in automation_settings, surfaced in the
+# Responsibilities catalog and each owner's "My Work". Everything that is the same
+# across duties (settings lookup, assignee resolution, department fallback,
+# idempotent upsert keyed by automation_type+project, obsolete cleanup) lives here
+# ONCE. A new duty only provides a collect(ctx) returning the per-project task
+# content, plus a DutySpec registered in DUTY_REGISTRY. Step-by-step playbook:
+# docs/duties_playbook.md.
+# =============================================================================
 
-    Runs the pending-expenses automation only when it is enabled in settings.
-    Idempotent (upserts one task per project, clears tasks for projects with no
-    remaining pending expenses) and never raises -- safe to fire-and-forget.
+@dataclass
+class DutyTask:
+    """Per-project task content produced by a duty's collect()."""
+    description: str
+    notes: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DutyContext:
+    """Inputs a duty's collect() may need beyond its own source query."""
+    settings: Dict[str, Any]
+    existing_tasks: Dict[Any, Dict[str, Any]]   # project_id -> existing automated task row
+
+
+@dataclass
+class DutySpec:
+    """Declarative definition of a connected duty. The only per-duty code is collect()."""
+    automation_type: str
+    # Resolve manager user_ids from settings (role -> every member). When set, the
+    # task carries managers_ids[] (one shared task) and is refreshed on update.
+    # When None, the task uses a single `manager` = default_manager_id (legacy mode).
+    resolve_managers: Optional[Callable[[Dict[str, Any]], List[str]]] = None
+    # Name fragment to resolve a fallback department when settings has none.
+    department_hint: Optional[str] = None
+    # Delete automated tasks for projects no longer produced by collect().
+    cleanup_obsolete: bool = True
+    # Source condition -> {project_id: DutyTask}. The heart of each duty.
+    collect: Optional[Callable[["DutyContext"], Dict[Any, DutyTask]]] = None
+
+
+def _resolve_not_started_status_id() -> Optional[str]:
+    resp = supabase.table("tasks_status").select("task_status_id").ilike(
+        "task_status", "not started"
+    ).execute()
+    return resp.data[0]["task_status_id"] if resp.data else None
+
+
+def _resolve_duty_department(settings: Dict[str, Any], hint: Optional[str]) -> Optional[str]:
+    """Configured department wins; otherwise fall back to a name match on `hint`."""
+    dept = settings.get("default_department_id")
+    if dept:
+        return dept
+    if hint:
+        resp = supabase.table("task_departments").select("department_id").ilike(
+            "department_name", f"%{hint}%"
+        ).execute()
+        if resp.data:
+            return resp.data[0]["department_id"]
+    return None
+
+
+def run_duty(spec: DutySpec) -> tuple:
+    """Generic duty runner. Returns (tasks_created, tasks_updated).
+
+    Does NOT check is_enabled (matches the legacy runners; the enabled gate lives
+    in trigger_duty and in the scheduler's selection of which duties to run).
+    Raises on hard errors so /automations/run can report them.
     """
+    atype = spec.automation_type
+    logger.info("[AUTOMATIONS] Running %s...", atype)
+
+    settings_resp = supabase.table("automation_settings").select("*").eq(
+        "automation_type", atype
+    ).execute()
+    settings = settings_resp.data[0] if settings_resp.data else {}
+
+    existing_resp = supabase.table("tasks").select(
+        "task_id, project_id, created_at"
+    ).eq("automation_type", atype).eq("is_automated", True).execute()
+    existing_tasks = {t["project_id"]: t for t in (existing_resp.data or [])}
+
+    ctx = DutyContext(settings=settings, existing_tasks=existing_tasks)
+    tasks_by_project = spec.collect(ctx) or {}
+
+    # Legacy safety: an empty result never deletes existing tasks (guards against a
+    # transient empty read wiping the whole cluster).
+    if not tasks_by_project:
+        return (0, 0)
+
+    multi = spec.resolve_managers is not None
+    default_owner_id = settings.get("default_owner_id")
+    if multi:
+        base_manager_ids = spec.resolve_managers(settings)
+        if not base_manager_ids:
+            logger.warning("[AUTOMATIONS] %s: no managers resolved", atype)
+    else:
+        mid = settings.get("default_manager_id")
+        base_manager_ids = [mid] if mid else []
+
+    department_id = _resolve_duty_department(settings, spec.department_hint)
+    not_started_status_id = _resolve_not_started_status_id()
+
+    created = 0
+    updated = 0
+
+    for project_id, dtask in tasks_by_project.items():
+        override_resp = supabase.table("automation_owner_overrides").select(
+            "owner_id, manager_id"
+        ).eq("automation_type", atype).eq("project_id", project_id).execute()
+
+        owner_id = default_owner_id
+        manager_ids = list(base_manager_ids)
+        if override_resp.data:
+            override = override_resp.data[0]
+            owner_id = override.get("owner_id") or default_owner_id
+            # A project-level manager override pins the task to that single user.
+            if override.get("manager_id"):
+                manager_ids = [override["manager_id"]]
+
+        legacy_manager = manager_ids[0] if manager_ids else None
+
+        if project_id in existing_tasks:
+            update_data: Dict[str, Any] = {
+                "task_description": dtask.description,
+                "task_notes": dtask.notes,
+                "automation_metadata": dtask.metadata,
+            }
+            # Only role-managed duties refresh assignees on update (role membership
+            # or config may have changed); single-manager duties leave it pinned.
+            if multi:
+                update_data["managers_ids"] = manager_ids
+                update_data["manager"] = legacy_manager
+            supabase.table("tasks").update(update_data).eq(
+                "task_id", existing_tasks[project_id]["task_id"]
+            ).execute()
+            updated += 1
+        else:
+            new_task: Dict[str, Any] = {
+                "task_description": dtask.description,
+                "task_notes": dtask.notes,
+                "project_id": project_id,
+                "Owner_id": owner_id,
+                "task_status": not_started_status_id,
+                "task_department": department_id,
+                "manager": legacy_manager,
+                "automation_type": atype,
+                "is_automated": True,
+                "automation_metadata": dtask.metadata,
+            }
+            if multi:
+                new_task["managers_ids"] = manager_ids
+            supabase.table("tasks").insert(new_task).execute()
+            created += 1
+
+    if spec.cleanup_obsolete:
+        for project_id, task in existing_tasks.items():
+            if project_id not in tasks_by_project:
+                supabase.table("tasks").delete().eq("task_id", task["task_id"]).execute()
+                logger.info("[AUTOMATIONS] %s: removed obsolete task for project %s", atype, project_id)
+
+    logger.info("[AUTOMATIONS] %s done: %s created, %s updated", atype, created, updated)
+    return (created, updated)
+
+
+def trigger_duty(automation_type: str) -> None:
+    """Fire-and-forget entrypoint for an event-driven duty. Runs only when the duty
+    is enabled in automation_settings. Never raises -- safe inside any write path."""
     try:
-        settings_response = supabase.table("automation_settings").select(
-            "is_enabled"
-        ).eq("automation_type", "pending_expenses_auth").execute()
-        enabled = bool(settings_response.data and settings_response.data[0].get("is_enabled"))
-        if not enabled:
+        spec = DUTY_REGISTRY.get(automation_type)
+        if not spec:
+            logger.warning("[AUTOMATIONS] trigger_duty: unknown duty %s", automation_type)
             return
-        _run_pending_expenses_automation()
-    except Exception as e:  # never block the expense write path
-        logger.error("[AUTOMATIONS] trigger_pending_expenses_automation failed: %s", repr(e))
+        enabled_resp = supabase.table("automation_settings").select("is_enabled").eq(
+            "automation_type", automation_type
+        ).execute()
+        if not (enabled_resp.data and enabled_resp.data[0].get("is_enabled")):
+            return
+        run_duty(spec)
+    except Exception as e:  # never block the calling write path
+        logger.error("[AUTOMATIONS] trigger_duty(%s) failed: %s", automation_type, repr(e))
+
+
+def trigger_pending_expenses_automation() -> None:
+    """Back-compat wrapper: the expense write paths call this by name. Delegates to
+    the generic duty trigger for pending_expenses_auth."""
+    trigger_duty("pending_expenses_auth")
 
 
 @router.post("/automations/run")
@@ -1130,16 +1304,8 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
 
     try:
         for automation_id in payload.automations:
-            if automation_id == "pending_expenses_auth":
-                created, updated = _run_pending_expenses_automation()
-                tasks_created += created
-                tasks_updated += updated
-            elif automation_id == "pending_expenses_categorize":
-                created, updated = _run_pending_expenses_categorize_automation()
-                tasks_created += created
-                tasks_updated += updated
-            elif automation_id == "pending_health_check":
-                created, updated = _run_pending_health_check_automation()
+            if automation_id in DUTY_REGISTRY:
+                created, updated = run_duty(DUTY_REGISTRY[automation_id])
                 tasks_created += created
                 tasks_updated += updated
             elif automation_id == "manual_responsibilities":
@@ -1149,9 +1315,6 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
             elif automation_id == "pending_invoices":
                 # TODO: Implementar logica para facturas pendientes
                 logger.info(f"[AUTOMATIONS] pending_invoices: Not implemented yet")
-            elif automation_id == "overdue_tasks":
-                # TODO: Implementar logica para tareas vencidas
-                logger.info(f"[AUTOMATIONS] overdue_tasks: Not implemented yet")
             else:
                 errors.append(f"Unknown automation: {automation_id}")
 
@@ -1211,192 +1374,43 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
 # @step_type: notification
 # @step_description: Task appears in manager's workflow for review
 # =============================================================================
-def _run_pending_expenses_automation() -> tuple:
-    """
-    Automation: Pending Expenses Authorization
+def _collect_pending_expenses_auth(ctx: DutyContext) -> Dict[Any, DutyTask]:
+    """One task per project with expenses pending authorization (auth_status
+    null/false). Role-managed (Accounting Manager) via DutySpec.resolve_managers."""
+    expenses = supabase.table("expenses_manual_COGS").select(
+        "expense_id, project, Amount"
+    ).or_("auth_status.is.null,auth_status.eq.false").execute().data or []
+    logger.info("[AUTOMATIONS] Found %s pending expenses", len(expenses))
+    if not expenses:
+        return {}
 
-    Crea una tarea por cada proyecto que tenga gastos pendientes de autorizacion.
-    Si ya existe una tarea automatizada para ese proyecto, la actualiza.
+    by_project: Dict[str, Dict] = {}
+    for exp in expenses:
+        project_id = exp.get("project")
+        if not project_id:
+            continue
+        bucket = by_project.setdefault(project_id, {"count": 0, "total": 0})
+        bucket["count"] += 1
+        bucket["total"] += float(exp.get("Amount") or 0)
 
-    La tarea se crea con:
-    - task_department: Bookkeeping (para que aparezca en el flujo de autorizacion)
-    - manager: Usuario con rol Accounting Manager o CEO/COO (quien autoriza)
-    - Owner_id: NULL (coordinacion lo asigna despues)
-    - task_status: Not Started
+    if not by_project:
+        return {}
 
-    Returns:
-        tuple: (tasks_created, tasks_updated)
-    """
-    logger.info("[AUTOMATIONS] Running pending_expenses_auth...")
+    projects_response = supabase.table("projects").select(
+        "project_id, project_name"
+    ).in_("project_id", list(by_project.keys())).execute()
+    projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
 
-    tasks_created = 0
-    tasks_updated = 0
-    automation_type = "pending_expenses_auth"
-
-    try:
-        # 1. Obtener gastos pendientes de autorizacion agrupados por proyecto
-        expenses_response = supabase.table("expenses_manual_COGS").select(
-            "expense_id, project, Amount"
-        ).or_("auth_status.is.null,auth_status.eq.false").execute()
-
-        expenses = expenses_response.data or []
-        logger.info(f"[AUTOMATIONS] Found {len(expenses)} pending expenses")
-
-        if not expenses:
-            return (0, 0)
-
-        # Agrupar por proyecto
-        by_project: Dict[str, Dict] = {}
-        for exp in expenses:
-            project_id = exp.get("project")
-            if not project_id:
-                continue
-
-            if project_id not in by_project:
-                by_project[project_id] = {"count": 0, "total": 0}
-
-            by_project[project_id]["count"] += 1
-            by_project[project_id]["total"] += float(exp.get("Amount") or 0)
-
-        logger.info(f"[AUTOMATIONS] Projects with pending expenses: {len(by_project)}")
-
-        if not by_project:
-            return (0, 0)
-
-        # 2. Obtener nombres de proyectos
-        project_ids = list(by_project.keys())
-        projects_response = supabase.table("projects").select(
-            "project_id, project_name, project_manager"
-        ).in_("project_id", project_ids).execute()
-
-        projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
-
-        # 3. Obtener el status_id de "not started"
-        status_response = supabase.table("tasks_status").select(
-            "task_status_id"
-        ).ilike("task_status", "not started").execute()
-
-        not_started_status_id = None
-        if status_response.data:
-            not_started_status_id = status_response.data[0]["task_status_id"]
-
-        # 4. Obtener el department_id de "bookkeeping"
-        bookkeeping_dept_id = None
-        dept_response = supabase.table("task_departments").select(
-            "department_id"
-        ).ilike("department_name", "%bookkeeping%").execute()
-
-        if dept_response.data:
-            bookkeeping_dept_id = dept_response.data[0]["department_id"]
-            logger.info(f"[AUTOMATIONS] Found bookkeeping department: {bookkeeping_dept_id}")
-        else:
-            logger.warning("[AUTOMATIONS] WARNING: Bookkeeping department not found")
-
-        # 5. Obtener configuracion de la automatizacion
-        settings_response = supabase.table("automation_settings").select(
-            "*"
-        ).eq("automation_type", automation_type).execute()
-
-        settings = settings_response.data[0] if settings_response.data else {}
-        default_owner_id = settings.get("default_owner_id")
-        settings_department_id = settings.get("default_department_id") or bookkeeping_dept_id
-
-        # 6. Resolver quien es responsable -> lista de manager user_ids.
-        # responsible_type='role' -> todos los usuarios del rol (una tarea por
-        # proyecto, todos como managers). responsible_type='user' -> ese usuario.
-        # Sin configurar -> fallback por nombre (Accounting Manager -> CEO/COO).
-        responsible_manager_ids = _resolve_pending_expense_managers(settings)
-        if not responsible_manager_ids:
-            logger.warning("[AUTOMATIONS] WARNING: No manager resolved for expense authorization")
-
-        # 7. Buscar tareas automatizadas existentes para estos proyectos
-        existing_tasks_response = supabase.table("tasks").select(
-            "task_id, project_id, task_notes"
-        ).eq("automation_type", automation_type).eq("is_automated", True).execute()
-
-        existing_tasks_map = {
-            t["project_id"]: t for t in (existing_tasks_response.data or [])
-        }
-
-        # 8. Crear o actualizar tareas
-        for project_id, data in by_project.items():
-            project_info = projects_map.get(project_id, {})
-            project_name = project_info.get("project_name", "Unknown Project")
-
-            count = data["count"]
-            total = data["total"]
-
-            task_description = f"Gastos pendientes por autorizar en {project_name}"
-            task_notes = f"{AUTOMATION_MARKER}:pending_expenses_auth | {count} gastos | ${total:,.2f} total"
-
-            # Verificar si hay override para este proyecto
-            override_response = supabase.table("automation_owner_overrides").select(
-                "owner_id, manager_id"
-            ).eq("automation_type", automation_type).eq("project_id", project_id).execute()
-
-            owner_id = default_owner_id
-            manager_ids = list(responsible_manager_ids)
-            if override_response.data:
-                override = override_response.data[0]
-                owner_id = override.get("owner_id") or default_owner_id
-                # A project-level manager override pins the task to that single user.
-                if override.get("manager_id"):
-                    manager_ids = [override["manager_id"]]
-
-            # Legacy single-manager column keeps the first responsible user so old
-            # views still work; managers_ids[] is what my-tasks queries match on.
-            legacy_manager = manager_ids[0] if manager_ids else None
-
-            if project_id in existing_tasks_map:
-                # Actualizar tarea existente (refresca conteo + responsables por si
-                # cambio la membresia del rol o la config).
-                existing_task = existing_tasks_map[project_id]
-                supabase.table("tasks").update({
-                    "task_description": task_description,
-                    "task_notes": task_notes,
-                    "managers_ids": manager_ids,
-                    "manager": legacy_manager,
-                    "automation_metadata": {"count": count, "total": total},
-                }).eq("task_id", existing_task["task_id"]).execute()
-
-                tasks_updated += 1
-                logger.info(f"[AUTOMATIONS] Updated task for project: {project_name}")
-            else:
-                # Crear nueva tarea
-                new_task_data = {
-                    "task_description": task_description,
-                    "task_notes": task_notes,
-                    "project_id": project_id,
-                    "Owner_id": owner_id,  # Puede ser None si no hay default
-                    "task_status": not_started_status_id,
-                    "task_department": settings_department_id,
-                    "managers_ids": manager_ids,
-                    "manager": legacy_manager,
-                    "automation_type": automation_type,
-                    "is_automated": True,
-                    "automation_metadata": {"count": count, "total": total},
-                }
-
-                supabase.table("tasks").insert(new_task_data).execute()
-                tasks_created += 1
-                logger.info(f"[AUTOMATIONS] Created task for project: {project_name}")
-
-        # 6. Opcional: Limpiar tareas automatizadas de proyectos que ya no tienen gastos pendientes
-        # (esto evita que queden tareas obsoletas)
-        for existing_project_id, existing_task in existing_tasks_map.items():
-            if existing_project_id not in by_project:
-                # El proyecto ya no tiene gastos pendientes, eliminar la tarea
-                supabase.table("tasks").delete().eq(
-                    "task_id", existing_task["task_id"]
-                ).execute()
-                logger.info(f"[AUTOMATIONS] Removed obsolete task for project: {existing_project_id}")
-
-        return (tasks_created, tasks_updated)
-
-    except Exception as e:
-        logger.error(f"[AUTOMATIONS] ERROR in pending_expenses_auth: {repr(e)}")
-        logger.debug(traceback.format_exc())
-        raise
+    out: Dict[Any, DutyTask] = {}
+    for project_id, data in by_project.items():
+        project_name = projects_map.get(project_id, {}).get("project_name", "Unknown Project")
+        count, total = data["count"], data["total"]
+        out[project_id] = DutyTask(
+            description=f"Gastos pendientes por autorizar en {project_name}",
+            notes=f"{AUTOMATION_MARKER}:pending_expenses_auth | {count} gastos | ${total:,.2f} total",
+            metadata={"count": count, "total": total},
+        )
+    return out
 
 
 # =============================================================================
@@ -1651,152 +1665,43 @@ def _run_manual_responsibilities() -> tuple:
 # @step_type: assignment
 # @step_description: Task assigned to bookkeeper for category assignment
 # =============================================================================
-def _run_pending_expenses_categorize_automation() -> tuple:
-    """
-    Automation: Pending Expenses Categorization
+def _collect_pending_expenses_categorize(ctx: DutyContext) -> Dict[Any, DutyTask]:
+    """One task per project with uncategorized expenses (expense_category null/empty).
+    Single-manager (default_manager_id) -- no DutySpec.resolve_managers."""
+    expenses = supabase.table("expenses_manual_COGS").select(
+        "expense_id, project, Amount"
+    ).or_("expense_category.is.null,expense_category.eq.").execute().data or []
+    logger.info("[AUTOMATIONS] Found %s uncategorized expenses", len(expenses))
+    if not expenses:
+        return {}
 
-    Crea una tarea por cada proyecto que tenga gastos sin categorizar.
-    Los gastos sin categorizar son aquellos donde expense_category es NULL o vacio.
+    by_project: Dict[str, Dict] = {}
+    for exp in expenses:
+        project_id = exp.get("project")
+        if not project_id:
+            continue
+        bucket = by_project.setdefault(project_id, {"count": 0, "total": 0})
+        bucket["count"] += 1
+        bucket["total"] += float(exp.get("Amount") or 0)
 
-    Returns:
-        tuple: (tasks_created, tasks_updated)
-    """
-    logger.info("[AUTOMATIONS] Running pending_expenses_categorize...")
+    if not by_project:
+        return {}
 
-    tasks_created = 0
-    tasks_updated = 0
-    automation_type = "pending_expenses_categorize"
+    projects_response = supabase.table("projects").select(
+        "project_id, project_name"
+    ).in_("project_id", list(by_project.keys())).execute()
+    projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
 
-    try:
-        # 1. Obtener gastos sin categorizar
-        expenses_response = supabase.table("expenses_manual_COGS").select(
-            "expense_id, project, Amount, expense_description"
-        ).or_("expense_category.is.null,expense_category.eq.").execute()
-
-        expenses = expenses_response.data or []
-        logger.info(f"[AUTOMATIONS] Found {len(expenses)} uncategorized expenses")
-
-        if not expenses:
-            return (0, 0)
-
-        # Agrupar por proyecto
-        by_project: Dict[str, Dict] = {}
-        for exp in expenses:
-            project_id = exp.get("project")
-            if not project_id:
-                continue
-
-            if project_id not in by_project:
-                by_project[project_id] = {"count": 0, "total": 0}
-
-            by_project[project_id]["count"] += 1
-            by_project[project_id]["total"] += float(exp.get("Amount") or 0)
-
-        logger.info(f"[AUTOMATIONS] Projects with uncategorized expenses: {len(by_project)}")
-
-        if not by_project:
-            return (0, 0)
-
-        # 2. Obtener configuracion de la automatizacion
-        settings_response = supabase.table("automation_settings").select(
-            "*"
-        ).eq("automation_type", automation_type).execute()
-
-        settings = settings_response.data[0] if settings_response.data else {}
-        default_owner_id = settings.get("default_owner_id")
-        default_manager_id = settings.get("default_manager_id")
-        default_department_id = settings.get("default_department_id")
-
-        # 3. Obtener status "Not Started"
-        status_response = supabase.table("tasks_status").select(
-            "task_status_id"
-        ).ilike("task_status", "not started").execute()
-
-        not_started_status_id = None
-        if status_response.data:
-            not_started_status_id = status_response.data[0]["task_status_id"]
-
-        # 4. Obtener nombres de proyectos
-        project_ids = list(by_project.keys())
-        projects_response = supabase.table("projects").select(
-            "project_id, project_name"
-        ).in_("project_id", project_ids).execute()
-
-        projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
-
-        # 5. Buscar tareas automatizadas existentes
-        existing_tasks_response = supabase.table("tasks").select(
-            "task_id, project_id"
-        ).eq("automation_type", automation_type).eq("is_automated", True).execute()
-
-        existing_tasks_map = {
-            t["project_id"]: t for t in (existing_tasks_response.data or [])
-        }
-
-        # 6. Crear o actualizar tareas
-        for project_id, data in by_project.items():
-            project_info = projects_map.get(project_id, {})
-            project_name = project_info.get("project_name", "Unknown Project")
-
-            count = data["count"]
-            total = data["total"]
-
-            task_description = f"Gastos pendientes por categorizar en {project_name}"
-            task_notes = f"{AUTOMATION_MARKER}:pending_expenses_categorize | {count} gastos | ${total:,.2f} total"
-
-            # Verificar si hay override para este proyecto
-            override_response = supabase.table("automation_owner_overrides").select(
-                "owner_id, manager_id"
-            ).eq("automation_type", automation_type).eq("project_id", project_id).execute()
-
-            owner_id = default_owner_id
-            manager_id = default_manager_id
-            if override_response.data:
-                override = override_response.data[0]
-                owner_id = override.get("owner_id") or default_owner_id
-                manager_id = override.get("manager_id") or default_manager_id
-
-            if project_id in existing_tasks_map:
-                # Actualizar tarea existente
-                existing_task = existing_tasks_map[project_id]
-                supabase.table("tasks").update({
-                    "task_description": task_description,
-                    "task_notes": task_notes,
-                    "automation_metadata": {"count": count, "total": total},
-                }).eq("task_id", existing_task["task_id"]).execute()
-
-                tasks_updated += 1
-            else:
-                # Crear nueva tarea
-                new_task_data = {
-                    "task_description": task_description,
-                    "task_notes": task_notes,
-                    "project_id": project_id,
-                    "Owner_id": owner_id,
-                    "manager": manager_id,
-                    "task_department": default_department_id,
-                    "task_status": not_started_status_id,
-                    "automation_type": automation_type,
-                    "is_automated": True,
-                    "automation_metadata": {"count": count, "total": total},
-                }
-
-                supabase.table("tasks").insert(new_task_data).execute()
-                tasks_created += 1
-
-        # 7. Limpiar tareas obsoletas
-        for existing_project_id, existing_task in existing_tasks_map.items():
-            if existing_project_id not in by_project:
-                supabase.table("tasks").delete().eq(
-                    "task_id", existing_task["task_id"]
-                ).execute()
-
-        return (tasks_created, tasks_updated)
-
-    except Exception as e:
-        logger.error(f"[AUTOMATIONS] ERROR in pending_expenses_categorize: {repr(e)}")
-        logger.debug(traceback.format_exc())
-        raise
+    out: Dict[Any, DutyTask] = {}
+    for project_id, data in by_project.items():
+        project_name = projects_map.get(project_id, {}).get("project_name", "Unknown Project")
+        count, total = data["count"], data["total"]
+        out[project_id] = DutyTask(
+            description=f"Gastos pendientes por categorizar en {project_name}",
+            notes=f"{AUTOMATION_MARKER}:pending_expenses_categorize | {count} gastos | ${total:,.2f} total",
+            metadata={"count": count, "total": total},
+        )
+    return out
 
 
 # =============================================================================
@@ -1841,197 +1746,205 @@ def _run_pending_expenses_categorize_automation() -> tuple:
 # @step_type: notification
 # @step_description: Project manager notified of health check task
 # =============================================================================
-def _run_pending_health_check_automation() -> tuple:
-    """
-    Automation: Pending Health Check
+def _collect_pending_health_check(ctx: DutyContext) -> Dict[Any, DutyTask]:
+    """Health-check task per active project that is over/near budget or hasn't been
+    checked in 30 days. Single-manager; no obsolete cleanup (DutySpec). Recency is
+    derived from ctx.existing_tasks (created_at)."""
+    from datetime import datetime, timedelta
 
-    Crea tareas de health check para proyectos activos que no han tenido
-    una revision de salud reciente. Verifica:
-    - Proyectos activos sin tareas de health check en los ultimos 30 dias
-    - Proyectos con presupuesto bajo (menos del 20% restante)
-    - Proyectos con gastos excesivos
+    projects = supabase.table("projects").select(
+        "project_id, project_name, budget"
+    ).eq("is_active", True).execute().data or []
+    logger.info("[AUTOMATIONS] Found %s active projects", len(projects))
+    if not projects:
+        return {}
 
-    Returns:
-        tuple: (tasks_created, tasks_updated)
-    """
-    logger.info("[AUTOMATIONS] Running pending_health_check...")
+    project_ids = [p["project_id"] for p in projects]
+    expenses = supabase.table("expenses_manual_COGS").select(
+        "project, Amount"
+    ).in_("project", project_ids).execute().data or []
 
-    tasks_created = 0
-    tasks_updated = 0
-    automation_type = "pending_health_check"
+    expenses_by_project: Dict[str, float] = {}
+    for exp in expenses:
+        pid = exp.get("project")
+        if pid:
+            expenses_by_project[pid] = expenses_by_project.get(pid, 0) + float(exp.get("Amount") or 0)
 
-    try:
-        from datetime import datetime, timedelta
+    # Projects checked within the last 30 days are skipped (no re-check).
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    recent_health_checks = set()
+    for project_id, task in ctx.existing_tasks.items():
+        created_at = task.get("created_at")
+        if created_at:
+            try:
+                task_date = datetime.fromisoformat(created_at.replace("Z", "+00:00").replace("+00:00", ""))
+                if task_date > thirty_days_ago:
+                    recent_health_checks.add(project_id)
+            except Exception as _exc:
+                logger.debug("Suppressed: %s", _exc)
 
-        # 1. Obtener proyectos activos
-        projects_response = supabase.table("projects").select(
-            "project_id, project_name, budget, project_manager"
-        ).eq("is_active", True).execute()
+    out: Dict[Any, DutyTask] = {}
+    for project in projects:
+        project_id = project["project_id"]
+        if project_id in recent_health_checks:
+            continue
 
-        projects = projects_response.data or []
-        logger.info(f"[AUTOMATIONS] Found {len(projects)} active projects")
+        project_name = project["project_name"]
+        budget = float(project.get("budget") or 0)
+        total_spent = expenses_by_project.get(project_id, 0)
 
-        if not projects:
-            return (0, 0)
+        remaining_percent = 100
+        if budget > 0:
+            remaining_percent = ((budget - total_spent) / budget) * 100
 
-        project_ids = [p["project_id"] for p in projects]
-        projects_map = {p["project_id"]: p for p in projects}
+        reasons = []
+        if remaining_percent < 20:
+            reasons.append(f"Budget bajo ({remaining_percent:.0f}% restante)")
+        if total_spent > budget and budget > 0:
+            reasons.append(f"Sobre presupuesto (${total_spent - budget:,.2f} excedido)")
+        # Always true here (recent ones were skipped above) -- preserves legacy text.
+        reasons.append("Sin revision reciente")
 
-        # 2. Calcular gastos totales por proyecto
-        expenses_response = supabase.table("expenses_manual_COGS").select(
-            "project, Amount"
-        ).in_("project", project_ids).execute()
+        out[project_id] = DutyTask(
+            description=f"Health Check requerido para {project_name}",
+            notes=f"{AUTOMATION_MARKER}:pending_health_check | Razones: {', '.join(reasons)}",
+            metadata={
+                "reasons": reasons,
+                "remaining_percent": remaining_percent,
+                "total_spent": total_spent,
+                "budget": budget,
+            },
+        )
 
-        expenses_by_project: Dict[str, float] = {}
-        for exp in (expenses_response.data or []):
-            pid = exp.get("project")
-            if pid:
-                expenses_by_project[pid] = expenses_by_project.get(pid, 0) + float(exp.get("Amount") or 0)
+    logger.info("[AUTOMATIONS] Projects needing health check: %s", len(out))
+    return out
 
-        # 3. Obtener configuracion de la automatizacion
-        settings_response = supabase.table("automation_settings").select(
-            "*"
-        ).eq("automation_type", automation_type).execute()
 
-        settings = settings_response.data[0] if settings_response.data else {}
-        default_owner_id = settings.get("default_owner_id")
-        default_manager_id = settings.get("default_manager_id")
-        default_department_id = settings.get("default_department_id")
+# =============================================================================
+# @process: Overdue_Tasks_Alert
+# @process_name: Overdue Tasks Alert Workflow
+# @process_category: coordination
+# @process_trigger: scheduled
+# @process_description: Creates one alert task per project that has work tasks past their deadline
+# @process_owner: Project Manager
+#
+# @step: 1
+# @step_name: Query Open Tasks
+# @step_type: action
+# @step_description: Fetch non-automated tasks not in a done/completed status
+# @step_connects_to: 2
+#
+# @step: 2
+# @step_name: Filter Overdue
+# @step_type: condition
+# @step_description: Keep tasks whose deadline (or due_date) is before today
+# @step_connects_to: 3
+#
+# @step: 3
+# @step_name: Group by Project
+# @step_type: action
+# @step_description: Count overdue tasks and find the oldest deadline per project
+# @step_connects_to: 4
+#
+# @step: 4
+# @step_name: Upsert Alert Task
+# @step_type: action
+# @step_description: Create/update one alert task per project; clear it when none remain
+# =============================================================================
+def _collect_overdue_tasks(ctx: DutyContext) -> Dict[Any, DutyTask]:
+    """One alert task per project that has overdue work tasks: deadline (or
+    due_date) before today and not in a done/completed status. Automated tasks are
+    excluded so the alert never counts itself or other duty tasks. Single-manager
+    (default_manager_id)."""
+    from datetime import datetime, timezone
 
-        # 4. Obtener status "Not Started"
-        status_response = supabase.table("tasks_status").select(
-            "task_status_id"
-        ).ilike("task_status", "not started").execute()
+    # Status ids that count as finished -> excluded from "overdue".
+    statuses = supabase.table("tasks_status").select(
+        "task_status_id, task_status"
+    ).execute().data or []
+    done_status_ids = {
+        s["task_status_id"] for s in statuses
+        if any(k in (s.get("task_status") or "").lower() for k in ("done", "complete"))
+    }
 
-        not_started_status_id = None
-        if status_response.data:
-            not_started_status_id = status_response.data[0]["task_status_id"]
+    # Only non-automated tasks (boolean filter is reliable; dates/status applied
+    # below in Python because deadline/due_date may be text or timestamps).
+    tasks = supabase.table("tasks").select(
+        "task_id, project_id, deadline, due_date, task_status, is_automated"
+    ).eq("is_automated", False).execute().data or []
 
-        # 5. Verificar tareas de health check existentes
-        existing_tasks_response = supabase.table("tasks").select(
-            "task_id, project_id, created_at"
-        ).eq("automation_type", automation_type).eq("is_automated", True).execute()
+    today = datetime.now(timezone.utc).date()
+    by_project: Dict[str, Dict] = {}
+    for t in tasks:
+        if t.get("task_status") in done_status_ids:
+            continue
+        project_id = t.get("project_id")
+        if not project_id:
+            continue
+        deadline_str = t.get("deadline") or t.get("due_date")
+        if not deadline_str:
+            continue
+        try:
+            deadline_date = datetime.fromisoformat(str(deadline_str).replace("Z", "")).date()
+        except Exception:
+            continue
+        if deadline_date >= today:
+            continue
+        bucket = by_project.setdefault(project_id, {"count": 0, "oldest": deadline_date})
+        bucket["count"] += 1
+        if deadline_date < bucket["oldest"]:
+            bucket["oldest"] = deadline_date
 
-        # Mapear por proyecto y verificar si son recientes (ultimos 30 dias)
-        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-        recent_health_checks = set()
-        existing_tasks_map = {}
+    if not by_project:
+        return {}
 
-        for task in (existing_tasks_response.data or []):
-            project_id = task.get("project_id")
-            existing_tasks_map[project_id] = task
+    projects_response = supabase.table("projects").select(
+        "project_id, project_name"
+    ).in_("project_id", list(by_project.keys())).execute()
+    projects_map = {p["project_id"]: p for p in (projects_response.data or [])}
 
-            created_at = task.get("created_at")
-            if created_at:
-                try:
-                    task_date = datetime.fromisoformat(created_at.replace("Z", "+00:00").replace("+00:00", ""))
-                    if task_date > thirty_days_ago:
-                        recent_health_checks.add(project_id)
-                except Exception as _exc:
-                    logger.debug("Suppressed: %s", _exc)
+    out: Dict[Any, DutyTask] = {}
+    for project_id, data in by_project.items():
+        project_name = projects_map.get(project_id, {}).get("project_name", "Unknown Project")
+        count = data["count"]
+        oldest = data["oldest"].isoformat()
+        days_overdue = (today - data["oldest"]).days
+        out[project_id] = DutyTask(
+            description=f"Tareas vencidas en {project_name}",
+            notes=f"{AUTOMATION_MARKER}:overdue_tasks | {count} vencidas | mas antigua {oldest} ({days_overdue}d)",
+            metadata={"count": count, "oldest_deadline": oldest, "days_overdue": days_overdue},
+        )
+    return out
 
-        # 6. Determinar proyectos que necesitan health check
-        projects_needing_check: Dict[str, Dict] = {}
 
-        for project in projects:
-            project_id = project["project_id"]
-            project_name = project["project_name"]
-            budget = float(project.get("budget") or 0)
-            total_spent = expenses_by_project.get(project_id, 0)
-
-            # Saltar si ya tiene health check reciente
-            if project_id in recent_health_checks:
-                continue
-
-            # Calcular porcentaje de presupuesto restante
-            remaining_percent = 100
-            if budget > 0:
-                remaining_percent = ((budget - total_spent) / budget) * 100
-
-            # Determinar razon del health check
-            reasons = []
-            if remaining_percent < 20:
-                reasons.append(f"Budget bajo ({remaining_percent:.0f}% restante)")
-            if total_spent > budget and budget > 0:
-                reasons.append(f"Sobre presupuesto (${total_spent - budget:,.2f} excedido)")
-            if project_id not in recent_health_checks:
-                reasons.append("Sin revision reciente")
-
-            if reasons:
-                projects_needing_check[project_id] = {
-                    "project_name": project_name,
-                    "reasons": reasons,
-                    "remaining_percent": remaining_percent,
-                    "total_spent": total_spent,
-                    "budget": budget,
-                }
-
-        logger.info(f"[AUTOMATIONS] Projects needing health check: {len(projects_needing_check)}")
-
-        # 7. Crear o actualizar tareas
-        for project_id, data in projects_needing_check.items():
-            project_name = data["project_name"]
-            reasons = data["reasons"]
-
-            task_description = f"Health Check requerido para {project_name}"
-            task_notes = f"{AUTOMATION_MARKER}:pending_health_check | Razones: {', '.join(reasons)}"
-
-            # Verificar override
-            override_response = supabase.table("automation_owner_overrides").select(
-                "owner_id, manager_id"
-            ).eq("automation_type", automation_type).eq("project_id", project_id).execute()
-
-            owner_id = default_owner_id
-            manager_id = default_manager_id
-            if override_response.data:
-                override = override_response.data[0]
-                owner_id = override.get("owner_id") or default_owner_id
-                manager_id = override.get("manager_id") or default_manager_id
-
-            if project_id in existing_tasks_map:
-                # Actualizar tarea existente
-                existing_task = existing_tasks_map[project_id]
-                supabase.table("tasks").update({
-                    "task_description": task_description,
-                    "task_notes": task_notes,
-                    "automation_metadata": {
-                        "reasons": reasons,
-                        "remaining_percent": data["remaining_percent"],
-                        "total_spent": data["total_spent"],
-                        "budget": data["budget"],
-                    },
-                }).eq("task_id", existing_task["task_id"]).execute()
-
-                tasks_updated += 1
-            else:
-                # Crear nueva tarea
-                new_task_data = {
-                    "task_description": task_description,
-                    "task_notes": task_notes,
-                    "project_id": project_id,
-                    "Owner_id": owner_id,
-                    "manager": manager_id,
-                    "task_department": default_department_id,
-                    "task_status": not_started_status_id,
-                    "automation_type": automation_type,
-                    "is_automated": True,
-                    "automation_metadata": {
-                        "reasons": reasons,
-                        "remaining_percent": data["remaining_percent"],
-                        "total_spent": data["total_spent"],
-                        "budget": data["budget"],
-                    },
-                }
-
-                supabase.table("tasks").insert(new_task_data).execute()
-                tasks_created += 1
-
-        return (tasks_created, tasks_updated)
-
-    except Exception as e:
-        logger.error(f"[AUTOMATIONS] ERROR in pending_health_check: {repr(e)}")
-        logger.debug(traceback.format_exc())
-        raise
+# Registry of connected system duties. Add a duty here (plus a collect_* above and
+# an automation_settings seed row) and it auto-wires into /automations/run,
+# trigger_duty(), and the Responsibilities catalog. See docs/duties_playbook.md.
+DUTY_REGISTRY: Dict[str, DutySpec] = {
+    "pending_expenses_auth": DutySpec(
+        automation_type="pending_expenses_auth",
+        resolve_managers=_resolve_pending_expense_managers,   # role -> shared task
+        department_hint="bookkeeping",
+        cleanup_obsolete=True,
+        collect=_collect_pending_expenses_auth,
+    ),
+    "pending_expenses_categorize": DutySpec(
+        automation_type="pending_expenses_categorize",
+        cleanup_obsolete=True,
+        collect=_collect_pending_expenses_categorize,
+    ),
+    "pending_health_check": DutySpec(
+        automation_type="pending_health_check",
+        cleanup_obsolete=False,
+        collect=_collect_pending_health_check,
+    ),
+    "overdue_tasks": DutySpec(
+        automation_type="overdue_tasks",
+        department_hint="coordination",
+        cleanup_obsolete=True,
+        collect=_collect_overdue_tasks,
+    ),
+}
 
 
 # ====== MY WORK / WORKLOAD ENDPOINTS ======
@@ -2419,6 +2332,16 @@ def get_automations_status() -> Dict[str, Any]:
             e.get("project") for e in (expenses_data.data or []) if e.get("project")
         )
 
+        # Overdue tasks count -- reuse the duty's collect logic (no settings needed).
+        try:
+            overdue_items = _collect_overdue_tasks(DutyContext(settings={}, existing_tasks={}))
+            overdue_count = sum(int(it.metadata.get("count", 0)) for it in overdue_items.values())
+            overdue_projects = len(overdue_items)
+        except Exception as _exc:
+            logger.debug("[AUTOMATIONS] overdue count failed: %s", _exc)
+            overdue_count = 0
+            overdue_projects = 0
+
         return {
             "pending_expenses_auth": {
                 "expenses_count": pending_expenses_count,
@@ -2428,7 +2351,8 @@ def get_automations_status() -> Dict[str, Any]:
                 "count": 0,  # TODO: Implementar
             },
             "overdue_tasks": {
-                "count": 0,  # TODO: Implementar
+                "count": overdue_count,
+                "projects_count": overdue_projects,
             }
         }
 
