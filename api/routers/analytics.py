@@ -82,9 +82,38 @@ def _round2(val: float) -> float:
     return round(val, 2)
 
 
+def _caller_role_id(current_user: dict):
+    """Resolve the caller's rol_id for role_permissions lookups.
+
+    The JWT carries the role *name* (`role`) and the `user_id` — not the rol_id
+    that role_permissions keys on — so resolve it from the user record. Honors an
+    explicit id first in case a future token starts carrying one. Returns None
+    when the user has no role.
+    """
+    rid = current_user.get("user_rol") or current_user.get("role_id")
+    if rid:
+        return str(rid)
+    uid = current_user.get("user_id")
+    if not uid:
+        return None
+    try:
+        resp = (
+            supabase.table("users")
+            .select("user_rol")
+            .eq("user_id", uid)
+            .single()
+            .execute()
+        )
+        val = (resp.data or {}).get("user_rol")
+        return str(val) if val else None
+    except Exception as exc:
+        logger.error("[analytics] role-id resolve failed for %s: %s", uid, exc)
+        return None
+
+
 def _user_has_permission(current_user: dict, module_key: str) -> bool:
     """Return True if the caller's role has can_view on *module_key*."""
-    user_role_id = current_user.get("user_rol")
+    user_role_id = _caller_role_id(current_user)
     if not user_role_id:
         return False
     try:
@@ -110,7 +139,7 @@ def _user_has_any_permission(current_user: dict, module_keys: list[str]) -> bool
     e.g. the migrated React Analytics grants access through `analytics` /
     `reporting`, while the legacy executive view used `project_kpis`.
     """
-    user_role_id = current_user.get("user_rol")
+    user_role_id = _caller_role_id(current_user)
     if not user_role_id or not module_keys:
         return False
     try:
@@ -830,7 +859,7 @@ async def executive_kpis(
     """
 
     # --- Permission check ---
-    if not current_user.get("user_rol"):
+    if not current_user.get("role"):
         raise HTTPException(status_code=403, detail="No role assigned to user")
     if not _user_has_any_permission(current_user, ["project_kpis", "analytics", "reporting"]):
         raise HTTPException(
@@ -3100,7 +3129,7 @@ async def operations_dashboard(
     can round-trip through a single string column.
     """
 
-    if not current_user.get("user_rol"):
+    if not current_user.get("role"):
         raise HTTPException(status_code=403, detail="No role assigned to user")
 
     can_view_financials = _user_has_permission(current_user, "project_kpis")
