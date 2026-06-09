@@ -4531,6 +4531,58 @@ async def duplicate_action(receipt_id: str, payload: DuplicateActionRequest, cur
         raise HTTPException(status_code=500, detail=f"Duplicate action error: {str(e)}")
 
 
+def _apply_line_item_assignments(line_items: list, assignments, project_id: str, user_id) -> int:
+    """Apply structured category overrides to line items in place.
+
+    Each assignment is {index, account_id, account_name} with a 0-based index
+    into line_items. Used by the confirm-all review list so an operator's picks
+    for items the UI flagged (below its display threshold) persist even when the
+    receipt was never parked in awaiting_category_confirmation. Logs a
+    correction whenever the chosen account differs from the one already on the
+    line item, feeding the same learning loop as the low-confidence modal.
+    Returns the number of line items updated.
+    """
+    if not isinstance(assignments, list):
+        return 0
+    construction_stage = "General"
+    applied = 0
+    for assign in assignments:
+        if not isinstance(assign, dict):
+            continue
+        idx = assign.get("index")
+        account_id = assign.get("account_id")
+        account_name = assign.get("account_name", "")
+        if idx is None or not account_id or idx < 0 or idx >= len(line_items):
+            continue
+        item = line_items[idx]
+        prev_id = item.get("account_id")
+        prev_name = item.get("account_name", "")
+        prev_conf = item.get("confidence", 0)
+        # Only log a correction when the user actually changed the category.
+        if prev_id and prev_id != account_id:
+            try:
+                supabase.table("categorization_corrections").insert({
+                    "project_id": project_id,
+                    "user_id": user_id,
+                    "description": item.get("description", ""),
+                    "construction_stage": construction_stage,
+                    "original_account_id": prev_id,
+                    "original_account_name": prev_name,
+                    "original_confidence": prev_conf,
+                    "corrected_account_id": account_id,
+                    "corrected_account_name": account_name,
+                    "correction_reason": "User correction from confirm-all review list",
+                }).execute()
+            except Exception as e:
+                logger.error(f"[FeedbackLoop] Failed to log correction: {e}")
+        item["account_id"] = account_id
+        item["account_name"] = account_name
+        item["confidence"] = 100
+        item["user_confirmed"] = True
+        applied += 1
+    return applied
+
+
 @router.post("/{receipt_id}/receipt-action")
 async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current_user: dict = Depends(get_current_user)):
     """
@@ -5136,6 +5188,17 @@ async def receipt_action(receipt_id: str, payload: ReceiptActionRequest, current
 
                 created_expenses = []
                 line_items = parsed_data.get("line_items", [])
+
+                # Optional category overrides from the confirm-all review list:
+                # items the UI flagged below its display threshold but that we
+                # never parked in awaiting_category_confirmation. Apply them so
+                # the operator's picks persist into the created expenses.
+                _override_payload = payload.payload if isinstance(payload.payload, dict) else {}
+                _assignments = _override_payload.get("assignments")
+                if _assignments:
+                    _n = _apply_line_item_assignments(line_items, _assignments, project_id, payload.user_id)
+                    if _n:
+                        logger.info(f"[ReceiptFlow] all_this_project: applied {_n} category override(s) before creation")
 
                 if auto_create and line_items:
                     # Human clicked "All for this project" -- skip confidence gate

@@ -36,7 +36,16 @@ class PlanCreate(BaseModel):
     id: Optional[str] = None
     filename: str
     project_id: Optional[str] = None
+    plan_type: Optional[str] = None       # Floor Plan, Footings, Title 24, Site…
+    status: Optional[str] = "draft"       # draft (estimator) | official (project)
     pages: List[PlanPageCreate] = []
+
+
+class PlanUpdate(BaseModel):
+    filename: Optional[str] = None
+    plan_type: Optional[str] = None
+    status: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 class CalibrationUpdate(BaseModel):
@@ -81,11 +90,14 @@ async def create_plan(body: PlanCreate, user=Depends(get_current_user)):
         plan_data = {
             "filename": body.filename,
             "created_by": user.get("uid", ""),
+            "status": body.status or "draft",
         }
         if body.id:
             plan_data["id"] = body.id
         if body.project_id:
             plan_data["project_id"] = body.project_id
+        if body.plan_type:
+            plan_data["plan_type"] = body.plan_type
 
         result = supabase.table("takeoff_plans").insert(plan_data).execute()
         if not result.data:
@@ -205,6 +217,29 @@ async def get_plan(plan_id: str, user=Depends(get_current_user)):
         raise
     except Exception as e:
         logger.error("[TAKEOFF] get_plan error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/plans/{plan_id}")
+async def update_plan(plan_id: str, body: PlanUpdate, user=Depends(get_current_user)):
+    """Rename a plan / set its type (Floor Plan, Footings…) / status
+    (draft → official on project approval) / link to a project."""
+    try:
+        update = {}
+        if body.filename is not None:
+            update["filename"] = body.filename
+        if body.plan_type is not None:
+            update["plan_type"] = body.plan_type
+        if body.status is not None:
+            update["status"] = body.status
+        if body.project_id is not None:
+            update["project_id"] = body.project_id
+        if not update:
+            return {"success": True}
+        result = supabase.table("takeoff_plans").update(update).eq("id", plan_id).execute()
+        return result.data[0] if result.data else {"success": True}
+    except Exception as e:
+        logger.error("[TAKEOFF] update_plan error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
