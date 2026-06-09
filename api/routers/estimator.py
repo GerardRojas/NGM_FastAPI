@@ -443,6 +443,7 @@ async def list_estimates(
                 "branch_count": 1,
                 "variation_count": 0,
                 "change_order_count": 0,
+                "review_status": "none",
             }
             est_company = None
             try:
@@ -459,6 +460,15 @@ async def list_estimates(
                         1 for b in branches
                         if b.get("id") != main_id and b.get("kind") != BRANCH_KIND_CHANGE_ORDER
                     )
+                    # Card-level review state: surface the most actionable across
+                    # branches (a branch awaiting approval outranks an approved one)
+                    # so the board flags "Pending approval".
+                    _review_rank = {"under_review": 4, "changes_requested": 3, "approved": 2, "rejected": 1, "none": 0}
+                    review_status = "none"
+                    for b in branches:
+                        rs = b.get("review_status") or "none"
+                        if _review_rank.get(rs, 0) > _review_rank.get(review_status, 0):
+                            review_status = rs
                     summary.update({
                         "name": manifest.get("project_name") or name,
                         "created_at": manifest.get("created_at") or summary["created_at"],
@@ -470,6 +480,7 @@ async def list_estimates(
                         "branch_count": len(branches),
                         "variation_count": var_count,
                         "change_order_count": co_count,
+                        "review_status": review_status,
                     })
                 else:
                     data = _download_json(f"{name}/estimate.ngm")
@@ -936,6 +947,14 @@ class ReviewDecisionRequest(BaseModel):
     note: Optional[str] = None
 
 
+class MarkPromotedRequest(BaseModel):
+    """Stamp a branch as promoted to a project's budget. Records the estimate ⇄
+    project ⇄ budget link on the branch so it is traceable from the estimator
+    side (the budget rows carry the reverse link via source_estimate_id)."""
+    project_id: str
+    budget_batch_id: Optional[str] = None             # batch returned by /budgets/import
+
+
 @router.put("/estimates/{estimate_id}/branches/{branch_id}/caratula")
 async def save_branch_caratula(estimate_id: str, branch_id: str, request: CaratulaSaveRequest):
     """Persist a generated carátula (cover/export snapshot) for one branch so it
@@ -1060,6 +1079,32 @@ async def decide_branch_review(estimate_id: str, branch_id: str, request: Review
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error recording review decision: {str(e)}")
+
+
+@router.post("/estimates/{estimate_id}/branches/{branch_id}/mark-promoted")
+async def mark_branch_promoted(estimate_id: str, branch_id: str, request: MarkPromotedRequest):
+    """Record that a branch was promoted to a project's budget (the
+    estimate→project→budget link). Called by the frontend right after a
+    successful POST /budgets/import so the estimator can show "Promoted to
+    project X" and stop re-prompting. Idempotent: re-promoting just overwrites
+    the stamp with the latest project/batch."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+        entry = find_branch(manifest, branch_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+        now_iso = datetime.now().isoformat()
+        entry["promoted_to_project_id"] = request.project_id
+        entry["promoted_budget_batch_id"] = request.budget_batch_id
+        entry["promoted_at"] = now_iso
+        entry["updated_at"] = now_iso
+        _upload_json(_manifest_path(estimate_id), manifest)
+        return {"success": True, "manifest": manifest}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error marking branch promoted: {str(e)}")
 
 
 # ============================================
