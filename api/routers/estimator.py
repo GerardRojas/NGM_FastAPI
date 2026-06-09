@@ -907,6 +907,162 @@ async def delete_branch(estimate_id: str, branch_id: str):
 
 
 # ============================================
+# BRANCH REVIEW + CARÁTULA
+# ----------------------------------------------------------------------------
+# Any branch (a variation, a change order, a budget version) can be sent to
+# review with its own persisted carátula. Review state lives on the manifest
+# branch entry; the carátula snapshot is a separate JSON blob per branch.
+# ============================================
+
+REVIEW_STATUSES = {"under_review", "approved", "rejected", "changes_requested"}
+
+
+def _caratula_path(estimate_id: str, branch_id: str) -> str:
+    return f"{estimate_id}/branches/{branch_id}/caratula.json"
+
+
+class CaratulaSaveRequest(BaseModel):
+    caratula: Dict[str, Any]                          # SheetDocument snapshot
+
+
+class SendToReviewRequest(BaseModel):
+    caratula: Optional[Dict[str, Any]] = None         # persist this snapshot on send
+    reviewer_user_ids: Optional[List[str]] = None     # explicit reviewers; else role-resolved
+    note: Optional[str] = None
+
+
+class ReviewDecisionRequest(BaseModel):
+    decision: str                                     # approved | rejected | changes_requested
+    note: Optional[str] = None
+
+
+@router.put("/estimates/{estimate_id}/branches/{branch_id}/caratula")
+async def save_branch_caratula(estimate_id: str, branch_id: str, request: CaratulaSaveRequest):
+    """Persist a generated carátula (cover/export snapshot) for one branch so it
+    can be viewed later (e.g. by a reviewer) independent of live edits."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+        entry = find_branch(manifest, branch_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+        now_iso = datetime.now().isoformat()
+        _upload_json(_caratula_path(estimate_id, branch_id), {
+            "branch_id": branch_id, "updated_at": now_iso, "document": request.caratula,
+        })
+        entry["has_caratula"] = True
+        entry["caratula_updated_at"] = now_iso
+        _upload_json(_manifest_path(estimate_id), manifest)
+        return {"success": True, "updated_at": now_iso}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving carátula: {str(e)}")
+
+
+@router.get("/estimates/{estimate_id}/branches/{branch_id}/caratula")
+async def get_branch_caratula(estimate_id: str, branch_id: str):
+    """Return the stored carátula snapshot for a branch (404 if none)."""
+    data = _download_json(_caratula_path(estimate_id, branch_id))
+    if data is None:
+        raise HTTPException(status_code=404, detail="No carátula stored for this branch")
+    return data
+
+
+@router.post("/estimates/{estimate_id}/branches/{branch_id}/send-to-review")
+async def send_branch_to_review(estimate_id: str, branch_id: str, request: SendToReviewRequest):
+    """Send a branch to review: mark it under_review, record reviewers + timestamp,
+    and persist its carátula when provided. Reviewers default to every user whose
+    role has can_review_estimates (CEO/COO always). Also creates the review task
+    (best-effort) so the reviewer sees the carátula + a link to this branch."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        manifest = ensure_manifest(estimate_id)
+        entry = find_branch(manifest, branch_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+
+        # Resolve reviewers: explicit override, else role-based. Lazy import keeps
+        # the routers decoupled / avoids any import cycle.
+        reviewer_ids = request.reviewer_user_ids
+        if not reviewer_ids:
+            try:
+                from api.routers.permissions import resolve_estimate_reviewer_user_ids
+                reviewer_ids = resolve_estimate_reviewer_user_ids()
+            except Exception as exc:
+                logger.warning("[ESTIMATOR] reviewer resolve failed: %s", exc)
+                reviewer_ids = []
+
+        now_iso = datetime.now().isoformat()
+        if request.caratula is not None:
+            _upload_json(_caratula_path(estimate_id, branch_id), {
+                "branch_id": branch_id, "updated_at": now_iso, "document": request.caratula,
+            })
+            entry["has_caratula"] = True
+            entry["caratula_updated_at"] = now_iso
+
+        entry["review_status"] = "under_review"
+        entry["review_sent_at"] = now_iso
+        entry["review_reviewer_ids"] = reviewer_ids
+        if request.note is not None:
+            entry["review_note"] = request.note
+        entry["updated_at"] = now_iso
+        _upload_json(_manifest_path(estimate_id), manifest)
+
+        # Create the review task for the resolved reviewers. Forward-compatible:
+        # this no-ops cleanly until the pipeline helper lands (Phase 3).
+        task_id = None
+        try:
+            from api.routers.pipeline import create_estimate_review_task
+            task_id = create_estimate_review_task(
+                estimate_id=estimate_id, branch=entry, manifest=manifest,
+                reviewer_ids=reviewer_ids, note=request.note,
+            )
+            if task_id:
+                entry["review_task_id"] = task_id
+                _upload_json(_manifest_path(estimate_id), manifest)
+        except Exception as exc:
+            logger.warning("[ESTIMATOR] review task create skipped: %s", exc)
+
+        return {"success": True, "manifest": manifest, "reviewer_ids": reviewer_ids, "task_id": task_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error sending branch to review: {str(e)}")
+
+
+@router.post("/estimates/{estimate_id}/branches/{branch_id}/review-decision")
+async def decide_branch_review(estimate_id: str, branch_id: str, request: ReviewDecisionRequest):
+    """Record a reviewer's decision on a branch. For change_order branches the
+    approved/rejected decision is mirrored onto the CO status so the Contract
+    Value rollup stays consistent."""
+    try:
+        ensure_bucket_exists(ESTIMATES_BUCKET)
+        decision = (request.decision or "").strip().lower()
+        if decision not in {"approved", "rejected", "changes_requested"}:
+            raise HTTPException(status_code=400, detail=f"Invalid decision: {decision}")
+        manifest = ensure_manifest(estimate_id)
+        entry = find_branch(manifest, branch_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+
+        now_iso = datetime.now().isoformat()
+        entry["review_status"] = decision
+        entry["review_decided_at"] = now_iso
+        if request.note is not None:
+            entry["review_note"] = request.note
+        if entry.get("kind") == BRANCH_KIND_CHANGE_ORDER and decision in ("approved", "rejected"):
+            entry["status"] = decision
+        entry["updated_at"] = now_iso
+        _upload_json(_manifest_path(estimate_id), manifest)
+        return {"success": True, "manifest": manifest}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error recording review decision: {str(e)}")
+
+
+# ============================================
 # TEMPLATES ENDPOINTS
 # ============================================
 

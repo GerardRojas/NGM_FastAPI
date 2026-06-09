@@ -577,3 +577,170 @@ async def set_expense_authorizers(payload: ExpenseAuthorizersPayload):
         return {"message": "Expense authorizers updated", "updated": len(payload.authorizers)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating expense authorizers: {str(e)}")
+
+
+# ========================================
+# ESTIMATE REVIEWERS — who can review/approve estimates (and CO branches sent to
+# review). Mirrors the expense-authorizer pattern: a can_review_estimates flag on
+# each role's 'estimator' permission row. CEO/COO are always reviewers (locked on).
+# ========================================
+
+ESTIMATOR_MODULE_KEY = "estimator"
+ALWAYS_REVIEW_ROLES = ["CEO", "COO"]
+
+
+class EstimateReviewerUpdate(BaseModel):
+    rol_id: str
+    can_review_estimates: bool
+
+
+class EstimateReviewersPayload(BaseModel):
+    reviewers: List[EstimateReviewerUpdate]
+
+
+def _log_review_change(rol_id, rol_name, old_value, new_value,
+                       actor_user_id, actor_name, actor_role, source) -> None:
+    """Audit a can_review_estimates change. Best-effort (see _log_authorize_change)."""
+    try:
+        supabase.table("role_permission_audit").insert({
+            "rol_id": str(rol_id) if rol_id is not None else None,
+            "rol_name": rol_name,
+            "module_key": ESTIMATOR_MODULE_KEY,
+            "field": "can_review_estimates",
+            "old_value": old_value,
+            "new_value": new_value,
+            "actor_user_id": str(actor_user_id) if actor_user_id is not None else None,
+            "actor_name": actor_name,
+            "actor_role": actor_role,
+            "source": source,
+        }).execute()
+    except Exception as e:
+        logger.warning(f"[permissions] review audit log failed (non-fatal): {e}")
+
+
+def set_role_can_review_estimates(
+    rol_id: str,
+    value: bool,
+    *,
+    rol_name: Optional[str] = None,
+    actor_user_id: Optional[str] = None,
+    actor_name: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    source: str = "roles_ui",
+) -> Dict[str, Any]:
+    """Set can_review_estimates on the 'estimator' role_permissions row for ONE
+    role. Mirrors set_role_can_authorize. CEO/COO are always reviewers (locked)."""
+    rid = str(rol_id)
+    if rol_name is None:
+        rol_name = _role_name_for(rid)
+    locked = rol_name in ALWAYS_REVIEW_ROLES
+    effective = True if locked else bool(value)
+
+    prior = (supabase.table("role_permissions")
+             .select("module_name, module_url, menu_item_id, can_view, can_edit, can_delete, can_review_estimates")
+             .eq("module_key", ESTIMATOR_MODULE_KEY)
+             .eq("rol_id", rid).limit(1).execute().data) or []
+    prior_row = prior[0] if prior else None
+    old_value = bool(prior_row.get("can_review_estimates")) if prior_row else False
+
+    if prior_row:
+        row = {
+            "rol_id": rol_id,
+            "module_key": ESTIMATOR_MODULE_KEY,
+            "module_name": prior_row.get("module_name") or "Estimator Suite",
+            "module_url": prior_row.get("module_url") or "estimator.html",
+            "menu_item_id": prior_row.get("menu_item_id"),
+            "can_view": bool(prior_row.get("can_view")),
+            "can_edit": bool(prior_row.get("can_edit")),
+            "can_delete": bool(prior_row.get("can_delete")),
+            "can_review_estimates": effective,
+        }
+    else:
+        mi = (supabase.table("menu_items").select("id")
+              .eq("slug", ESTIMATOR_MODULE_KEY).limit(1).execute().data) or []
+        row = {
+            "rol_id": rol_id,
+            "module_key": ESTIMATOR_MODULE_KEY,
+            "module_name": "Estimator Suite",
+            "module_url": "estimator.html",
+            "menu_item_id": mi[0]["id"] if mi else None,
+            "can_view": effective,
+            "can_edit": False,
+            "can_delete": False,
+            "can_review_estimates": effective,
+        }
+
+    supabase.table("role_permissions").upsert(
+        row, on_conflict="rol_id,module_key"
+    ).execute()
+
+    changed = old_value != effective
+    if changed:
+        _log_review_change(rid, rol_name, old_value, effective,
+                           actor_user_id, actor_name, actor_role, source)
+
+    return {"old": old_value, "new": effective, "changed": changed,
+            "rol_name": rol_name, "locked": locked}
+
+
+def resolve_estimate_reviewer_user_ids() -> List[str]:
+    """Every user whose role has can_review_estimates on the 'estimator' module
+    (CEO/COO always included). Used to assign the review task's managers_ids."""
+    try:
+        perms = (supabase.table("role_permissions")
+                 .select("rol_id, can_review_estimates")
+                 .eq("module_key", ESTIMATOR_MODULE_KEY).execute().data) or []
+        reviewer_role_ids = {str(p["rol_id"]) for p in perms if p.get("can_review_estimates")}
+        roles = (supabase.table("rols").select("rol_id, rol_name").execute().data) or []
+        for r in roles:
+            if (r.get("rol_name") or "") in ALWAYS_REVIEW_ROLES:
+                reviewer_role_ids.add(str(r["rol_id"]))
+        if not reviewer_role_ids:
+            return []
+        users = (supabase.table("users").select("user_id, user_rol")
+                 .in_("user_rol", list(reviewer_role_ids)).execute().data) or []
+        return [str(u["user_id"]) for u in users if u.get("user_id")]
+    except Exception as e:
+        logger.error(f"[permissions] resolve reviewers failed: {e}")
+        return []
+
+
+@router.get("/estimate-reviewers")
+async def get_estimate_reviewers():
+    """List every role with whether it can review estimates. CEO/COO locked on."""
+    try:
+        roles = (supabase.table("rols").select("rol_id, rol_name").execute().data) or []
+        perms = (supabase.table("role_permissions")
+                 .select("rol_id, can_review_estimates")
+                 .eq("module_key", ESTIMATOR_MODULE_KEY).execute().data) or []
+        by_role = {str(p["rol_id"]): bool(p.get("can_review_estimates")) for p in perms}
+        out = []
+        for r in roles:
+            rid = str(r["rol_id"]); name = r.get("rol_name") or ""
+            locked = name in ALWAYS_REVIEW_ROLES
+            out.append({
+                "rol_id": rid, "rol_name": name,
+                "can_review_estimates": True if locked else by_role.get(rid, False),
+                "locked": locked,
+            })
+        out.sort(key=lambda x: x["rol_name"].lower())
+        return {"data": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching estimate reviewers: {str(e)}")
+
+
+@router.put("/estimate-reviewers", dependencies=[Depends(require_leadership)])
+async def set_estimate_reviewers(payload: EstimateReviewersPayload):
+    """Set can_review_estimates on the 'estimator' permission row for given roles."""
+    try:
+        roles_resp = (supabase.table("rols").select("rol_id, rol_name").execute().data) or []
+        name_by_id = {str(r["rol_id"]): r.get("rol_name") for r in roles_resp}
+        for u in payload.reviewers:
+            set_role_can_review_estimates(
+                u.rol_id, u.can_review_estimates,
+                rol_name=name_by_id.get(str(u.rol_id)),
+                source="roles_ui",
+            )
+        return {"message": "Estimate reviewers updated", "updated": len(payload.reviewers)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating estimate reviewers: {str(e)}")
