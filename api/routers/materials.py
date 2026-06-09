@@ -38,6 +38,9 @@ class MaterialCreate(BaseModel):
     # Design element = a finish/selection (tile, WC, paint…) that appears on the
     # Design Take Off. Catalog-level flag; only meaningful for cost_type=material.
     is_design_element: Optional[bool] = False
+    # Design package position: the same switch key across finishes marks the same
+    # role (see design packages). Pairs with design_package_option (the finish).
+    design_switch_key: Optional[str] = None
 
 
 class MaterialUpdate(BaseModel):
@@ -56,6 +59,7 @@ class MaterialUpdate(BaseModel):
     unit_id: Optional[str] = None
     cost_type: Optional[str] = None
     is_design_element: Optional[bool] = None
+    design_switch_key: Optional[str] = None
 
 
 class MaterialResponse(BaseModel):
@@ -73,6 +77,7 @@ class MaterialResponse(BaseModel):
     unit_id: Optional[str] = None
     cost_type: Optional[str] = None
     is_design_element: Optional[bool] = None
+    design_switch_key: Optional[str] = None
     # Joined data
     vendor_name: Optional[str] = None
     category_name: Optional[str] = None
@@ -172,6 +177,7 @@ async def list_materials(
                 "unit_id": m.get("unit_id"),
                 "cost_type": m.get("cost_type"),
                 "is_design_element": m.get("is_design_element"),
+                "design_switch_key": m.get("design_switch_key"),
                 "updated_at": m.get("updated_at"),
                 # Nombres de relaciones
                 "vendor_name": m.get("Vendors", {}).get("vendor_name") if m.get("Vendors") else None,
@@ -209,7 +215,7 @@ async def get_materials_by_ids(ids: str = Query(..., description="Comma-separate
             return {"data": {}}
         resp = (
             supabase.table("materials")
-            .select('"ID","Short Description","Image","Brand","SKU","Model",cost_type,is_design_element,units(unit_name)')
+            .select('"ID","Short Description","Image","Brand","SKU","Model",price_numeric,cost_type,class_id,is_design_element,design_switch_key,units(unit_name)')
             .in_('"ID"', id_list)
             .execute()
         )
@@ -225,8 +231,11 @@ async def get_materials_by_ids(ids: str = Query(..., description="Comma-separate
                 "brand": m.get("Brand"),
                 "sku": m.get("SKU"),
                 "model": m.get("Model"),
+                "price_numeric": m.get("price_numeric"),
                 "cost_type": m.get("cost_type"),
+                "class_id": m.get("class_id"),
                 "is_design_element": bool(m.get("is_design_element")),
+                "design_switch_key": m.get("design_switch_key"),
                 "unit_name": m.get("units", {}).get("unit_name") if m.get("units") else None,
             }
         return {"data": out}
@@ -270,6 +279,7 @@ async def get_material(material_id: str):
             "unit_id": m.get("unit_id"),
             "cost_type": m.get("cost_type"),
             "is_design_element": m.get("is_design_element"),
+            "design_switch_key": m.get("design_switch_key"),
             "updated_at": m.get("updated_at"),
             "vendor_name": m.get("Vendors", {}).get("vendor_name") if m.get("Vendors") else None,
             "category_name": m.get("material_categories", {}).get("name") if m.get("material_categories") else None,
@@ -313,6 +323,7 @@ async def create_material(material: MaterialCreate):
             "unit_id": material.unit_id,
             "cost_type": material.cost_type or "material",
             "is_design_element": bool(material.is_design_element),
+            "design_switch_key": material.design_switch_key,
         }
 
         # Remover None values
@@ -375,6 +386,8 @@ async def update_material(material_id: str, material: MaterialUpdate):
             update_data["cost_type"] = material.cost_type
         if material.is_design_element is not None:
             update_data["is_design_element"] = bool(material.is_design_element)
+        if material.design_switch_key is not None:
+            update_data["design_switch_key"] = material.design_switch_key
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -448,6 +461,7 @@ async def bulk_create_materials(materials: List[MaterialCreate]):
                 "unit_id": m.unit_id,
                 "cost_type": m.cost_type or "material",
                 "is_design_element": bool(m.is_design_element),
+                "design_switch_key": m.design_switch_key,
             }
             # Remover None values
             data = {k: v for k, v in data.items() if v is not None}

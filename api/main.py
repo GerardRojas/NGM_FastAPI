@@ -42,6 +42,7 @@ from api.routers.reconciliations import router as reconciliations_router
 from api.routers.materials import router as materials_router
 from api.routers.material_categories import router as material_categories_router
 from api.routers.material_classes import router as material_classes_router
+from api.routers.design_packages import router as design_packages_router
 from api.routers.units import router as units_router
 from api.routers.concepts import router as concepts_router
 from api.routers.percentage_items import router as percentage_items_router
@@ -265,6 +266,7 @@ app.include_router(estimator_router)
 
 # Budget Sheet Manager (export templates for the Estimator)
 app.include_router(sheet_templates_router)
+app.include_router(design_packages_router)
 
 app.include_router(team_router)
 
