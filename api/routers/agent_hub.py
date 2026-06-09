@@ -61,6 +61,7 @@ _ANDREW_BOOKKEEPING_ROLES_DEFAULT = ["Bookkeeper", "Accounting Manager"]
 class AccessRolesUpdate(BaseModel):
     arturito_admin_roles: Optional[List[str]] = None
     andrew_bookkeeping_roles: Optional[List[str]] = None
+    andrew_viewer_roles: Optional[List[str]] = None
     agent_hub_manager_roles: Optional[List[str]] = None
 
 
@@ -71,6 +72,9 @@ def get_access_roles(current_user: dict = Depends(get_current_user)):
     return {
         "arturito_admin_roles": roles_for("arturito_admin_roles", _ARTURITO_ADMIN_ROLES_DEFAULT),
         "andrew_bookkeeping_roles": roles_for("andrew_bookkeeping_roles", _ANDREW_BOOKKEEPING_ROLES_DEFAULT),
+        # Who can SEE Andrew in the Agent Hub. Empty when unset -> agent_access
+        # falls back to the default audience (bookkeeping roles + management).
+        "andrew_viewer_roles": roles_for("andrew_viewer_roles", []),
         "agent_hub_manager_roles": roles_for("agent_hub_manager_roles", _MANAGER_ROLES_DEFAULT),
     }
 
