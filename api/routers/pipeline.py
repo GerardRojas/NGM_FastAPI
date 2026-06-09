@@ -395,6 +395,112 @@ def create_task(payload: TaskCreate) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"DB error: {e}") from e
 
 
+# ============================================================================
+# ESTIMATE REVIEW TASK — created when a branch is sent to review (estimator.py
+# calls this). Assigned to the resolved reviewers (managers_ids) plus any person
+# configured on the 'estimate_review' automation. Idempotent per branch.
+# ============================================================================
+def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, note=None):
+    """Create or refresh the review task for a branch sent to review.
+
+    managers_ids = role-resolved reviewers (passed in) ∪ the person(s) configured
+    on the 'estimate_review' automation (default_manager_id + config.reviewer_user_ids).
+    Idempotent per (estimate_id, branch_id): re-sending refreshes the same task
+    instead of duplicating. Returns the task_id (or None on failure).
+    """
+    branch_id = branch.get("id")
+    review_key = f"{estimate_id}:{branch_id}"
+
+    # Optional automation config: a specific person reviewer + department.
+    settings = {}
+    try:
+        s = (supabase.table("automation_settings").select("*")
+             .eq("automation_type", "estimate_review").limit(1).execute().data) or []
+        settings = s[0] if s else {}
+    except Exception as exc:
+        logger.debug("[PIPELINE] estimate_review settings miss: %s", exc)
+
+    cfg = settings.get("config") or {}
+    people = [str(u) for u in (reviewer_ids or []) if u]
+    for uid in (cfg.get("reviewer_user_ids") or []):
+        if uid and str(uid) not in people:
+            people.append(str(uid))
+    if settings.get("default_manager_id") and str(settings["default_manager_id"]) not in people:
+        people.append(str(settings["default_manager_id"]))
+    # A role assigned via the Responsibilities catalog contributes its members too.
+    role_id = settings.get("responsible_role_id") if settings.get("responsible_type") == "role" else None
+    if role_id:
+        try:
+            members = (supabase.table("users").select("user_id")
+                       .eq("user_rol", str(role_id)).execute().data) or []
+            for m in members:
+                uid = m.get("user_id")
+                if uid and str(uid) not in people:
+                    people.append(str(uid))
+        except Exception as exc:
+            logger.debug("[PIPELINE] reviewer role members miss: %s", exc)
+
+    project_name = manifest.get("project_name") or "Estimate"
+    branch_name = branch.get("name") or branch_id
+    kind = branch.get("kind") or "variation"
+    label = "Change Order" if kind == "change_order" else "Estimate"
+    deep_link = f"/estimator?estimate={estimate_id}&branch={branch_id}"
+    desc = f"Review {label}: {project_name} — {branch_name}"
+    notes = (note.strip() + "\n\n") if note else ""
+    notes += f"Sent for review. Open the branch: {deep_link}"
+
+    metadata = {
+        "branch_review_key": review_key,
+        "estimate_id": estimate_id,
+        "branch_id": branch_id,
+        "branch_name": branch_name,
+        "kind": kind,
+        "has_caratula": bool(branch.get("has_caratula")),
+        "deep_link": deep_link,
+    }
+
+    status_id = None
+    try:
+        st = (supabase.table("tasks_status").select("task_status_id")
+              .ilike("task_status", "not started").execute().data) or []
+        status_id = st[0]["task_status_id"] if st else None
+    except Exception:
+        status_id = None
+
+    task_data = {
+        "task_description": desc,
+        "task_notes": notes,
+        "managers_ids": people or None,
+        "automation_type": "estimate_review",
+        "is_automated": True,
+        "automation_metadata": metadata,
+    }
+    if status_id is not None:
+        task_data["task_status"] = status_id
+    if settings.get("default_department_id"):
+        task_data["task_department"] = settings["default_department_id"]
+
+    # Idempotent: refresh the existing review task for this branch if present.
+    try:
+        existing = (supabase.table("tasks").select("task_id")
+                    .eq("automation_type", "estimate_review")
+                    .contains("automation_metadata", {"branch_review_key": review_key})
+                    .limit(1).execute().data) or []
+    except Exception as exc:
+        logger.debug("[PIPELINE] review task lookup failed: %s", exc)
+        existing = []
+
+    if existing:
+        tid = existing[0]["task_id"]
+        # Refresh assignment + notes, but don't force-reopen the status on resend.
+        upd = {k: v for k, v in task_data.items() if k != "task_status"}
+        supabase.table("tasks").update(upd).eq("task_id", tid).execute()
+        return tid
+
+    resp = supabase.table("tasks").insert(task_data).execute()
+    return resp.data[0]["task_id"] if (resp and resp.data) else None
+
+
 # Mapeo de campos UI → columnas de la tabla tasks
 FIELD_TO_COLUMN = {
     "task_description": "task_description",
