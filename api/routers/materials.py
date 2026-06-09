@@ -23,6 +23,7 @@ class MaterialCreate(BaseModel):
     full_description: Optional[str] = None
     brand: Optional[str] = None
     sku: Optional[str] = None
+    model: Optional[str] = None
     price_numeric: Optional[float] = None
     image: Optional[str] = None
     design_package_option: Optional[str] = None
@@ -34,6 +35,9 @@ class MaterialCreate(BaseModel):
     unit_id: Optional[str] = None
     # Categories re-arch: material | labor | external_service
     cost_type: Optional[str] = "material"
+    # Design element = a finish/selection (tile, WC, paint…) that appears on the
+    # Design Take Off. Catalog-level flag; only meaningful for cost_type=material.
+    is_design_element: Optional[bool] = False
 
 
 class MaterialUpdate(BaseModel):
@@ -41,6 +45,7 @@ class MaterialUpdate(BaseModel):
     full_description: Optional[str] = None
     brand: Optional[str] = None
     sku: Optional[str] = None
+    model: Optional[str] = None
     price_numeric: Optional[float] = None
     image: Optional[str] = None
     design_package_option: Optional[str] = None
@@ -50,6 +55,7 @@ class MaterialUpdate(BaseModel):
     class_id: Optional[str] = None
     unit_id: Optional[str] = None
     cost_type: Optional[str] = None
+    is_design_element: Optional[bool] = None
 
 
 class MaterialResponse(BaseModel):
@@ -58,6 +64,7 @@ class MaterialResponse(BaseModel):
     full_description: Optional[str] = None
     brand: Optional[str] = None
     sku: Optional[str] = None
+    model: Optional[str] = None
     price_numeric: Optional[float] = None
     image: Optional[str] = None
     vendor_id: Optional[str] = None
@@ -65,6 +72,7 @@ class MaterialResponse(BaseModel):
     class_id: Optional[str] = None
     unit_id: Optional[str] = None
     cost_type: Optional[str] = None
+    is_design_element: Optional[bool] = None
     # Joined data
     vendor_name: Optional[str] = None
     category_name: Optional[str] = None
@@ -152,6 +160,7 @@ async def list_materials(
                 "full_description": m.get("Full Description"),
                 "brand": m.get("Brand"),
                 "sku": m.get("SKU"),
+                "model": m.get("Model"),
                 "price_numeric": m.get("price_numeric"),
                 "price": m.get("Price"),
                 "image": m.get("Image"),
@@ -162,6 +171,7 @@ async def list_materials(
                 "class_id": m.get("class_id"),
                 "unit_id": m.get("unit_id"),
                 "cost_type": m.get("cost_type"),
+                "is_design_element": m.get("is_design_element"),
                 "updated_at": m.get("updated_at"),
                 # Nombres de relaciones
                 "vendor_name": m.get("Vendors", {}).get("vendor_name") if m.get("Vendors") else None,
@@ -185,6 +195,43 @@ async def list_materials(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching materials: {str(e)}")
+
+
+@router.get("/by-ids")
+async def get_materials_by_ids(ids: str = Query(..., description="Comma-separated material IDs")):
+    """Resolve a set of materials by ID to the minimal product fields the Design
+    Take Off selection schedule needs (image, brand, sku, model, unit,
+    is_design_element). Declared BEFORE /{material_id} so the literal path wins.
+    Returns { data: { <id>: {…} } } keyed by material ID for O(1) lookup."""
+    try:
+        id_list = [s.strip() for s in (ids or "").split(",") if s.strip()]
+        if not id_list:
+            return {"data": {}}
+        resp = (
+            supabase.table("materials")
+            .select('"ID","Short Description","Image","Brand","SKU","Model",cost_type,is_design_element,units(unit_name)')
+            .in_('"ID"', id_list)
+            .execute()
+        )
+        out = {}
+        for m in resp.data or []:
+            mid = m.get("ID")
+            if not mid:
+                continue
+            out[str(mid)] = {
+                "id": str(mid),
+                "short_description": m.get("Short Description"),
+                "image": m.get("Image"),
+                "brand": m.get("Brand"),
+                "sku": m.get("SKU"),
+                "model": m.get("Model"),
+                "cost_type": m.get("cost_type"),
+                "is_design_element": bool(m.get("is_design_element")),
+                "unit_name": m.get("units", {}).get("unit_name") if m.get("units") else None,
+            }
+        return {"data": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching materials by ids: {str(e)}")
 
 
 @router.get("/{material_id}")
@@ -211,6 +258,7 @@ async def get_material(material_id: str):
             "full_description": m.get("Full Description"),
             "brand": m.get("Brand"),
             "sku": m.get("SKU"),
+            "model": m.get("Model"),
             "price_numeric": m.get("price_numeric"),
             "price": m.get("Price"),
             "image": m.get("Image"),
@@ -221,6 +269,7 @@ async def get_material(material_id: str):
             "class_id": m.get("class_id"),
             "unit_id": m.get("unit_id"),
             "cost_type": m.get("cost_type"),
+            "is_design_element": m.get("is_design_element"),
             "updated_at": m.get("updated_at"),
             "vendor_name": m.get("Vendors", {}).get("vendor_name") if m.get("Vendors") else None,
             "category_name": m.get("material_categories", {}).get("name") if m.get("material_categories") else None,
@@ -251,6 +300,7 @@ async def create_material(material: MaterialCreate):
             "Full Description": material.full_description,
             "Brand": material.brand,
             "SKU": material.sku,
+            "Model": material.model,
             # "Price" drives price_numeric via the sync trigger (see _price_text).
             "Price": _price_text(material.price_numeric),
             "price_numeric": material.price_numeric,
@@ -262,6 +312,7 @@ async def create_material(material: MaterialCreate):
             "class_id": material.class_id,
             "unit_id": material.unit_id,
             "cost_type": material.cost_type or "material",
+            "is_design_element": bool(material.is_design_element),
         }
 
         # Remover None values
@@ -299,6 +350,8 @@ async def update_material(material_id: str, material: MaterialUpdate):
             update_data["Brand"] = material.brand
         if material.sku is not None:
             update_data["SKU"] = material.sku
+        if material.model is not None:
+            update_data["Model"] = material.model
         if material.price_numeric is not None:
             update_data["price_numeric"] = material.price_numeric
             # Keep the "Price" text column (the trigger's source) in sync so the
@@ -320,6 +373,8 @@ async def update_material(material_id: str, material: MaterialUpdate):
             update_data["unit_id"] = material.unit_id
         if material.cost_type is not None:
             update_data["cost_type"] = material.cost_type
+        if material.is_design_element is not None:
+            update_data["is_design_element"] = bool(material.is_design_element)
 
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
@@ -381,6 +436,7 @@ async def bulk_create_materials(materials: List[MaterialCreate]):
                 "Full Description": m.full_description,
                 "Brand": m.brand,
                 "SKU": m.sku,
+                "Model": m.model,
                 "Price": _price_text(m.price_numeric),
                 "price_numeric": m.price_numeric,
                 "Image": m.image,
@@ -391,6 +447,7 @@ async def bulk_create_materials(materials: List[MaterialCreate]):
                 "class_id": m.class_id,
                 "unit_id": m.unit_id,
                 "cost_type": m.cost_type or "material",
+                "is_design_element": bool(m.is_design_element),
             }
             # Remover None values
             data = {k: v for k, v in data.items() if v is not None}
