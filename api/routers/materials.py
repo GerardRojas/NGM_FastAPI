@@ -73,6 +73,18 @@ class MaterialResponse(BaseModel):
 
 
 # ========================================
+# Helpers
+# ========================================
+
+def _price_text(price_numeric):
+    """materials.price_numeric is kept in sync by a BEFORE INSERT/UPDATE trigger
+    that derives it from the text "Price" column. An insert that sends only
+    price_numeric (with "Price" empty) gets clobbered to NULL by that trigger,
+    so we populate "Price" and let the trigger compute the numeric value."""
+    return None if price_numeric is None else f"{price_numeric}"
+
+
+# ========================================
 # Endpoints
 # ========================================
 
@@ -239,6 +251,8 @@ async def create_material(material: MaterialCreate):
             "Full Description": material.full_description,
             "Brand": material.brand,
             "SKU": material.sku,
+            # "Price" drives price_numeric via the sync trigger (see _price_text).
+            "Price": _price_text(material.price_numeric),
             "price_numeric": material.price_numeric,
             "Image": material.image,
             "Design Package Option": material.design_package_option,
@@ -287,6 +301,9 @@ async def update_material(material_id: str, material: MaterialUpdate):
             update_data["SKU"] = material.sku
         if material.price_numeric is not None:
             update_data["price_numeric"] = material.price_numeric
+            # Keep the "Price" text column (the trigger's source) in sync so the
+            # two never drift; the trigger re-derives the same numeric value.
+            update_data["Price"] = _price_text(material.price_numeric)
         if material.image is not None:
             update_data["Image"] = material.image
         if material.design_package_option is not None:
@@ -364,6 +381,7 @@ async def bulk_create_materials(materials: List[MaterialCreate]):
                 "Full Description": m.full_description,
                 "Brand": m.brand,
                 "SKU": m.sku,
+                "Price": _price_text(m.price_numeric),
                 "price_numeric": m.price_numeric,
                 "Image": m.image,
                 "Design Package Option": m.design_package_option,

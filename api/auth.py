@@ -67,10 +67,11 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
 def require_internal(current_user: dict = Depends(get_current_user)) -> dict:
     """
-    Guard for internal-only endpoints: rejects external client accounts.
-    Defense-in-depth — clients should never reach the internal API surface.
+    Guard for internal-only endpoints: rejects portal accounts (clients AND
+    external collaborators). Defense-in-depth — neither should ever reach the
+    internal API surface.
     """
-    if (current_user.get("account_type") or "internal") == "client":
+    if (current_user.get("account_type") or "internal") in ("client", "external"):
         raise HTTPException(status_code=403, detail="Internal access only")
     return current_user
 
@@ -268,12 +269,19 @@ def login(request: Request, payload: LoginRequest):
     rols_data = user.get("rols")
     role_name = rols_data.get("rol_name") if rols_data else None
 
-    # 4) Generar token (funciona con o sin rol)
+    # 4) Generar token (funciona con o sin rol). External collaborators
+    # (users.is_external) get account_type='external' so they're confined to the
+    # portal plane exactly like clients — never the internal API surface.
+    db_account_type = user.get("account_type") or "internal"
+    if db_account_type != "client" and user.get("is_external"):
+        effective_account_type = "external"
+    else:
+        effective_account_type = db_account_type
     access_token = make_access_token(
         user_id=str(user.get("user_id")),
         username=user.get("user_name"),
         role=role_name,
-        account_type=user.get("account_type") or "internal",
+        account_type=effective_account_type,
         client_id=user.get("client_id"),
     )
 
@@ -309,31 +317,59 @@ def login(request: Request, payload: LoginRequest):
 # ====== CLIENT PORTAL: magic-link invitation onboarding ======
 
 def _decode_invite(token: str) -> dict:
-    """Decode + validate a client_invite JWT and its DB row (status/expiry)."""
+    """Decode a magic-link invite. Handles both client invites (provision a new
+    client account) and external-user invites (set the password on an existing
+    Team-Management external user). Returns a dict with 'kind'."""
     try:
         decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=400, detail="This invitation has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=400, detail="Invalid invitation link")
-    if decoded.get("type") != "client_invite":
-        raise HTTPException(status_code=400, detail="Invalid invitation link")
 
-    res = supabase.table("client_invites").select("*").eq("token", token).execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Invitation not found")
-    invite = res.data[0]
-    if invite["status"] == "accepted":
-        raise HTTPException(status_code=400, detail="This invitation has already been used")
-    if invite["status"] == "revoked":
-        raise HTTPException(status_code=400, detail="This invitation has been revoked")
-    return invite
+    itype = decoded.get("type")
+
+    if itype == "client_invite":
+        res = supabase.table("client_invites").select("*").eq("token", token).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Invitation not found")
+        invite = res.data[0]
+        if invite["status"] == "accepted":
+            raise HTTPException(status_code=400, detail="This invitation has already been used")
+        if invite["status"] == "revoked":
+            raise HTTPException(status_code=400, detail="This invitation has been revoked")
+        invite["kind"] = "client"
+        return invite
+
+    if itype == "external_invite":
+        user_id = decoded.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Invalid invitation link")
+        res = (
+            supabase.table("users")
+            .select("user_id, user_name, is_external, password_hash")
+            .eq("user_id", user_id).limit(1).execute()
+        )
+        rows = res.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Invitation not found")
+        u = rows[0]
+        if not u.get("is_external"):
+            raise HTTPException(status_code=400, detail="Invalid invitation link")
+        # One-time onboarding: once a password is set the link can't reset it.
+        if u.get("password_hash"):
+            raise HTTPException(status_code=400, detail="This account is already set up — please sign in.")
+        return {"kind": "external", "user_id": str(u["user_id"]), "email": u.get("user_name"), "user_name": u.get("user_name")}
+
+    raise HTTPException(status_code=400, detail="Invalid invitation link")
 
 
 @router.get("/invite/verify")
 def verify_invite(token: str):
     """Public: validate an invite and return who it's for (powers the accept page)."""
     invite = _decode_invite(token)
+    if invite["kind"] == "external":
+        return {"valid": True, "kind": "external", "email": invite.get("email"), "client_name": None}
     client_name = None
     try:
         c = supabase.table("clients").select("client_name").eq("client_id", invite["client_id"]).single().execute()
@@ -342,6 +378,7 @@ def verify_invite(token: str):
         pass
     return {
         "valid": True,
+        "kind": "client",
         "email": invite["email"],
         "client_id": invite["client_id"],
         "client_name": client_name,
@@ -357,6 +394,33 @@ def accept_invite(payload: AcceptInviteRequest):
     invite = _decode_invite(payload.token)
     if len(payload.password or "") < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    # External user: set the password on the existing Team-Management user and
+    # auto-login as an external (portal-only) account.
+    if invite["kind"] == "external":
+        try:
+            updated = supabase.table("users").update({
+                "password_hash": hash_password(payload.password),
+            }).eq("user_id", invite["user_id"]).execute()
+        except Exception as e:
+            logger.error("Error onboarding external user: %r", e)
+            raise HTTPException(status_code=500, detail="Could not set up the account")
+        if not updated.data:
+            raise HTTPException(status_code=500, detail="Account not found")
+        access_token = make_access_token(
+            user_id=invite["user_id"], username=invite["user_name"], role=None,
+            account_type="external", client_id=None,
+        )
+        return {
+            "message": "Invitation accepted",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "user_id": invite["user_id"],
+                "user_name": invite["user_name"],
+                "account_type": "external",
+            },
+        }
 
     email = invite["email"]
     # Don't hijack an existing account — the email/username must be free.

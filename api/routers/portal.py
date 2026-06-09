@@ -15,11 +15,13 @@ Tables: portal_shares, project_client_access (see sql/client_portal_phase1.sql).
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
-from api.auth import get_current_client
+from api.auth import get_current_user
 from api.supabase_client import supabase
 from api.services.vault_service import get_download_url
 
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/portal", tags=["Client Portal"])
 
 # Portal module keys carried in project_client_access.modules
-PORTAL_MODULES = {"overview", "photos", "plans", "timeline", "documents", "messages", "deals", "estimates"}
+PORTAL_MODULES = {"overview", "photos", "plans", "timeline", "documents", "messages", "deals", "estimates", "invoices"}
 
 
 # ============================================================
@@ -53,18 +55,253 @@ def get_access(client_id: str, project_id: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def assert_module(client_id: str, project_id: str, module: str) -> Dict[str, bool]:
+def get_user_access(user_id: str, project_id: str) -> Optional[Dict[str, Any]]:
+    """Return the project_user_access row for (external user, project), or None.
+    Parallel to get_access but keyed by users.user_id (external collaborators)."""
+    try:
+        res = (
+            supabase.table("project_user_access")
+            .select("modules")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        logger.error("[portal] user access lookup failed: %s", e)
+        raise HTTPException(status_code=500, detail="Access lookup failed")
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+# Modules that are CLIENT-only and must never open to external collaborators:
+# Messages is the client's private conversation; Invoices is the client's billing.
+CLIENT_ONLY_MODULES = {"messages", "invoices"}
+
+
+def get_portal_principal(current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """The portal's caller, normalized. Accepts client accounts (scope by
+    client_id) and external collaborators (scope by user_id). Internal accounts
+    are rejected — they use /connect, not /portal."""
+    account_type = current_user.get("account_type") or "internal"
+    if account_type == "client":
+        cid = current_user.get("client_id")
+        if not cid:
+            raise HTTPException(status_code=403, detail="Client account is not linked to a client")
+        return {"kind": "client", "user_id": current_user.get("user_id"), "access_id": str(cid), "client_id": str(cid)}
+    if account_type == "external":
+        uid = current_user.get("user_id")
+        if not uid:
+            raise HTTPException(status_code=403, detail="Invalid external session")
+        return {"kind": "user", "user_id": str(uid), "access_id": str(uid), "client_id": None}
+    raise HTTPException(status_code=403, detail="Client portal access only")
+
+
+def assert_module(principal: Dict[str, Any], project_id: str, module: str) -> Dict[str, bool]:
     """
-    Ensure this client may see this project AND the given portal module is
-    enabled for the pairing. Raises 403 otherwise. Returns the modules flag bag.
+    Ensure this principal (client OR external user) may see this project AND the
+    module is enabled. External users are additionally barred from client-only
+    modules (messages/invoices). Raises 403 otherwise; returns the modules bag.
     """
-    access = get_access(client_id, project_id)
+    if principal.get("kind") == "user" and module in CLIENT_ONLY_MODULES:
+        raise HTTPException(status_code=403, detail=f"The '{module}' section is not available")
+    if principal.get("kind") == "client":
+        access = get_access(principal["access_id"], project_id)
+    else:
+        access = get_user_access(principal["access_id"], project_id)
     if access is None:
         raise HTTPException(status_code=403, detail="No access to this project")
     modules = access.get("modules") or {}
     if not modules.get(module, False):
         raise HTTPException(status_code=403, detail=f"The '{module}' section is not enabled")
     return modules
+
+
+# ============================================================
+# Client conversation — the one channel a client participates in.
+# Lives entirely in the Connect portal (workspace), NOT the internal Messages
+# page, but reuses the messages/message_attachments tables. A project has one
+# client (projects.client), so the channel is keyed by (channel_type, project).
+# Both planes (client via /portal, team via /connect) read/write the same rows.
+# ============================================================
+
+CLIENT_CHANNEL_TYPE = "project_client"
+
+
+class ClientMessageCreate(BaseModel):
+    content: str = ""
+    attachments: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+def _client_message_attachments(message_id: str) -> List[Dict[str, Any]]:
+    try:
+        return (
+            supabase.table("message_attachments")
+            .select("name, type, size, url, thumbnail_url")
+            .eq("message_id", message_id)
+            .execute()
+        ).data or []
+    except Exception:
+        return []
+
+
+def _shape_client_message(row: Dict[str, Any], sender: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    u = sender or row.get("users") or {}
+    mid = row.get("id")
+    return {
+        "id": mid,
+        "content": row.get("content") or "",
+        "channel_type": row.get("channel_type"),
+        "channel_id": row.get("channel_id"),
+        "project_id": row.get("project_id"),
+        "user_id": row.get("user_id"),
+        "user_name": u.get("user_name"),
+        "avatar_color": u.get("avatar_color"),
+        "reply_to_id": row.get("reply_to_id"),
+        "thread_count": 0,
+        "is_edited": bool(row.get("is_edited")),
+        "is_deleted": bool(row.get("is_deleted")),
+        "created_at": row.get("created_at"),
+        "reactions": {},
+        "attachments": _client_message_attachments(mid),
+        "metadata": row.get("metadata"),
+    }
+
+
+def list_client_messages(project_id: str, limit: int = 300) -> List[Dict[str, Any]]:
+    """Every message in the project's client channel, oldest first."""
+    try:
+        rows = (
+            supabase.table("messages")
+            .select("*, users!user_id(user_name, avatar_color)")
+            .eq("channel_type", CLIENT_CHANNEL_TYPE)
+            .eq("project_id", project_id)
+            .is_("reply_to_id", "null")
+            .order("created_at", desc=False)
+            .limit(limit)
+            .execute()
+        ).data or []
+    except Exception as e:
+        logger.error("[portal] list client messages failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not load messages")
+    return [_shape_client_message(r) for r in rows]
+
+
+def post_client_message(
+    project_id: str,
+    user_id: str,
+    content: str,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Append a message to the project's client channel (from client OR team)."""
+    text = (content or "").strip()
+    attachments = attachments or []
+    if not text and not attachments:
+        raise HTTPException(status_code=400, detail="Message must have content or an attachment.")
+    try:
+        res = (
+            supabase.table("messages")
+            .insert({
+                "content": text,
+                "channel_type": CLIENT_CHANNEL_TYPE,
+                "project_id": project_id,
+                "user_id": user_id,
+            })
+            .execute()
+        )
+    except Exception as e:
+        logger.error("[portal] post client message failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not send message")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Message was not created")
+    msg = res.data[0]
+    for att in attachments:
+        try:
+            supabase.table("message_attachments").insert({
+                "message_id": msg["id"],
+                "name": att.get("name", ""),
+                "type": att.get("type", ""),
+                "size": att.get("size", 0),
+                "url": att.get("url", ""),
+                "thumbnail_url": att.get("thumbnail_url"),
+            }).execute()
+        except Exception as e:
+            logger.warning("[portal] attachment insert failed (non-blocking): %s", e)
+    sender = None
+    try:
+        u = supabase.table("users").select("user_name, avatar_color").eq("user_id", user_id).limit(1).execute().data or []
+        sender = u[0] if u else None
+    except Exception:
+        sender = None
+    return _shape_client_message(msg, sender)
+
+
+# ============================================================
+# Invoices — a curated wrapper around invoice_links (Stripe). portal_invoices ties
+# a Stripe payment link to a (project, client) + caption; the authoritative amount
+# and payment status always come from the linked invoice_links row at read time.
+# ============================================================
+
+from api.services.email import FRONTEND_URL  # noqa: E402  (settings constant)
+
+
+def _shape_invoice(pi: Dict[str, Any], link: Dict[str, Any]) -> Dict[str, Any]:
+    token = link.get("token")
+    return {
+        "id": pi.get("id"),
+        "invoice_ref": link.get("invoice_ref"),
+        "description": link.get("description"),
+        "amount_cents": link.get("amount_cents"),
+        "link_type": link.get("link_type"),
+        "status": link.get("status") or "active",
+        "caption": pi.get("caption"),
+        "pay_url": f"{FRONTEND_URL}/client-billing.html?token={token}" if token else None,
+        "created_at": pi.get("created_at"),
+        "viewed_at": pi.get("viewed_at"),
+        "paid_at": link.get("paid_at"),
+    }
+
+
+def list_project_invoices(
+    project_id: str,
+    client_id: Optional[str] = None,
+    mark_viewed: bool = False,
+) -> List[Dict[str, Any]]:
+    """Invoices shared on a project (optionally scoped to one client). Joins the
+    invoice_links row for live amount + status. When mark_viewed, stamps any
+    unseen invoice as viewed (client opened their billing tab)."""
+    try:
+        q = supabase.table("portal_invoices").select("*").eq("project_id", project_id)
+        if client_id:
+            q = q.eq("client_id", client_id)
+        rows = q.order("created_at", desc=True).execute().data or []
+    except Exception as e:
+        logger.error("[portal] list invoices failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not load invoices")
+    if not rows:
+        return []
+    link_ids = [r["invoice_link_id"] for r in rows if r.get("invoice_link_id")]
+    links: Dict[str, Dict[str, Any]] = {}
+    if link_ids:
+        try:
+            lrows = (
+                supabase.table("invoice_links")
+                .select("id, invoice_ref, description, amount_cents, link_type, status, token, paid_at")
+                .in_("id", link_ids).execute()
+            ).data or []
+            links = {str(l["id"]): l for l in lrows}
+        except Exception as e:
+            logger.error("[portal] invoice links join failed: %s", e)
+    if mark_viewed:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for r in rows:
+            if not r.get("viewed_at"):
+                try:
+                    supabase.table("portal_invoices").update({"viewed_at": now_iso}).eq("id", r["id"]).execute()
+                    r["viewed_at"] = now_iso
+                except Exception:
+                    pass
+    return [_shape_invoice(r, links.get(str(r.get("invoice_link_id")), {})) for r in rows]
 
 
 def _active_shares(project_id: str, item_type: str) -> List[Dict[str, Any]]:
@@ -96,13 +333,16 @@ def _file_url(file_id: str) -> Optional[str]:
 # Per-section data builders (reused by /connect preview)
 # ============================================================
 
-def list_projects(client_id: str) -> List[Dict[str, Any]]:
-    """Projects this client can access, with enabled modules and project name."""
+def list_projects(principal: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Projects this principal (client OR external user) can access, with enabled
+    modules and project name."""
+    table = "project_client_access" if principal.get("kind") == "client" else "project_user_access"
+    key = "client_id" if principal.get("kind") == "client" else "user_id"
     try:
         access = (
-            supabase.table("project_client_access")
+            supabase.table(table)
             .select("project_id, modules")
-            .eq("client_id", client_id)
+            .eq(key, principal["access_id"])
             .execute()
         ).data or []
     except Exception as e:
@@ -390,47 +630,69 @@ def get_overview(project_id: str) -> Dict[str, Any]:
 # ============================================================
 
 @router.get("/projects")
-def portal_projects(client: dict = Depends(get_current_client)):
-    return {"projects": list_projects(client["client_id"])}
+def portal_projects(principal: dict = Depends(get_portal_principal)):
+    return {"projects": list_projects(principal)}
 
 
 @router.get("/projects/{project_id}/overview")
-def portal_overview(project_id: str, client: dict = Depends(get_current_client)):
-    assert_module(client["client_id"], project_id, "overview")
+def portal_overview(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "overview")
     return get_overview(project_id)
 
 
 @router.get("/projects/{project_id}/photos")
-def portal_photos(project_id: str, client: dict = Depends(get_current_client)):
-    assert_module(client["client_id"], project_id, "photos")
+def portal_photos(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "photos")
     return {"photos": get_photos(project_id)}
 
 
 @router.get("/projects/{project_id}/plans")
-def portal_plans(project_id: str, client: dict = Depends(get_current_client)):
-    assert_module(client["client_id"], project_id, "plans")
+def portal_plans(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "plans")
     return {"plans": get_plans(project_id)}
 
 
 @router.get("/projects/{project_id}/timeline")
-def portal_timeline(project_id: str, client: dict = Depends(get_current_client)):
-    assert_module(client["client_id"], project_id, "timeline")
+def portal_timeline(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "timeline")
     return get_timeline(project_id)
 
 
 @router.get("/projects/{project_id}/documents")
-def portal_documents(project_id: str, client: dict = Depends(get_current_client)):
-    assert_module(client["client_id"], project_id, "documents")
+def portal_documents(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "documents")
     return {"documents": get_documents(project_id)}
 
 
 @router.get("/projects/{project_id}/deals")
-def portal_deals(project_id: str, client: dict = Depends(get_current_client)):
-    assert_module(client["client_id"], project_id, "deals")
+def portal_deals(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "deals")
     return {"deals": get_deals(project_id)}
 
 
 @router.get("/projects/{project_id}/estimates")
-def portal_estimates(project_id: str, client: dict = Depends(get_current_client)):
-    assert_module(client["client_id"], project_id, "estimates")
+def portal_estimates(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "estimates")
     return {"estimates": get_estimates(project_id)}
+
+
+@router.get("/projects/{project_id}/messages")
+def portal_messages(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "messages")  # client-only (blocks external)
+    return {"messages": list_client_messages(project_id)}
+
+
+@router.post("/projects/{project_id}/messages", status_code=201)
+def portal_send_message(
+    project_id: str,
+    payload: ClientMessageCreate,
+    principal: dict = Depends(get_portal_principal),
+):
+    assert_module(principal, project_id, "messages")  # client-only (blocks external)
+    return post_client_message(project_id, principal["user_id"], payload.content, payload.attachments)
+
+
+@router.get("/projects/{project_id}/invoices")
+def portal_invoices(project_id: str, principal: dict = Depends(get_portal_principal)):
+    assert_module(principal, project_id, "invoices")  # client-only (blocks external)
+    return {"invoices": list_project_invoices(project_id, client_id=principal["client_id"], mark_viewed=True)}
