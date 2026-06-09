@@ -193,6 +193,12 @@ def check_agent_viewer_permission(agent: str, user_id: str) -> Dict[str, Any]:
     view_users = _load_list(keys["viewer_users"])
 
     if not view_roles and not view_users:
+        # Andrew is the bookkeeping agent: its audience (bookkeeping roles, e.g.
+        # Bookkeeper / Accounting Manager) can SEE it by default even though
+        # commanding stays management-gated. An explicit andrew_viewer_roles (set
+        # in Agent Settings) overrides this default.
+        if agent == "andrew" and _role_matches(role, bookkeeping_roles()):
+            return {"allowed": True, "role": role, "reason": "bookkeeping audience"}
         return check_agent_operator_permission(agent, user_id)
 
     if str(user_id) in view_users or _role_matches(role, view_roles):

@@ -45,6 +45,11 @@ class BudgetImportRequest(BaseModel):
     project_id: str  # NGM project ID to link budgets to
     headers: List[str]  # CSV headers
     data: List[List[str]]  # CSV rows as arrays
+    # Provenance: when the producer is the estimator, these tie every imported
+    # row back to its source estimate/branch (the reverse of the branch's
+    # promoted_* stamp). Optional — QBO/CSV imports leave them null.
+    source_estimate_id: Optional[str] = None
+    source_branch_id: Optional[str] = None
 
 
 # ================================
@@ -278,11 +283,19 @@ async def import_budgets(
                     "amount_sum": amount_sum,
                     "ngm_project_id": request.project_id,
                     "import_batch_id": batch_id,
-                    "import_source": "csv",
+                    "import_source": "estimator" if request.source_estimate_id else "csv",
                     "category_id": category_id_val,
                     "subcategory_id": subcategory_id_val,
                     "cost_type": cost_type_val,
                 }
+
+                # Only attach provenance keys when present (estimator-originated
+                # imports). Omitting them keeps plain QBO/CSV imports working even
+                # before the source_* columns migration has run — no hard dependency.
+                if request.source_estimate_id:
+                    record["source_estimate_id"] = request.source_estimate_id
+                if request.source_branch_id:
+                    record["source_branch_id"] = request.source_branch_id
 
                 records.append(record)
 
