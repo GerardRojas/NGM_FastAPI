@@ -69,6 +69,33 @@ def _user_can_authorize_expenses(user_id: str) -> tuple[bool, str]:
         return False, ""
 
 
+# Only these roles may delete an expense PERMANENTLY (hard delete). Everyone with
+# can_delete on the expenses module can soft-delete (recoverable).
+HARD_DELETE_ROLES = {"accounting manager", "ceo", "coo"}
+
+
+def _user_delete_perms(user_id: str) -> tuple[bool, bool, str]:
+    """(can_delete, can_hard_delete, role_name). can_delete comes from
+    role_permissions.can_delete on the 'expenses' module (the Roles UI flag);
+    can_hard_delete (permanent) is reserved for Accounting Manager / CEO / COO."""
+    if not user_id:
+        return False, False, ""
+    try:
+        resp = supabase.table("users").select(
+            "user_rol, rols!users_user_rol_fkey(rol_name, role_permissions(module_key, can_delete))"
+        ).eq("user_id", user_id).single().execute()
+        rols_data = (resp.data or {}).get("rols") or {}
+        role_name = rols_data.get("rol_name") or ""
+        perms = rols_data.get("role_permissions") or []
+        perm = next((p for p in perms if p.get("module_key") == "expenses"), None)
+        can_delete = bool(perm and perm.get("can_delete"))
+        can_hard = role_name.strip().lower() in HARD_DELETE_ROLES
+        return can_delete, can_hard, role_name
+    except Exception as exc:
+        logger.error("[AUTHZ] can_delete lookup failed for %s: %s", user_id, exc)
+        return False, False, ""
+
+
 def _load_account_overlay() -> dict:
     """account_id -> {subcategory_id, cost_type} from the categories overlay.
     Fetched fresh (small table) so remaps in the Categories UI take effect."""
@@ -647,7 +674,7 @@ def update_expenses_batch(payload: ExpenseBatchUpdate, background_tasks: Backgro
 
 
 @router.get("")
-def list_expenses(project: Optional[str] = None, company_id: Optional[str] = None, limit: Optional[int] = None, current_user: dict = Depends(get_current_user)):
+def list_expenses(project: Optional[str] = None, company_id: Optional[str] = None, limit: Optional[int] = None, deleted_only: bool = False, current_user: dict = Depends(get_current_user)):
     """
     Lista todos los gastos, opcionalmente filtrados por project.
     Incluye información de tipo de transacción, proyecto, vendor, etc.
@@ -688,6 +715,9 @@ def list_expenses(project: Optional[str] = None, company_id: Optional[str] = Non
 
         while True:
             query = supabase.table("expenses_manual_COGS").select("*")
+            # Soft delete: the ledger hides deleted rows; the Deleted/trash view
+            # asks for them explicitly via deleted_only=true.
+            query = query.eq("is_deleted", bool(deleted_only))
             if project:
                 query = query.eq("project", project)
             elif company_project_ids is not None:
@@ -786,6 +816,7 @@ def list_all_expenses(limit: Optional[int] = 1000, company_id: Optional[str] = N
             page_end = min(offset + _PAGE_SIZE, max_rows) - 1
             q = (
                 supabase.table("expenses_manual_COGS").select("*")
+                .eq("is_deleted", False)   # hide soft-deleted
                 .order("TxnDate", desc=True)
             )
             if company_project_ids is not None:
@@ -1176,7 +1207,7 @@ def export_expenses(
         offset = 0
 
         while True:
-            query = supabase.table("expenses_manual_COGS").select("*")
+            query = supabase.table("expenses_manual_COGS").select("*").eq("is_deleted", False)
 
             if project:
                 query = query.eq("project", project)
@@ -1617,7 +1648,7 @@ def patch_expense(expense_id: str, payload: ExpenseUpdate, background_tasks: Bac
 
 
 @router.delete("/{expense_id}")
-def delete_expense(expense_id: str, user_id: Optional[str] = None, delete_reason: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+def delete_expense(expense_id: str, user_id: Optional[str] = None, delete_reason: Optional[str] = None, hard: bool = False, current_user: dict = Depends(get_current_user)):
     """
     Elimina un gasto con logging si estaba autorizado.
 
@@ -1626,60 +1657,96 @@ def delete_expense(expense_id: str, user_id: Optional[str] = None, delete_reason
     - delete_reason: Reason for deletion (required for authorized expenses)
     """
     try:
-        # Verificar que el gasto existe y obtener status
-        existing_resp = supabase.table("expenses_manual_COGS").select(
-            "expense_id, status, auth_status, Amount, LineDescription, account_id"
-        ).eq("expense_id", expense_id).single().execute()
+        # Actor = the verified JWT user (authoritative); user_id query param kept
+        # for backward compat / logging only.
+        actor = current_user.get("user_id") or user_id
+        can_delete, can_hard, role_name = _user_delete_perms(actor)
+        if not can_delete:
+            raise HTTPException(status_code=403, detail="You do not have permission to delete expenses.")
 
+        existing_resp = supabase.table("expenses_manual_COGS").select(
+            "expense_id, status, auth_status, Amount, LineDescription, account_id, is_deleted"
+        ).eq("expense_id", expense_id).single().execute()
         if not existing_resp.data:
             raise HTTPException(status_code=404, detail="Expense not found")
 
         existing = existing_resp.data
         current_status = existing.get("status") or ("auth" if existing.get("auth_status") else "pending")
+        reason = _clean(delete_reason)
 
-        # If expense is authorized or in review, require user_id and reason
-        if current_status in ['auth', 'review']:
-            if not user_id:
+        # ---- HARD delete (permanent) — Accounting Manager / CEO / COO only ----
+        if hard:
+            if not can_hard:
                 raise HTTPException(
-                    status_code=400,
-                    detail="user_id is required when deleting authorized expenses"
+                    status_code=403,
+                    detail="Only Accounting Manager, CEO or COO can permanently delete an expense.",
                 )
-            if not delete_reason:
-                raise HTTPException(
-                    status_code=400,
-                    detail="delete_reason is required when deleting authorized expenses"
-                )
+            supabase.table("expense_status_log").insert({
+                "expense_id": expense_id, "old_status": current_status, "new_status": "deleted",
+                "changed_by": actor, "reason": reason or "Permanent delete",
+                "metadata": {"hard_delete": True, "amount": existing.get("Amount"),
+                             "description": existing.get("LineDescription"), "account_id": existing.get("account_id")},
+            }).execute()
+            supabase.table("expenses_manual_COGS").delete().eq("expense_id", expense_id).execute()
+            return {"message": "Expense permanently deleted", "hard": True}
 
-            # Log the deletion
-            log_data = {
-                "expense_id": expense_id,
-                "old_status": current_status,
-                "new_status": "deleted",
-                "changed_by": user_id,
-                "reason": delete_reason,
-                "metadata": {
-                    "deleted": True,
-                    "amount": existing.get("Amount"),
-                    "description": existing.get("LineDescription"),
-                    "account_id": existing.get("account_id")
-                }
-            }
+        # ---- SOFT delete (default) — recoverable, hidden from ledger + reports ----
+        if existing.get("is_deleted"):
+            return {"message": "Expense is already deleted", "soft": True, "already": True}
 
-            supabase.table("expense_status_log").insert(log_data).execute()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        supabase.table("expenses_manual_COGS").update({
+            "is_deleted": True, "deleted_at": now_iso, "deleted_by": actor,
+            "delete_reason": reason, "updated_by": actor,
+        }).eq("expense_id", expense_id).execute()
 
-        # Eliminar
-        supabase.table("expenses_manual_COGS").delete().eq("expense_id", expense_id).execute()
+        # The expense is no longer pending/actionable — resolve any Daneel hold.
+        try:
+            supabase.table("daneel_pending_info").update({
+                "resolved_at": now_iso,
+            }).eq("expense_id", expense_id).is_("resolved_at", "null").execute()
+        except Exception:
+            pass  # non-critical
 
-        return {
-            "message": "Expense deleted",
-            "was_authorized": current_status in ['auth', 'review'],
-            "logged": current_status in ['auth', 'review']
-        }
+        supabase.table("expense_status_log").insert({
+            "expense_id": expense_id, "old_status": current_status, "new_status": "deleted",
+            "changed_by": actor, "reason": reason or "Soft delete",
+            "metadata": {"soft_delete": True, "amount": existing.get("Amount"),
+                         "description": existing.get("LineDescription"), "account_id": existing.get("account_id")},
+        }).execute()
+
+        return {"message": "Expense moved to Deleted", "soft": True, "was_authorized": current_status in ("auth", "review")}
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{expense_id}/restore")
+def restore_expense(expense_id: str, current_user: dict = Depends(get_current_user)):
+    """Restore a soft-deleted expense back into the ledger. Allowed for anyone
+    with can_delete on the expenses module."""
+    actor = current_user.get("user_id")
+    can_delete, _can_hard, _role = _user_delete_perms(actor)
+    if not can_delete:
+        raise HTTPException(status_code=403, detail="You do not have permission to restore expenses.")
+    existing = supabase.table("expenses_manual_COGS").select("expense_id, status").eq("expense_id", expense_id).single().execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    supabase.table("expenses_manual_COGS").update({
+        "is_deleted": False, "deleted_at": None, "deleted_by": None, "delete_reason": None,
+        "updated_by": actor,
+    }).eq("expense_id", expense_id).execute()
+    try:
+        supabase.table("expense_status_log").insert({
+            "expense_id": expense_id, "old_status": "deleted",
+            "new_status": existing.data.get("status") or "pending",
+            "changed_by": actor, "reason": "Restored", "metadata": {"restored": True},
+        }).execute()
+    except Exception:
+        pass
+    return {"message": "Expense restored"}
 
 
 # ====== STATUS MANAGEMENT ======
@@ -2060,7 +2127,7 @@ def get_expenses_summary_by_txn_type(project: Optional[str] = None, current_user
         raw_expenses = []
         offset = 0
         while True:
-            q = supabase.table("expenses_manual_COGS").select("txn_type, Amount")
+            q = supabase.table("expenses_manual_COGS").select("txn_type, Amount").eq("is_deleted", False)
             if project:
                 q = q.eq("project", project)
             q = q.eq("auth_status", True).neq("status", "review")
@@ -2110,7 +2177,7 @@ def get_expenses_summary_by_project(current_user: dict = Depends(get_current_use
         while True:
             batch = (
                 supabase.table("expenses_manual_COGS").select("project, Amount")
-                .eq("auth_status", True).neq("status", "review")
+                .eq("auth_status", True).neq("status", "review").eq("is_deleted", False)
                 .range(offset, offset + _PAGE_SIZE - 1)
                 .execute()
             ).data or []

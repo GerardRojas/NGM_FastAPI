@@ -1016,6 +1016,7 @@ def _compute_executive_kpis(
                 supabase.table("expenses_manual_COGS")
                 .select("project")
                 .eq("status", "pending")
+                .eq("is_deleted", False)
             )
             if pid_list:
                 pa_query = pa_query.in_("project", pid_list)

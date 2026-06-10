@@ -110,7 +110,7 @@ async def get_bill_expenses(
         all_expenses = []
         offset = 0
         while True:
-            q = supabase.table("expenses_manual_COGS").select("*").eq("bill_id", bill_id)
+            q = supabase.table("expenses_manual_COGS").select("*").eq("bill_id", bill_id).eq("is_deleted", False)
             if project_id:
                 q = q.eq("project", project_id)
             batch = q.range(offset, offset + _PAGE_SIZE - 1).execute().data or []
