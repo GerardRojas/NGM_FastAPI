@@ -992,8 +992,8 @@ def handle_search_expenses(
         accounts_resp = supabase.table("accounts").select("account_id, Name").execute()
         accounts_map = {a["account_id"]: a["Name"] for a in (accounts_resp.data or [])}
 
-        # Start building query
-        query = supabase.table("expenses_manual_COGS").select("*")
+        # Start building query (exclude soft-deleted expenses)
+        query = supabase.table("expenses_manual_COGS").select("*").eq("is_deleted", False)
 
         # Filter by vendor if specified (fuzzy match)
         matched_vendor_id = None

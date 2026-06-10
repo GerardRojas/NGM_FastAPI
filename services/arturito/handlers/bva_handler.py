@@ -447,6 +447,7 @@ def fetch_expenses(project_id: str) -> List[Dict[str, Any]]:
                 .select("*")
                 .eq("project", project_id)
                 .eq("status", "auth")
+                .eq("is_deleted", False)   # soft-deleted never count as actuals
                 .range(offset, offset + page_size - 1)
                 .execute()
             )

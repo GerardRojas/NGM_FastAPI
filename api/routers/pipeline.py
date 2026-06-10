@@ -1709,7 +1709,7 @@ def _collect_pending_expenses_auth(ctx: DutyContext) -> Dict[Any, DutyTask]:
     null/false). Role-managed (Accounting Manager) via DutySpec.resolve_managers."""
     expenses = supabase.table("expenses_manual_COGS").select(
         "expense_id, project, Amount"
-    ).or_("auth_status.is.null,auth_status.eq.false").execute().data or []
+    ).or_("auth_status.is.null,auth_status.eq.false").eq("is_deleted", False).execute().data or []
     logger.info("[AUTOMATIONS] Found %s pending expenses", len(expenses))
     if not expenses:
         return {}
@@ -2000,7 +2000,7 @@ def _collect_pending_expenses_categorize(ctx: DutyContext) -> Dict[Any, DutyTask
     Single-manager (default_manager_id) -- no DutySpec.resolve_managers."""
     expenses = supabase.table("expenses_manual_COGS").select(
         "expense_id, project, Amount"
-    ).or_("expense_category.is.null,expense_category.eq.").execute().data or []
+    ).or_("expense_category.is.null,expense_category.eq.").eq("is_deleted", False).execute().data or []
     logger.info("[AUTOMATIONS] Found %s uncategorized expenses", len(expenses))
     if not expenses:
         return {}
@@ -2092,7 +2092,7 @@ def _collect_pending_health_check(ctx: DutyContext) -> Dict[Any, DutyTask]:
     project_ids = [p["project_id"] for p in projects]
     expenses = supabase.table("expenses_manual_COGS").select(
         "project, Amount"
-    ).in_("project", project_ids).execute().data or []
+    ).in_("project", project_ids).eq("is_deleted", False).execute().data or []
 
     expenses_by_project: Dict[str, float] = {}
     for exp in expenses:
@@ -2649,14 +2649,14 @@ def get_automations_status() -> Dict[str, Any]:
         # Pending expenses count
         expenses_response = supabase.table("expenses_manual_COGS").select(
             "project", count="exact"
-        ).or_("auth_status.is.null,auth_status.eq.false").execute()
+        ).or_("auth_status.is.null,auth_status.eq.false").eq("is_deleted", False).execute()
 
         pending_expenses_count = expenses_response.count if expenses_response.count else 0
 
         # Get unique projects with pending expenses
         expenses_data = supabase.table("expenses_manual_COGS").select(
             "project"
-        ).or_("auth_status.is.null,auth_status.eq.false").execute()
+        ).or_("auth_status.is.null,auth_status.eq.false").eq("is_deleted", False).execute()
 
         unique_projects = set(
             e.get("project") for e in (expenses_data.data or []) if e.get("project")

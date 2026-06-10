@@ -122,7 +122,7 @@ async def get_1099_summary(year: Optional[int] = Query(None, description="Tax ye
 
         expenses_query = supabase.table("expenses_manual_COGS").select(
             "vendor_id, Amount, TxnDate"
-        ).in_("vendor_id", vendor_ids)
+        ).in_("vendor_id", vendor_ids).eq("is_deleted", False)
 
         if year:
             expenses_query = expenses_query.gte("TxnDate", f"{year}-01-01").lte("TxnDate", f"{year}-12-31")
@@ -186,7 +186,7 @@ async def get_vendor_summary(vendor_id: str, year: Optional[int] = Query(None)):
             raise HTTPException(status_code=404, detail="Vendor not found")
 
         # Get expenses
-        exp_query = supabase.table("expenses_manual_COGS").select("Amount, TxnDate").eq("vendor_id", vendor_id)
+        exp_query = supabase.table("expenses_manual_COGS").select("Amount, TxnDate").eq("vendor_id", vendor_id).eq("is_deleted", False)
         if year:
             exp_query = exp_query.gte("TxnDate", f"{year}-01-01").lte("TxnDate", f"{year}-12-31")
         exp_resp = exp_query.execute()
