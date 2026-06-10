@@ -181,19 +181,49 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ========================================
-# Demo accounts are read-only: block all mutating requests carrying a demo token.
+# Demo accounts run a sandbox workspace: writes PERSIST, but only to the
+# company-scoped modules whose data is isolated by company_id/source_company. A
+# demo session is pinned to its Demo company (users.company_id -> JWT), so those
+# writes land inside the sandbox and never touch another workspace. Mutations to
+# anything OUTSIDE this allowlist — global/shared taxonomy (categories, materials,
+# concepts), org config, team/roles, etc. — stay blocked so a demo can't corrupt
+# production-shared data. This is the server-side guardrail behind the Demo
+# Manager's per-module visibility; it holds even for direct (non-browser) calls.
 # Registered BEFORE CORS so the CORS middleware stays outermost and still tags
-# the 403 with CORS headers. This is the server-side counterpart to the client
-# write-block; it also stops direct (non-browser) API calls with a demo token.
+# the 403 with CORS headers.
 # ========================================
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+# Path prefixes a demo (sandbox) account may write to. Keep in sync with the
+# company-scoped "safe" module set surfaced in the Demo Manager checklist.
+_DEMO_WRITE_ALLOWED_PREFIXES = (
+    "/projects",
+    "/expenses",
+    "/budgets",
+    "/budget-alerts",
+    "/estimator",
+    "/vendors",
+    "/art",
+    "/reports",
+    "/sheet-templates",
+)
+
+
+def _demo_write_allowed(path: str) -> bool:
+    p = (path or "").rstrip("/") or "/"
+    return any(p == pre or p.startswith(pre + "/") for pre in _DEMO_WRITE_ALLOWED_PREFIXES)
+
 
 async def _block_demo_writes(request, call_next):
-    if request.method in _MUTATING_METHODS and demo_account_from_request(
-        request.headers.get("authorization")
+    if (
+        request.method in _MUTATING_METHODS
+        and demo_account_from_request(request.headers.get("authorization"))
+        and not _demo_write_allowed(request.url.path)
     ):
-        return JSONResponse(status_code=403, content={"detail": "Demo accounts are read-only."})
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "This action isn't available in the demo workspace."},
+        )
     return await call_next(request)
 
 

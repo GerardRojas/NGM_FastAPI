@@ -2,7 +2,7 @@
 Router para gestion de Companies (Empresas)
 """
 from fastapi import APIRouter, HTTPException, Query, Depends
-from api.auth import require_internal, require_leadership
+from api.auth import require_internal, require_leadership, get_current_user
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from api.supabase_client import supabase
@@ -41,14 +41,26 @@ class CompanyUpdate(BaseModel):
 @router.get("")
 async def list_companies(
     q: Optional[str] = Query(default=None, description="Search by company name"),
+    current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """
     Lista todas las companies ordenadas por nombre, con busqueda opcional.
+
+    Demo accounts are pinned to their Demo workspace: they only ever see the
+    single company they're linked to (users.company_id), so the workspace
+    switcher can't leave the sandbox. Falls back to all is_demo companies if the
+    account somehow has no company_id. Normal accounts see every company.
     """
     try:
         qry = supabase.table("companies").select("*")
         if q:
             qry = qry.ilike("name", f"%{q}%")
+        if (current_user.get("account_type") or "internal") == "demo":
+            home = current_user.get("company_id")
+            if home:
+                qry = qry.eq("id", home)
+            else:
+                qry = qry.eq("is_demo", True)
         response = qry.order("name").execute()
         return response.data or []
     except Exception as e:

@@ -60,6 +60,9 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         "role": role,
         "account_type": decoded.get("account_type") or "internal",
         "client_id": decoded.get("client_id"),
+        # Home workspace (company). Demo accounts are pinned to their Demo company;
+        # null for normal internal users (who see every company).
+        "company_id": decoded.get("company_id"),
     }
 
 
@@ -155,6 +158,7 @@ def make_access_token(
     role: str | None,
     account_type: str = "internal",
     client_id: str | None = None,
+    company_id: str | None = None,
 ) -> str:
     now = datetime.now(timezone.utc)
     payload = {
@@ -165,6 +169,9 @@ def make_access_token(
         # scope from these two claims alone (never from request params).
         "account_type": account_type or "internal",
         "client_id": str(client_id) if client_id else None,
+        # Home workspace. Demo accounts are pinned to a Demo company so the
+        # backend can keep the session inside its sandbox.
+        "company_id": str(company_id) if company_id else None,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=JWT_EXPIRES_MIN)).timestamp()),
     }
@@ -283,6 +290,7 @@ def login(request: Request, payload: LoginRequest):
         role=role_name,
         account_type=effective_account_type,
         client_id=user.get("client_id"),
+        company_id=user.get("company_id"),
     )
 
     security_logger.info("login_ok user=%r ip=%s role=%s", user.get("user_name"), ip, role_name)

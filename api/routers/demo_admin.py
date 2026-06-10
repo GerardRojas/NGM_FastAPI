@@ -1,18 +1,23 @@
 """
 Demo Admin Router — CRUD over demo accounts for the IT > "Demo Manager" page.
 
-A demo account is a real `users` row with account_type = 'demo' (so the JWT
-carries account_type:'demo' and the React app's isDemoAccount() flips the whole
-session read-only — writes blocked, fixtures served, realtime off). Each demo
-user owns a DEDICATED role ("Demo — <name>"), and which modules that demo can
-see is just that role's role_permissions (can_view). Modules the demo can't view
-still render in the sidebar greyed-out (see SidebarNav getDemoLockedModules).
+A demo account is a real `users` row with account_type = 'demo'. Every demo user
+is pinned to the single canonical "Demo" workspace (a companies row with
+is_demo = true); users.company_id -> the Demo company, carried into the JWT. The
+demo session is a SANDBOX: it sees only the Demo workspace's seeded data and its
+writes PERSIST there (scoped by company_id/source_company), but a server-side
+allowlist (api/main.py) keeps those writes off global/shared tables. The active
+Demo workspace is also what turns on the guided-tour bubbles in the hub.
 
-Visibility is the ONLY thing controlled per demo — demos are always read-only,
-so can_edit/can_delete stay false. All endpoints are CEO/COO only.
+Each demo user owns a DEDICATED role ("Demo — <name>"), and which modules that
+demo can see is just that role's role_permissions (can_view). Modules the demo
+can't view still render in the sidebar greyed-out (see SidebarNav
+getDemoLockedModules). All endpoints are CEO/COO only.
 """
 from __future__ import annotations
 
+import uuid
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,7 +31,28 @@ router = APIRouter(prefix="/demo-admin", tags=["demo-admin"])
 
 DEMO_ACCOUNT_TYPE = "demo"
 DEMO_ROLE_PREFIX = "Demo"  # dedicated roles are named "Demo — <user_name>"
+DEMO_COMPANY_NAME = "Demo"  # the single shared sandbox workspace
 _LEADERSHIP_ROLES = {"ceo", "coo"}
+
+# Modules whose backend is company-scoped (data isolated by company_id /
+# source_company), so they're SAFE to expose in a demo sandbox: a demo session
+# only sees the Demo workspace's rows and its writes stay inside it. Everything
+# else (global/shared taxonomy, org config, team tools) is marked unsafe so the
+# Demo Manager can warn/disable it. Keep in sync with _DEMO_WRITE_ALLOWED_PREFIXES
+# in api/main.py.
+_DEMO_SCOPED_SLUGS = {
+    "dashboard",
+    "analytics",
+    "projects",
+    "expenses",
+    "budgets",
+    "budget-vs-actuals",
+    "pnl-report",
+    "reporting",
+    "estimator",
+    "vendors",
+    "art",
+}
 
 # Internal IT / admin tools never offered to (or shown greyed for) demo accounts:
 # managing the org, roles, AI spend, or demos themselves makes no sense for a demo
@@ -92,6 +118,8 @@ def _module_catalog() -> List[Dict[str, Any]]:
             "category_order": cat.get("category_order") or 0,
             "item_order": i.get("item_order") or 0,
             "menu_item_id": i.get("id"),
+            # Safe to grant in a demo sandbox (its data is company-scoped)?
+            "scoped": slug.lower() in _DEMO_SCOPED_SLUGS,
         })
     out.sort(key=lambda m: (m["category_order"], m["item_order"], m["item_name"]))
     return out
@@ -165,6 +193,105 @@ def _unique_role_name(base_name: str) -> str:
     return f"{candidate} ({n})"
 
 
+# ---------------------------------------------------------------------------
+# The shared "Demo" workspace (one canonical company every demo user is pinned to)
+# ---------------------------------------------------------------------------
+def _ensure_demo_company() -> str:
+    """Return the id of the canonical Demo workspace, creating + seeding it on
+    first use. Prefers an existing is_demo company; falls back to one named
+    'Demo'; otherwise creates it (is_demo=true) and seeds starter data."""
+    found = (supabase.table("companies").select("id")
+             .eq("is_demo", True).limit(1).execute().data) or []
+    if found:
+        return found[0]["id"]
+
+    by_name = (supabase.table("companies").select("id")
+               .eq("name", DEMO_COMPANY_NAME).limit(1).execute().data) or []
+    if by_name:
+        cid = by_name[0]["id"]
+        # Make sure the flag is set so the hub turns on the guided experience.
+        supabase.table("companies").update({"is_demo": True}).eq("id", cid).execute()
+        return cid
+
+    created = (supabase.table("companies").insert({
+        "name": DEMO_COMPANY_NAME,
+        "description": "Sandbox workspace for product demos.",
+        "is_demo": True,
+        "status": "Active",
+    }).execute().data) or []
+    if not created:
+        raise HTTPException(status_code=500, detail="Could not create the Demo workspace.")
+    cid = created[0]["id"]
+    _seed_demo_company_data(cid)
+    return cid
+
+
+# Starter dataset: a handful of projects, each with a few expenses. Kept small
+# and FK-safe (only required columns) so it can't break on schema drift. Shared
+# by all demo users; the Reset action wipes and re-applies it.
+_DEMO_PROJECTS = [
+    {"name": "Maple Ave Residence", "city": "Austin", "address": "1420 Maple Ave"},
+    {"name": "Riverside Office Fit-Out", "city": "Denver", "address": "88 Riverside Dr"},
+    {"name": "Oakwood Retail Remodel", "city": "Dallas", "address": "305 Oakwood Blvd"},
+]
+_DEMO_EXPENSES = [  # (project index, description, amount, days-ago)
+    (0, "Framing lumber package", 8450.00, 40),
+    (0, "Concrete — foundation pour", 12200.00, 35),
+    (0, "Electrical rough-in", 6300.00, 20),
+    (1, "HVAC units", 18750.00, 30),
+    (1, "Drywall + finishing", 9100.00, 14),
+    (2, "Storefront glazing", 15400.00, 25),
+    (2, "Flooring — polished concrete", 7200.00, 10),
+]
+
+
+def _seed_demo_company_data(company_id: str) -> Dict[str, int]:
+    """Insert starter projects + expenses for the Demo workspace (idempotent: a
+    no-op if it already has projects). Returns inserted counts."""
+    existing = (supabase.table("projects").select("project_id")
+                .eq("source_company", company_id).limit(1).execute().data) or []
+    if existing:
+        return {"projects": 0, "expenses": 0}
+
+    project_ids: List[str] = []
+    for p in _DEMO_PROJECTS:
+        pid = str(uuid.uuid4())
+        supabase.table("projects").insert({
+            "project_id": pid,
+            "project_name": p["name"],
+            "source_company": company_id,
+            "city": p["city"],
+            "address": p["address"],
+        }).execute()
+        project_ids.append(pid)
+
+    exp_rows = []
+    for proj_idx, desc, amount, days_ago in _DEMO_EXPENSES:
+        exp_rows.append({
+            "project": project_ids[proj_idx],
+            "TxnDate": (date.today() - timedelta(days=days_ago)).isoformat(),
+            "Amount": amount,
+            "LineDescription": desc,
+            "show_on_reports": True,
+        })
+    if exp_rows:
+        supabase.table("expenses_manual_COGS").insert(exp_rows).execute()
+
+    return {"projects": len(project_ids), "expenses": len(exp_rows)}
+
+
+def _clear_demo_company_data(company_id: str) -> None:
+    """Delete the Demo workspace's project-scoped data (expenses first, then
+    projects) so a reset can re-seed from a clean slate."""
+    projs = (supabase.table("projects").select("project_id")
+             .eq("source_company", company_id).execute().data) or []
+    pids = [p["project_id"] for p in projs]
+    for pid in pids:
+        supabase.table("expenses_manual_COGS").delete().eq("project", pid).execute()
+    if pids:
+        supabase.table("projects").delete().eq("source_company", company_id).execute()
+
+
 def _load_demo_user(user_id: str) -> Dict[str, Any]:
     rows = (supabase.table("users")
             .select("user_id, user_name, user_rol, account_type")
@@ -185,7 +312,8 @@ async def list_modules(current_user: dict = Depends(get_current_user)):
     """The full catalog of modules a demo can be granted (for the checklist)."""
     _require_leadership(current_user)
     return {"data": [
-        {"slug": c["slug"], "item_name": c["item_name"], "category_name": c["category_name"]}
+        {"slug": c["slug"], "item_name": c["item_name"],
+         "category_name": c["category_name"], "scoped": c["scoped"]}
         for c in _module_catalog()
     ]}
 
@@ -215,6 +343,8 @@ async def create_demo_user(payload: DemoUserCreate,
     if dup:
         raise HTTPException(status_code=409, detail=f'A user named "{name}" already exists.')
 
+    company_id = _ensure_demo_company()
+
     role_ins = (supabase.table("rols")
                 .insert({"rol_name": _unique_role_name(name)}).execute().data) or []
     if not role_ins:
@@ -228,6 +358,7 @@ async def create_demo_user(payload: DemoUserCreate,
             "user_rol": rol_id,
             "account_type": DEMO_ACCOUNT_TYPE,
             "is_external": False,
+            "company_id": company_id,
         }).execute().data) or []
     except Exception as e:
         # Roll back the orphan role so a retry isn't blocked by a stale role.
@@ -295,4 +426,18 @@ async def delete_demo_user(user_id: str,
              .eq("rol_id", rol_id).limit(1).execute().data) or []
         if r and str(r[0].get("rol_name") or "").startswith(DEMO_ROLE_PREFIX):
             supabase.table("rols").delete().eq("rol_id", rol_id).execute()
+    # The shared Demo company is intentionally NOT deleted — other demo users may
+    # still be pinned to it. Use the Reset action to clean its sandbox data.
     return {"ok": True}
+
+
+@router.post("/workspace/reset")
+async def reset_demo_workspace(current_user: dict = Depends(get_current_user)):
+    """Wipe the Demo workspace's sandbox data (projects + expenses) and re-seed it
+    from the starter dataset. Lets a cluttered demo be reset to a clean slate.
+    The company row, demo users and roles are preserved."""
+    _require_leadership(current_user)
+    company_id = _ensure_demo_company()
+    _clear_demo_company_data(company_id)
+    counts = _seed_demo_company_data(company_id)
+    return {"ok": True, "company_id": company_id, "seeded": counts}
