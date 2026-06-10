@@ -39,6 +39,11 @@ class IssueUpdate(BaseModel):
     type: Optional[str] = None
 
 
+class IssueFeedback(BaseModel):
+    satisfied: bool
+    comment: Optional[str] = None
+
+
 def _clean(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -202,7 +207,36 @@ async def update_issue(issue_id: str, payload: IssueUpdate, current_user: dict =
                 detail=f"Invalid status. Allowed: {', '.join(sorted(ISSUE_STATUSES))}",
             )
         update["status"] = status_value
-        update["resolved_at"] = datetime.now(timezone.utc).isoformat() if status_value == "resolved" else None
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if status_value == "resolved":
+            # Stamp who resolved it and (when the reporter is someone else) queue the
+            # confirmation Art will ask them via the floating assistant.
+            existing = (
+                supabase.table("issue_reports")
+                .select("created_by")
+                .eq("id", issue_id)
+                .execute()
+                .data
+            )
+            if not existing:
+                raise HTTPException(status_code=404, detail="Issue not found")
+            created_by = existing[0].get("created_by")
+            resolver_id = current_user.get("user_id")
+
+            update["resolved_at"] = now_iso
+            update["resolved_by"] = resolver_id
+            update["resolved_by_name"] = current_user.get("username")
+            if created_by and str(created_by) != str(resolver_id):
+                update["feedback_status"] = "pending"
+                update["feedback_requested_at"] = now_iso
+        else:
+            # Manual reopen by the team — drop any stale pending ask and resolver stamp.
+            update["resolved_at"] = None
+            update["resolved_by"] = None
+            update["resolved_by_name"] = None
+            update["feedback_status"] = None
+            update["feedback_requested_at"] = None
 
     if payload.title is not None:
         title = _clean(payload.title)
@@ -228,6 +262,77 @@ async def update_issue(issue_id: str, payload: IssueUpdate, current_user: dict =
         result = supabase.table("issue_reports").update(update).eq("id", issue_id).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update issue: {e}")
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Issue not found")
+
+    updated = result.data[0]
+    updated["attachments"] = _attachments_for([issue_id]).get(issue_id, [])
+    return updated
+
+
+# ── GET /issues/my-feedback ────────────────────────────────────
+
+@router.get("/my-feedback")
+async def my_feedback_requests(current_user: dict = Depends(require_internal)) -> List[Dict[str, Any]]:
+    """Pending resolution confirmations for the current user (tickets they raised
+    that the team just marked resolved). Polled by the floating assistant (Art)."""
+    user_id = current_user.get("user_id")
+    if not user_id:
+        return []
+    try:
+        rows = (
+            supabase.table("issue_reports")
+            .select("id, ticket_number, title, type, resolved_by_name, resolved_at")
+            .eq("created_by", user_id)
+            .eq("feedback_status", "pending")
+            .order("resolved_at", desc=True)
+            .execute()
+            .data
+        ) or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching feedback requests: {e}")
+    return rows
+
+
+# ── POST /issues/{id}/feedback ─────────────────────────────────
+
+@router.post("/{issue_id}/feedback")
+async def submit_issue_feedback(
+    issue_id: str,
+    payload: IssueFeedback,
+    current_user: dict = Depends(require_internal),
+):
+    """The reporter confirms whether a resolved ticket actually fixed their problem.
+    Satisfied -> stays resolved (confirmed). Not satisfied -> reopened for the team."""
+    existing = (
+        supabase.table("issue_reports").select("created_by, reopen_count").eq("id", issue_id).execute().data
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Issue not found")
+
+    created_by = existing[0].get("created_by")
+    if not created_by or str(created_by) != str(current_user.get("user_id")):
+        raise HTTPException(status_code=403, detail="Only the reporter can answer this request")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update: Dict[str, Any] = {
+        "feedback_status": "satisfied" if payload.satisfied else "unsatisfied",
+        "feedback_comment": _clean(payload.comment),
+        "feedback_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    if not payload.satisfied:
+        # Send it back to the team and bump the reopen counter.
+        update["status"] = "open"
+        update["resolved_at"] = None
+        update["reopen_count"] = int(existing[0].get("reopen_count") or 0) + 1
+
+    try:
+        result = supabase.table("issue_reports").update(update).eq("id", issue_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save feedback: {e}")
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Issue not found")
