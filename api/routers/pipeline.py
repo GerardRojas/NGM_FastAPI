@@ -459,13 +459,10 @@ def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, not
         "deep_link": deep_link,
     }
 
-    status_id = None
-    try:
-        st = (supabase.table("tasks_status").select("task_status_id")
-              .ilike("task_status", "not started").execute().data) or []
-        status_id = st[0]["task_status_id"] if st else None
-    except Exception:
-        status_id = None
+    # Sent-to-review = pending the reviewer's approval, so the task lands in the
+    # board's "Awaiting Approval" column from the start (it then auto-advances via
+    # set_estimate_review_task_status on the reviewer's decision).
+    status_id = _review_status_id("awaiting approval")
 
     task_data = {
         "task_description": desc,
@@ -474,6 +471,12 @@ def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, not
         "automation_type": "estimate_review",
         "is_automated": True,
         "automation_metadata": metadata,
+        # tasks.Owner_id / task_finished_status carry a broken DEFAULT
+        # (gen_random_uuid()) that fails their FK on any insert that omits them.
+        # A review task has no single owner (it's assigned via managers_ids), so
+        # pin both to NULL — same guard the normal create-task path uses.
+        "Owner_id": None,
+        "task_finished_status": None,
     }
     if status_id is not None:
         task_data["task_status"] = status_id
@@ -492,7 +495,153 @@ def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, not
 
     if existing:
         tid = existing[0]["task_id"]
-        # Refresh assignment + notes, but don't force-reopen the status on resend.
+        # Refresh assignment + notes AND re-open to Awaiting Approval on resend
+        # (e.g. after changes were requested), so the board reflects the new round.
+        supabase.table("tasks").update(task_data).eq("task_id", tid).execute()
+        return tid
+
+    resp = supabase.table("tasks").insert(task_data).execute()
+    return resp.data[0]["task_id"] if (resp and resp.data) else None
+
+
+# Branch review_status → pipeline task status. The estimate review task is a live
+# mirror of the branch's review state on the board, so its column resolves itself
+# as the operation proceeds — no coordination intervention until it's approved.
+_REVIEW_STATUS_TO_TASK_STATUS = {
+    "under_review": "awaiting approval",
+    "changes_requested": "resubmittal needed",
+    "approved": "good to go",
+    "rejected": "done",
+}
+
+
+def _review_status_id(status_name: str):
+    """Resolve a tasks_status row id by (case-insensitive) name; None if absent."""
+    try:
+        rows = (supabase.table("tasks_status").select("task_status_id")
+                .ilike("task_status", status_name).execute().data) or []
+        return rows[0]["task_status_id"] if rows else None
+    except Exception as exc:
+        logger.debug("[PIPELINE] status id lookup (%s) failed: %s", status_name, exc)
+        return None
+
+
+def set_estimate_review_task_status(estimate_id, branch, review_status):
+    """Mirror a branch's review_status onto its pipeline task so the board reflects
+    the estimate review lifecycle automatically. Idempotent / best-effort: returns
+    the task_id it moved, or None. The task is found by branch_review_key so it
+    works even if review_task_id was never persisted on the branch."""
+    branch_id = branch.get("id")
+    review_key = f"{estimate_id}:{branch_id}"
+    status_name = _REVIEW_STATUS_TO_TASK_STATUS.get((review_status or "").lower())
+    if not status_name:
+        return None
+    status_id = _review_status_id(status_name)
+    if not status_id:
+        return None
+    try:
+        rows = (supabase.table("tasks").select("task_id")
+                .eq("automation_type", "estimate_review")
+                .contains("automation_metadata", {"branch_review_key": review_key})
+                .limit(1).execute().data) or []
+    except Exception as exc:
+        logger.debug("[PIPELINE] review task lookup (status sync) failed: %s", exc)
+        return None
+    if not rows:
+        return None
+    tid = rows[0]["task_id"]
+    try:
+        supabase.table("tasks").update({"task_status": status_id}).eq("task_id", tid).execute()
+        return tid
+    except Exception as exc:
+        logger.warning("[PIPELINE] review task status update failed: %s", exc)
+        return None
+
+
+def create_estimate_to_budget_task(estimate_id, branch, manifest):
+    """On estimate approval, hand the branch off to the Costs/Budgets department:
+    create an actionable task to import the approved estimate into Budgets.
+
+    Idempotent per branch (automation_metadata.budget_handoff_key). Assignment +
+    department come from the 'estimate_to_budget' automation (configured in
+    Responsibilities / the Operations automations page). Returns task_id or None.
+    """
+    branch_id = branch.get("id")
+    handoff_key = f"{estimate_id}:{branch_id}"
+
+    settings = {}
+    try:
+        s = (supabase.table("automation_settings").select("*")
+             .eq("automation_type", "estimate_to_budget").limit(1).execute().data) or []
+        settings = s[0] if s else {}
+    except Exception as exc:
+        logger.debug("[PIPELINE] estimate_to_budget settings miss: %s", exc)
+
+    if settings.get("is_enabled") is False:
+        return None  # automation explicitly disabled
+
+    # Resolve the assignees: configured people ∪ default person ∪ responsible role.
+    cfg = settings.get("config") or {}
+    people = [str(u) for u in (cfg.get("assignee_user_ids") or []) if u]
+    if settings.get("default_manager_id") and str(settings["default_manager_id"]) not in people:
+        people.append(str(settings["default_manager_id"]))
+    role_id = settings.get("responsible_role_id") if settings.get("responsible_type") == "role" else None
+    if role_id:
+        try:
+            members = (supabase.table("users").select("user_id")
+                       .eq("user_rol", str(role_id)).execute().data) or []
+            for m in members:
+                uid = m.get("user_id")
+                if uid and str(uid) not in people:
+                    people.append(str(uid))
+        except Exception as exc:
+            logger.debug("[PIPELINE] budget handoff role members miss: %s", exc)
+
+    project_name = manifest.get("project_name") or "Estimate"
+    branch_name = branch.get("name") or branch_id
+    deep_link = f"/estimator?estimate={estimate_id}&branch={branch_id}"
+    desc = f"Send approved estimate to Budgets: {project_name} — {branch_name}"
+    notes = ("Estimate approved. Import the approved branch into Budgets for the "
+             f"costs department.\n\nOpen the branch: {deep_link}")
+
+    metadata = {
+        "budget_handoff_key": handoff_key,
+        "estimate_id": estimate_id,
+        "branch_id": branch_id,
+        "branch_name": branch_name,
+        "deep_link": deep_link,
+    }
+
+    task_data = {
+        "task_description": desc,
+        "task_notes": notes,
+        "managers_ids": people or None,
+        "automation_type": "estimate_to_budget",
+        "is_automated": True,
+        "automation_metadata": metadata,
+        # Same broken-DEFAULT guard as the review task (see create_estimate_review_task).
+        "Owner_id": None,
+        "task_finished_status": None,
+    }
+    status_id = _review_status_id("not started")
+    if status_id is not None:
+        task_data["task_status"] = status_id
+    if settings.get("default_department_id"):
+        task_data["task_department"] = settings["default_department_id"]
+
+    # Idempotent: refresh the existing handoff task for this branch if present.
+    try:
+        existing = (supabase.table("tasks").select("task_id")
+                    .eq("automation_type", "estimate_to_budget")
+                    .contains("automation_metadata", {"budget_handoff_key": handoff_key})
+                    .limit(1).execute().data) or []
+    except Exception as exc:
+        logger.debug("[PIPELINE] budget handoff lookup failed: %s", exc)
+        existing = []
+
+    if existing:
+        tid = existing[0]["task_id"]
+        # Don't force-reopen status on re-approval; just refresh assignment/notes.
         upd = {k: v for k, v in task_data.items() if k != "task_status"}
         supabase.table("tasks").update(upd).eq("task_id", tid).execute()
         return tid
