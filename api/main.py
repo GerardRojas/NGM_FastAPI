@@ -27,6 +27,7 @@ from api.routers.estimator import router as estimator_router
 from api.routers.sheet_templates import router as sheet_templates_router
 from api.routers.team import router as team_router
 from api.routers.companies import router as companies_router
+from api.routers.clients import router as clients_router
 from api.routers.expenses import router as expenses_router
 from api.routers.general_expenses import router as general_expenses_router
 from api.routers.vendors import router as vendors_router
@@ -272,6 +273,9 @@ app.include_router(team_router)
 
 # Companies Management (CRUD de empresas)
 app.include_router(companies_router)
+
+# Clients Management (CRUD de clientes)
+app.include_router(clients_router)
 
 app.include_router(expenses_router)
 app.include_router(general_expenses_router)
