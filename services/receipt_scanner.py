@@ -1338,6 +1338,7 @@ IMPORTANT:
 - DO NOT include any text before or after the JSON"""
 
 
+@ai_feature("categorization")
 def _categorize_chunk_via_gpt(
     stage: str,
     expenses_chunk: list,
@@ -1349,6 +1350,11 @@ def _categorize_chunk_via_gpt(
     Categorize a chunk of expenses via GPT (mini→heavy fallback).
     Returns list of validated categorization dicts.
     Raises RuntimeError on total failure.
+
+    Tagged with @ai_feature here (not only on the auto_categorize caller) because
+    large batches fan these calls out across a ThreadPoolExecutor, and contextvars
+    don't propagate into worker threads — without this, parallel chunks logged to
+    the AI-usage ledger as "unknown" instead of "categorization".
     """
     from api.services.gpt_client import gpt
 
