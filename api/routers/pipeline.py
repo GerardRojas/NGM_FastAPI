@@ -420,6 +420,9 @@ def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, not
     except Exception as exc:
         logger.debug("[PIPELINE] estimate_review settings miss: %s", exc)
 
+    if settings.get("is_enabled") is False:
+        return None  # automation explicitly disabled (mirrors estimate_to_budget)
+
     cfg = settings.get("config") or {}
     people = [str(u) for u in (reviewer_ids or []) if u]
     for uid in (cfg.get("reviewer_user_ids") or []):
@@ -482,6 +485,13 @@ def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, not
         task_data["task_status"] = status_id
     if settings.get("default_department_id"):
         task_data["task_department"] = settings["default_department_id"]
+    # Populate the rest of the board columns from data we already have, so the task
+    # isn't a bare row: workspace (company) + configured priority.
+    if manifest.get("company_id"):
+        task_data["company_management"] = manifest["company_id"]
+    prio_id = _priority_id_for_level(settings.get("default_priority"))
+    if prio_id:
+        task_data["task_priority"] = prio_id
 
     # Idempotent: refresh the existing review task for this branch if present.
     try:
@@ -500,6 +510,8 @@ def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, not
         supabase.table("tasks").update(task_data).eq("task_id", tid).execute()
         return tid
 
+    from datetime import datetime
+    task_data["start_date"] = datetime.utcnow().date().isoformat()  # only on create
     resp = supabase.table("tasks").insert(task_data).execute()
     return resp.data[0]["task_id"] if (resp and resp.data) else None
 
@@ -523,6 +535,29 @@ def _review_status_id(status_name: str):
         return rows[0]["task_status_id"] if rows else None
     except Exception as exc:
         logger.debug("[PIPELINE] status id lookup (%s) failed: %s", status_name, exc)
+        return None
+
+
+# automation_settings.default_priority is a 1..5 level, but tasks.task_priority is
+# a FK to tasks_priority (named rows). Map by the conventional ascending order so
+# the configured priority actually lands on the board instead of being dropped.
+_PRIORITY_LEVEL_NAMES = {1: "Low", 2: "Normal", 3: "Important", 4: "High Priority", 5: "Critical"}
+
+
+def _priority_id_for_level(level) -> Optional[str]:
+    """Resolve a tasks_priority id from a numeric default_priority; None if absent."""
+    try:
+        name = _PRIORITY_LEVEL_NAMES.get(int(level))
+    except (TypeError, ValueError):
+        return None
+    if not name:
+        return None
+    try:
+        rows = (supabase.table("tasks_priority").select("priority_id")
+                .ilike("priority", name).limit(1).execute().data) or []
+        return rows[0]["priority_id"] if rows else None
+    except Exception as exc:
+        logger.debug("[PIPELINE] priority id lookup (%s) failed: %s", name, exc)
         return None
 
 
@@ -628,6 +663,12 @@ def create_estimate_to_budget_task(estimate_id, branch, manifest):
         task_data["task_status"] = status_id
     if settings.get("default_department_id"):
         task_data["task_department"] = settings["default_department_id"]
+    # Same inference as the review task: workspace (company) + configured priority.
+    if manifest.get("company_id"):
+        task_data["company_management"] = manifest["company_id"]
+    prio_id = _priority_id_for_level(settings.get("default_priority"))
+    if prio_id:
+        task_data["task_priority"] = prio_id
 
     # Idempotent: refresh the existing handoff task for this branch if present.
     try:
@@ -646,6 +687,8 @@ def create_estimate_to_budget_task(estimate_id, branch, manifest):
         supabase.table("tasks").update(upd).eq("task_id", tid).execute()
         return tid
 
+    from datetime import datetime
+    task_data["start_date"] = datetime.utcnow().date().isoformat()  # only on create
     resp = supabase.table("tasks").insert(task_data).execute()
     return resp.data[0]["task_id"] if (resp and resp.data) else None
 
@@ -1454,6 +1497,19 @@ def run_duty(spec: DutySpec) -> tuple:
 
     department_id = _resolve_duty_department(settings, spec.department_hint)
     not_started_status_id = _resolve_not_started_status_id()
+    duty_priority_id = _priority_id_for_level(settings.get("default_priority"))
+    from datetime import datetime
+    start_today = datetime.utcnow().date().isoformat()
+    # Scope each per-project duty task to that project's workspace (one batched read).
+    project_company: Dict[Any, Any] = {}
+    pids = [pid for pid in tasks_by_project.keys() if pid]
+    if pids:
+        try:
+            rows = (supabase.table("projects").select("project_id, source_company")
+                    .in_("project_id", pids).execute().data) or []
+            project_company = {r.get("project_id"): r.get("source_company") for r in rows}
+        except Exception as exc:
+            logger.debug("[AUTOMATIONS] %s: project company lookup failed: %s", atype, exc)
 
     created = 0
     updated = 0
@@ -1501,7 +1557,12 @@ def run_duty(spec: DutySpec) -> tuple:
                 "automation_type": atype,
                 "is_automated": True,
                 "automation_metadata": dtask.metadata,
+                "start_date": start_today,
             }
+            if duty_priority_id:
+                new_task["task_priority"] = duty_priority_id
+            if project_company.get(project_id):
+                new_task["company_management"] = project_company[project_id]
             if multi:
                 new_task["managers_ids"] = manager_ids
             supabase.table("tasks").insert(new_task).execute()
@@ -1556,10 +1617,23 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
     tasks_created = 0
     tasks_updated = 0
     errors = []
+    skipped = []
 
     try:
         for automation_id in payload.automations:
             if automation_id in DUTY_REGISTRY:
+                # The is_enabled toggle is authoritative: never run a duty that's
+                # explicitly disabled, regardless of what the caller passed. (An
+                # absent settings row falls through to run, matching legacy.)
+                try:
+                    en = (supabase.table("automation_settings").select("is_enabled")
+                          .eq("automation_type", automation_id).limit(1).execute().data) or []
+                except Exception:
+                    en = []
+                if en and en[0].get("is_enabled") is False:
+                    logger.info("[AUTOMATIONS] %s skipped (disabled)", automation_id)
+                    skipped.append(automation_id)
+                    continue
                 created, updated = run_duty(DUTY_REGISTRY[automation_id])
                 tasks_created += created
                 tasks_updated += updated
@@ -1577,6 +1651,7 @@ def run_automations(payload: AutomationsRunRequest) -> Dict[str, Any]:
             "success": True,
             "tasks_created": tasks_created,
             "tasks_updated": tasks_updated,
+            "skipped": skipped if skipped else None,
             "errors": errors if errors else None
         }
 
