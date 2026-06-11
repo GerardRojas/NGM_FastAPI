@@ -519,10 +519,13 @@ def create_estimate_review_task(estimate_id, branch, manifest, reviewer_ids, not
 # Branch review_status → pipeline task status. The estimate review task is a live
 # mirror of the branch's review state on the board, so its column resolves itself
 # as the operation proceeds — no coordination intervention until it's approved.
+# On approval the review task is finished (Done): a fresh "Send estimate" task is
+# spawned for Coordination (create_send_estimate_task), so the review row closes
+# out rather than lingering in "Good to Go".
 _REVIEW_STATUS_TO_TASK_STATUS = {
     "under_review": "awaiting approval",
     "changes_requested": "resubmittal needed",
-    "approved": "good to go",
+    "approved": "done",
     "rejected": "done",
 }
 
@@ -678,6 +681,113 @@ def create_estimate_to_budget_task(estimate_id, branch, manifest):
                     .limit(1).execute().data) or []
     except Exception as exc:
         logger.debug("[PIPELINE] budget handoff lookup failed: %s", exc)
+        existing = []
+
+    if existing:
+        tid = existing[0]["task_id"]
+        # Don't force-reopen status on re-approval; just refresh assignment/notes.
+        upd = {k: v for k, v in task_data.items() if k != "task_status"}
+        supabase.table("tasks").update(upd).eq("task_id", tid).execute()
+        return tid
+
+    from datetime import datetime
+    task_data["start_date"] = datetime.utcnow().date().isoformat()  # only on create
+    resp = supabase.table("tasks").insert(task_data).execute()
+    return resp.data[0]["task_id"] if (resp and resp.data) else None
+
+
+def create_send_estimate_task(estimate_id, branch, manifest):
+    """On estimate approval, hand the approved branch off to Coordination: create an
+    actionable task to send the estimate/proposal to the client.
+
+    This is the coordination-side counterpart to create_estimate_to_budget_task (the
+    costs-side handoff): approval closes the review and fans out into two parallel
+    next steps — Budgets import (Costs) and Send estimate (Coordination).
+
+    Idempotent per branch (automation_metadata.send_estimate_key). Assignment +
+    department come from the 'send_estimate' automation (configured in
+    Responsibilities / the Operations automations page). Returns task_id or None.
+    """
+    branch_id = branch.get("id")
+    send_key = f"{estimate_id}:{branch_id}"
+
+    settings = {}
+    try:
+        s = (supabase.table("automation_settings").select("*")
+             .eq("automation_type", "send_estimate").limit(1).execute().data) or []
+        settings = s[0] if s else {}
+    except Exception as exc:
+        logger.debug("[PIPELINE] send_estimate settings miss: %s", exc)
+
+    if settings.get("is_enabled") is False:
+        return None  # automation explicitly disabled
+
+    # Resolve the assignees: configured people ∪ default person ∪ responsible role.
+    cfg = settings.get("config") or {}
+    people = [str(u) for u in (cfg.get("assignee_user_ids") or []) if u]
+    if settings.get("default_manager_id") and str(settings["default_manager_id"]) not in people:
+        people.append(str(settings["default_manager_id"]))
+    role_id = settings.get("responsible_role_id") if settings.get("responsible_type") == "role" else None
+    if role_id:
+        try:
+            members = (supabase.table("users").select("user_id")
+                       .eq("user_rol", str(role_id)).execute().data) or []
+            for m in members:
+                uid = m.get("user_id")
+                if uid and str(uid) not in people:
+                    people.append(str(uid))
+        except Exception as exc:
+            logger.debug("[PIPELINE] send estimate role members miss: %s", exc)
+
+    project_name = manifest.get("project_name") or "Estimate"
+    branch_name = branch.get("name") or branch_id
+    kind = branch.get("kind") or "variation"
+    label = "Change Order" if kind == "change_order" else "Estimate"
+    deep_link = f"/estimator?estimate={estimate_id}&branch={branch_id}"
+    desc = f"Send {label}: {project_name} — {branch_name}"
+    notes = ("Estimate approved. Send the approved estimate to the client.\n\n"
+             f"Open the branch: {deep_link}")
+
+    metadata = {
+        "send_estimate_key": send_key,
+        "estimate_id": estimate_id,
+        "branch_id": branch_id,
+        "branch_name": branch_name,
+        "kind": kind,
+        "deep_link": deep_link,
+    }
+
+    task_data = {
+        "task_description": desc,
+        "task_notes": notes,
+        "managers_ids": people or None,
+        "automation_type": "send_estimate",
+        "is_automated": True,
+        "automation_metadata": metadata,
+        # Same broken-DEFAULT guard as the review/budget tasks (see create_estimate_review_task).
+        "Owner_id": None,
+        "task_finished_status": None,
+    }
+    status_id = _review_status_id("not started")
+    if status_id is not None:
+        task_data["task_status"] = status_id
+    if settings.get("default_department_id"):
+        task_data["task_department"] = settings["default_department_id"]
+    # Same inference as the other estimate tasks: workspace (company) + configured priority.
+    if manifest.get("company_id"):
+        task_data["company_management"] = manifest["company_id"]
+    prio_id = _priority_id_for_level(settings.get("default_priority"))
+    if prio_id:
+        task_data["task_priority"] = prio_id
+
+    # Idempotent: refresh the existing send task for this branch if present.
+    try:
+        existing = (supabase.table("tasks").select("task_id")
+                    .eq("automation_type", "send_estimate")
+                    .contains("automation_metadata", {"send_estimate_key": send_key})
+                    .limit(1).execute().data) or []
+    except Exception as exc:
+        logger.debug("[PIPELINE] send estimate lookup failed: %s", exc)
         existing = []
 
     if existing:
@@ -4162,6 +4272,56 @@ def approve_task(task_id: str, payload: TaskApproveRequest) -> Dict[str, Any]:
             raise HTTPException(status_code=404, detail="Task not found")
 
         task = existing.data[0]
+
+        # Estimate-review tasks carry their own approval side-effects (stamp the
+        # branch approved, move the review task to Done, and fan out to Budgets +
+        # Coordination). Delegate to the estimator's shared decision logic so
+        # approving here from the dashboard behaves exactly like approving inside
+        # the Estimator. The review task's status is advanced by
+        # set_estimate_review_task_status (approved -> Done) within that call.
+        if task.get("automation_type") == "estimate_review":
+            meta = task.get("automation_metadata") or {}
+            est_id = meta.get("estimate_id")
+            br_id = meta.get("branch_id")
+            # Guarantee the review task closes (Done) even if the storage-backed
+            # manifest read inside the handoff below fails — the board must reflect
+            # the approval regardless.
+            done_resp = supabase.table("tasks_status").select("task_status_id").or_(
+                "task_status.ilike.done,task_status.ilike.completed"
+            ).execute()
+            done_id = done_resp.data[0]["task_status_id"] if done_resp.data else None
+            if done_id:
+                supabase.table("tasks").update(
+                    {"task_status": done_id, "workflow_state": "completed", "reviewer_notes": payload.reviewer_notes}
+                ).eq("task_id", task_id).execute()
+            if est_id and br_id:
+                try:
+                    from api.routers.estimator import apply_branch_review_decision
+                    apply_branch_review_decision(est_id, br_id, "approved", note=payload.reviewer_notes)
+                except Exception as exc:
+                    logger.warning("[WORKFLOW] estimate-review approval side-effects skipped: %s", exc)
+            _log_workflow_event(
+                task_id=task_id,
+                event_type="approved",
+                performed_by=payload.performed_by,
+                old_status=task.get("task_status"),
+                new_status=None,
+                notes=payload.reviewer_notes,
+                metadata={
+                    "approved_at": datetime.utcnow().isoformat(),
+                    "estimate_id": est_id,
+                    "branch_id": br_id,
+                },
+            )
+            refreshed = supabase.table("tasks").select("*").eq("task_id", task_id).execute()
+            return {
+                "success": True,
+                "task": (refreshed.data or [task])[0],
+                "new_status": "Done",
+                "review_task_completed": True,
+                "message": "Estimate approved; handed off to Coordination (Send estimate).",
+            }
+
         original_task_id = task.get("parent_task_id") or task_id
         review_task_id = task_id if task.get("parent_task_id") else task.get("review_task_id")
 

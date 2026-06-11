@@ -1050,49 +1050,68 @@ async def send_branch_to_review(estimate_id: str, branch_id: str, request: SendT
         raise HTTPException(status_code=500, detail=f"Error sending branch to review: {str(e)}")
 
 
+def apply_branch_review_decision(estimate_id: str, branch_id: str, decision: str, note=None):
+    """Record a reviewer's decision on a branch and fan out the approval side-effects.
+
+    Shared by the in-estimator decision endpoint AND the dashboard "Approve" flow
+    (pipeline.approve_task), so a reviewer approving from either place produces the
+    same result: the branch is stamped, the review task advances (approved -> Done),
+    and on approval the branch hands off in parallel to Budgets (Costs) and to
+    Coordination (Send estimate). Returns the updated manifest.
+    """
+    ensure_bucket_exists(ESTIMATES_BUCKET)
+    decision = (decision or "").strip().lower()
+    if decision not in {"approved", "rejected", "changes_requested"}:
+        raise HTTPException(status_code=400, detail=f"Invalid decision: {decision}")
+    manifest = ensure_manifest(estimate_id)
+    entry = find_branch(manifest, branch_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
+
+    now_iso = datetime.now().isoformat()
+    entry["review_status"] = decision
+    entry["review_decided_at"] = now_iso
+    if note is not None:
+        entry["review_note"] = note
+    if entry.get("kind") == BRANCH_KIND_CHANGE_ORDER and decision in ("approved", "rejected"):
+        entry["status"] = decision
+    entry["updated_at"] = now_iso
+    _upload_json(_manifest_path(estimate_id), manifest)
+
+    # Mirror the decision onto the review task so the pipeline board advances
+    # itself (approved -> Done, changes_requested -> Resubmittal Needed,
+    # rejected -> Done). Best-effort; never blocks the decision.
+    try:
+        from api.routers.pipeline import set_estimate_review_task_status
+        set_estimate_review_task_status(estimate_id, entry, decision)
+    except Exception as exc:
+        logger.warning("[ESTIMATOR] review task status sync skipped: %s", exc)
+
+    # On approval, fan out the two parallel handoffs. Best-effort, idempotent:
+    #  - Costs/Budgets: import the approved estimate into Budgets.
+    #  - Coordination: send the approved estimate to the client.
+    if decision == "approved":
+        try:
+            from api.routers.pipeline import create_estimate_to_budget_task
+            create_estimate_to_budget_task(estimate_id, entry, manifest)
+        except Exception as exc:
+            logger.warning("[ESTIMATOR] budget handoff task skipped: %s", exc)
+        try:
+            from api.routers.pipeline import create_send_estimate_task
+            create_send_estimate_task(estimate_id, entry, manifest)
+        except Exception as exc:
+            logger.warning("[ESTIMATOR] send-estimate handoff task skipped: %s", exc)
+
+    return manifest
+
+
 @router.post("/estimates/{estimate_id}/branches/{branch_id}/review-decision")
 async def decide_branch_review(estimate_id: str, branch_id: str, request: ReviewDecisionRequest):
     """Record a reviewer's decision on a branch. For change_order branches the
     approved/rejected decision is mirrored onto the CO status so the Contract
     Value rollup stays consistent."""
     try:
-        ensure_bucket_exists(ESTIMATES_BUCKET)
-        decision = (request.decision or "").strip().lower()
-        if decision not in {"approved", "rejected", "changes_requested"}:
-            raise HTTPException(status_code=400, detail=f"Invalid decision: {decision}")
-        manifest = ensure_manifest(estimate_id)
-        entry = find_branch(manifest, branch_id)
-        if not entry:
-            raise HTTPException(status_code=404, detail=f"Branch not found: {branch_id}")
-
-        now_iso = datetime.now().isoformat()
-        entry["review_status"] = decision
-        entry["review_decided_at"] = now_iso
-        if request.note is not None:
-            entry["review_note"] = request.note
-        if entry.get("kind") == BRANCH_KIND_CHANGE_ORDER and decision in ("approved", "rejected"):
-            entry["status"] = decision
-        entry["updated_at"] = now_iso
-        _upload_json(_manifest_path(estimate_id), manifest)
-
-        # Mirror the decision onto the review task so the pipeline board advances
-        # itself (approved -> Good to Go, changes_requested -> Resubmittal Needed,
-        # rejected -> Done). Best-effort; never blocks the decision.
-        try:
-            from api.routers.pipeline import set_estimate_review_task_status
-            set_estimate_review_task_status(estimate_id, entry, decision)
-        except Exception as exc:
-            logger.warning("[ESTIMATOR] review task status sync skipped: %s", exc)
-
-        # On approval, hand the branch off to the Costs/Budgets department: a task
-        # to import the approved estimate into Budgets. Best-effort, idempotent.
-        if decision == "approved":
-            try:
-                from api.routers.pipeline import create_estimate_to_budget_task
-                create_estimate_to_budget_task(estimate_id, entry, manifest)
-            except Exception as exc:
-                logger.warning("[ESTIMATOR] budget handoff task skipped: %s", exc)
-
+        manifest = apply_branch_review_decision(estimate_id, branch_id, request.decision, note=request.note)
         return {"success": True, "manifest": manifest}
     except HTTPException:
         raise
