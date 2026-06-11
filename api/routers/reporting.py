@@ -116,9 +116,9 @@ async def generate_bva_report(body: BvaReportRequest):
     expenses = _filter_by_date(fetch_expenses(body.project_id), body.start_date, body.end_date)
     accounts = fetch_accounts()
     overlay = fetch_account_overlay()
-    category_order, subcategory_index = fetch_category_tree()
+    category_order, subcategory_index, category_names = fetch_category_tree()
 
-    report_data = build_report(budgets, expenses, accounts, overlay, category_order, subcategory_index)
+    report_data = build_report(budgets, expenses, accounts, overlay, category_order, subcategory_index, category_names)
 
     pdf_url = None
     if body.generate_pdf:
@@ -153,10 +153,10 @@ async def generate_pnl_report(body: PnlReportRequest):
     expenses = _filter_by_date(fetch_expenses(body.project_id), body.start_date, body.end_date)
     accounts = fetch_accounts()
     overlay = fetch_account_overlay()
-    category_order, subcategory_index = fetch_category_tree()
+    category_order, subcategory_index, category_names = fetch_category_tree()
 
     # No budgets -> P&L (actuals only); same engine as BVA so totals reconcile.
-    report_data = build_report([], expenses, accounts, overlay, category_order, subcategory_index)
+    report_data = build_report([], expenses, accounts, overlay, category_order, subcategory_index, category_names)
 
     pdf_url = None
     if body.generate_pdf:

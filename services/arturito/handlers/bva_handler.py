@@ -112,10 +112,10 @@ def handle_budget_vs_actuals(
         expenses = fetch_expenses(project_id)
         accounts = fetch_accounts()
         overlay = fetch_account_overlay()
-        category_order, subcategory_index = fetch_category_tree()
+        category_order, subcategory_index, category_names = fetch_category_tree()
 
         # 3. Procesar reporte con el motor unificado (Phase-B + orden de categorías)
-        report_data = build_report(budgets, expenses, accounts, overlay, category_order, subcategory_index)
+        report_data = build_report(budgets, expenses, accounts, overlay, category_order, subcategory_index, category_names)
 
         # 4. Generar PDF y subir a Storage
         if not REPORTLAB_AVAILABLE:
