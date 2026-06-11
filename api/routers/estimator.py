@@ -1143,14 +1143,30 @@ async def list_templates():
         # Filter for folders (templates) - folders have id=None in Supabase storage
         templates = []
         for item in files or []:
-            name = item.get("name", "")
-            if name and "." not in name:
-                templates.append({
-                    "id": name,
-                    "name": name,
-                    "created_at": item.get("created_at"),
-                    "updated_at": item.get("updated_at")
-                })
+            folder = item.get("name", "")
+            if not folder or "." in folder:
+                continue
+            # Prefer the friendly name/description from template_meta.json; the
+            # folder id ("spearhead-adu-estimate-1780989508130") is the canonical
+            # key but an unreadable label. Fall back to the folder name if the
+            # meta is missing or unreadable so the template still lists.
+            display_name = folder
+            description = None
+            try:
+                blob = supabase.storage.from_(TEMPLATES_BUCKET).download(f"{folder}/template_meta.json")
+                if blob:
+                    meta = json.loads(blob.decode("utf-8"))
+                    display_name = (meta.get("name") or "").strip() or folder
+                    description = meta.get("description")
+            except Exception as _exc:
+                logger.debug("[ESTIMATOR] template meta skip for %s: %s", folder, _exc)
+            templates.append({
+                "id": folder,
+                "name": display_name,
+                "description": description,
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+            })
 
         return {"templates": templates, "count": len(templates)}
 
