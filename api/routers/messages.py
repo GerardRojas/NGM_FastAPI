@@ -224,6 +224,48 @@ def get_attachments_for_message(message_id: str) -> List[Dict[str, Any]]:
         return []
 
 
+def get_reactions_for_messages(message_ids: List[str]) -> Dict[str, Dict[str, List[str]]]:
+    """Reactions grouped by emoji, keyed by message_id — one query for a whole
+    page of messages (avoids the per-message N+1). Shape per message matches
+    get_reactions_for_message: {emoji: [user_id, ...]}."""
+    if not message_ids:
+        return {}
+    try:
+        result = supabase.table("message_reactions") \
+            .select("message_id, emoji, user_id") \
+            .in_("message_id", message_ids) \
+            .execute()
+
+        out: Dict[str, Dict[str, List[str]]] = {}
+        for row in (result.data or []):
+            mid = str(row.get("message_id"))
+            emoji = row.get("emoji")
+            out.setdefault(mid, {}).setdefault(emoji, []).append(str(row.get("user_id")))
+        return out
+    except Exception:
+        return {}
+
+
+def get_attachments_for_messages(message_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """Attachments keyed by message_id — one query for a whole page of messages.
+    The per-message lists match get_attachments_for_message (message_id stripped)."""
+    if not message_ids:
+        return {}
+    try:
+        result = supabase.table("message_attachments") \
+            .select("id, name, type, size, url, thumbnail_url, message_id") \
+            .in_("message_id", message_ids) \
+            .execute()
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for row in (result.data or []):
+            mid = str(row.pop("message_id", None))
+            out.setdefault(mid, []).append(row)
+        return out
+    except Exception:
+        return {}
+
+
 def extract_mentioned_user_ids(content: str, sender_user_id: str) -> List[str]:
     """
     Extract user IDs from @mentions in message content.
@@ -673,12 +715,17 @@ def get_messages(
             .range(offset, offset + limit - 1) \
             .execute()
 
+        rows = result.data or []
+        msg_ids = [str(row["id"]) for row in rows]
+        reactions_map = get_reactions_for_messages(msg_ids)
+        attachments_map = get_attachments_for_messages(msg_ids)
+
         messages = []
-        for row in (result.data or []):
+        for row in rows:
             msg = normalize_message(row)
-            # Fetch reactions and attachments
-            msg["reactions"] = get_reactions_for_message(row["id"])
-            msg["attachments"] = get_attachments_for_message(row["id"])
+            mid = str(row["id"])
+            msg["reactions"] = reactions_map.get(mid, {})
+            msg["attachments"] = attachments_map.get(mid, [])
             messages.append(msg)
 
         return {"messages": messages}
@@ -731,10 +778,11 @@ def get_broadcast_feed(
             .limit(limit) \
             .execute()
 
+        data_rows = [r for r in (rows.data or []) if not r.get("is_deleted")]
+        reactions_map = get_reactions_for_messages([str(r["id"]) for r in data_rows])
+
         items = []
-        for row in (rows.data or []):
-            if row.get("is_deleted"):
-                continue
+        for row in data_rows:
             msg = normalize_message(row)
             cid = msg.get("channel_id")
             items.append({
@@ -745,7 +793,7 @@ def get_broadcast_feed(
                 "sender_name": msg["user_name"],
                 "avatar_color": msg["avatar_color"],
                 "created_at": msg["created_at"],
-                "reactions": get_reactions_for_message(row["id"]),
+                "reactions": reactions_map.get(str(row["id"]), {}),
             })
 
         return {"items": items}
@@ -1023,10 +1071,13 @@ def get_thread_replies(
             .order("created_at", desc=False) \
             .execute()
 
+        rows = result.data or []
+        reactions_map = get_reactions_for_messages([str(row["id"]) for row in rows])
+
         replies = []
-        for row in (result.data or []):
+        for row in rows:
             msg = normalize_message(row)
-            msg["reactions"] = get_reactions_for_message(row["id"])
+            msg["reactions"] = reactions_map.get(str(row["id"]), {})
             replies.append(msg)
 
         return {"replies": replies}
