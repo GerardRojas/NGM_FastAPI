@@ -729,13 +729,27 @@ async def _execute_function_call(
         # Skip posting if handler already posted its own messages (e.g. receipt flow)
         if result_text:
             personalized = await _personalize(agent_name, result_text)
+            response_meta: Dict[str, Any] = {
+                "agent_brain": True,
+                "function": fn_name,
+            }
+            # Daneel's authorization run also rides along as a structured payload so
+            # the web client can render it as an interactive card (headline counts +
+            # collapsible per-decision groups) instead of a flat markdown wall. The
+            # text above stays as the fallback for clients that ignore the metadata.
+            if agent_name == "daneel" and fn_name == "run_auto_auth" and isinstance(result, dict):
+                response_meta["daneel_report"] = {
+                    k: result.get(k)
+                    for k in (
+                        "authorized", "missing_info", "duplicates", "escalated",
+                        "expenses_processed", "scope", "criteria", "decisions",
+                        "decisions_truncated",
+                    )
+                }
             await _post_response(
                 agent_name, project_id, channel_type, channel_id,
                 personalized,
-                metadata={
-                    "agent_brain": True,
-                    "function": fn_name,
-                },
+                metadata=response_meta,
             )
 
     except Exception as e:
