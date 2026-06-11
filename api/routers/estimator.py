@@ -1137,6 +1137,32 @@ async def mark_branch_promoted(estimate_id: str, branch_id: str, request: MarkPr
         entry["promoted_budget_batch_id"] = request.budget_batch_id
         entry["promoted_at"] = now_iso
         entry["updated_at"] = now_iso
+
+        # Keep the estimate's workspace aligned with the project it was promoted
+        # into. The estimator board scopes by the manifest's company_id while
+        # Budgets/Projects scope by projects.source_company; promotion is the
+        # moment the project (the destination workspace) becomes authoritative,
+        # so mirror it here. Without this the same deal can show under company A
+        # in Estimates and company B in Budgets. Best-effort: never block the
+        # promotion stamp on the lookup.
+        try:
+            proj = (
+                supabase.table("projects")
+                .select("source_company")
+                .eq("project_id", request.project_id)
+                .single()
+                .execute()
+            )
+            src_company = (proj.data or {}).get("source_company")
+            if src_company and manifest.get("company_id") != src_company:
+                logger.info(
+                    "[ESTIMATOR] aligning estimate %s company_id %s -> %s (project %s)",
+                    estimate_id, manifest.get("company_id"), src_company, request.project_id,
+                )
+                manifest["company_id"] = src_company
+        except Exception as exc:
+            logger.warning("[ESTIMATOR] company sync on promote skipped: %s", exc)
+
         _upload_json(_manifest_path(estimate_id), manifest)
         return {"success": True, "manifest": manifest}
     except HTTPException:
