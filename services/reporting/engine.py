@@ -83,6 +83,7 @@ def _strip_code(value: Any) -> str:
 # deliberately: generic "finishes materials" — too ambiguous to map blindly.)
 _CATEGORY_ALIASES = {
     "texture": "Drywall",
+    "drywall texture": "Drywall",
     "stucco": "Exterior Finishes",
     "plumbing material": "Rough Plumbing",
     "electrical exits": "Rough Electrical",
