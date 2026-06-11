@@ -93,6 +93,8 @@ from api.routers.feasibility import router as feasibility_router
 
 # ========= FIX & FLIP: Fix-and-flip calculator saved deals ==========
 from api.routers.fix_flip import router as fix_flip_router
+# ========= RD: Residential Development calculator saved deals ==========
+from api.routers.rd import router as rd_router
 
 # ========= LISTINGS: For-sale property listings (RentCast proxy) ==========
 from api.routers.listings import router as listings_router
@@ -441,6 +443,8 @@ app.include_router(feasibility_router)
 
 # Fix & Flip (fix-and-flip calculator saved deals)
 app.include_router(fix_flip_router)
+# Residential Development (RD calculator saved deals)
+app.include_router(rd_router)
 
 # Listings (for-sale property listings via RentCast proxy; feeds Fix & Flip Deal Finder)
 app.include_router(listings_router)
