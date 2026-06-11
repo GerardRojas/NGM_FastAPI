@@ -115,10 +115,10 @@ def handle_pnl_cogs(
         expenses = fetch_expenses(project_id)
         accounts = fetch_accounts()
         overlay = fetch_account_overlay()
-        category_order, subcategory_index = fetch_category_tree()
+        category_order, subcategory_index, category_names = fetch_category_tree()
 
         # 3. Process report with the unified engine (no budgets -> actuals only)
-        report_data = build_report([], expenses, accounts, overlay, category_order, subcategory_index)
+        report_data = build_report([], expenses, accounts, overlay, category_order, subcategory_index, category_names)
 
         # 4. Generate PDF
         if not REPORTLAB_AVAILABLE:

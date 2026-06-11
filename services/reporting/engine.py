@@ -20,6 +20,7 @@ return, so the existing reportlab PDF generators consume it unchanged:
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from api.supabase_client import supabase
@@ -62,6 +63,34 @@ def _norm_name(value: Any) -> str:
     return " ".join(_str(value).lower().split())
 
 
+# Estimate-pushed budgets carry the estimator's category code as a name prefix
+# (e.g. "C1 Plans & Permits", "C12 Exterior Finishes"). Strip a single leading
+# short code token so the name can bridge to the NGM category taxonomy. Kept
+# conservative — only a leading "C1 ", "C12 ", "12 ", "01-100 " style token —
+# and the result is only ever USED when it exact-matches a real category name,
+# so an over-strip can't invent a wrong mapping.
+_CODE_PREFIX_RE = re.compile(r"^\s*[A-Za-z]{0,2}\d+(?:[.\-]\d+)*[\s.):\-]+")
+
+
+def _strip_code(value: Any) -> str:
+    return _CODE_PREFIX_RE.sub("", _str(value)).strip()
+
+
+# Curated synonyms for local category names that appear in some imported
+# estimates but aren't in the NGM category taxonomy. Keyed by normalized,
+# code-stripped name -> canonical NGM category name. Small + explicit on purpose;
+# extend as new imported estimates surface new local names. (Left out
+# deliberately: generic "finishes materials" — too ambiguous to map blindly.)
+_CATEGORY_ALIASES = {
+    "texture": "Drywall",
+    "stucco": "Exterior Finishes",
+    "plumbing material": "Rough Plumbing",
+    "electrical exits": "Rough Electrical",
+    "electrical material": "Rough Electrical",
+    "windows & glass doors- material & labor": "Windows",
+}
+
+
 def _is_authorized(expense: Dict[str, Any]) -> bool:
     """Canonical 'authorized' definition shared everywhere: status == 'auth'."""
     return _str(expense.get("status")) == "auth"
@@ -80,15 +109,19 @@ def _all(table: str, cols: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def fetch_category_tree() -> Tuple[List[str], Dict[str, str]]:
-    """Returns (order, subcategory_index):
+def fetch_category_tree() -> Tuple[List[str], Dict[str, str], Dict[str, str]]:
+    """Returns (order, subcategory_index, category_names):
       - order: normalized category names in the estimator's sort_order, used to
         order the report's categories the same way the estimator lists them.
       - subcategory_index: subcategory_id -> category name, the bridge that lets
         rows classify by their direct (subcategory_id, cost_type) triple.
+      - category_names: normalized category name -> canonical name, the bridge
+        that lets a row whose NAME is a category (e.g. estimate-pushed budgets
+        like "C1 Plans & Permits") classify into that category by name.
     Empty fallbacks mean the report uses the overlay-by-account path exclusively."""
     order: List[str] = []
     subcategory_index: Dict[str, str] = {}
+    category_names: Dict[str, str] = {}
     try:
         cats = _all("categories", "id, name, sort_order")
         cats.sort(key=lambda c: (c.get("sort_order") or 0, _str(c.get("name")).lower()))
@@ -98,6 +131,7 @@ def fetch_category_tree() -> Tuple[List[str], Dict[str, str]]:
             cat_name_by_id[c.get("id")] = name
             if name:
                 order.append(_norm_name(name))
+                category_names.setdefault(_norm_name(name), name)
         for s in _all("subcategories", "id, category_id, name"):
             sid = _str(s.get("id"))
             cat_name = cat_name_by_id.get(s.get("category_id"))
@@ -105,7 +139,7 @@ def fetch_category_tree() -> Tuple[List[str], Dict[str, str]]:
                 subcategory_index[sid] = cat_name
     except Exception as e:
         logger.warning("[REPORT] category tree unavailable: %s", e)
-    return order, subcategory_index
+    return order, subcategory_index, category_names
 
 
 def build_report(
@@ -115,12 +149,14 @@ def build_report(
     overlay: Optional[Dict[str, Dict[str, str]]] = None,
     category_order: Optional[List[str]] = None,
     subcategory_index: Optional[Dict[str, str]] = None,
+    category_names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Group budgets and authorized expenses by account (flat `rows`) AND by the
     Category -> cost_type hierarchy (`categories`). For P&L pass budgets=[]."""
     overlay = overlay or {}
     category_order = category_order or []
     subcategory_index = subcategory_index or {}
+    category_names = category_names or {}
 
     def account_name(account_id: Any, provided_name: Any) -> str:
         name = _str(provided_name)
@@ -206,6 +242,7 @@ def build_report(
     categories = _build_categories(
         budgets_by_id, expenses_by_id, id_name, overlay, overlay_by_name,
         category_order, id_subcategory_id, id_cost_type, subcategory_index,
+        category_names,
     )
 
     total_budget = sum(r["budget"] for r in rows)
@@ -232,6 +269,7 @@ def _build_categories(
     id_subcategory_id: Dict[str, str],
     id_cost_type: Dict[str, str],
     subcategory_index: Dict[str, str],
+    category_names: Dict[str, str],
 ) -> List[Dict[str, Any]]:
     groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
@@ -240,11 +278,21 @@ def _build_categories(
         #   1. Direct (subcategory_id, cost_type) on the row — Phase B producers.
         #   2. Overlay by raw account_id (matches expenses + dual-write source).
         #   3. Overlay by account name (rescues QBO budgets in a different id space).
+        #   4. Name IS a category (rescues estimate-pushed budgets whose name is
+        #      the category itself, e.g. "C1 Plans & Permits" — exact match on the
+        #      raw or code-stripped name against the category taxonomy).
         # Anything unresolved lands in Uncategorized so totals reconcile.
         direct_sub = id_subcategory_id.get(key)
         direct_cost_type = id_cost_type.get(key)
         direct_hit = subcategory_index.get(direct_sub) if direct_sub else None
         ov = overlay.get(key) or overlay_by_name.get(_norm_name(id_name.get(key)))
+        raw_name = id_name.get(key, "")
+        stripped_norm = _norm_name(_strip_code(raw_name))
+        name_cat = (
+            category_names.get(_norm_name(raw_name))
+            or category_names.get(stripped_norm)
+            or category_names.get(_norm_name(_CATEGORY_ALIASES.get(stripped_norm, "")))
+        )
 
         if direct_hit and direct_cost_type:
             category = direct_hit or UNCATEGORIZED
@@ -254,6 +302,11 @@ def _build_categories(
         elif ov:
             category = ov["category"]
             cost_type = ov.get("cost_type", "")
+            line_key = cost_type or "_"
+            label = TYPE_LABEL.get(cost_type, cost_type or "—")
+        elif name_cat:
+            category = name_cat
+            cost_type = id_cost_type.get(key, "") or ""
             line_key = cost_type or "_"
             label = TYPE_LABEL.get(cost_type, cost_type or "—")
         else:
