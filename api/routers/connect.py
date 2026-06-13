@@ -37,6 +37,10 @@ router = APIRouter(prefix="/connect", tags=["NGM Connect"])
 VALID_ITEM_TYPES = {"photo", "plan_revision", "vault_file", "milestone", "phase", "deal", "estimate"}
 INVITE_TTL_DAYS = 14
 
+# Modules an anonymous link may expose. Client-only modules (messages, invoices)
+# need an identity, so they can never ride a link — mirrors portal.CLIENT_ONLY_MODULES.
+LINK_SHAREABLE_MODULES = {"overview", "photos", "plans", "timeline", "documents", "deals", "estimates"}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -83,6 +87,13 @@ class InvoiceCreate(BaseModel):
     link_type: str = "fixed"               # "fixed" | "open"
     expires_days: int = 30
     caption: Optional[str] = None
+
+
+class LinkCreate(BaseModel):
+    project_id: str = Field(..., min_length=1)
+    modules: Dict[str, bool] = Field(default_factory=dict)
+    label: Optional[str] = None
+    expires_days: int = 30                  # 1..365
 
 
 def _check_item_type(item_type: str) -> str:
@@ -893,3 +904,103 @@ def revoke_invite(invite_id: str, user: dict = Depends(require_internal)):
     if not res.data:
         raise HTTPException(status_code=404, detail="Pending invite not found")
     return {"ok": True, "id": invite_id}
+
+
+# ============================================================
+# Anonymous workspace links (link-only audience) — team management.
+# The public read plane lives in routers/public_workspace.py.
+# ============================================================
+
+def _link_url(token: str) -> str:
+    return f"{FRONTEND_URL}/workspace?token={token}"
+
+
+def _sanitize_link_modules(modules: Dict[str, bool]) -> Dict[str, bool]:
+    """Keep only enabled, link-shareable modules. Overview is always on so the
+    link has a landing page even if nothing else is toggled."""
+    out = {k: True for k, v in (modules or {}).items() if v and k in LINK_SHAREABLE_MODULES}
+    out["overview"] = True
+    return out
+
+
+@router.post("/links", status_code=201)
+def create_link(payload: LinkCreate, user: dict = Depends(require_internal)):
+    """Mint a signed, anonymous read-only link to a curated workspace for one
+    project. The JWT carries the expiry; the row carries the curated modules and
+    lets us revoke server-side."""
+    if payload.expires_days < 1 or payload.expires_days > 365:
+        raise HTTPException(status_code=400, detail="Expiry must be between 1 and 365 days")
+    modules = _sanitize_link_modules(payload.modules)
+    now = _now()
+    exp = now + timedelta(days=payload.expires_days)
+    token = jwt.encode(
+        {
+            "type": "workspace_link",
+            "project_id": payload.project_id,
+            "iat": int(now.timestamp()),
+            "exp": int(exp.timestamp()),
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALG,
+    )
+    row = {
+        "token": token,
+        "project_id": payload.project_id,
+        "modules": modules,
+        "label": (payload.label or "").strip() or None,
+        "status": "active",
+        "created_by": user.get("user_id"),
+        "expires_at": exp.isoformat(),
+    }
+    try:
+        res = supabase.table("workspace_links").insert(row).execute()
+    except Exception as e:
+        logger.error("[connect] create_link failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not create link")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Link returned no data")
+    created = res.data[0]
+    return {
+        "id": created["id"],
+        "token": token,
+        "url": _link_url(token),
+        "project_id": payload.project_id,
+        "modules": modules,
+        "label": row["label"],
+        "status": "active",
+        "expires_at": exp.isoformat(),
+    }
+
+
+@router.get("/links")
+def list_links(project_id: Optional[str] = Query(None), user: dict = Depends(require_internal)):
+    """List anonymous links, optionally for one project. Includes the share URL so
+    the team can re-copy it (the token is needed to rebuild the URL)."""
+    try:
+        q = supabase.table("workspace_links").select(
+            "id, token, project_id, modules, label, status, expires_at, created_at, viewed_at, view_count"
+        ).order("created_at", desc=True)
+        if project_id:
+            q = q.eq("project_id", project_id)
+        rows = q.execute().data or []
+    except Exception as e:
+        logger.error("[connect] list_links failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not list links")
+    out = []
+    for r in rows:
+        token = r.pop("token", "")
+        r["url"] = _link_url(token) if token else None
+        out.append(r)
+    return {"links": out}
+
+
+@router.delete("/links/{link_id}")
+def revoke_link(link_id: str, user: dict = Depends(require_internal)):
+    try:
+        res = supabase.table("workspace_links").update({"status": "revoked"}).eq("id", link_id).eq("status", "active").execute()
+    except Exception as e:
+        logger.error("[connect] revoke_link failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not revoke link")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Active link not found")
+    return {"ok": True, "id": link_id}
