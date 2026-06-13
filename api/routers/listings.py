@@ -322,50 +322,113 @@ async def search_listings(payload: ListingSearch, current_user: dict = Depends(g
 # works end-to-end without RENTCAST_API_KEY.
 
 CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
+# Nominatim's usage policy requires a descriptive User-Agent. Used only as a
+# fallback (when Census returns nothing) + manual reverse lookups, so volume is low.
+NOMINATIM_HEADERS = {"User-Agent": "NGM-Hub/1.0 (real-estate calculator; contact german@ngmanagements.com)"}
+GEOCODE_MAX_MATCHES = 5
 
 
 class GeocodeRequest(BaseModel):
     address: str
 
 
+class ReverseGeocodeRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+
+async def _census_matches(client: httpx.AsyncClient, addr: str) -> List[Dict[str, Any]]:
+    """Up to GEOCODE_MAX_MATCHES Census candidates. [] on any failure (caller
+    falls back to Nominatim) — never raises, so one provider being down isn't fatal."""
+    try:
+        r = await client.get(
+            CENSUS_GEOCODER_URL,
+            params={"address": addr, "benchmark": "Public_AR_Current", "format": "json"},
+            timeout=20.0,
+        )
+        r.raise_for_status()
+        raw = ((r.json().get("result") or {}).get("addressMatches")) or []
+    except Exception as e:
+        logger.warning("[LISTINGS] Census geocoder failed (will try fallback): %r", e)
+        return []
+    out: List[Dict[str, Any]] = []
+    for m in raw[:GEOCODE_MAX_MATCHES]:
+        c = m.get("coordinates") or {}
+        if "x" in c and "y" in c:
+            out.append({"lat": c["y"], "lng": c["x"], "matched_address": m.get("matchedAddress") or addr, "source": "census"})
+    return out
+
+
+async def _nominatim_matches(client: httpx.AsyncClient, addr: str) -> List[Dict[str, Any]]:
+    """OpenStreetMap/Nominatim fallback for addresses Census can't resolve."""
+    try:
+        r = await client.get(
+            NOMINATIM_SEARCH_URL,
+            params={"q": addr, "format": "json", "limit": GEOCODE_MAX_MATCHES, "countrycodes": "us", "addressdetails": 0},
+            headers=NOMINATIM_HEADERS,
+            timeout=20.0,
+        )
+        r.raise_for_status()
+        raw = r.json() or []
+    except Exception as e:
+        logger.warning("[LISTINGS] Nominatim geocoder failed: %r", e)
+        return []
+    out: List[Dict[str, Any]] = []
+    for m in raw:
+        try:
+            out.append({"lat": float(m["lat"]), "lng": float(m["lon"]), "matched_address": m.get("display_name") or addr, "source": "nominatim"})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 @router.post("/geocode")
 async def geocode_address(payload: GeocodeRequest, current_user: dict = Depends(get_current_user)):
-    """Resolve a U.S. address to lat/lng via the free Census geocoder. Used by
-    the Calculator to locate a subject property before pulling comps. Returns
-    404 when no match — no other errors are raised so the UI can show a single
-    'address not found' message without parsing a 502.
-    """
+    """Resolve a U.S. address to lat/lng. Tries the free Census geocoder first,
+    then falls back to OpenStreetMap/Nominatim when Census returns nothing. Returns
+    the best match at the top level (back-compat) plus a `matches` list so the UI
+    can offer a 'did you mean' picker. 404 only when BOTH providers find nothing."""
     addr = (payload.address or "").strip()
     if not addr:
         raise HTTPException(status_code=400, detail="Address is required.")
 
+    async with httpx.AsyncClient() as client:
+        matches = await _census_matches(client, addr)
+        if not matches:
+            matches = await _nominatim_matches(client, addr)
+
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Address not found: {addr}. Try adding the city, state, or ZIP code.")
+
+    best = matches[0]
+    return {**best, "matches": matches}
+
+
+@router.post("/geocode/reverse")
+async def reverse_geocode(payload: ReverseGeocodeRequest, current_user: dict = Depends(get_current_user)):
+    """lat/lng -> a human address (for the draggable map pin). Uses Nominatim. The
+    point is authoritative; we only resolve a label, so failure returns the coords
+    with an empty label instead of erroring."""
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
-                CENSUS_GEOCODER_URL,
-                params={"address": addr, "benchmark": "Public_AR_Current", "format": "json"},
+                NOMINATIM_REVERSE_URL,
+                params={"lat": payload.latitude, "lon": payload.longitude, "format": "json"},
+                headers=NOMINATIM_HEADERS,
                 timeout=20.0,
             )
             r.raise_for_status()
-            data = r.json()
+            data = r.json() or {}
     except Exception as e:
-        logger.error("[LISTINGS] Census geocoder failed: %r", e)
-        raise HTTPException(status_code=502, detail=f"Geocoder error: {e}")
-
-    matches = ((data.get("result") or {}).get("addressMatches")) or []
-    if not matches:
-        raise HTTPException(status_code=404, detail=f"Address not found: {addr}")
-
-    m = matches[0]
-    coords = m.get("coordinates") or {}
-    if "x" not in coords or "y" not in coords:
-        raise HTTPException(status_code=404, detail="Geocoder returned no coordinates.")
-
+        logger.warning("[LISTINGS] Nominatim reverse failed: %r", e)
+        data = {}
     return {
-        "lat": coords["y"],
-        "lng": coords["x"],
-        "matched_address": m.get("matchedAddress") or addr,
-        "source": "census",
+        "lat": payload.latitude,
+        "lng": payload.longitude,
+        "matched_address": data.get("display_name") or "",
+        "source": "nominatim",
     }
 
 
