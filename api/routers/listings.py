@@ -81,6 +81,15 @@ class ListingSearch(BaseModel):
         return seen
 
 
+def _contact(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Compact a RentCast listingAgent / listingOffice object to {name, phone,
+    email, website}, dropping empty fields. None when nothing is present."""
+    if not isinstance(obj, dict):
+        return None
+    out = {k: obj.get(k) for k in ("name", "phone", "email", "website") if obj.get(k)}
+    return out or None
+
+
 def _normalize(item: Dict[str, Any]) -> Dict[str, Any]:
     """Map a RentCast sale-listing object to the compact shape the UI expects."""
     return {
@@ -103,6 +112,9 @@ def _normalize(item: Dict[str, Any]) -> Dict[str, Any]:
         "days_on_market": item.get("daysOnMarket"),
         "listed_date": item.get("listedDate"),
         "mls_name": item.get("mlsName"),
+        # B: listing agent + brokerage contact (name/phone/email/website).
+        "listing_agent": _contact(item.get("listingAgent")),
+        "listing_office": _contact(item.get("listingOffice")),
     }
 
 
@@ -112,11 +124,14 @@ _DEMO_LISTINGS: List[Dict[str, Any]] = [
     {"id": "demo-1", "address": "3812 Marlborough Ave, San Diego, CA 92105", "city": "San Diego", "state": "CA",
      "zip": "92105", "county": "San Diego", "lat": 32.748, "lng": -117.097, "property_type": "Single Family",
      "bedrooms": 3, "bathrooms": 2, "sqft": 1320, "lot_size": 6000, "year_built": 1952, "price": 689000,
-     "status": "Active", "days_on_market": 12, "listed_date": "2026-05-15", "mls_name": "CRMLS"},
+     "status": "Active", "days_on_market": 12, "listed_date": "2026-05-15", "mls_name": "CRMLS",
+     "listing_agent": {"name": "Jordan Avery", "phone": "6195550142", "email": "javery@example.com"},
+     "listing_office": {"name": "Pacific Crest Realty", "phone": "6195550100"}},
     {"id": "demo-2", "address": "4521 33rd St, San Diego, CA 92116", "city": "San Diego", "state": "CA",
      "zip": "92116", "county": "San Diego", "lat": 32.762, "lng": -117.128, "property_type": "Single Family",
      "bedrooms": 2, "bathrooms": 1, "sqft": 980, "lot_size": 4500, "year_built": 1941, "price": 735000,
-     "status": "Active", "days_on_market": 5, "listed_date": "2026-05-22", "mls_name": "CRMLS"},
+     "status": "Active", "days_on_market": 5, "listed_date": "2026-05-22", "mls_name": "CRMLS",
+     "listing_agent": {"name": "Sam Delgado", "phone": "6195550199", "email": "sdelgado@example.com"}},
     {"id": "demo-3", "address": "1290 Hornblend St, San Diego, CA 92109", "city": "San Diego", "state": "CA",
      "zip": "92109", "county": "San Diego", "lat": 32.799, "lng": -117.252, "property_type": "Condo",
      "bedrooms": 2, "bathrooms": 2, "sqft": 1100, "lot_size": 0, "year_built": 1978, "price": 815000,
@@ -500,3 +515,127 @@ async def fetch_comps(payload: CompsRequest, current_user: dict = Depends(get_cu
         "comps": [_normalize_comp(c) for c in comparables],
         "source": "rentcast",
     }
+
+
+# ============================================================
+# Property records (RentCast /properties) — owner, owner-occupancy, last sale,
+# tax assessment + annual taxes, HOA, features. Owner data is name + MAILING
+# ADDRESS only (RentCast does NOT expose owner phone/email — that's skip tracing,
+# a separate future integration). Useful here to flag absentee owners and gauge
+# the seller's basis (what they paid) for a flip.
+# ============================================================
+
+class PropertyRecordRequest(BaseModel):
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
+def _latest_year(d: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(d, dict) or not d:
+        return None
+    try:
+        return max(d.keys())
+    except (ValueError, TypeError):
+        return None
+
+
+def _normalize_property(p: Dict[str, Any]) -> Dict[str, Any]:
+    """RentCast property record → compact UI shape. Surfaces owner (name + mailing
+    address + entity type), owner-occupancy, last sale, latest tax assessment +
+    annual property tax, HOA fee, and the raw features bag."""
+    owner = p.get("owner") if isinstance(p.get("owner"), dict) else {}
+    mailing = owner.get("mailingAddress") if isinstance(owner.get("mailingAddress"), dict) else None
+    assessments = p.get("taxAssessments") if isinstance(p.get("taxAssessments"), dict) else {}
+    taxes = p.get("propertyTaxes") if isinstance(p.get("propertyTaxes"), dict) else {}
+    a_year = _latest_year(assessments)
+    t_year = _latest_year(taxes)
+    hoa = p.get("hoa") if isinstance(p.get("hoa"), dict) else None
+    return {
+        "address": p.get("formattedAddress") or p.get("addressLine1"),
+        "lat": p.get("latitude"),
+        "lng": p.get("longitude"),
+        "property_type": p.get("propertyType"),
+        "bedrooms": p.get("bedrooms"),
+        "bathrooms": p.get("bathrooms"),
+        "sqft": p.get("squareFootage"),
+        "lot_size": p.get("lotSize"),
+        "year_built": p.get("yearBuilt"),
+        "owner": {
+            "names": owner.get("names") or [],
+            "type": owner.get("type"),
+            "mailing_address": (mailing.get("formattedAddress") if mailing else None),
+        } if owner else None,
+        "owner_occupied": p.get("ownerOccupied"),
+        "last_sale_price": p.get("lastSalePrice"),
+        "last_sale_date": p.get("lastSaleDate"),
+        "hoa_fee": (hoa.get("fee") if hoa else None),
+        "tax_assessment": ({"year": a_year, "value": (assessments.get(a_year) or {}).get("value")} if a_year else None),
+        "property_tax": ({"year": t_year, "total": (taxes.get(t_year) or {}).get("total")} if t_year else None),
+        "features": p.get("features") or None,
+        "source": "rentcast",
+    }
+
+
+_DEMO_PROPERTY: Dict[str, Any] = {
+    "address": "3812 Marlborough Ave, San Diego, CA 92105",
+    "lat": 32.748, "lng": -117.097,
+    "property_type": "Single Family", "bedrooms": 3, "bathrooms": 2, "sqft": 1320,
+    "lot_size": 6000, "year_built": 1952,
+    "owner": {"names": ["Maria T Gonzalez"], "type": "Individual", "mailing_address": "PO Box 1182, Chula Vista, CA 91912"},
+    "owner_occupied": False,
+    "last_sale_price": 415000, "last_sale_date": "2014-08-21",
+    "hoa_fee": None,
+    "tax_assessment": {"year": "2025", "value": 498000},
+    "property_tax": {"year": "2025", "total": 5840},
+    "features": {"architectureType": "Bungalow", "garage": True, "pool": False, "roofType": "Composition"},
+    "source": "demo",
+    "note": "Demo property record — set RENTCAST_API_KEY on the server to pull live data.",
+}
+
+
+@router.post("/property")
+async def fetch_property_record(payload: PropertyRecordRequest, current_user: dict = Depends(get_current_user)):
+    """Return a RentCast property record for an address (or lat+lng). Falls back to
+    a demo record when RENTCAST_API_KEY is unset."""
+    api_key = os.getenv("RENTCAST_API_KEY")
+    if not (payload.address or (payload.latitude is not None and payload.longitude is not None)):
+        raise HTTPException(status_code=400, detail="Provide an address or a lat+lng.")
+
+    if not api_key:
+        return dict(_DEMO_PROPERTY)
+
+    params: Dict[str, Any] = {}
+    if payload.address:
+        params["address"] = payload.address
+    if payload.latitude is not None and payload.longitude is not None:
+        params["latitude"] = payload.latitude
+        params["longitude"] = payload.longitude
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{RENTCAST_BASE}/properties",
+                params=params,
+                headers={"X-Api-Key": api_key, "Accept": "application/json"},
+                timeout=RENTCAST_TIMEOUT,
+            )
+    except Exception as e:
+        logger.error("[LISTINGS] RentCast properties request failed: %r", e)
+        raise HTTPException(status_code=502, detail=f"Property provider error: {e}")
+
+    if r.status_code == 401:
+        raise HTTPException(status_code=502, detail="Property provider rejected the API key (401).")
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="No property record found for this address.")
+    if r.status_code == 429:
+        raise HTTPException(status_code=429, detail="Property provider quota exceeded. Try again later.")
+    if r.status_code >= 400:
+        logger.warning("[LISTINGS] RentCast properties %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail=f"Property provider returned {r.status_code}.")
+
+    data = r.json() if r.content else []
+    items = data if isinstance(data, list) else (data.get("data") or [data])
+    if not items:
+        raise HTTPException(status_code=404, detail="No property record found for this address.")
+    return _normalize_property(items[0])
