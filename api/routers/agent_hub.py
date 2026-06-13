@@ -62,19 +62,31 @@ class AccessRolesUpdate(BaseModel):
     arturito_admin_roles: Optional[List[str]] = None
     andrew_bookkeeping_roles: Optional[List[str]] = None
     andrew_viewer_roles: Optional[List[str]] = None
+    andrew_operator_roles: Optional[List[str]] = None
+    daneel_viewer_roles: Optional[List[str]] = None
+    daneel_operator_roles: Optional[List[str]] = None
     agent_hub_manager_roles: Optional[List[str]] = None
 
 
 @router.get("/access-roles")
 def get_access_roles(current_user: dict = Depends(get_current_user)):
     """Role lists that gate privileged agent actions. Returns the configured
-    list or the hardcoded default for each key."""
+    list or the hardcoded default for each key.
+
+    The per-agent viewer/operator lists return empty when unset; agent_access
+    then applies its built-in defaults (operator -> management; Daneel viewer ->
+    same as operator; Andrew viewer -> bookkeeping audience + management). CEO/COO
+    always qualify regardless, enforced in agent_access."""
     return {
         "arturito_admin_roles": roles_for("arturito_admin_roles", _ARTURITO_ADMIN_ROLES_DEFAULT),
         "andrew_bookkeeping_roles": roles_for("andrew_bookkeeping_roles", _ANDREW_BOOKKEEPING_ROLES_DEFAULT),
-        # Who can SEE Andrew in the Agent Hub. Empty when unset -> agent_access
-        # falls back to the default audience (bookkeeping roles + management).
+        # Who can SEE / COMMAND Andrew. Empty when unset -> agent_access falls back
+        # to the default audience (bookkeeping roles + management) / management.
         "andrew_viewer_roles": roles_for("andrew_viewer_roles", []),
+        "andrew_operator_roles": roles_for("andrew_operator_roles", []),
+        # Who can SEE / COMMAND Daneel. Empty when unset -> management default.
+        "daneel_viewer_roles": roles_for("daneel_viewer_roles", []),
+        "daneel_operator_roles": roles_for("daneel_operator_roles", []),
         "agent_hub_manager_roles": roles_for("agent_hub_manager_roles", _MANAGER_ROLES_DEFAULT),
     }
 
