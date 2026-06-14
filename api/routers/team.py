@@ -244,6 +244,62 @@ def list_team_users(
     return [normalize_user_row(r) for r in (res.data or [])]
 
 
+def _sync_external_contact(user_id: str) -> None:
+    """Keep the unified external_contacts directory in sync with an external user
+    login. For team members external_contacts.id == users.user_id (see
+    sql/create_external_contacts.sql). Best-effort — never block the user op."""
+    if not user_id:
+        return
+    try:
+        u = (
+            supabase.table("users")
+            .select("user_id, user_name, is_external, user_phone_number, user_address, user_description")
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+        )
+        row = u.data or {}
+    except Exception:
+        return
+    if not row:
+        return
+
+    if bool(row.get("is_external")):
+        fields = {
+            "name": row.get("user_name") or "External team member",
+            "phone": row.get("user_phone_number"),
+            "address": row.get("user_address"),
+            "notes": row.get("user_description"),
+        }
+        fields = {k: v for k, v in fields.items() if v is not None}
+        try:
+            existing = supabase.table("external_contacts").select("id").eq("id", user_id).execute()
+            if existing.data:
+                supabase.table("external_contacts").update(fields).eq("id", user_id).execute()
+            else:
+                supabase.table("external_contacts").insert(
+                    {"id": user_id, "tier": "team_member", "category": "contractor", **fields}
+                ).execute()
+            supabase.table("users").update({"contact_id": user_id}).eq("user_id", user_id).execute()
+        except Exception:
+            pass
+    else:
+        # No longer external: drop the team_member directory entry + unlink.
+        try:
+            existing = (
+                supabase.table("external_contacts")
+                .select("id")
+                .eq("id", user_id)
+                .eq("tier", "team_member")
+                .execute()
+            )
+            if existing.data:
+                supabase.table("external_contacts").delete().eq("id", user_id).eq("tier", "team_member").execute()
+                supabase.table("users").update({"contact_id": None}).eq("user_id", user_id).execute()
+        except Exception:
+            pass
+
+
 @router.post("/users", dependencies=[Depends(require_leadership)])
 def create_user(payload: UserCreate) -> Dict[str, Any]:
     data = payload.model_dump()
@@ -280,6 +336,8 @@ def create_user(payload: UserCreate) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Insert succeeded but returned no data")
 
     user_id = ins.data[0].get("user_id")
+    if data.get("is_external"):
+        _sync_external_contact(user_id)
     return fetch_user_by_id(user_id)
 
 
@@ -329,6 +387,10 @@ def update_user(user_id: str, payload: UserUpdate) -> Dict[str, Any]:
     if upd.data == []:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Keep the external_contacts directory in sync (handles is_external toggles
+    # and name/contact-field edits). Cheap + best-effort.
+    _sync_external_contact(user_id)
+
     return fetch_user_by_id(user_id)
 
 
@@ -342,5 +404,11 @@ def delete_user(user_id: str) -> Dict[str, Any]:
 
     if res.data == []:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Drop the matching team_member directory entry (best-effort).
+    try:
+        supabase.table("external_contacts").delete().eq("id", user_id).eq("tier", "team_member").execute()
+    except Exception:
+        pass
 
     return {"ok": True, "deleted_user_id": user_id}
