@@ -29,6 +29,7 @@ from api.routers.team import router as team_router
 from api.routers.companies import router as companies_router
 from api.routers.clients import router as clients_router
 from api.routers.external_contacts import router as external_contacts_router
+from api.routers.workspaces import router as workspaces_router
 from api.routers.expenses import router as expenses_router
 from api.routers.general_expenses import router as general_expenses_router
 from api.routers.vendors import router as vendors_router
@@ -315,6 +316,9 @@ app.include_router(clients_router)
 
 # External Contacts (directorio unificado: team_member + client)
 app.include_router(external_contacts_router)
+
+# Workspaces (capa de agrupacion: members + projects)
+app.include_router(workspaces_router)
 
 app.include_router(expenses_router)
 app.include_router(general_expenses_router)
