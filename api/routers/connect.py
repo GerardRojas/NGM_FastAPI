@@ -63,6 +63,16 @@ class ShareBulkCreate(BaseModel):
     item_ids: List[str] = Field(..., min_length=1)
 
 
+class MemberShareCreate(BaseModel):
+    # Project-independent share straight to a workspace member (workspace_shares).
+    external_type: str = Field(..., pattern="^(client|user)$")
+    external_id: str = Field(..., min_length=1)
+    item_type: str = Field(..., min_length=1)   # 'caratula' (estimate budget)
+    estimate_id: Optional[str] = None
+    branch_id: Optional[str] = None
+    client_caption: Optional[str] = None
+
+
 class AccessUpsert(BaseModel):
     project_id: str = Field(..., min_length=1)
     modules: Dict[str, bool] = Field(default_factory=dict)
@@ -190,6 +200,86 @@ def list_shares(
     except Exception as e:
         logger.error("[connect] list_shares failed: %s", e)
         raise HTTPException(status_code=500, detail="Could not list shares")
+    return {"shares": res.data or []}
+
+
+# ============================================================
+# Member-scoped, project-independent shares — workspace_shares
+# (e.g. an Estimate Budget / carátula shared straight to a member)
+# ============================================================
+
+@router.post("/member-shares", status_code=201)
+def share_to_member(payload: MemberShareCreate, user: dict = Depends(require_internal)):
+    """Share an item directly to a workspace member (no project). Re-activates an
+    existing (member, item_type, estimate, branch) row if present."""
+    row = {
+        "external_type": payload.external_type,
+        "external_id": payload.external_id,
+        "item_type": payload.item_type,
+        "estimate_id": payload.estimate_id,
+        "branch_id": payload.branch_id,
+        "caption": payload.client_caption,
+        "shared_by": user.get("user_id"),
+        "is_active": True,
+        "shared_at": _now().isoformat(),
+    }
+    try:
+        existing = (
+            supabase.table("workspace_shares")
+            .select("id")
+            .eq("external_type", payload.external_type)
+            .eq("external_id", payload.external_id)
+            .eq("item_type", payload.item_type)
+            .eq("estimate_id", payload.estimate_id)
+            .eq("branch_id", payload.branch_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if existing:
+            res = supabase.table("workspace_shares").update(row).eq("id", existing[0]["id"]).execute()
+        else:
+            res = supabase.table("workspace_shares").insert(row).execute()
+    except Exception as e:
+        logger.error("[connect] member share failed: %s", e)
+        raise HTTPException(status_code=500, detail="Share failed")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Share returned no data")
+    return res.data[0]
+
+
+@router.delete("/member-shares/{share_id}")
+def unshare_member(share_id: str, user: dict = Depends(require_internal)):
+    """Unshare (deactivate) a member-scoped share."""
+    try:
+        res = supabase.table("workspace_shares").update({"is_active": False}).eq("id", share_id).execute()
+    except Exception as e:
+        logger.error("[connect] member unshare failed: %s", e)
+        raise HTTPException(status_code=500, detail="Unshare failed")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Share not found")
+    return {"ok": True, "id": share_id}
+
+
+@router.get("/member-shares")
+def list_member_shares(
+    external_type: Optional[str] = Query(None),
+    external_id: Optional[str] = Query(None),
+    item_type: Optional[str] = Query(None),
+    user: dict = Depends(require_internal),
+):
+    """List active member shares. No member filter -> all active (badge lookup)."""
+    q = supabase.table("workspace_shares").select("*").eq("is_active", True).order("shared_at", desc=True)
+    if external_type:
+        q = q.eq("external_type", external_type)
+    if external_id:
+        q = q.eq("external_id", external_id)
+    if item_type:
+        q = q.eq("item_type", item_type)
+    try:
+        res = q.execute()
+    except Exception as e:
+        logger.error("[connect] list_member_shares failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not list member shares")
     return {"shares": res.data or []}
 
 
