@@ -541,6 +541,32 @@ def _review_status_id(status_name: str):
         return None
 
 
+@router.get("/send-estimate-good-to-go")
+def send_estimate_good_to_go():
+    """Keys ('estimate_id:branch_id') of Send-Estimate coordination tasks currently
+    in 'Good to Go'. These are the approved estimates Coordination has cleared to
+    send — used to gate sharing a carátula with a client."""
+    gid = _review_status_id("good to go")
+    if gid is None:
+        return {"keys": []}
+    try:
+        rows = (supabase.table("tasks").select("automation_metadata")
+                .eq("automation_type", "send_estimate")
+                .eq("task_status", gid).execute().data) or []
+    except Exception as exc:
+        logger.error("[PIPELINE] send_estimate_good_to_go failed: %s", exc)
+        return {"keys": []}
+    keys = []
+    for r in rows:
+        meta = r.get("automation_metadata") or {}
+        key = meta.get("send_estimate_key")
+        if not key and meta.get("estimate_id") and meta.get("branch_id"):
+            key = f"{meta['estimate_id']}:{meta['branch_id']}"
+        if key:
+            keys.append(key)
+    return {"keys": keys}
+
+
 # automation_settings.default_priority is a 1..5 level, but tasks.task_priority is
 # a FK to tasks_priority (named rows). Map by the conventional ascending order so
 # the configured priority actually lands on the board instead of being dropped.
