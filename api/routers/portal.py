@@ -696,3 +696,84 @@ def portal_send_message(
 def portal_invoices(project_id: str, principal: dict = Depends(get_portal_principal)):
     assert_module(principal, project_id, "invoices")  # client-only (blocks external)
     return {"invoices": list_project_invoices(project_id, client_id=principal["client_id"], mark_viewed=True)}
+
+
+# ── Budgets — member-scoped, project-independent carátula shares ─────────────
+# Unlike the per-project modules above, a Budget (Estimate carátula) is shared
+# DIRECTLY with the member (workspace_shares), no project needed. Visibility is
+# share-driven: the Budget module only appears when something is shared.
+
+@router.get("/budgets")
+def portal_budgets(principal: dict = Depends(get_portal_principal)):
+    """Estimate Budgets (carátulas) shared directly with this member."""
+    try:
+        rows = (
+            supabase.table("workspace_shares")
+            .select("id, estimate_id, branch_id, caption, shared_at")
+            .eq("external_type", principal["kind"])
+            .eq("external_id", principal["access_id"])
+            .eq("item_type", "caratula")
+            .eq("is_active", True)
+            .order("shared_at", desc=True)
+            .execute()
+            .data
+        ) or []
+    except Exception as e:
+        logger.error("[portal] budgets list failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not load budgets")
+
+    from api.routers import estimator as est
+    out = []
+    for r in rows:
+        eid = r.get("estimate_id")
+        bid = r.get("branch_id")
+        name = r.get("caption")
+        branch_name = None
+        try:
+            manifest = est.ensure_manifest(eid)
+            if not name:
+                name = manifest.get("project_name") or eid
+            b = est.find_branch(manifest, bid) if bid else None
+            branch_name = b.get("name") if b else None
+        except Exception:
+            if not name:
+                name = eid
+        out.append({
+            "id": r.get("id"),
+            "estimate_id": eid,
+            "branch_id": bid,
+            "name": name,
+            "branch_name": branch_name,
+            "shared_at": r.get("shared_at"),
+        })
+    return {"budgets": out}
+
+
+@router.get("/budgets/{estimate_id}/{branch_id}")
+def portal_budget_caratula(estimate_id: str, branch_id: str, principal: dict = Depends(get_portal_principal)):
+    """Return a shared carátula document — only if actively shared with this member."""
+    try:
+        share = (
+            supabase.table("workspace_shares")
+            .select("id")
+            .eq("external_type", principal["kind"])
+            .eq("external_id", principal["access_id"])
+            .eq("item_type", "caratula")
+            .eq("estimate_id", estimate_id)
+            .eq("branch_id", branch_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+            .data
+        ) or []
+    except Exception as e:
+        logger.error("[portal] budget caratula auth failed: %s", e)
+        raise HTTPException(status_code=500, detail="Could not load budget")
+    if not share:
+        raise HTTPException(status_code=403, detail="This budget is not shared with you")
+
+    from api.routers import estimator as est
+    data = est._download_json(est._caratula_path(estimate_id, branch_id))
+    if data is None:
+        raise HTTPException(status_code=404, detail="No carátula stored for this budget")
+    return data
